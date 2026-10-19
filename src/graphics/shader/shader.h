@@ -150,6 +150,9 @@ struct ShaderVertexInputInfo {
 	uint32_t                wave_size           = 64;
 	uint32_t                scratch_size_dwords = 0;
 	uint32_t                pa_cl_vs_out_cntl    = 0;
+	// Register-only user clip planes (PA_CL_UCP_*) the vertex shader emulates as ClipDistance.
+	// The plane equations come from push data at draw time, so only the mask is static.
+	uint32_t                user_clip_plane_mask = 0;
 	ShaderClipSpaceTransform clip_space;
 	ShaderMeshInputInfo      mesh;
 	ShaderTessellationInputInfo tess;
