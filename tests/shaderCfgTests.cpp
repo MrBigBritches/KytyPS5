@@ -2341,12 +2341,12 @@ void TestNewShaderRecompilerScalarVectorAlu() {
 }
 
 void TestNewShaderRecompilerTrapTemporaries() {
-  // Atelier Yumia uses trap temporaries (TTMP3 is scalar operand code 0x73) as
+  // Atelier Yumia uses trap temporaries (TTMP3 is scalar operand code 0x6f on RDNA) as
   // scratch scalar registers. They decode into the slots past the SGPR file.
   const uint32_t shader[] = {
       EncodeSMovB32(0, 129),          // s0 = 1
-      EncodeSop2(0x00, 115, 0, 129),  // s_add_u32 ttmp3, s0, 1
-      EncodeSop2(0x00, 2, 115, 1),    // s_add_u32 s2, ttmp3, s1
+      EncodeSop2(0x00, 111, 0, 129),  // s_add_u32 ttmp3, s0, 1
+      EncodeSop2(0x00, 2, 111, 1),    // s_add_u32 s2, ttmp3, s1
       0xbf810000u,
   };
 
@@ -10728,6 +10728,33 @@ void TestNewShaderRecompilerBranchConditionForms() {
   }
 }
 
+void TestDecoderTrailingDwordLength() {
+  using namespace ShaderRecompiler;
+  // s_setreg_imm32_b32 carries a trailing literal; it must not be decoded as an instruction.
+  {
+    const uint32_t code[] = {EncodeSopk(0x15, 0, 0x0801), 0xc0610000u, EncodeSopp(0x01)};
+    Decoder::Program decoded;
+    Decoder::DecodeProgram(code, decoded);
+    Check(decoded.instructions.size() == 2 &&
+              decoded.instructions[0].opcode == Decoder::Opcode::S_SETREG_IMM32_B32 &&
+              decoded.instructions[0].word_count == 2 &&
+              decoded.instructions[0].src0.value == 0xc0610000u &&
+              decoded.instructions[1].opcode == Decoder::Opcode::S_ENDPGM,
+          "S_SETREG_IMM32_B32 did not consume its literal");
+  }
+  // An unimplemented SOP2 opcode with a literal source must still skip the literal.
+  {
+    const uint32_t code[] = {EncodeSop2(0x5f, 0, 255, 0), 0xc0610000u, EncodeSopp(0x01)};
+    Decoder::Program decoded;
+    Decoder::DecodeProgram(code, decoded);
+    Check(decoded.instructions.size() == 2 &&
+              decoded.instructions[0].opcode == Decoder::Opcode::UNSUPPORTED &&
+              decoded.instructions[0].word_count == 2 &&
+              decoded.instructions[1].opcode == Decoder::Opcode::S_ENDPGM,
+          "unsupported instruction did not consume its literal");
+  }
+}
+
 void TestGraphicsComputeGetreg() {
   using namespace ShaderRecompiler;
   for (const auto [word, expected] : {std::pair{0xb96a1818u, 6u}, std::pair{0xb96a0a18u, 0u}}) {
@@ -16742,6 +16769,7 @@ int main() {
   TestNewShaderRecompilerUnsupportedMemoryDecode();
 
   TestNewShaderRecompilerTrapTemporaries();
+  TestDecoderTrailingDwordLength();
   TestNewShaderRecompilerVop3LaneReadDestinationEncoding();
 
   return 0;
