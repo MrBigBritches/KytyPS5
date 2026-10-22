@@ -435,13 +435,6 @@ jobs:
 
   release:
     name: Release KytyPS5
-    if: >-
-      always() &&
-      github.event_name == 'push' &&
-      github.repository == 'KytyPS5/KytyPS5' &&
-      (needs.windows.result == 'success' ||
-       needs.macos.result == 'success' ||
-       needs.linux.result == 'success')
     needs: [metadata, windows, macos, linux]
     runs-on: ubuntu-latest
     permissions:
