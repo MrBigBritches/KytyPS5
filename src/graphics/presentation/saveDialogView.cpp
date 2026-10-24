@@ -1,13 +1,12 @@
 #include "graphics/presentation/saveDialogView.h"
 
-#include "common/logging/log.h"
+#include "common/stringUtils.h"
+#include "graphics/presentation/overlayHelpers.h"
 #include "imgui_internal.h"
 #include "libs/controller.h"
-#include "stb_image.h"
 
 #include <algorithm>
-#include <cstring>
-#include <limits>
+#include <span>
 #include <utility>
 
 namespace Libs::Graphics {
@@ -129,35 +128,17 @@ void SaveDialogView::FeedControls(ImGuiIO& io) {
 void SaveDialogView::TextCenteredWrapped(const std::string& text) {
 	const float left  = ImGui::GetCursorPosX();
 	const float avail = std::max(ImGui::GetContentRegionAvail().x, 1.0f);
-	ImFont*     font  = ImGui::GetFont();
-	const float size  = ImGui::GetFontSize();
-	const char* begin = text.c_str();
-	const char* end   = begin + text.size();
-	std::vector<std::pair<const char*, const char*>> lines;
-	while (begin < end) {
-		const char* line_end = font->CalcWordWrapPosition(size, begin, end, avail);
-		if (line_end == begin) {
-			line_end = begin + 1; // a single glyph wider than the line
-		}
-		const char* newline = static_cast<const char*>(
-		    std::memchr(begin, '\n', static_cast<size_t>(line_end - begin)));
-		if (newline != nullptr) {
-			line_end = newline;
-		}
-		lines.emplace_back(begin, line_end);
-		begin = line_end;
-		while (begin < end && (*begin == ' ' || *begin == '\n')) {
-			begin++;
-		}
-	}
+	const auto  lines = WrapText(text, ImGui::GetFontSize(), avail);
 	// Lines sit as close as wrapped text; the usual spacing follows the last one.
 	const ImVec2 spacing = ImGui::GetStyle().ItemSpacing;
 	for (size_t i = 0; i < lines.size(); i++) {
 		const bool last = i + 1 == lines.size();
 		ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {spacing.x, last ? spacing.y : 0.0f});
-		const float width = ImGui::CalcTextSize(lines[i].first, lines[i].second).x;
+		const char* begin = lines[i].data();
+		const char* end   = begin + lines[i].size();
+		const float width = ImGui::CalcTextSize(begin, end).x;
 		ImGui::SetCursorPosX(left + std::max((avail - width) * 0.5f, 0.0f));
-		ImGui::TextUnformatted(lines[i].first, lines[i].second);
+		ImGui::TextUnformatted(begin, end);
 		ImGui::PopStyleVar();
 	}
 }
@@ -394,33 +375,10 @@ ImTextureData* SaveDialogView::IconTexture(const Item& item) {
 		}
 	}
 	if (m_icons.size() >= MAX_ICONS) {
-		return nullptr; // keeps within the descriptor pool; the row draws without a picture
+		return nullptr; // keeps within the descriptor pool; the row shows an empty thumbnail
 	}
-	Icon icon {item.icon_png, nullptr};
-	const auto& encoded = *item.icon_png;
-	int         width   = 0;
-	int         height  = 0;
-	if (!encoded.empty() &&
-	    encoded.size() <= static_cast<size_t>(std::numeric_limits<int>::max()) &&
-	    stbi_info_from_memory(encoded.data(), static_cast<int>(encoded.size()), &width, &height,
-	                          nullptr) &&
-	    width > 0 && height > 0 && width <= 2048 && height <= 2048) {
-		auto* pixels = stbi_load_from_memory(encoded.data(), static_cast<int>(encoded.size()),
-		                                     &width, &height, nullptr, 4);
-		if (pixels != nullptr) {
-			icon.texture = std::make_unique<ImTextureData>();
-			icon.texture->Create(ImTextureFormat_RGBA32, width, height);
-			std::memcpy(icon.texture->Pixels, pixels,
-			            static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 4);
-			icon.texture->UseColors = true;
-			stbi_image_free(pixels);
-			ImGui::RegisterUserTexture(icon.texture.get());
-		}
-	}
-	if (icon.texture == nullptr) {
-		LOGF("SaveDataDialog: could not decode a save icon (%zu bytes)\n", encoded.size());
-	}
-	m_icons.push_back(std::move(icon));
+	m_icons.push_back({item.icon_png, LoadPngTexture(std::as_bytes(std::span(*item.icon_png)), 2048,
+	                                                 "SaveDataDialog: thumbnail")});
 	return m_icons.back().texture.get();
 }
 
@@ -443,20 +401,8 @@ std::string SaveDialogView::FullWidthSpaceFallback(const std::string& text) {
 		m_full_width_space_missing =
 		    m_font != nullptr && !m_font->IsGlyphInFont(static_cast<ImWchar>(0x3000));
 	}
-	if (!m_full_width_space_missing || text.find("\xE3\x80\x80") == std::string::npos) {
-		return text;
-	}
-	std::string result;
-	result.reserve(text.size());
-	for (size_t i = 0; i < text.size(); ++i) {
-		if (text.compare(i, 3, "\xE3\x80\x80") == 0) {
-			result += "\xE2\x80\x83";
-			i += 2;
-		} else {
-			result += text[i];
-		}
-	}
-	return result;
+	return m_full_width_space_missing ? Common::ReplaceStr(text, "\xE3\x80\x80", "\xE2\x80\x83")
+	                                  : text;
 }
 
 // One save: its thumbnail, then the title and the lines `style` (SceSaveDataDialogItemStyle)

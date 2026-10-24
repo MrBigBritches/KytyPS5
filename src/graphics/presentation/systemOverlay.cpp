@@ -9,6 +9,7 @@
 #include "gpu_blit_shaders/gpu_imgui_hdr_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/presentation/ddsImage.h"
+#include "graphics/presentation/overlayHelpers.h"
 #include "graphics/presentation/performanceOverlay.h"
 #include "graphics/presentation/saveDialogView.h"
 #include "graphics/presentation/window/hostInput.h"
@@ -257,37 +258,6 @@ std::array<std::filesystem::path, 2> g_splash_paths;
 std::atomic<bool>                    g_splash_active {false};
 std::atomic<Clock::duration::rep>    g_splash_hidden_at {0};
 bool                                 g_splash_fast = false;
-
-std::vector<std::string_view> WrapTrophyTitle(std::string_view text, float font_size, float width) {
-	std::vector<std::string_view> lines;
-	auto* const                  font = ImGui::GetFont();
-	for (;;) {
-		const auto newline   = text.find('\n');
-		const auto paragraph = text.substr(0, newline);
-		auto       line      = paragraph.substr(0, 0);
-		for (auto start = paragraph.find_first_not_of(" \t\r"); start != std::string_view::npos;) {
-			const auto end  = std::min(paragraph.find_first_of(" \t\r", start), paragraph.size());
-			const auto word = paragraph.substr(start, end - start);
-			const std::string_view candidate(line.empty() ? word.begin() : line.begin(),
-			                                 word.end());
-			// Keep an oversized word intact; the toast's clip rectangle handles overflow.
-			if (!line.empty() && font->CalcTextSizeA(font_size, std::numeric_limits<float>::max(),
-			                                       0.0f, candidate.data(),
-			                                       candidate.data() + candidate.size()).x > width) {
-				lines.push_back(line);
-				line = word;
-			} else {
-				line = candidate;
-			}
-			start = paragraph.find_first_not_of(" \t\r", end);
-		}
-		lines.push_back(line);
-		if (newline == std::string_view::npos) {
-			return lines;
-		}
-		text.remove_prefix(newline + 1);
-	}
-}
 
 // ImGui's built-in font covers Latin only. Merge installed fonts for the selected console language.
 // Merges installed fonts for characters the last added font lacks (CJK, Thai, Arabic, ...).
@@ -1079,37 +1049,6 @@ struct SystemOverlay::Impl {
 		return texture;
 	}
 
-	std::unique_ptr<ImTextureData> LoadTrophyIcon(std::span<const std::byte> encoded) {
-		if (encoded.empty() ||
-		    encoded.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
-			return nullptr;
-		}
-
-		const auto* data   = reinterpret_cast<const stbi_uc*>(encoded.data());
-		const int   size   = static_cast<int>(encoded.size());
-		int         width  = 0;
-		int         height = 0;
-		if (!stbi_info_from_memory(data, size, &width, &height, nullptr) || width <= 0 ||
-		    height <= 0 || width > 512 || height > 512) {
-			LOGF("[Trophy] invalid icon or dimensions exceed 512x512\n");
-			return nullptr;
-		}
-		auto* pixels = stbi_load_from_memory(data, size, &width, &height, nullptr, 4);
-		if (pixels == nullptr) {
-			LOGF("[Trophy] could not decode trophy icon: %s\n", stbi_failure_reason());
-			return nullptr;
-		}
-
-		auto texture = std::make_unique<ImTextureData>();
-		texture->Create(ImTextureFormat_RGBA32, width, height);
-		std::memcpy(texture->Pixels, pixels,
-		            static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 4);
-		texture->UseColors = true;
-		stbi_image_free(pixels);
-		ImGui::RegisterUserTexture(texture.get());
-		return texture;
-	}
-
 	void FinishSplash() {
 		g_splash_active.store(false, std::memory_order_release);
 		if (splash_dds[0] || splash_dds[1]) {
@@ -1770,7 +1709,7 @@ struct SystemOverlay::Impl {
 			}
 			trophy_notification_subtitle = PrepareTrophySubtitle(Config::GetConsoleLanguage());
 			trophy_notification_born     = now;
-			trophy_notification_image    = LoadTrophyIcon(trophy_notification->icon_png);
+			trophy_notification_image    = LoadPngTexture(trophy_notification->icon_png, 512, "[Trophy] icon");
 			PlayTrophySound();
 		}
 		const float age = std::chrono::duration<float>(now - trophy_notification_born).count();
@@ -1795,7 +1734,7 @@ struct SystemOverlay::Impl {
 		const float title_size   = 26.0f * screen_scale;
 		const float line_height  = 30.0f * screen_scale;
 		const float text_padding = 16.0f * screen_scale;
-		const auto  title_lines  = WrapTrophyTitle(trophy_notification->name, title_size,
+		const auto  title_lines  = WrapText(trophy_notification->name, title_size,
 		                                           width - title_offset - text_padding);
 		const float block_height =
 		    static_cast<float>(title_lines.size()) * line_height + 28.0f * screen_scale;
