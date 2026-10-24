@@ -785,6 +785,15 @@ add_custom_target(kyty_touch_cursors
 add_dependencies(kyty_emulator kyty_touch_cursors)
 install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/assets/cursors" DESTINATION assets)
 
+# Noto Sans (SIL Open Font License, assets/fonts/OFL.txt) for the save data dialog.
+add_custom_target(kyty_overlay_fonts
+	COMMAND ${CMAKE_COMMAND} -E copy_directory
+		"${CMAKE_CURRENT_SOURCE_DIR}/assets/fonts"
+		"$<TARGET_FILE_DIR:kyty_emulator>/assets/fonts"
+	VERBATIM)
+add_dependencies(kyty_emulator kyty_overlay_fonts)
+install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/assets/fonts" DESTINATION assets)
+
 target_link_libraries(kyty_emulator ${kyty_emulator_link_libraries})
 if (WIN32)
 	target_link_libraries(kyty_emulator opengl32)

@@ -17,6 +17,7 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <vector>
@@ -126,6 +127,10 @@ public:
 	void ResetOrientation();
 	void ToggleGyroEmulation(int id);
 	void ResetInputState();
+	ControllerState CurrentState() {
+		Common::LockGuard lock(m_mutex);
+		return m_state;
+	}
 	void GetConnectionInfo(bool* flag, int* count);
 	void SetVibration(uint8_t large_motor, uint8_t small_motor);
 	int  GetActiveControllerId();
@@ -218,11 +223,22 @@ static GameController* PlayerForHandle(int handle) {
 	return PadVrHand(handle) >= 0 ? g_players[0].get() : nullptr;
 }
 
-static void pad_fill_data(PadData* data, const ControllerState& state, bool connected,
+static std::atomic<bool> g_system_input_focus = false;
+
+static void pad_fill_data(PadData* data, const ControllerState& source, bool connected,
                           int connected_count) {
 	EXIT_IF(data == nullptr);
 
 	std::memset(data, 0, sizeof(*data));
+
+	// A system dialog has the controls: the game sees an idle, intercepted pad.
+	ControllerState intercepted;
+	const bool      focus = g_system_input_focus.load(std::memory_order_acquire);
+	if (focus) {
+		intercepted.time    = source.time;
+		intercepted.buttons = PAD_BUTTON_INTERCEPTED;
+	}
+	const ControllerState& state = focus ? intercepted : source;
 
 	data->buttons           = state.buttons;
 	data->left_stick_x      = state.axes[static_cast<int>(Axis::LeftX)];
@@ -1126,6 +1142,33 @@ void ResetInputState() {
 			player->ResetInputState();
 		}
 	}
+}
+
+void SetSystemInputFocus(bool focus) {
+	if (g_system_input_focus.exchange(focus, std::memory_order_acq_rel) != focus) {
+		ResetInputState();
+	}
+}
+
+SystemInput GetSystemInput() {
+	SystemInput input;
+	int         deviation = 0;
+	for (const auto& player: g_players) {
+		if (player == nullptr) {
+			continue;
+		}
+		const auto state = player->CurrentState();
+		input.buttons |= state.buttons;
+		const int x = state.axes[static_cast<int>(Axis::LeftX)];
+		const int y = state.axes[static_cast<int>(Axis::LeftY)];
+		const int d = std::max(std::abs(x - 128), std::abs(y - 128));
+		if (d > deviation) {
+			deviation    = d;
+			input.left_x = x;
+			input.left_y = y;
+		}
+	}
+	return input;
 }
 
 int GetActiveControllerId() {

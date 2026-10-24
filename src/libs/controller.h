@@ -40,6 +40,7 @@ constexpr uint32_t PAD_BUTTON_CIRCLE    = 0x00002000;
 constexpr uint32_t PAD_BUTTON_CROSS     = 0x00004000;
 constexpr uint32_t PAD_BUTTON_SQUARE    = 0x00008000;
 constexpr uint32_t PAD_BUTTON_TOUCH_PAD = 0x00100000;
+constexpr uint32_t PAD_BUTTON_INTERCEPTED = 0x80000000;
 
 enum class Axis {
 	LeftX        = 0,
@@ -84,6 +85,18 @@ void SetSensor(int id, Sensor sensor, const float* data, uint64_t time_us);
 void ToggleGyroEmulation(int id);
 void ResetInputState();
 int  GetActiveControllerId();
+
+// While a system dialog (e.g. the save data dialog) has the input focus, games read neutral pad
+// data marked intercepted, and the dialog reads the mapped controls through GetSystemInput.
+// Changing the focus clears held input, so a press does not carry over to the other side.
+void SetSystemInputFocus(bool focus);
+
+struct SystemInput {
+	uint32_t buttons = 0;   // PAD_BUTTON_* of all players
+	int      left_x  = 128; // the left stick furthest from the centre
+	int      left_y  = 128;
+};
+SystemInput GetSystemInput();
 // True when the player has a keyboard or gamepad assigned.
 bool IsPlayerConnected(int player);
 

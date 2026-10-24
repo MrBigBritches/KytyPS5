@@ -9,6 +9,7 @@
 #include "kernel/fileSystem.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
+#include "libs/saveData.h"
 #include "libs/saveDataMountSlots.h"
 #include "loader/symbolDatabase.h"
 #include "loader/systemContent.h"
@@ -393,6 +394,26 @@ static std::filesystem::path save_param_path(const std::filesystem::path& direct
 	return directory / "sce_sys" / "param.bin";
 }
 
+static constexpr size_t SAVE_DATA_ICON_MAX_SIZE = 4 * 1024 * 1024;
+
+static std::filesystem::path save_icon_path(const std::filesystem::path& directory) {
+	return directory / "sce_sys" / "icon0.png";
+}
+
+static bool read_icon_file(const std::filesystem::path& path, std::vector<uint8_t>* data) {
+	if (!Common::File::IsFileExisting(path)) {
+		return false;
+	}
+	Common::File file(path, Common::File::Mode::Read);
+	if (file.IsInvalid() || file.Size() == 0 || file.Size() > SAVE_DATA_ICON_MAX_SIZE) {
+		return false;
+	}
+	data->resize(static_cast<size_t>(file.Size()));
+	uint32_t read = 0;
+	file.Read(data->data(), static_cast<uint32_t>(data->size()), &read);
+	return read == data->size();
+}
+
 static int64_t newest_save_time(const std::filesystem::path& directory) {
 	int64_t mtime = 0;
 	std::error_code error;
@@ -616,9 +637,40 @@ int KYTY_SYSV_ABI SaveDataDirNameSearch(const SaveDataDirNameSearchCond* cond,
 		}
 	}
 
-	std::sort(dir_list.begin(), dir_list.end(), [](const std::string& a, const std::string& b) {
-		return std::strcmp(a.c_str(), b.c_str()) < 0;
+	// Sort by the requested key, ties (and the directory name key) by name.
+	struct SortEntry {
+		std::string name;
+		uint64_t    value = 0;
+	};
+	std::vector<SortEntry> sorted;
+	sorted.reserve(dir_list.size());
+	for (const auto& name: dir_list) {
+		SortEntry entry {name, 0};
+		if (cond->key == SaveDataSortKey::UserParam || cond->key == SaveDataSortKey::Mtime) {
+			SaveDataParam param {};
+			if (load_save_param(root / name, &param) == OK) {
+				entry.value = cond->key == SaveDataSortKey::UserParam
+				                  ? param.user_param
+				                  : static_cast<uint64_t>(std::max<int64_t>(param.mtime, 0));
+			}
+		} else if (cond->key == SaveDataSortKey::Blocks ||
+		           cond->key == SaveDataSortKey::FreeBlocks) {
+			uint64_t blocks = 0;
+			if (read_save_blocks(root / name, &blocks) == OK) {
+				entry.value = blocks; // host saves report their allocation as free space too
+			}
+		}
+		sorted.push_back(std::move(entry));
+	}
+	std::stable_sort(sorted.begin(), sorted.end(), [](const SortEntry& a, const SortEntry& b) {
+		if (a.value != b.value) {
+			return a.value < b.value;
+		}
+		return std::strcmp(a.name.c_str(), b.name.c_str()) < 0;
 	});
+	for (size_t i = 0; i < sorted.size(); i++) {
+		dir_list[i] = std::move(sorted[i].name);
+	}
 
 	if (cond->order == SaveDataSortOrder::Descent) {
 		std::vector<std::string> reversed;
@@ -1099,9 +1151,30 @@ int KYTY_SYSV_ABI SaveDataLoadIcon(const SaveDataMountPoint* mount_point, SaveDa
 	     mount_point->data, reinterpret_cast<uint64_t>(icon->buf), icon->buf_size);
 
 	icon->data_size = 0;
-
+	if (std::memchr(mount_point->data, 0, sizeof(mount_point->data)) == nullptr) {
+		return SAVE_DATA_ERROR_PARAMETER;
+	}
+	Common::LockGuard lock(g_mount_mutex);
+	const int slot = g_mount_slots.Find(mount_point->data);
+	if (slot == SaveDataMountSlots::FULL) {
+		return SAVE_DATA_ERROR_NOT_MOUNTED;
+	}
+	std::vector<uint8_t> data;
+	if (!read_icon_file(save_icon_path(g_mount_slots.Directory(static_cast<size_t>(slot))),
+	                    &data)) {
+		return OK; // no icon saved: an empty icon, as before icons were stored
+	}
+	icon->data_size = data.size();
+	if (icon->buf == nullptr || icon->buf_size < data.size()) {
+		return SAVE_DATA_ERROR_PARAMETER;
+	}
+	std::memcpy(icon->buf, data.data(), data.size());
 	return OK;
 }
+
+int KYTY_SYSV_ABI SaveDataSaveIcon(const SaveDataMountPoint* mount_point, const SaveDataIcon* icon);
+
+static bool read_guest_file(const char* path, size_t max_size, std::vector<uint8_t>* data);
 
 int KYTY_SYSV_ABI SaveDataSaveIconByPath(const SaveDataMountPoint* mount_point, const char* path) {
 	PRINT_NAME();
@@ -1114,7 +1187,15 @@ int KYTY_SYSV_ABI SaveDataSaveIconByPath(const SaveDataMountPoint* mount_point, 
 	     "\t path        = %s\n",
 	     mount_point->data, path);
 
-	return OK;
+	std::vector<uint8_t> data;
+	if (!read_guest_file(path, SAVE_DATA_ICON_MAX_SIZE, &data)) {
+		return SAVE_DATA_ERROR_NOT_FOUND;
+	}
+	SaveDataIcon icon {};
+	icon.buf       = data.data();
+	icon.buf_size  = data.size();
+	icon.data_size = data.size();
+	return SaveDataSaveIcon(mount_point, &icon);
 }
 
 int KYTY_SYSV_ABI SaveDataSyncSaveDataMemory(const SaveDataMemorySync* sync_param) {
@@ -1280,17 +1361,106 @@ int KYTY_SYSV_ABI SaveDataGetMountInfo(const SaveDataMountPoint* mount_point,
 	return OK;
 }
 
+// The icon (a PNG) is stored as sce_sys/icon0.png in the save directory, where the save data
+// dialog shows it as the save's thumbnail.
 int KYTY_SYSV_ABI SaveDataSaveIcon(const SaveDataMountPoint* mount_point,
                                    const SaveDataIcon*       icon) {
-	EXIT_NOT_IMPLEMENTED(mount_point == nullptr);
-	EXIT_NOT_IMPLEMENTED(icon == nullptr);
+	PRINT_NAME();
+
+	if (mount_point == nullptr || icon == nullptr || icon->buf == nullptr ||
+	    std::memchr(mount_point->data, 0, sizeof(mount_point->data)) == nullptr) {
+		return SAVE_DATA_ERROR_PARAMETER;
+	}
 
 	LOGF("\t buf       = %016" PRIx64 "\n"
 	     "\t buf_size  = %" PRIu64 "\n"
 	     "\t data_size = %" PRIu64 "\n",
 	     reinterpret_cast<uint64_t>(icon->buf), icon->buf_size, icon->data_size);
 
-	return OK;
+	if (icon->data_size == 0 || icon->data_size > icon->buf_size ||
+	    icon->data_size > SAVE_DATA_ICON_MAX_SIZE) {
+		return SAVE_DATA_ERROR_PARAMETER;
+	}
+	Common::LockGuard lock(g_mount_mutex);
+	const int slot = g_mount_slots.Find(mount_point->data);
+	if (slot == SaveDataMountSlots::FULL) {
+		return SAVE_DATA_ERROR_NOT_MOUNTED;
+	}
+	return write_save_file(save_icon_path(g_mount_slots.Directory(static_cast<size_t>(slot))),
+	                       icon->buf, static_cast<uint32_t>(icon->data_size));
+}
+
+static_assert(sizeof(SaveDataParam) == SAVE_DATA_PARAM_SIZE);
+
+// Reads a whole guest file (e.g. a path given to SaveDataSaveIconByPath) of at most
+// `max_size` bytes.
+static bool read_guest_file(const char* path, size_t max_size, std::vector<uint8_t>* data) {
+	namespace FileSystem = LibKernel::FileSystem;
+	if (path == nullptr || data == nullptr) {
+		return false;
+	}
+	const int fd = FileSystem::KernelOpen(path, 0, 0);
+	if (fd < 0) {
+		return false;
+	}
+	FileSystem::FileStat stat {};
+	bool ok = FileSystem::KernelFstat(fd, &stat) == 0 && stat.st_size > 0 &&
+	          static_cast<uint64_t>(stat.st_size) <= max_size;
+	if (ok) {
+		data->resize(static_cast<size_t>(stat.st_size));
+		ok = FileSystem::KernelRead(fd, data->data(), data->size()) == stat.st_size;
+	}
+	FileSystem::KernelClose(fd);
+	return ok;
+}
+
+bool ReadSaveDataIcon(int32_t user_id, const char* title_id, const char* dir_name,
+                      std::vector<uint8_t>* png) {
+	if (dir_name == nullptr || png == nullptr || !valid_path_component(std::string_view(dir_name)) ||
+	    (title_id != nullptr && !valid_path_component(std::string_view(title_id)))) {
+		return false;
+	}
+	Common::LockGuard lock(g_mount_mutex);
+	const std::string title = title_id != nullptr ? std::string(title_id) : get_title_id();
+	return read_icon_file(save_icon_path(save_directory(title, dir_name, user_id)), png);
+}
+
+uint64_t GetSaveDataSize(int32_t user_id, const char* title_id, const char* dir_name) {
+	if (dir_name == nullptr || !valid_path_component(std::string_view(dir_name)) ||
+	    (title_id != nullptr && !valid_path_component(std::string_view(title_id)))) {
+		return 0;
+	}
+	Common::LockGuard lock(g_mount_mutex);
+	const std::string title     = title_id != nullptr ? std::string(title_id) : get_title_id();
+	const auto        directory = save_directory(title, dir_name, user_id);
+	uint64_t          size      = 0;
+	std::error_code   error;
+	for (std::filesystem::recursive_directory_iterator it(
+	         directory, std::filesystem::directory_options::skip_permission_denied, error),
+	     end;
+	     it != end; it.increment(error)) {
+		if (error) {
+			break;
+		}
+		if (it->is_regular_file(error) && !error) {
+			size += it->file_size(error);
+		}
+		error.clear();
+	}
+	return size;
+}
+
+bool ReadSaveDataParam(int32_t user_id, const char* title_id, const char* dir_name, void* param,
+                       size_t param_size) {
+	if (dir_name == nullptr || param == nullptr || param_size != sizeof(SaveDataParam) ||
+	    !valid_path_component(std::string_view(dir_name)) ||
+	    (title_id != nullptr && !valid_path_component(std::string_view(title_id)))) {
+		return false;
+	}
+	Common::LockGuard lock(g_mount_mutex);
+	const std::string title     = title_id != nullptr ? std::string(title_id) : get_title_id();
+	const auto        directory = save_directory(title, dir_name, user_id);
+	return load_save_param(directory, static_cast<SaveDataParam*>(param)) == OK;
 }
 
 } // namespace SaveData

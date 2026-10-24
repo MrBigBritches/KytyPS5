@@ -4,6 +4,11 @@
 #include "common/abi.h"
 #include "common/common.h"
 
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <vector>
+
 namespace Libs::Dialog {
 
 namespace CommonDialog {
@@ -50,6 +55,51 @@ int KYTY_SYSV_ABI SaveDataDialogIsReadyToDisplay();
 int KYTY_SYSV_ABI SaveDataDialogTerminate();
 int KYTY_SYSV_ABI SaveDataDialogProgressBarInc(int target, uint32_t delta);
 int KYTY_SYSV_ABI SaveDataDialogProgressBarSetValue(int target, uint32_t rate);
+
+// What the system overlay draws for an open save data dialog.
+enum class HostView { List, Message, Progress };
+enum class HostButtons { Ok, YesNo, None, OkCancel };
+
+struct HostItem {
+	std::string dir_name; // empty for the new-item entry
+	std::string title;
+	std::string subtitle;
+	std::string date;
+	std::string size; // e.g. "1.95 MB"
+	bool        is_new = false;
+	// The save's thumbnail (PNG), shared so snapshots stay cheap; null if there is none.
+	std::shared_ptr<const std::vector<uint8_t>> icon_png;
+};
+
+struct HostSnapshot {
+	uint64_t              generation = 0;
+	int32_t               disp_type  = 0; // 1 save, 2 load, 3 delete
+	HostView              view       = HostView::List;
+	std::vector<HostItem> items;          // the list, or the item a message is about
+	size_t                focus      = 0; // initially focused list entry
+	// SceSaveDataDialogItemStyle: 0 title, date and size, subtitle; 1 title, subtitle, date and
+	// size; 2 title, date and size.
+	uint32_t              item_style = 0;
+	bool                  can_cancel = true;
+	std::string           message;
+	bool                  error_message = false;
+	HostButtons           buttons       = HostButtons::Ok;
+	uint32_t              progress      = 0; // percent
+};
+
+struct VisualState {
+	bool     active;
+	uint64_t revision;
+};
+
+bool        GetHostSnapshot(HostSnapshot* snapshot);
+VisualState GetVisualState() noexcept;
+// The player chose list entry `index` (an index into HostSnapshot::items).
+bool HostSelect(uint64_t generation, size_t index);
+// The player pressed OK/Yes (1) or No (2).
+bool HostButton(uint64_t generation, int32_t button_id);
+// The player backed out (Circle, or the Cancel button).
+bool HostCancel(uint64_t generation);
 
 } // namespace SaveDataDialog
 

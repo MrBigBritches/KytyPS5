@@ -10,6 +10,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/presentation/ddsImage.h"
 #include "graphics/presentation/performanceOverlay.h"
+#include "graphics/presentation/saveDialogView.h"
 #include "graphics/presentation/window/hostInput.h"
 #include "imgui.h"
 #include "imgui_impl_vulkan.h"
@@ -51,6 +52,7 @@ using Clock = std::chrono::steady_clock;
 namespace CoreIme      = Libs::Ime;
 namespace DialogIme    = Libs::Dialog::ImeDialog;
 namespace SystemDialog = Libs::Dialog::SystemDialog;
+namespace SaveDialog   = Libs::Dialog::SaveDataDialog;
 
 namespace Ime {
 
@@ -123,7 +125,7 @@ bool HostQueueExternalInput(uint64_t generation, ExternalInput input) {
 
 } // namespace Ime
 
-enum class OverlayKind : uint8_t { None, Ime, Dialog };
+enum class OverlayKind : uint8_t { None, Ime, Dialog, SaveData };
 
 struct OverlaySession {
 	OverlayKind kind       = OverlayKind::None;
@@ -136,11 +138,16 @@ struct OverlaySnapshot {
 	OverlaySession             session;
 	Ime::HostSnapshot          ime;
 	SystemDialog::HostSnapshot dialog;
+	SaveDialog::HostSnapshot   save;
 };
 
 bool GetOverlaySnapshot(OverlaySnapshot* snapshot) {
 	if (SystemDialog::GetHostSnapshot(&snapshot->dialog)) {
 		snapshot->session = {OverlayKind::Dialog, snapshot->dialog.generation};
+		return true;
+	}
+	if (SaveDialog::GetHostSnapshot(&snapshot->save)) {
+		snapshot->session = {OverlayKind::SaveData, snapshot->save.generation};
 		return true;
 	}
 	if (Ime::GetHostSnapshot(&snapshot->ime)) {
@@ -283,8 +290,8 @@ std::vector<std::string_view> WrapTrophyTitle(std::string_view text, float font_
 }
 
 // ImGui's built-in font covers Latin only. Merge installed fonts for the selected console language.
-void AddSystemFontFallbacks(ImGuiIO& io) {
-	io.Fonts->AddFontDefault();
+// Merges installed fonts for characters the last added font lacks (CJK, Thai, Arabic, ...).
+void MergeSystemFontFallbacks(ImGuiIO& io) {
 	const auto add = [&](std::initializer_list<const char*> paths) {
 		for (const char* path: paths) {
 			std::error_code error;
@@ -337,6 +344,33 @@ void AddSystemFontFallbacks(ImGuiIO& io) {
 	}
 }
 
+void AddSystemFontFallbacks(ImGuiIO& io) {
+	io.Fonts->AddFontDefault();
+	MergeSystemFontFallbacks(io);
+}
+
+// A font shipped in assets/fonts (anti-aliased, unlike the default bitmap-style font), with the
+// installed fallbacks merged in. Null if the file is missing.
+ImFont* AddAssetFont(ImGuiIO& io, const char* file_name) {
+	const char* base_path = SDL_GetBasePath();
+	if (base_path == nullptr) {
+		return nullptr;
+	}
+	const auto      path = std::filesystem::path(base_path) / "assets" / "fonts" / file_name;
+	std::error_code error;
+	if (!std::filesystem::is_regular_file(path, error)) {
+		LOGF("Overlay font not found: %s\n", Common::PathToString(path).c_str());
+		return nullptr;
+	}
+	ImFontConfig config;
+	config.Flags = ImFontFlags_NoLoadError;
+	ImFont* font = io.Fonts->AddFontFromFileTTF(Common::PathToString(path).c_str(), 0.0f, &config);
+	if (font != nullptr) {
+		MergeSystemFontFallbacks(io);
+	}
+	return font;
+}
+
 void ClearInputEvents() {
 	std::scoped_lock lock(g_input_mutex);
 	g_input_events.clear();
@@ -377,6 +411,19 @@ void RetryVisibilityWakeup() {
 	}
 }
 
+// The game's controls stay blocked while the save dialog is open and while it is still on
+// screen afterwards (fading out, or holding a finished save), so nothing reaches the game
+// behind it.
+static std::mutex g_save_focus_mutex;
+static bool       g_save_focus_open    = false;
+static bool       g_save_focus_visible = false;
+
+static void SetSaveInputFocus(bool* source, bool value) {
+	std::scoped_lock lock(g_save_focus_mutex);
+	*source = value;
+	Controller::SetSystemInputFocus(g_save_focus_open || g_save_focus_visible);
+}
+
 void RefreshVisibility() {
 	std::scoped_lock visibility_lock(g_visibility_mutex);
 	if (!g_input_lifecycle_active) {
@@ -392,6 +439,9 @@ void RefreshVisibility() {
 	bool capture_keyboard   = false;
 	bool text_input         = false;
 	bool multiline          = false;
+	// The save data dialog reads the controls through the emulator's input mapping, like the
+	// game; the game sees an intercepted pad meanwhile.
+	SetSaveInputFocus(&g_save_focus_open, snapshot.session.kind == OverlayKind::SaveData);
 	if (snapshot.session.kind == OverlayKind::Dialog) {
 		capture_controller = true;
 		capture_keyboard   = true;
@@ -680,6 +730,8 @@ void ShutdownSystemOverlayInput() {
 		std::scoped_lock lock(g_visibility_mutex);
 		g_input_lifecycle_active = false;
 		g_session                = {};
+		SetSaveInputFocus(&g_save_focus_open, false);
+		SetSaveInputFocus(&g_save_focus_visible, false);
 		if (std::exchange(g_controller_captured, false)) {
 			Controller::ResetInputState();
 		}
@@ -702,18 +754,29 @@ void ShutdownSystemOverlayInput() {
 	g_input_window = nullptr;
 }
 
+// The save dialog stays on screen for a moment after the game closes it (fading out, or holding
+// a finished save). The presenter only prepares overlay frames while something is active, so
+// that time counts as active too; otherwise the fade never ran and the game's controls, blocked
+// while the dialog shows, stayed blocked.
+static std::atomic<bool>     g_save_lingering        = false;
+static std::atomic<uint32_t> g_save_lingering_frames = 0;
+
 SystemOverlayVisualState GetSystemOverlayVisualState() noexcept {
 	const auto core   = CoreIme::GetVisualState();
 	const auto dialog = DialogIme::GetVisualState();
 	const auto system = SystemDialog::GetVisualState();
+	const auto save   = SaveDialog::GetVisualState();
 	const bool trophy_active = g_trophy_notification_active.load(std::memory_order_acquire);
 	const bool splash        = g_splash_active.load(std::memory_order_acquire);
 	const auto cursor        = GetHostInputTouchPadVisualState();
-	return {core.active || dialog.active || system.active || trophy_active || splash ||
-	            (cursor.enabled && cursor.cursor_visible),
-	        core.revision + dialog.revision + system.revision + (trophy_active ? 1u : 0u) +
-	            (splash ? 2u : 0u) + static_cast<decltype(core.revision)>(cursor.revision) +
-	            PerformanceOverlayRevision()};
+	const bool save_lingering = g_save_lingering.load(std::memory_order_acquire);
+	return {core.active || dialog.active || system.active || save.active || save_lingering ||
+	            trophy_active || splash || (cursor.enabled && cursor.cursor_visible),
+	        core.revision + dialog.revision + system.revision + save.revision +
+	            (trophy_active ? 1u : 0u) + (splash ? 2u : 0u) +
+	            static_cast<decltype(core.revision)>(cursor.revision) +
+	            PerformanceOverlayRevision() +
+	            g_save_lingering_frames.load(std::memory_order_acquire)};
 }
 
 bool ProcessSystemOverlayInput(const SDL_Event& event) {
@@ -765,6 +828,13 @@ bool ProcessSystemOverlayInput(const SDL_Event& event) {
 	                            event.type == SDL_EVENT_KEY_DOWN || event.type == SDL_EVENT_KEY_UP;
 	if (keyboard_event && !g_input_keyboard) {
 		return false;
+	}
+	const bool mouse_event = event.type == SDL_EVENT_MOUSE_MOTION ||
+	                         event.type == SDL_EVENT_MOUSE_BUTTON_DOWN ||
+	                         event.type == SDL_EVENT_MOUSE_BUTTON_UP ||
+	                         event.type == SDL_EVENT_MOUSE_WHEEL;
+	if (mouse_event && session.kind == OverlayKind::SaveData) {
+		return true; // no mouse in the save dialog, as on the console
 	}
 	if (keyboard_event && session.kind == OverlayKind::Dialog) {
 		if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat &&
@@ -890,6 +960,7 @@ struct SystemOverlay::Impl {
 			for (const auto& texture: retired_trophy_images) {
 				ImGui::UnregisterUserTexture(texture.get());
 			}
+			save_dialog.UnregisterTextures();
 			ImGui::DestroyContext(imgui_context);
 		}
 	}
@@ -910,6 +981,8 @@ struct SystemOverlay::Impl {
 		io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
 		io.BackendPlatformName = "Kyty system overlay input";
 		AddSystemFontFallbacks(io);
+		save_dialog.SetFonts(AddAssetFont(io, "NotoSans-Regular.ttf"),
+		                     AddAssetFont(io, "NotoSans-Bold.ttf"));
 		ImGui::StyleColorsDark();
 		auto& style          = ImGui::GetStyle();
 		style.WindowRounding = 10.0f;
@@ -1112,7 +1185,9 @@ struct SystemOverlay::Impl {
 		info.Device                       = static_cast<VkDevice>(graphics.device);
 		info.QueueFamily                  = graphics.queue_family;
 		info.Queue                        = static_cast<VkQueue>(graphics.queue);
-		info.DescriptorPoolSize           = IMGUI_IMPL_VULKAN_MINIMUM_SAMPLED_IMAGE_POOL_SIZE;
+		// Room for the font atlas, cursors, a trophy icon and the save dialog's thumbnails (a
+		// list and the one being retired can be alive together).
+		info.DescriptorPoolSize = IMGUI_IMPL_VULKAN_MINIMUM_SAMPLED_IMAGE_POOL_SIZE + 512;
 		info.MinImageCount                = image_count;
 		info.ImageCount                   = image_count;
 		info.UseDynamicRendering          = true;
@@ -1797,7 +1872,8 @@ struct SystemOverlay::Impl {
 		OverlaySnapshot snapshot;
 		const bool      has_overlay = GetOverlaySnapshot(&snapshot);
 		const auto now = Clock::now();
-		if (!has_overlay && !g_trophy_notification_active.load(std::memory_order_acquire) &&
+		if (!has_overlay && !g_save_lingering.load(std::memory_order_acquire) &&
+		    !g_trophy_notification_active.load(std::memory_order_acquire) &&
 		    !g_splash_active.load(std::memory_order_acquire) &&
 		    !GetHostInputTouchPadVisualState().enabled && !PerformanceOverlayEnabled()) {
 			return false;
@@ -1820,6 +1896,13 @@ struct SystemOverlay::Impl {
 		DrainInput(snapshot.session);
 
 		auto& io       = ImGui::GetIO();
+		// No hover or clicks in the save dialog, even from a mouse position seen earlier.
+		if (snapshot.session.kind == OverlayKind::SaveData) {
+			io.ConfigFlags |= ImGuiConfigFlags_NoMouse;
+			SaveDialogView::FeedControls(io);
+		} else {
+			io.ConfigFlags &= ~ImGuiConfigFlags_NoMouse;
+		}
 		io.DisplaySize = {static_cast<float>(frame_extent.width),
 		                  static_cast<float>(frame_extent.height)};
 		io.DeltaTime   = last_frame == std::chrono::steady_clock::time_point {}
@@ -1832,12 +1915,25 @@ struct SystemOverlay::Impl {
 		DrawSplash(frame_extent);
 		const float performance_bottom = DrawPerformanceOverlay(graphics, frame_extent);
 		GetOverlaySnapshot(&snapshot);
-		if (has_overlay && snapshot.session == prepared_session) {
+		const bool current   = has_overlay && snapshot.session == prepared_session;
+		const bool save_open = current && snapshot.session.kind == OverlayKind::SaveData;
+		if (current) {
 			if (snapshot.session.kind == OverlayKind::Dialog) {
 				DrawDialog(snapshot.dialog, frame_extent);
-			} else {
+			} else if (!save_open) {
 				DrawIme(snapshot.ime, frame_extent);
 			}
+		}
+		const bool save_shown = save_dialog.Frame(
+		    save_open ? &snapshot.save : nullptr, focus_pending,
+		    {static_cast<float>(frame_extent.width), static_cast<float>(frame_extent.height)},
+		    io.DeltaTime, now);
+		SetSaveInputFocus(&g_save_focus_visible, save_shown);
+		// Set while the dialog is open too: the presenter checks this before preparing the frame
+		// in which the game has just closed the dialog, so it must already be set then.
+		g_save_lingering.store(save_shown, std::memory_order_release);
+		if (save_shown && !save_open) {
+			g_save_lingering_frames.fetch_add(1, std::memory_order_acq_rel);
 		}
 		DrawTrophyNotification(frame_extent, now, performance_bottom);
 		DrawTouchPadCursor(GetHostInputTouchPadVisualState());
@@ -1911,6 +2007,13 @@ struct SystemOverlay::Impl {
 	std::string                                 trophy_notification_subtitle;
 	Clock::time_point                           trophy_notification_born;
 	std::vector<std::unique_ptr<ImTextureData>> retired_trophy_images;
+
+	// Thumbnails it no longer draws join the trophy images for destruction, which keeps the
+	// overlay running until the backend has destroyed them.
+	SaveDialogView save_dialog {[this](std::unique_ptr<ImTextureData> texture) {
+		retired_trophy_images.push_back(std::move(texture));
+		g_trophy_notification_active.store(true, std::memory_order_release);
+	}};
 	std::array<std::unique_ptr<DdsImage>, 2>      splash_dds;
 	Clock::time_point                             splash_born;
 	SDL_AudioStream*                            trophy_sound_stream      = nullptr;
