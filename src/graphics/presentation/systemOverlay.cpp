@@ -251,9 +251,9 @@ std::atomic<bool>                    g_splash_active {false};
 std::atomic<Clock::duration::rep>    g_splash_hidden_at {0};
 bool                                 g_splash_fast = false;
 
-std::vector<std::string_view> WrapTrophyTitle(std::string_view text, float font_size, float width) {
+std::vector<std::string_view> WrapTrophyTitle(ImFont* font, std::string_view text, float font_size,
+                                              float width) {
 	std::vector<std::string_view> lines;
-	auto* const                  font = ImGui::GetFont();
 	for (;;) {
 		const auto newline   = text.find('\n');
 		const auto paragraph = text.substr(0, newline);
@@ -282,9 +282,9 @@ std::vector<std::string_view> WrapTrophyTitle(std::string_view text, float font_
 	}
 }
 
-// ImGui's built-in font covers Latin only. Merge installed fonts for the selected console language.
-void AddSystemFontFallbacks(ImGuiIO& io) {
-	io.Fonts->AddFontDefault();
+// Merges installed fonts for the characters the last added font lacks, for the selected console
+// language (CJK, Thai, Arabic, ...).
+void MergeSystemFontFallbacks(ImGuiIO& io) {
 	const auto add = [&](std::initializer_list<const char*> paths) {
 		for (const char* path: paths) {
 			std::error_code error;
@@ -334,6 +334,42 @@ void AddSystemFontFallbacks(ImGuiIO& io) {
 	if (!found) {
 		LOGF("[Trophy] no installed fallback font for %.*s\n", static_cast<int>(locale.size()),
 		     locale.data());
+	}
+}
+
+// Noto Sans from assets/fonts (see CMakeLists.txt), with the installed fallbacks merged in. Null if
+// the file is missing.
+ImFont* AddOverlayFont(ImGuiIO& io, const char* file_name) {
+	const char* base_path = SDL_GetBasePath();
+	if (base_path == nullptr) {
+		return nullptr;
+	}
+	const auto      path = std::filesystem::path(base_path) / "assets" / "fonts" / file_name;
+	std::error_code error;
+	if (!std::filesystem::is_regular_file(path, error)) {
+		LOGF("Overlay font not found: %s\n", Common::PathToString(path).c_str());
+		return nullptr;
+	}
+	ImFontConfig config;
+	config.Flags = ImFontFlags_NoLoadError;
+	ImFont* font = io.Fonts->AddFontFromFileTTF(Common::PathToString(path).c_str(), 0.0f, &config);
+	if (font != nullptr) {
+		MergeSystemFontFallbacks(io);
+	}
+	return font;
+}
+
+// The overlay draws in Noto Sans, the first font added and so ImGui's default. Without it, ImGui's
+// built-in font (Latin only) takes its place, and the bold font falls back to the regular one.
+void AddOverlayFonts(ImGuiIO& io, ImFont** bold) {
+	ImFont* regular = AddOverlayFont(io, "NotoSans-Regular.ttf");
+	if (regular == nullptr) {
+		regular = io.Fonts->AddFontDefault();
+		MergeSystemFontFallbacks(io);
+	}
+	*bold = AddOverlayFont(io, "NotoSans-Bold.ttf");
+	if (*bold == nullptr) {
+		*bold = regular;
 	}
 }
 
@@ -909,7 +945,7 @@ struct SystemOverlay::Impl {
 		io.ConfigNavCursorVisibleAlways = true;
 		io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
 		io.BackendPlatformName = "Kyty system overlay input";
-		AddSystemFontFallbacks(io);
+		AddOverlayFonts(io, &bold_font);
 		ImGui::StyleColorsDark();
 		auto& style          = ImGui::GetStyle();
 		style.WindowRounding = 10.0f;
@@ -1720,8 +1756,8 @@ struct SystemOverlay::Impl {
 		const float title_size   = 26.0f * screen_scale;
 		const float line_height  = 30.0f * screen_scale;
 		const float text_padding = 16.0f * screen_scale;
-		const auto  title_lines  = WrapTrophyTitle(trophy_notification->name, title_size,
-		                                           width - title_offset - text_padding);
+		const auto  title_lines  = WrapTrophyTitle(bold_font, trophy_notification->name,
+		                                           title_size, width - title_offset - text_padding);
 		const float block_height =
 		    static_cast<float>(title_lines.size()) * line_height + 28.0f * screen_scale;
 		const float  height   = std::max(base_height, block_height + 2.0f * text_padding);
@@ -1775,7 +1811,7 @@ struct SystemOverlay::Impl {
 		draw->PushClipRect(top_left, {bottom_right.x - text_padding, bottom_right.y}, true);
 		float line_y = title_y;
 		for (const auto line : title_lines) {
-			draw->AddText(nullptr, title_size, {title_x, line_y}, fade(255, 255, 255, 255),
+			draw->AddText(bold_font, title_size, {title_x, line_y}, fade(255, 255, 255, 255),
 			              line.data(), line.data() + line.size());
 			line_y += line_height;
 		}
@@ -1895,6 +1931,7 @@ struct SystemOverlay::Impl {
 	ImVec2                                right_stick {};
 	OverlaySession                              session;
 	std::unique_ptr<ImTextureData>              trophy_notification_image;
+	ImFont*                                     bold_font = nullptr;
 	std::unique_ptr<ImTextureData>              hand_cursor_image;
 	std::unique_ptr<ImTextureData>              drawing_cursor_image;
 	bool                                        cursor_initialized = false;
