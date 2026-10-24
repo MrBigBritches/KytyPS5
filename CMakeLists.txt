@@ -811,6 +811,19 @@ add_custom_target(kyty_touch_cursors
 add_dependencies(kyty_emulator kyty_touch_cursors)
 install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/assets/cursors" DESTINATION assets)
 
+# Noto Sans for the system UI, downloaded at configure time (3rdparty/CMakeLists.txt).
+set(KYTY_SYSTEM_UI_FONTS
+	"${KYTY_NOTO_SANS_DIR}/NotoSans-Regular.ttf"
+	"${KYTY_NOTO_SANS_DIR}/NotoSans-Bold.ttf")
+add_custom_target(kyty_system_ui_fonts
+	COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:kyty_emulator>/assets/fonts"
+	COMMAND ${CMAKE_COMMAND} -E copy_if_different ${KYTY_SYSTEM_UI_FONTS}
+		"$<TARGET_FILE_DIR:kyty_emulator>/assets/fonts"
+	VERBATIM)
+add_dependencies(kyty_emulator kyty_system_ui_fonts)
+install(FILES ${KYTY_SYSTEM_UI_FONTS} DESTINATION assets/fonts)
+install(FILES "${KYTY_NOTO_SANS_DIR}/LICENSE" DESTINATION "licenses/noto-sans")
+
 target_link_libraries(kyty_emulator ${kyty_emulator_link_libraries})
 if (WIN32)
 	target_link_libraries(kyty_emulator opengl32)
