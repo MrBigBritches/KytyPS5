@@ -47,6 +47,36 @@ target_link_libraries(launcher_game_views_tests Qt6::Widgets common)
 target_include_directories(launcher_game_views_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
 set_target_properties(launcher_game_views_tests PROPERTIES AUTOUIC ON AUTORCC ON)
 
+# Fork-only Experiments tab model. Its test runs under ctest, so Qt's DLLs go on the path.
+add_executable(launcher_experiments_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/LauncherExperimentsTests.cpp"
+	src/experimentSettings.cpp
+	src/experimentsTab.cpp
+	include/experimentsTab.h
+	src/configuration.cpp
+	include/configuration.h
+)
+target_link_libraries(launcher_experiments_tests Qt6::Widgets common)
+set_target_properties(launcher_experiments_tests PROPERTIES AUTOMOC ON)
+target_include_directories(launcher_experiments_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include"
+	${inc_headers})
+# ENVIRONMENT_MODIFICATION needs CTest 3.22. Older versions ignore it without warning, and on
+# Windows the test would then fail to find Qt, so it is only registered where the change applies.
+if(BUILD_TESTING AND CMAKE_VERSION VERSION_GREATER_EQUAL 3.22)
+	add_test(NAME launcher_experiments
+	         COMMAND $<TARGET_FILE:launcher_experiments_tests> $<TARGET_FILE:kyty_emulator>)
+	set(launcher_experiments_env "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>")
+	# The build folder's deployed platforms folder holds only the windows plugin, so the test is
+	# pointed at Qt's own offscreen plugin, which draws nothing and opens no error dialogs.
+	if(WIN32 AND TARGET Qt6::QOffscreenIntegrationPlugin)
+		list(APPEND launcher_experiments_env
+			"QT_QPA_PLATFORM_PLUGIN_PATH=set:$<TARGET_FILE_DIR:Qt6::QOffscreenIntegrationPlugin>")
+	endif()
+	set_tests_properties(launcher_experiments PROPERTIES
+		ENVIRONMENT_MODIFICATION "${launcher_experiments_env}")
+	add_dependencies(kyty_tests launcher_experiments_tests kyty_emulator)
+endif()
+
 if(WIN32 AND NOT KYTY_CLANG_CL)
 	set_target_properties(launcher PROPERTIES LINK_FLAGS "${KYTY_LD_OPTIONS}")
 elseif(LINUX)

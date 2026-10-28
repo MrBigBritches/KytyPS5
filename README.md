@@ -1,13 +1,12 @@
-# KytyPS5
+# KytyPS5 @ MrBigBritches 
+This is a fork of [KytyPS5](https://github.com/KytyPS5/KytyPS5) with changes and experiments targetting a myriad of games. The releases for this repository are based on the latest upstream/main and any of my pending, open PRs. [Grab the latest release here](https://github.com/MrBigBritches/KytyPS5/releases/latest).
 
-[![Build KytyPS5 (Windows)](https://img.shields.io/github/check-runs/KytyPS5/KytyPS5/main?nameFilter=Build%20KytyPS5%20%28Windows%29&label=Build%20KytyPS5%20%28Windows%29)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml)
-[![Build KytyPS5 (Linux)](https://img.shields.io/github/check-runs/KytyPS5/KytyPS5/main?nameFilter=Build%20KytyPS5%20%28Linux%29&label=Build%20KytyPS5%20%28Linux%29)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml)
-[![Build KytyPS5 (macOS)](https://img.shields.io/github/check-runs/KytyPS5/KytyPS5/main?nameFilter=Build%20KytyPS5%20%28macOS%29&label=Build%20KytyPS5%20%28macOS%29)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml)
-[![Platform](https://img.shields.io/badge/platform-Windows%20x64%20%7C%20Linux%20x64%20%7C%20macOS%20x86__64-0078D4.svg)](#system-requirements)
-[![Status](https://img.shields.io/badge/status-active%20development-orange.svg)](#current-status)
+[![Build KytyPS5 (Windows)](https://img.shields.io/github/check-runs/MrBigBritches/KytyPS5/release?nameFilter=Build%20KytyPS5%20%28Windows%29&label=Build%20KytyPS5%20%28Windows%29)](https://github.com/MrBigBritches/KytyPS5/actions/workflows/build.yml)
+[![Build KytyPS5 (Linux)](https://img.shields.io/github/check-runs/MrBigBritches/KytyPS5/release?nameFilter=Build%20KytyPS5%20%28Linux%29&label=Build%20KytyPS5%20%28Linux%29)](https://github.com/MrBigBritches/KytyPS5/actions/workflows/build.yml)
+[![Build KytyPS5 (macOS)](https://img.shields.io/github/check-runs/MrBigBritches/KytyPS5/release?nameFilter=Build%20KytyPS5%20%28macOS%29&label=Build%20KytyPS5%20%28macOS%29)](https://github.com/MrBigBritches/KytyPS5/actions/workflows/build.yml)
 [![License](https://img.shields.io/badge/license-GPL--2.0-blue.svg)](LICENSE)
 
-**[Weekly updates](https://github.com/KytyPS5/KytyPS5/discussions/862)** — game progress, recent fixes, and ongoing development.
+# KytyPS5
 
 **[Development on Discord](https://discord.gg/UNrkMqGaBg)** — KytyPS5 development.
 
