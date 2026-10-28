@@ -301,6 +301,8 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 		args << "--keymap" << binding;
 	}
 	AddFlag(args, info.renderdoc_enabled, "--rd");
+	// The fork's experiments are opt-in emulator flags, kept in one call so rebases stay simple.
+	info.experiments.AppendFlags(&args);
 
 	QString game = info.basedir;
 	if (!info.elf.isEmpty() && !GameContent::IsArchive(info.basedir)) {
