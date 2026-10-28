@@ -2,6 +2,7 @@
 #define LAUNCHER_INCLUDE_CONFIGURATION_H_
 
 #include "common/emulatorConfig.h"
+#include "experimentSettings.h"
 
 #include <QByteArray>
 #include <QChar>
@@ -146,6 +147,8 @@ public:
 	bool red_zone_protection_enabled = false;
 #endif
 	QStringList host_input_mapping;
+	// Fork-only experiments, kept in their own struct so the upstream settings merge cleanly.
+	ExperimentSettings experiments;
 
 	QString elf = QStringLiteral("eboot.bin");
 
@@ -189,6 +192,7 @@ public:
 		red_zone_protection_enabled = other.red_zone_protection_enabled;
 #endif
 		host_input_mapping = other.host_input_mapping;
+		experiments        = other.experiments;
 	}
 
 	void CopyGameInfoFrom(const Configuration& other) {
