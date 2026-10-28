@@ -15,6 +15,7 @@ class QSettings;
 class QWidget;
 
 class Configuration;
+class ExperimentsTab;
 namespace Ui {
 class ConfigurationEditDialog;
 } // namespace Ui
@@ -47,6 +48,7 @@ private:
 	QToolButton*                 m_remove_game_dir_button = nullptr;
 	bool                         m_global_settings        = false;
 	bool                         m_geometry_restored      = false;
+	ExperimentsTab*              m_experiments_tab        = nullptr;
 
 protected:
 	void Init(const Configuration& info);

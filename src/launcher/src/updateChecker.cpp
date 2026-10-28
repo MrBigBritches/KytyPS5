@@ -87,12 +87,7 @@ UpdateChecker::~UpdateChecker() {
 }
 
 bool UpdateChecker::IsSupported() {
-#if defined(KYTY_OFFICIAL_BUILD) && defined(NDEBUG)
-	return !QString::fromLatin1(KYTY_GIT_HASH).endsWith(QStringLiteral("-dirty")) &&
-	       !UpdateRelease::PlatformSuffix().isEmpty();
-#else
 	return false;
-#endif
 }
 
 void UpdateChecker::ShowPreviousResult(QWidget* parent) {
