@@ -2,6 +2,7 @@
 
 #include "common/emulatorConfig.h"
 #include "configuration.h"
+#include "experimentsTab.h"
 #include "mandatoryLineEdit.h"
 #include <SDL3/SDL.h>
 
@@ -127,6 +128,9 @@ ConfigurationEditDialog::ConfigurationEditDialog(Configuration& info, QWidget* p
     : QDialog(parent, Qt::WindowMaximizeButtonHint | Qt::WindowCloseButtonHint),
       m_ui(new Ui::ConfigurationEditDialog), m_info(info) {
 	m_ui->setupUi(this);
+	// Added before the tabs are wrapped in scroll areas, which every tab is expected to have.
+	m_experiments_tab = new ExperimentsTab(m_ui->settings_tabs);
+	m_ui->settings_tabs->addTab(m_experiments_tab, tr("Experiments"));
 	MakeTabsScrollable();
 	InitGameDirectories();
 	m_ui->controller_group->setVisible(false);
@@ -335,6 +339,7 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	m_ui->lineEdit_printf_file->setEnabled(info.printf_direction ==
 	                                       Configuration::LogDirection::File);
 	m_ui->checkBox_profiler->setChecked(info.profiler_enabled);
+	m_experiments_tab->Load(info.experiments);
 }
 
 void ConfigurationEditDialog::InitGameDirectories() {
@@ -600,6 +605,7 @@ void ConfigurationEditDialog::save() {
 	}
 
 	UpdateInfo(m_info, *m_ui, m_global_settings);
+	m_info.experiments = m_experiments_tab->Values();
 
 	emit accept();
 }

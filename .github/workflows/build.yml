@@ -3,7 +3,7 @@ name: Build and Release KytyPS5
 on:
   workflow_dispatch:
   push:
-    branches: [ main, master ]
+    branches: [ release ]
   pull_request:
 
 concurrency:
@@ -438,10 +438,9 @@ jobs:
     if: >-
       always() &&
       github.event_name == 'push' &&
-      github.repository == 'KytyPS5/KytyPS5' &&
-      (needs.windows.result == 'success' ||
-       needs.macos.result == 'success' ||
-       needs.linux.result == 'success')
+      needs.windows.result == 'success' &&
+      needs.macos.result == 'success' &&
+      needs.linux.result == 'success'
     needs: [metadata, windows, macos, linux]
     runs-on: ubuntu-latest
     permissions:
@@ -450,6 +449,14 @@ jobs:
       RELEASE_NAME: ${{ needs.metadata.outputs.release_tag }}
 
     steps:
+      # Only the release notes are needed here, the builds come from the artifacts
+      - name: Check out release notes
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: /RELEASE.md
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
       - name: Download Windows build
         if: needs.windows.result == 'success'
         uses: actions/download-artifact@v4
@@ -523,8 +530,13 @@ jobs:
               --clobber \
               --repo "$GITHUB_REPOSITORY"
           else
+            # Use RELEASE.md as the notes when the pushed commit has one, otherwise let GitHub generate them
+            notes=(--generate-notes)
+            if [[ -s RELEASE.md ]]; then
+              notes=(--notes-file RELEASE.md)
+            fi
             gh release create "$RELEASE_NAME" "${assets[@]}" \
-              --generate-notes \
+              "${notes[@]}" \
               --repo "$GITHUB_REPOSITORY" \
               --target "$GITHUB_SHA" \
               --title "$RELEASE_NAME"

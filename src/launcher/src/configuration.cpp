@@ -135,6 +135,8 @@ void Configuration::WriteSettings(QSettings* s) const {
 	s->setValue("game_path", game_path);
 	s->setValue("custom_settings", QVariant::fromValue(custom_settings).toString());
 	s->setValue("host_input_mapping", host_input_mapping);
+	// Saved here rather than in GameSettings, so exported game settings stay importable elsewhere.
+	experiments.WriteTo(s);
 }
 
 void Configuration::ReadSettings(QSettings* s) {
@@ -144,6 +146,7 @@ void Configuration::ReadSettings(QSettings* s) {
 	game_path          = s->value("game_path").toString();
 	custom_settings    = s->value("custom_settings").toBool();
 	host_input_mapping = s->value("host_input_mapping", host_input_mapping).toStringList();
+	experiments.ReadFrom(*s);
 }
 
 bool Configuration::SetGameSettings(const QJsonObject& settings, QString& error) {
