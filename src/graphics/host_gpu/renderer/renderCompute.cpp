@@ -283,7 +283,7 @@ static void BackAddressBases(RenderContext& context, const ShaderStageRuntime& s
 		const auto base = flat[low] | uint64_t {flat[high]} << 32u;
 		for (uint64_t index = 0; index <= 2; ++index) {
 			const auto page = base + index * Page;
-			if (context.IsMapped(page, 1)) (void)context.GetBufferCache().FindBuffer(page, 1);
+			if (context.IsMapped(page, 1)) (void)context.GetBufferCache().FindBufferForShaderRead(page, 1);
 		}
 	}
 }
