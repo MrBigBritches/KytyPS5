@@ -17,7 +17,9 @@ struct ExperimentSettings {
 	// This fork exists to try the experiments, so they start on.
 	static constexpr bool DEFAULT_ENABLED = true;
 
-	bool example_experiment_name     = DEFAULT_ENABLED;
+	bool audio_compile_hold     = DEFAULT_ENABLED;
+	bool structured_jump_tables = DEFAULT_ENABLED;
+	bool select_guarded_loads   = DEFAULT_ENABLED;
 
 	/// Reads the experiments, using the default for any key an older config does not have.
 	template <class Settings>
@@ -43,8 +45,12 @@ struct ExperimentEntry {
 };
 
 inline constexpr std::array EXPERIMENT_ENTRIES {
-    ExperimentEntry {&ExperimentSettings::example_experiment_name, 
-										"experiment_example_experiment_name","--example_experiment_flag"},
+    ExperimentEntry {&ExperimentSettings::audio_compile_hold, "experiment_audio_compile_hold",
+                     "--audio-compile-hold"},
+    ExperimentEntry {&ExperimentSettings::structured_jump_tables,
+                     "experiment_structured_jump_tables", "--structured-jump-tables"},
+    ExperimentEntry {&ExperimentSettings::select_guarded_loads, "experiment_select_guarded_loads",
+                     "--select-guarded-loads"},
 };
 
 // True when no two entries edit the same field, so with the size check below every field has
