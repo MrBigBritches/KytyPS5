@@ -19,9 +19,21 @@ struct ExperimentText {
 };
 
 constexpr std::array<ExperimentText, EXPERIMENT_ENTRIES.size()> EXPERIMENT_TEXTS {{
-  	{&ExperimentSettings::example_experiment_name,
-     QT_TRANSLATE_NOOP("ExperimentsTab", "Example label"),
-     QT_TRANSLATE_NOOP("ExperimentsTab", "Example Description")},
+    {&ExperimentSettings::audio_compile_hold, QT_TRANSLATE_NOOP("ExperimentsTab", "Audio compile hold"),
+     QT_TRANSLATE_NOOP("ExperimentsTab",
+                       "Pause game audio while a long shader pipeline compile freezes the game, so "
+                       "audio-paced cutscenes stay in sync.")},
+    {&ExperimentSettings::structured_jump_tables,
+     QT_TRANSLATE_NOOP("ExperimentsTab", "Structured jump tables"),
+     QT_TRANSLATE_NOOP("ExperimentsTab",
+                       "Compile shader jump tables as structured control flow instead of a "
+                       "dispatcher loop, which makes shader compiles much faster. Changing this "
+                       "recompiles the game's shaders.")},
+    {&ExperimentSettings::select_guarded_loads,
+     QT_TRANSLATE_NOOP("ExperimentsTab", "Selected guarded loads"),
+     QT_TRANSLATE_NOOP("ExperimentsTab",
+                       "Emit bounds-checked shader loads as selects instead of branches, which "
+                       "speeds up pipeline compiles. Changing this recompiles the game's shaders.")},
 }};
 
 // True when the text table lists the experiments in the same order as the settings table, so a
