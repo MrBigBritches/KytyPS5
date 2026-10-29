@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 
+#include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/parallelFor.h"
 #include "common/stringUtils.h"
@@ -68,7 +69,9 @@ std::vector<uint8_t> StoreHeader(const GraphicContext& graphics) {
 		return {};
 	}
 	Writer header;
-	IoAll(header, stamp, SpirvProfile(graphics),
+	// The jump-table mode changes recompiler output, so a store written in the other mode
+	// is discarded.
+	IoAll(header, stamp, Config::StructuredJumpTablesEnabled(), SpirvProfile(graphics),
 	      graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize);
 	return std::move(header.bytes);
 }

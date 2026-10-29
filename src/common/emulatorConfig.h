@@ -78,6 +78,8 @@ struct ConfigOptions {
 	bool                   shader_cache_enabled        = false;
 	// Opts in to selecting guarded shader loads instead of branching around them.
 	bool                   select_guarded_loads        = false;
+	// Opts in to compiling S_SETPC_B64 jump tables as structured control flow.
+	bool                   structured_jump_tables      = false;
 	ShaderOptimizationType shader_optimization_type    = ShaderOptimizationType::None;
 	LogDirection           shader_log_direction        = LogDirection::Silent;
 	std::filesystem::path  shader_log_folder           = "_Shaders";
@@ -153,6 +155,8 @@ bool GraphicsDebugDumpEnabled();
 
 // True when guarded shader loads should be selected instead of branched around.
 bool SelectGuardedLoadsEnabled();
+// True when jump tables should be compiled as structured control flow.
+bool StructuredJumpTablesEnabled();
 
 LogDirection          GetPrintfDirection();
 std::filesystem::path GetPrintfOutputFile();
