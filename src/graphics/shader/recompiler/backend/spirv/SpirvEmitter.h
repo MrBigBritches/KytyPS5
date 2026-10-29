@@ -17,6 +17,9 @@ struct Profile {
 	uint32_t device_clock_period_ps = 0;
 	// Storage buffer elements past the descriptor range, to the byte, read zero and drop writes.
 	bool robust_buffer_access = false;
+	// Opts in to running safe guarded loads unconditionally and selecting the result, instead of
+	// branching around them. Off by default while it is new.
+	bool select_guarded_loads = false;
 };
 
 inline constexpr Profile DefaultProfile {};
