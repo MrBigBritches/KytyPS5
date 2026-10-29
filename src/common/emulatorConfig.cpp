@@ -169,6 +169,10 @@ bool SelectGuardedLoadsEnabled() {
 	return g_config->select_guarded_loads;
 }
 
+bool StructuredJumpTablesEnabled() {
+	return g_config->structured_jump_tables;
+}
+
 LogDirection GetPrintfDirection() {
 	return g_config->printf_direction;
 }
