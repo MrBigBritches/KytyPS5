@@ -2098,6 +2098,17 @@ void TextureCache::ResumeMemory(uint64_t address, uint64_t size) {
 	}
 }
 
+bool TextureCache::HeldFromCollection(Image& image) {
+	// Resident heaps sample an image without touching it. A suspended image has no host mapping
+	// to read back from and its range is expected to return, so neither may be freed or
+	// downloaded. Touching it keeps it young for when the hold ends.
+	if (image.heap_refs.load(std::memory_order_relaxed) == 0u && !image.suspended) {
+		return false;
+	}
+	TouchImage(image);
+	return true;
+}
+
 void TextureCache::RunGarbageCollector() {
 	std::scoped_lock lock {m_lock};
 	const uint64_t   tick = m_gc_tick++;
@@ -2129,9 +2140,7 @@ void TextureCache::RunGarbageCollector() {
 			if (owner == nullptr || !owner->registered || owner->depth_id) {
 				continue;
 			}
-			if (owner->heap_refs.load(std::memory_order_relaxed) != 0u) {
-				// Resident heaps sample it without touching it.
-				TouchImage(*owner);
+			if (HeldFromCollection(*owner)) {
 				continue;
 			}
 			if (owner->IsGpuModified()) {
@@ -2169,12 +2178,17 @@ void TextureCache::ProcessDownloadImages() {
 		return;
 	}
 	std::scoped_lock lock {m_lock};
-	for (const auto id: m_download_images) {
-		if (m_slot_images[id].IsGpuModified()) {
+	// Suspended images stay pending so that their readback lands after the resume.
+	std::erase_if(m_download_images, [this](ImageId id) {
+		auto& image = m_slot_images[id];
+		if (image.suspended) {
+			return false;
+		}
+		if (image.IsGpuModified()) {
 			(void)DownloadImageMemory(id);
 		}
-	}
-	m_download_images.clear();
+		return true;
+	});
 }
 
 } // namespace Libs::Graphics

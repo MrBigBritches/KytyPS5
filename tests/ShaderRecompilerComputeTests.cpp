@@ -6511,6 +6511,104 @@ public:
     cache.UnmapMemory(kTexSuspendBase, kTexSuspendMapSize);
   }
 
+  // Whether a collector set up to evict everything older than the current tick frees the image.
+  static bool CollectorFrees(TextureCache &cache, ImageId id) {
+    constexpr uint64_t old_tick = 81;
+    constexpr uint64_t every_image_pressured = 0;
+    TextureCacheTestAccess::ConfigureGarbageCollection(
+        cache, std::array{id}, old_tick, every_image_pressured);
+    cache.RunGarbageCollector();
+    return !TextureCacheTestAccess::Contains(cache, id);
+  }
+
+  // The collector frees a clean image but must leave a suspended or heap-referenced one alone.
+  static void CheckTexSuspendCollector(const char *name, TextureCache &cache) {
+    TextureCacheTestAccess::SetKeepTexturesOnSuspend(cache, true);
+    const TexSuspendCase clean{"collector skips held images"};
+    Require(name, clean.label,
+            CollectorFrees(cache, MakeTexSuspendImage(cache, clean)),
+            "the collector did not evict an ordinary clean image, so the setup proves nothing");
+    cache.UnmapMemory(kTexSuspendBase, kTexSuspendMapSize);
+    const auto suspended = MakeTexSuspendImage(cache, clean);
+    cache.SuspendMemory(kTexSuspendBase, kTexSuspendRange);
+    Require(name, clean.label,
+            TextureCacheTestAccess::Owner(cache, suspended)->suspended &&
+                !CollectorFrees(cache, suspended),
+            "the collector freed a suspended image");
+    cache.UnmapMemory(kTexSuspendBase, kTexSuspendMapSize);
+    const auto held = MakeTexSuspendImage(cache, clean);
+    cache.GetImage(held).heap_refs.store(1u);
+    Require(name, clean.label, !CollectorFrees(cache, held),
+            "the collector freed an image that a resident heap references");
+    cache.GetImage(held).heap_refs.store(0u);
+    cache.UnmapMemory(kTexSuspendBase, kTexSuspendMapSize);
+  }
+
+  // Creates a GPU-written linear image with a pending readback and returns its id.
+  static ImageId MakeTexDownloadImage(RenderContext &context, uint32_t gpu_value) {
+    auto &cache = context.GetTextureCache();
+    auto desc = MakeLinearDesc(kTexSuspendBase + kTexSuspendProbeOffset, sizeof(gpu_value),
+                               vk::Format::eR32Uint, Prospero::BufferFormat::k32UInt,
+                               Prospero::ImageType::kColor2D, {1, 1, 1}, 1, 4, 1);
+    desc.type = TextureCache::BindingType::Storage;
+    desc.view_info.usage = vk::ImageUsageFlagBits::eStorage;
+    const auto id = cache.FindImage(desc);
+    (void)cache.FindTexture(id, desc);
+    Require("TextureSuspendSelection", "download image clear",
+            cache.ClearImageFromBuffer(context.GetCommandScheduler().Current(),
+                                       desc.info.data.address, desc.info.data.size, gpu_value),
+            "failed to give the image GPU contents");
+    TextureCacheTestAccess::TrackDownload(cache, id);
+    return id;
+  }
+
+  // Runs the readback and returns the guest word once the deferred write has landed.
+  static uint32_t ProcessTexDownloads(RenderContext &context) {
+    auto &scheduler = context.GetCommandScheduler();
+    context.GetTextureCache().ProcessDownloadImages();
+    scheduler.Finish();
+    scheduler.DrainPriorityOperations();
+    uint32_t word = 0;
+    Libs::LibKernel::Memory::TryReadBacking(kTexSuspendBase + kTexSuspendProbeOffset, &word,
+                                            sizeof(word));
+    return word;
+  }
+
+  // A suspended image keeps its pending readback, which lands after the resume.
+  static void CheckTexSuspendDownload(const char *name, RenderContext &context) {
+    constexpr uint32_t gpu_value = 0x13579bdfu;
+    constexpr uint32_t stale_value = 0x2468ace0u;
+    constexpr uint64_t word_address = kTexSuspendBase + kTexSuspendProbeOffset;
+    auto &cache = context.GetTextureCache();
+    TextureCacheTestAccess::SetLinearReadback(cache, true);
+    TextureCacheTestAccess::SetKeepTexturesOnSuspend(cache, true);
+    for (const bool suspend : {false, true}) {
+      const auto id = MakeTexDownloadImage(context, gpu_value);
+      Libs::LibKernel::Memory::WriteBacking(word_address, &stale_value, sizeof(stale_value));
+      if (suspend) {
+        cache.SuspendMemory(kTexSuspendBase, kTexSuspendRange);
+      }
+      const auto first = ProcessTexDownloads(context);
+      const bool pending = TextureCacheTestAccess::PendingDownload(cache, id);
+      if (!suspend) {
+        Require(name, "download baseline", first == gpu_value && !pending,
+                "the unsuspended image did not download, so the setup proves nothing");
+      } else {
+        Require(name, "suspended download stays pending",
+                TextureCacheTestAccess::Owner(cache, id)->suspended && first == stale_value &&
+                    pending,
+                "a suspended image was downloaded or lost its pending readback");
+        cache.ResumeMemory(kTexSuspendBase, kTexSuspendRange);
+        Require(name, "resumed download lands",
+                ProcessTexDownloads(context) == gpu_value &&
+                    !TextureCacheTestAccess::PendingDownload(cache, id),
+                "the readback did not land after the resume");
+      }
+      cache.UnmapMemory(kTexSuspendBase, kTexSuspendMapSize);
+    }
+    TextureCacheTestAccess::SetLinearReadback(cache, false);
+  }
+
   void CheckTextureSuspendSelection() {
     constexpr const char *name = "TextureSuspendSelection";
     constexpr uint64_t allocation_alignment = 0x10000;
@@ -6541,6 +6639,8 @@ public:
     CheckTexSuspendRules(name, cache);
     CheckTexSuspendMeta(name, cache);
     CheckTexSuspendResume(name, cache);
+    CheckTexSuspendCollector(name, cache);
+    CheckTexSuspendDownload(name, context);
     scheduler.Finish();
     context.UnmapMemory(kTexSuspendBase, kTexSuspendMapSize);
     Require(name, "unmap direct backing",

@@ -170,6 +170,8 @@ private:
 	void CopyImageMip(ImageId destination, ImageId source, uint32_t mip, uint32_t layer);
 	void ValidateImageDesc(const ImageDesc& desc) const;
 
+	// Caller holds m_lock. Whether the collector must skip the image, which it also touches.
+	[[nodiscard]] bool HeldFromCollection(Image& image);
 	void               InvalidateCpuAliases(uint64_t address, uint64_t size);
 	[[nodiscard]] bool DownloadImageMemory(ImageId id);
 	// Caller holds m_lock. Erases the surface metadata whose base lies in the range.
