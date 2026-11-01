@@ -6261,6 +6261,170 @@ public:
     Libs::LibKernel::Memory::SetKeepGpuCacheOnReuse(false);
   }
 
+  // Areas of the texture cases of CheckKeepGpuCacheOnReuse. The write case takes two, one for
+  // the flag-off baseline and one with the flag on. The flag case takes two in the same way.
+  static constexpr uint32_t kKeepTexWriteOff = 7;
+  static constexpr uint32_t kKeepTexWriteOn = 8;
+  static constexpr uint32_t kKeepTexDifferentOffset = 9;
+  static constexpr uint32_t kKeepTexTeardown = 10;
+  static constexpr uint32_t kKeepTexFlagOff = 11;
+  static constexpr uint32_t kKeepTexFlagOn = 12;
+  // The word under the texture before the guest changes it.
+  static constexpr uint32_t kKeepTexOldValue = 0x13572468u;
+
+  // The one-texel texture lies on the word that KeepWriteWord changes, on the page that the write
+  // cases touch.
+  static uint64_t KeepTextureAddress(uint64_t area) {
+    return area + kKeepWrittenPage * kSuspendPageSize + kSuspendValueOffset;
+  }
+
+  // One R32 texel over the word KeepWriteWord writes, so a guest write lands in the texture.
+  static TextureCache::ImageDesc KeepTextureDesc(uint64_t area) {
+    return MakeLinearDesc(KeepTextureAddress(area), sizeof(uint32_t), vk::Format::eR32Uint,
+                          Prospero::BufferFormat::k32UInt, Prospero::ImageType::kColor2D,
+                          {1, 1, 1}, 1, 4, 1);
+  }
+
+  // Finds the texture of an area and makes it current, as a draw would.
+  static ImageId KeepTextureFind(TextureCache &cache, uint64_t area) {
+    auto desc = KeepTextureDesc(area);
+    const auto id = cache.FindImage(desc);
+    (void)cache.FindTexture(id, desc);
+    return id;
+  }
+
+  // Maps a block, puts the old word under a texture and returns the block's offset.
+  int64_t KeepTexturePrime(const char *name, uint64_t area, ImageId &id, uint64_t &serial,
+                           TextureCache &cache) {
+    const int64_t offset = KeepAllocate(name);
+    KeepMap(name, area, offset);
+    KeepWriteWord(area, kKeepWrittenPage, kKeepTexOldValue);
+    id = KeepTextureFind(cache, area);
+    serial = TextureCacheTestAccess::Owner(cache, id)->serial;
+    return offset;
+  }
+
+  // A real guest write after an exact remap reaches the kept texture through its re-armed page.
+  void CheckKeepTextureWrite(const char *name, const SuspendRig &rig) {
+    auto &cache = rig.context.GetTextureCache();
+    for (const bool keep : {false, true}) {
+      const auto area = KeepArea(keep ? kKeepTexWriteOn : kKeepTexWriteOff);
+      Libs::LibKernel::Memory::SetKeepGpuCacheOnReuse(true);
+      TextureCacheTestAccess::SetKeepTexturesOnSuspend(cache, keep);
+      ImageId id{};
+      uint64_t serial = 0;
+      const int64_t offset = KeepTexturePrime(name, area, id, serial, cache);
+      KeepReleaseAndRemap(name, rig, area, offset);
+      KeepWriteWord(area, kKeepWrittenPage, kKeepWrittenValue);
+      if (keep) {
+        const auto *owner = TextureCacheTestAccess::Owner(cache, id);
+        Require(name, "write dirties the kept texture",
+                owner->registered && owner->serial == serial && !owner->suspended &&
+                    owner->IsDefinitelyCpuDirty(),
+                "the guest write did not reach the kept texture");
+      }
+      const auto after = KeepTextureFind(cache, area);
+      Require(name, keep ? "kept texture is the same" : "flag off replaces the texture",
+              (TextureCacheTestAccess::Owner(cache, after)->serial == serial) == keep,
+              "the texture identity does not match the flag");
+      Require(name, "new texel visible",
+              ReadCachedTexel(name, rig.context, after) == std::vector<u32>{kKeepWrittenValue},
+              "the texture shows a stale texel after the guest write");
+      KeepUnmap(name, area);
+      KeepRelease(name, offset);
+      TextureCacheTestAccess::SetKeepTexturesOnSuspend(cache, false);
+      Libs::LibKernel::Memory::SetKeepGpuCacheOnReuse(false);
+    }
+  }
+
+  // A remap at a different physical offset frees the suspended texture and shows the new bytes.
+  void CheckKeepTextureDifferentOffset(const char *name, const SuspendRig &rig) {
+    auto &cache = rig.context.GetTextureCache();
+    const auto area = KeepArea(kKeepTexDifferentOffset);
+    Libs::LibKernel::Memory::SetKeepGpuCacheOnReuse(true);
+    TextureCacheTestAccess::SetKeepTexturesOnSuspend(cache, true);
+    ImageId id{};
+    uint64_t serial = 0;
+    const int64_t released = KeepTexturePrime(name, area, id, serial, cache);
+    KeepRelease(name, released);
+    const auto *owner = TextureCacheTestAccess::Owner(cache, id);
+    Require(name, "texture suspended",
+            owner->registered && owner->suspended && owner->serial == serial,
+            "the release did not keep the texture, so the case proves nothing");
+    KeepRequireSameOffset(name, released);
+    const int64_t other = KeepAllocate(name);
+    Require(name, "different offset", other != released, "the allocator returned the same offset");
+    const auto scratch = area + kKeepScratchDelta;
+    KeepMap(name, scratch, other);
+    KeepWriteWord(scratch, kKeepWrittenPage, kKeepForeignBase);
+    KeepUnmap(name, scratch);
+    KeepMap(name, area, other);
+    Require(name, "old texture freed", !TextureCacheTestAccess::Contains(cache, id),
+            "a remap at another offset kept the old texture");
+    const auto after = KeepTextureFind(cache, area);
+    Require(name, "new texture with new bytes",
+            TextureCacheTestAccess::Owner(cache, after)->serial != serial &&
+                ReadCachedTexel(name, rig.context, after) == std::vector<u32>{kKeepForeignBase},
+            "the texture at the new offset reused the old one or shows old bytes");
+    KeepUnmap(name, area);
+    KeepRelease(name, other);
+    KeepRelease(name, released);
+    TextureCacheTestAccess::SetKeepTexturesOnSuspend(cache, false);
+    Libs::LibKernel::Memory::SetKeepGpuCacheOnReuse(false);
+  }
+
+  // Dropping the GPU resources while a texture is suspended frees it. The caller installs the
+  // resources again, because the later cases need them.
+  void CheckKeepTextureTeardown(const char *name, const SuspendRig &rig) {
+    auto &cache = rig.context.GetTextureCache();
+    const auto area = KeepArea(kKeepTexTeardown);
+    Libs::LibKernel::Memory::SetKeepGpuCacheOnReuse(true);
+    TextureCacheTestAccess::SetKeepTexturesOnSuspend(cache, true);
+    ImageId id{};
+    uint64_t serial = 0;
+    const int64_t offset = KeepTexturePrime(name, area, id, serial, cache);
+    KeepRelease(name, offset);
+    Require(name, "texture suspended at teardown",
+            rig.context.IsSuspended(area, kKeepSize) &&
+                TextureCacheTestAccess::Owner(cache, id)->suspended,
+            "the release did not keep the texture, so the case proves nothing");
+    Libs::LibKernel::Memory::InstallGpuResources(nullptr);
+    Require(name, "teardown frees the texture",
+            !TextureCacheTestAccess::Contains(cache, id) &&
+                !rig.context.IsSuspended(area, kKeepSize),
+            "tearing down the GPU resources left a suspended texture");
+    Libs::LibKernel::Memory::InstallGpuResources(&rig.context);
+    TextureCacheTestAccess::SetKeepTexturesOnSuspend(cache, false);
+    Libs::LibKernel::Memory::SetKeepGpuCacheOnReuse(false);
+  }
+
+  // The textures flag alone changes nothing, because only the kernel suspend reaches the cache.
+  void CheckKeepTextureFlagAlone(const char *name, const SuspendRig &rig) {
+    auto &cache = rig.context.GetTextureCache();
+    for (const bool textures : {false, true}) {
+      const auto area = KeepArea(textures ? kKeepTexFlagOn : kKeepTexFlagOff);
+      Libs::LibKernel::Memory::SetKeepGpuCacheOnReuse(false);
+      TextureCacheTestAccess::SetKeepTexturesOnSuspend(cache, textures);
+      ImageId id{};
+      uint64_t serial = 0;
+      const int64_t offset = KeepTexturePrime(name, area, id, serial, cache);
+      KeepRelease(name, offset);
+      Require(name, "plain release frees the texture",
+              !rig.context.IsSuspended(area, kKeepSize) &&
+                  !TextureCacheTestAccess::Contains(cache, id),
+              "a release without the cache flag suspended or kept a texture");
+      KeepRequireSameOffset(name, offset);
+      KeepMap(name, area, offset);
+      const auto after = KeepTextureFind(cache, area);
+      Require(name, "plain remap makes a new texture",
+              TextureCacheTestAccess::Owner(cache, after)->serial != serial,
+              "a remap without the cache flag reused a texture");
+      KeepUnmap(name, area);
+      KeepRelease(name, offset);
+      TextureCacheTestAccess::SetKeepTexturesOnSuspend(cache, false);
+    }
+  }
+
   // Runs the end to end cases against the real kernel with a real RenderContext installed.
   void CheckKeepGpuCacheOnReuse() {
     constexpr const char *name = "KeepGpuCacheOnReuse";
@@ -6280,6 +6444,10 @@ public:
     CheckKeepAliasWrite(name, rig, 3);
     CheckKeepWriteAfterResume(name, rig, 4);
     CheckKeepRepeatedCycles(name, rig, 5);
+    CheckKeepTextureWrite(name, rig);
+    CheckKeepTextureDifferentOffset(name, rig);
+    CheckKeepTextureTeardown(name, rig);
+    CheckKeepTextureFlagAlone(name, rig);
     // The kernel cancels before any map, so the last resort in MapMemory must never have run.
     Require(name, "safety net did not fire", KeepSafetyNetCount(rig) == 0,
             "a map reached the RenderContext safety net over suspended memory");
