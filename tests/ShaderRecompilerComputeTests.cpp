@@ -6653,6 +6653,299 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
+  // Checks of RenderContext suspend, resume and cancel with --keep-gpu-textures-on-reuse. Each case
+  // runs the same steps with the flag off as its baseline, so only the kept textures differ.
+  // Base of the mapping, which holds eleven case areas. It is clear of every other fixture.
+  static constexpr uintptr_t kTexResumeBase = 0x000000020f000000ull;
+  static constexpr uint64_t kTexResumeMapSize = 0x180000;
+  // Distance between case areas, and the length of the range that each case suspends. It holds
+  // an image at the start and DCC metadata half way in.
+  static constexpr uint64_t kTexResumeStride = 0x20000;
+  static constexpr uint64_t kTexResumeMetaOffset = 0x10000;
+  static constexpr uint64_t kTexResumeMetaSize = 0x1000;
+  static constexpr uint64_t kTexResumeColorSize = 0x4000;
+  // The guest word under the image and the GPU word that is painted over it.
+  static constexpr uint32_t kTexResumeGuestWord = 0x01020304u;
+  static constexpr uint32_t kTexResumeGpuWord = 0x0a0b0c0du;
+  // Captured descriptor words. Word 6 holds flag bits in its low 24 bits and the metadata address
+  // byte above them.
+  static constexpr uint32_t kTexResumeDccWord1 = 0xc1600000u;
+  static constexpr uint32_t kTexResumeDccWord2 = 0x000fc00fu;
+  static constexpr uint32_t kTexResumeDccWord3 = 0x91b00204u;
+  static constexpr uint32_t kTexResumeDccWord5 = 0x00700000u;
+  static constexpr uint32_t kTexResumeDccWord6Flags = 0x002b0000u;
+  // The fast-clear code that the guest writes into DCC metadata, which clears to opaque white.
+  static constexpr uint32_t kTexResumeClearWhite = 0x80808080u;
+  // The color that the DCC surface holds before any clear.
+  static constexpr uint32_t kTexResumeDccStart = 0x5a5a5a5au;
+  static constexpr uint8_t kTexResumeDccStartByte = 0x5a;
+  static constexpr uint8_t kTexResumeNoClearByte = 0xff;
+
+  // Case areas, one per scenario of each case. The flag-off baseline of a case takes the lower one.
+  static constexpr uint32_t kTexResumeSurvivesOff = 0;
+  static constexpr uint32_t kTexResumeSurvivesOn = 1;
+  static constexpr uint32_t kTexResumeGpuOff = 2;
+  static constexpr uint32_t kTexResumeGpuOn = 3;
+  static constexpr uint32_t kTexResumeRearmedOff = 4;
+  static constexpr uint32_t kTexResumeRearmedOn = 5;
+  // The cancel, unmap and map safety net scenarios take consecutive areas from here.
+  static constexpr uint32_t kTexResumeEndsFirst = 6;
+  static constexpr uint32_t kTexResumeEndsCount = 3;
+  // Scenario indices within that run, in area order.
+  static constexpr uint32_t kTexResumeScenarioCancel = 0;
+  static constexpr uint32_t kTexResumeScenarioSafetyNet = 2;
+  static constexpr uint32_t kTexResumeDccPlain = 9;
+  static constexpr uint32_t kTexResumeDccWritten = 10;
+
+  static uint64_t TexResumeArea(uint32_t index) {
+    return kTexResumeBase + uint64_t{index} * kTexResumeStride;
+  }
+
+  // A one-texel storage image over the first word of an area.
+  static TextureCache::ImageDesc TexResumeDesc(uint64_t area) {
+    auto desc = MakeLinearDesc(area, sizeof(uint32_t), vk::Format::eR32Uint,
+                               Prospero::BufferFormat::k32UInt,
+                               Prospero::ImageType::kColor2D, {1, 1, 1}, 1, 4, 1);
+    desc.type = TextureCache::BindingType::Storage;
+    desc.view_info.usage = vk::ImageUsageFlagBits::eStorage;
+    return desc;
+  }
+
+  // Finds the image of a descriptor and makes it current, as a draw would.
+  static ImageId TexResumeFind(TextureCache &cache, TextureCache::ImageDesc desc) {
+    const auto id = cache.FindImage(desc);
+    (void)cache.FindTexture(id, desc);
+    return id;
+  }
+
+  static void TexResumeWrite(uint64_t area, uint32_t value) {
+    std::memcpy(reinterpret_cast<void *>(area), &value, sizeof(value));
+  }
+
+  // Suspends an area, hands the guest a fresh view of the same memory and resumes it.
+  static void TexResumeCycle(const char *name, const SuspendRig &rig, uint64_t area) {
+    rig.context.SuspendMemory(area, kTexResumeStride);
+    RemapFreshView(name, rig, area, kTexResumeStride);
+    rig.context.ResumeMemory(area, kTexResumeStride);
+  }
+
+  // Case 1. A kept image is neither uploaded nor replaced by a resume.
+  static void CheckTexResumeSurvives(const char *name, const SuspendRig &rig) {
+    auto &cache = rig.context.GetTextureCache();
+    const bool counters_were_enabled = Common::DebugCounters::Enabled();
+    Common::DebugCounters::SetEnabled(true);
+    for (const bool keep : {false, true}) {
+      const auto area = TexResumeArea(keep ? kTexResumeSurvivesOn : kTexResumeSurvivesOff);
+      TextureCacheTestAccess::SetKeepTexturesOnSuspend(cache, keep);
+      TexResumeWrite(area, kTexResumeGuestWord);
+      const auto desc = TexResumeDesc(area);
+      const auto serial = TextureCacheTestAccess::Owner(cache, TexResumeFind(cache, desc))->serial;
+      const auto uploaded =
+          Common::DebugCounters::Get(Common::DebugCounters::Counter::TextureUploadBytes);
+      TexResumeCycle(name, rig, area);
+      const auto after = TexResumeFind(cache, desc);
+      const auto delta =
+          Common::DebugCounters::Get(Common::DebugCounters::Counter::TextureUploadBytes) -
+          uploaded;
+      const auto *owner = TextureCacheTestAccess::Owner(cache, after);
+      const bool same = owner->serial == serial;
+      Require(name, keep ? "kept image is not uploaded" : "flag off re-uploads",
+              keep ? delta == 0 && same && !owner->suspended : delta > 0 && !same,
+              keep ? "a resume uploaded, replaced or left suspended a kept image"
+                   : "the baseline did not re-upload, so the case proves nothing");
+      cache.UnmapMemory(area, kTexResumeStride);
+    }
+    Common::DebugCounters::SetEnabled(counters_were_enabled);
+  }
+
+  // Case 2. GPU contents that guest memory never saw survive the cycle.
+  void CheckTexResumeGpuContents(const char *name, const SuspendRig &rig) {
+    auto &cache = rig.context.GetTextureCache();
+    for (const bool keep : {false, true}) {
+      const auto area = TexResumeArea(keep ? kTexResumeGpuOn : kTexResumeGpuOff);
+      TextureCacheTestAccess::SetKeepTexturesOnSuspend(cache, keep);
+      TexResumeWrite(area, kTexResumeGuestWord);
+      (void)TexResumeFind(cache, TexResumeDesc(area));
+      Require(name, "paint the image",
+              cache.ClearImageFromBuffer(rig.scheduler.Current(), area, sizeof(uint32_t),
+                                         kTexResumeGpuWord),
+              "could not give the image GPU contents");
+      TexResumeCycle(name, rig, area);
+      const auto id = TexResumeFind(cache, TexResumeDesc(area));
+      Require(name, keep ? "GPU contents survive" : "flag off loses GPU contents",
+              ReadCachedTexel(name, rig.context, id) ==
+                  std::vector<u32>{keep ? kTexResumeGpuWord : kTexResumeGuestWord},
+              keep ? "the kept image lost what the GPU wrote"
+                   : "the baseline kept GPU contents, so the case proves nothing");
+      cache.UnmapMemory(area, kTexResumeStride);
+    }
+  }
+
+  // Case 3. A page that only the kept image watches is protected again after the resume.
+  static void CheckTexResumeRearmed(const char *name, const SuspendRig &rig) {
+    auto &cache = rig.context.GetTextureCache();
+    for (const bool keep : {false, true}) {
+      const auto area = TexResumeArea(keep ? kTexResumeRearmedOn : kTexResumeRearmedOff);
+      TextureCacheTestAccess::SetKeepTexturesOnSuspend(cache, keep);
+      (void)TexResumeFind(cache, TexResumeDesc(area));
+      RequirePageProtection(name, "image page watched", area, 1, HostPageProtection::ReadOnly);
+      TexResumeCycle(name, rig, area);
+      RequirePageProtection(name, keep ? "kept image re-armed" : "freed image unwatched", area,
+                            1, keep ? HostPageProtection::ReadOnly
+                                    : HostPageProtection::ReadWrite);
+      cache.UnmapMemory(area, kTexResumeStride);
+    }
+  }
+
+  // Requires an image to be suspended and registered, or gone without a trace of its range.
+  static void RequireTexResumeState(const char *name, const char *stage, const SuspendRig &rig,
+                                    uint64_t area, ImageId id, bool kept) {
+    auto &cache = rig.context.GetTextureCache();
+    const bool present = TextureCacheTestAccess::Contains(cache, id);
+    const bool registered = cache.IsRegionRegistered(area, kTexResumeStride);
+    const bool owned = TextureCacheTestAccess::PageOwnerCount(cache, area) != 0;
+    Require(name, stage, present == kept && registered == kept && owned == kept,
+            kept ? "the image is not kept while suspended"
+                 : "the image or its page ownership survived");
+  }
+
+  // Cases 4 to 6. A suspended image is freed by a cancel, an unmap and the map safety net.
+  static void CheckTexResumeEnds(const char *name, const SuspendRig &rig) {
+    auto &cache = rig.context.GetTextureCache();
+    TextureCacheTestAccess::SetKeepTexturesOnSuspend(cache, true);
+    for (uint32_t scenario = 0; scenario < kTexResumeEndsCount; ++scenario) {
+      const auto area = TexResumeArea(kTexResumeEndsFirst + scenario);
+      const auto id = TexResumeFind(cache, TexResumeDesc(area));
+      rig.context.SuspendMemory(area, kTexResumeStride);
+      RequireTexResumeState(name, "suspended baseline", rig, area, id, true);
+      if (scenario == kTexResumeScenarioSafetyNet) {
+        // The guest maps a fresh view without a resume, which only the safety net can handle.
+        RemapFreshView(name, rig, area, kTexResumeStride);
+        rig.context.MapMemory(area, kTexResumeStride);
+        RequireTexResumeState(name, "map over suspended memory frees", rig, area, id, false);
+        continue;
+      }
+      ReleaseHostView(name, area, kTexResumeStride);
+      if (scenario == kTexResumeScenarioCancel) {
+        rig.context.CancelSuspendedMemory(area, kTexResumeStride);
+      } else {
+        rig.context.UnmapMemory(area, kTexResumeStride);
+      }
+      const bool cancelled = scenario == kTexResumeScenarioCancel;
+      RequireTexResumeState(name, cancelled ? "cancel frees" : "unmap frees", rig, area, id,
+                            false);
+      MapFreshView(name, rig, area, kTexResumeStride);
+      rig.context.MapMemory(area, kTexResumeStride);
+    }
+  }
+
+  // Resolves the sampled color descriptor of the 64x64 R32 surface whose DCC sits in the area.
+  static TextureBinding TexResumeDccBinding(RenderContext &context, uint64_t area) {
+    const uint64_t dcc = area + kTexResumeMetaOffset;
+    // Words 1 to 3 and 5 are the captured descriptor of PPSA01593's 64x64 R32 DCC surface, which
+    // the sampled-DCC fixture also uses. Words 0, 6 and 7 carry the relocated addresses.
+    const ShaderTextureResource descriptor{{static_cast<uint32_t>(area >> 8u),
+        kTexResumeDccWord1, kTexResumeDccWord2, kTexResumeDccWord3, 0, kTexResumeDccWord5,
+        kTexResumeDccWord6Flags | (static_cast<uint32_t>(dcc >> 8u) << 24u),
+        static_cast<uint32_t>(dcc >> 16u)}};
+    ShaderRecompiler::IR::DescriptorValue value{};
+    value.dword_count = 8;
+    std::copy_n(descriptor.fields, 8, value.dwords.begin());
+    ShaderRecompiler::IR::ImageResource resource{};
+    resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Sampled;
+    resource.numeric_class = Prospero::TextureNumericClass::Float;
+    resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+    resource.read = true;
+    auto binding = RenderExecutorTestAccess::ResolveTexture(context.GetRenderExecutor(),
+                                                            resource, value);
+    (void)context.GetTextureCache().FindTexture(binding.image_id, binding.desc);
+    return binding;
+  }
+
+  // Case 7. A kept DCC image applies a fast clear that the guest writes after the resume once.
+  void CheckTexResumeDccClear(const char *name, const SuspendRig &rig) {
+    auto &cache = rig.context.GetTextureCache();
+    TextureCacheTestAccess::SetKeepTexturesOnSuspend(cache, true);
+    for (const bool write_clear : {false, true}) {
+      const auto area = TexResumeArea(write_clear ? kTexResumeDccWritten : kTexResumeDccPlain);
+      std::memset(reinterpret_cast<void *>(area), kTexResumeDccStartByte, kTexResumeColorSize);
+      std::memset(reinterpret_cast<void *>(area + kTexResumeMetaOffset), kTexResumeNoClearByte,
+                  kTexResumeMetaSize);
+      const auto first = TexResumeDccBinding(rig.context, area);
+      const auto serial = TextureCacheTestAccess::Owner(cache, first.image_id)->serial;
+      Require(name, "DCC image starts unchanged",
+              ReadCachedTexel(name, rig.context, first.image_id) ==
+                  std::vector<u32>{kTexResumeDccStart},
+              "the DCC image was cleared before any clear code was written");
+      TexResumeCycle(name, rig, area);
+      if (write_clear) {
+        WriteMetadata(rig.context, area + kTexResumeMetaOffset, kTexResumeMetaSize,
+                      kTexResumeClearWhite);
+      }
+      const auto second = TexResumeDccBinding(rig.context, area);
+      const bool kept = TextureCacheTestAccess::Owner(cache, second.image_id)->serial == serial;
+      const auto expected = write_clear ? std::bit_cast<u32>(1.0f) : kTexResumeDccStart;
+      Require(name, write_clear ? "new clear code applies" : "no clear without a write",
+              kept && ReadCachedTexel(name, rig.context, second.image_id) ==
+                          std::vector<u32>{expected},
+              "the DCC image was replaced or its clear was applied wrongly");
+      // The clear consumed its code, so a later look must leave the GPU's own contents alone.
+      vk::ClearValue paint{};
+      paint.color.float32 = std::array{0.375f, 0.f, 0.f, 0.f};
+      TextureCacheTestAccess::ClearImage(cache, rig.scheduler.Current(), second.image_id,
+          {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, paint);
+      const auto third = TexResumeDccBinding(rig.context, area);
+      Require(name, "clear applies exactly once",
+              ReadCachedTexel(name, rig.context, third.image_id) ==
+                  std::vector<u32>{std::bit_cast<u32>(0.375f)},
+              "a clear code was applied again after it was consumed");
+      cache.UnmapMemory(area, kTexResumeStride);
+    }
+  }
+
+  void CheckTextureSuspendResume() {
+    constexpr const char *name = "TextureSuspendResume";
+    constexpr uint64_t allocation_alignment = 0x10000;
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), kTexResumeMapSize,
+                allocation_alignment, 0, &direct_offset) == 0,
+            "direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(kTexResumeBase);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, kTexResumeMapSize, kSuspendMapProtection, kSuspendMapFixed,
+                direct_offset, allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(kTexResumeBase),
+            "fixed direct-memory mapping failed");
+    context.MapMemory(kTexResumeBase, kTexResumeMapSize);
+    const SuspendRig rig{context, scheduler, kTexResumeBase, direct_offset};
+    CheckTexResumeSurvives(name, rig);
+    CheckTexResumeGpuContents(name, rig);
+    CheckTexResumeRearmed(name, rig);
+    CheckTexResumeEnds(name, rig);
+    CheckTexResumeDccClear(name, rig);
+    scheduler.Finish();
+    context.UnmapMemory(kTexResumeBase, kTexResumeMapSize);
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(kTexResumeBase, kTexResumeMapSize) == 0,
+            "direct-memory mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset,
+                                                               kTexResumeMapSize) == 0,
+            "direct-memory allocation release failed");
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
   void CheckResidentImageHeap() {
     constexpr const char *name = "ResidentImageHeap";
     constexpr uintptr_t base = 0x0000000206800000ull;
@@ -55918,6 +56211,7 @@ int main(int argc, char **argv) {
     vulkan.CheckBufferCacheSuspendResume();
     vulkan.CheckKeepGpuCacheOnReuse();
     vulkan.CheckTextureSuspendSelection();
+    vulkan.CheckTextureSuspendResume();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--sampler-border-only") == 0) {
