@@ -149,6 +149,9 @@ public:
 	ImageUsage       usage;
 	ImageBinding     binding;
 	bool             registered     = false;
+	// Set while the guest memory is released but its contents are kept for a likely remap.
+	// Guarded by TextureCache::m_lock, so it needs no atomic.
+	bool             suspended      = false;
 	mutable bool     picked         = false; // Set only while FindImagesInRegion collects it.
 	uint64_t         track_addr     = 0;
 	uint64_t         track_addr_end = 0;

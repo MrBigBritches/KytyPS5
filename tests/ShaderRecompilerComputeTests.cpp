@@ -88,6 +88,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <initializer_list>
 #include <limits>
 #include <map>
@@ -377,6 +378,15 @@ struct TextureCacheTestAccess {
 
   static void SetLinearReadback(TextureCache &cache, bool enabled) {
     cache.m_readback_linear_images = enabled;
+  }
+
+  static void UntrackHead(TextureCache &cache, ImageId id) {
+    std::lock_guard lock(cache.m_lock);
+    cache.UntrackImageHead(id);
+  }
+
+  static void SetKeepTexturesOnSuspend(TextureCache &cache, bool enabled) {
+    cache.m_keep_textures_on_suspend = enabled;
   }
 
   static std::pair<uint8_t *, uint64_t>
@@ -6277,6 +6287,269 @@ public:
     Require(name, "safety net did not fire when stopping", KeepSafetyNetCount(rig) == 0,
             "a map reached the RenderContext safety net over suspended memory");
     Libs::LibKernel::Memory::InstallGpuResources(nullptr);
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
+  // Checks of which images TextureCache::SuspendMemory keeps with --keep-gpu-textures-on-reuse.
+  // They drive the cache directly because RenderContext does not call it yet. Every case runs
+  // twice, once as a plain clean image that must be kept and once with only the behaviour under
+  // test changed, so nothing else in the setup can produce the result.
+  // Base of the mapping. It is clear of the suspend fixture and every KeepArea.
+  static constexpr uintptr_t kTexSuspendBase = 0x000000020e000000ull;
+  // Mapped size. It reaches past the suspended range so a straddling image has memory.
+  static constexpr uint64_t kTexSuspendMapSize = 0x40000;
+  // Length of the suspended range, which starts at the base.
+  static constexpr uint64_t kTexSuspendRange = 0x10000;
+  // Offset of the ordinary probe image, clear of the edges of the range.
+  static constexpr uint64_t kTexSuspendProbeOffset = 0x1000;
+  // Bytes of the probe format per texel.
+  static constexpr uint32_t kTexSuspendTexelBytes = 4;
+  // Texel width of the image that straddles the end of the range.
+  static constexpr uint32_t kTexSuspendWideWidth = 0x800;
+  // Offset of that image, which puts its last half past the range.
+  static constexpr uint64_t kTexSuspendStraddleOffset =
+      kTexSuspendRange - kTexSuspendWideWidth * kTexSuspendTexelBytes / 2;
+  // Distance past the range of a metadata block that belongs to no image in it.
+  static constexpr uint64_t kTexSuspendMetaDelta = 0x2000;
+  // Size of that metadata block.
+  static constexpr uint64_t kTexSuspendMetaSize = 0x100;
+
+  // What a suspend did to an image. Untouched means it is still registered but not suspended,
+  // which neither a keep nor a free produces.
+  enum class TexSuspendFate { Kept, Freed, Untouched };
+
+  struct TexSuspendCase {
+    const char *label;
+    uint64_t offset = kTexSuspendProbeOffset;
+    uint32_t width = 1;
+    bool depth = false;
+    std::function<void(TextureCache &, ImageId)> prepare;
+    TexSuspendFate fate = TexSuspendFate::Freed;
+    bool expect_gpu_modified = false;
+  };
+
+  struct TexSuspendOutcome {
+    TexSuspendFate fate = TexSuspendFate::Untouched;
+    bool gpu_modified = false;
+  };
+
+  // Creates a clean tracked image for a case and returns its id.
+  static ImageId MakeTexSuspendImage(TextureCache &cache, const TexSuspendCase &test) {
+    const uint64_t size = uint64_t{test.width} * kTexSuspendTexelBytes;
+    auto desc = MakeLinearDesc(kTexSuspendBase + test.offset, size,
+                               test.depth ? vk::Format::eD32Sfloat
+                                          : vk::Format::eR8G8B8A8Srgb,
+                               test.depth ? Prospero::BufferFormat::k32Float
+                                          : Prospero::BufferFormat::k8_8_8_8Srgb,
+                               Prospero::ImageType::kColor2D, {test.width, 1, 1}, 1,
+                               kTexSuspendTexelBytes, 1);
+    if (test.depth) {
+      desc.type = TextureCache::BindingType::DepthTarget;
+      desc.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
+      desc.view_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+    }
+    const auto id = cache.FindImage(desc);
+    // The view lookup uploads the texels and starts watching the pages.
+    if (test.depth) {
+      (void)cache.FindDepthTarget(id, desc);
+    } else {
+      (void)cache.FindTexture(id, desc);
+    }
+    return id;
+  }
+
+  // Suspends the range around one prepared image, reports what became of it and clears the cache.
+  static TexSuspendOutcome RunTexSuspendCase(const char *name, TextureCache &cache,
+                                             const TexSuspendCase &test, bool keep_flag) {
+    TextureCacheTestAccess::SetKeepTexturesOnSuspend(cache, keep_flag);
+    const auto id = MakeTexSuspendImage(cache, test);
+    const auto *before = TextureCacheTestAccess::Owner(cache, id);
+    Require(name, test.label,
+            before != nullptr && before->IsTracked() && !before->IsCpuDirty() &&
+                before->IsGpuModified() == test.depth,
+            "the probe image did not start clean and tracked");
+    const auto serial = before->serial;
+    if (test.prepare) {
+      test.prepare(cache, id);
+    }
+    cache.SuspendMemory(kTexSuspendBase, kTexSuspendRange);
+    TexSuspendOutcome outcome;
+    const auto *after = TextureCacheTestAccess::Owner(cache, id);
+    if (after != nullptr && after->registered && after->serial == serial) {
+      outcome.fate = after->suspended ? TexSuspendFate::Kept : TexSuspendFate::Untouched;
+    } else {
+      outcome.fate = TexSuspendFate::Freed;
+    }
+    outcome.gpu_modified = outcome.fate == TexSuspendFate::Kept && after->IsGpuModified();
+    cache.UnmapMemory(kTexSuspendBase, kTexSuspendMapSize);
+    return outcome;
+  }
+
+  // Runs a case against its baseline, a clean color image that differs only in the tested trait.
+  static void CheckTexSuspendCase(const char *name, TextureCache &cache,
+                                  const TexSuspendCase &test) {
+    TexSuspendCase baseline{test.label};
+    baseline.width = test.width;
+    const auto plain = RunTexSuspendCase(name, cache, baseline, true);
+    Require(name, test.label, plain.fate == TexSuspendFate::Kept,
+            "the baseline clean image was not kept, so the case proves nothing");
+    const auto outcome = RunTexSuspendCase(name, cache, test, true);
+    Require(name, test.label,
+            outcome.fate == test.fate &&
+                outcome.gpu_modified == test.expect_gpu_modified,
+            test.fate == TexSuspendFate::Kept
+                ? "an image that should stay was freed or lost its data"
+                : "an image that cannot stay was kept or left registered");
+  }
+
+  // Cases that free an image, and the one that keeps a GPU-modified image.
+  static void CheckTexSuspendRules(const char *name, TextureCache &cache) {
+    const std::vector<TexSuspendCase> cases = {
+        {"CPU-dirty image is freed", kTexSuspendProbeOffset, 1, false,
+         [](TextureCache &c, ImageId id) { c.GetImage(id).MarkCpuDirty(); }},
+        {"maybe-dirty image is freed", kTexSuspendProbeOffset, 1, false,
+         [](TextureCache &c, ImageId id) { c.GetImage(id).MarkMaybeCpuDirty(); }},
+        {"depth image is freed", kTexSuspendProbeOffset, 1, true, nullptr},
+        {"straddling image is freed", kTexSuspendStraddleOffset,
+         kTexSuspendWideWidth, false, nullptr},
+        {"buffer-modified image is freed", kTexSuspendProbeOffset, 1, false,
+         [](TextureCache &c, ImageId id) { c.GetImage(id).MarkBufferModified(); }},
+        {"GPU-modified image is kept", kTexSuspendProbeOffset, 1, false,
+         [](TextureCache &c, ImageId id) { c.MarkGpuWritten(id); },
+         TexSuspendFate::Kept, true},
+        {"partly tracked image is freed", kTexSuspendProbeOffset,
+         kTexSuspendWideWidth, false,
+         [](TextureCache &c, ImageId id) {
+           // Two tracker pages, so dropping the first leaves a tracked tail and no dirty mark.
+           TextureCacheTestAccess::UntrackHead(c, id);
+           const auto &image = c.GetImage(id);
+           Require("TextureSuspendSelection", "partly tracked image is freed",
+                   image.IsTracked() && !image.IsCpuDirty() &&
+                       image.track_addr != image.info.data.address,
+                   "the head untrack did not leave a clean, partly tracked image");
+         }},
+        {"compressed image is freed", kTexSuspendProbeOffset, 1, false,
+         [](TextureCache &c, ImageId id) {
+           c.GetImage(id).info.metadata.compression =
+               VideoOutCompression::Dcc256_256_0;
+         }},
+        {"image with metadata outside is freed", kTexSuspendProbeOffset, 1, false,
+         [](TextureCache &c, ImageId id) {
+           c.GetImage(id).info.metadata.range = {
+               kTexSuspendBase + kTexSuspendRange + kTexSuspendMetaDelta,
+               kTexSuspendMetaSize};
+         }},
+        {"heap-referenced image is freed", kTexSuspendProbeOffset, 1, false,
+         [](TextureCache &c, ImageId id) {
+           c.GetImage(id).heap_refs.store(1u);
+         }},
+        {"bound image is freed", kTexSuspendProbeOffset, 1, false,
+         [](TextureCache &c, ImageId id) {
+           c.GetImage(id).binding.is_bound = true;
+         }},
+        {"render target image is freed", kTexSuspendProbeOffset, 1, false,
+         [](TextureCache &c, ImageId id) {
+           c.GetImage(id).binding.is_target = true;
+         }},
+        {"image needing a rebind is freed", kTexSuspendProbeOffset, 1, false,
+         [](TextureCache &c, ImageId id) {
+           c.GetImage(id).binding.needs_rebind = true;
+         }},
+    };
+    for (const auto &test : cases) {
+      CheckTexSuspendCase(name, cache, test);
+    }
+  }
+
+  // The baseline is a clean image with the flag off. It must be freed like an unmap.
+  static void CheckTexSuspendFlagOff(const char *name, TextureCache &cache) {
+    const TexSuspendCase clean{"flag off frees a clean image"};
+    Require(name, clean.label,
+            RunTexSuspendCase(name, cache, clean, true).fate == TexSuspendFate::Kept,
+            "the clean image was not kept with the flag on");
+    Require(name, clean.label,
+            RunTexSuspendCase(name, cache, clean, false).fate == TexSuspendFate::Freed,
+            "a clean image was not freed with the flag off");
+  }
+
+  // Suspending erases the metadata in the range and leaves metadata outside it, as an unmap does.
+  static void CheckTexSuspendMeta(const char *name, TextureCache &cache) {
+    constexpr uint64_t inside = kTexSuspendBase + kTexSuspendProbeOffset;
+    constexpr uint64_t outside =
+        kTexSuspendBase + kTexSuspendRange + kTexSuspendMetaDelta;
+    for (const bool keep_flag : {true, false}) {
+      TextureCacheTestAccess::SetKeepTexturesOnSuspend(cache, keep_flag);
+      TextureCacheTestAccess::RegisterHtileMeta(cache, inside);
+      TextureCacheTestAccess::RegisterHtileMeta(cache, outside);
+      Require(name, "metadata registered", cache.IsMeta(inside) && cache.IsMeta(outside),
+              "the metadata baseline was missing before the suspend");
+      cache.SuspendMemory(kTexSuspendBase, kTexSuspendRange);
+      Require(name, "metadata erased in range",
+              !cache.IsMeta(inside) && cache.IsMeta(outside),
+              "the suspend did not erase exactly the metadata in its range");
+      cache.UnmapMemory(kTexSuspendBase, kTexSuspendMapSize);
+    }
+  }
+
+  // Resume clears the mark on the suspended range and leaves other ranges alone.
+  static void CheckTexSuspendResume(const char *name, TextureCache &cache) {
+    TextureCacheTestAccess::SetKeepTexturesOnSuspend(cache, true);
+    const TexSuspendCase clean{"resume clears the mark"};
+    const auto id = MakeTexSuspendImage(cache, clean);
+    const auto serial = TextureCacheTestAccess::Owner(cache, id)->serial;
+    cache.SuspendMemory(kTexSuspendBase, kTexSuspendRange);
+    const auto *owner = TextureCacheTestAccess::Owner(cache, id);
+    Require(name, clean.label, owner->registered && owner->suspended,
+            "the image was not suspended before the resume");
+    cache.ResumeMemory(kTexSuspendBase + kTexSuspendRange, kTexSuspendRange);
+    Require(name, clean.label, owner->suspended,
+            "a resume of another range cleared the mark");
+    cache.ResumeMemory(kTexSuspendBase, kTexSuspendRange);
+    Require(name, clean.label,
+            owner->registered && !owner->suspended && owner->serial == serial,
+            "the resume did not clear the mark on a kept image");
+    cache.UnmapMemory(kTexSuspendBase, kTexSuspendMapSize);
+  }
+
+  void CheckTextureSuspendSelection() {
+    constexpr const char *name = "TextureSuspendSelection";
+    constexpr uint64_t allocation_alignment = 0x10000;
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                kTexSuspendMapSize, allocation_alignment, 0, &direct_offset) == 0,
+            "direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(kTexSuspendBase);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, kTexSuspendMapSize, kSuspendMapProtection, kSuspendMapFixed,
+                direct_offset, allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(kTexSuspendBase),
+            "fixed direct-memory mapping failed");
+    context.MapMemory(kTexSuspendBase, kTexSuspendMapSize);
+    auto &cache = context.GetTextureCache();
+    CheckTexSuspendFlagOff(name, cache);
+    CheckTexSuspendRules(name, cache);
+    CheckTexSuspendMeta(name, cache);
+    CheckTexSuspendResume(name, cache);
+    scheduler.Finish();
+    context.UnmapMemory(kTexSuspendBase, kTexSuspendMapSize);
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(kTexSuspendBase, kTexSuspendMapSize) == 0,
+            "direct-memory mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset,
+                                                               kTexSuspendMapSize) == 0,
+            "direct-memory allocation release failed");
     std::printf("[host]    %-32s ok\n", name);
   }
 
@@ -55544,6 +55817,7 @@ int main(int argc, char **argv) {
     vulkan.CheckBufferCacheDirtyGarbageCollection();
     vulkan.CheckBufferCacheSuspendResume();
     vulkan.CheckKeepGpuCacheOnReuse();
+    vulkan.CheckTextureSuspendSelection();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--sampler-border-only") == 0) {

@@ -125,7 +125,8 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
       m_tiler(graphics, scheduler, buffer_cache.GetUtilityBuffer(MemoryUsage::Stream)),
       m_buffer_cache(buffer_cache),
       m_readback_linear_images(Config::ReadbackLinearImagesEnabled()),
-      m_readback_tiled_images(Config::ReadbackTiledImagesEnabled()) {
+      m_readback_tiled_images(Config::ReadbackTiledImagesEnabled()),
+      m_keep_textures_on_suspend(Config::KeepGpuTexturesOnReuse()) {
 	if (m_graphics.CanReportMemoryUsage()) {
 		constexpr int64_t GiB = 1024ll * 1024 * 1024;
 		const auto        budget =
@@ -1987,6 +1988,18 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 		EXIT("TextureCache: invalid unmap range\n");
 	}
 	std::scoped_lock lock {m_lock};
+	EraseSurfaceMetas(address, size);
+	auto images = FindImagesInRegion(address, size, false);
+	for (const auto id: images) {
+		auto owner = m_slot_images.try_get(id);
+		if (owner == nullptr) {
+			continue;
+		}
+		FreeImage(id);
+	}
+}
+
+void TextureCache::EraseSurfaceMetas(uint64_t address, uint64_t size) {
 	for (auto metadata = m_surface_metas.begin(); metadata != m_surface_metas.end();) {
 		const auto base = metadata->first;
 		if (base >= address && base < address + size) {
@@ -1995,13 +2008,93 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 			++metadata;
 		}
 	}
-	auto images = FindImagesInRegion(address, size, false);
-	for (const auto id: images) {
-		auto owner = m_slot_images.try_get(id);
-		if (owner == nullptr) {
+}
+
+namespace {
+
+// Whether the inner range lies entirely inside the outer range.
+// Callers pass a nonempty inner range.
+bool RangeInside(uint64_t outer_address, uint64_t outer_size, const GuestRange& inner) {
+	return inner.address >= outer_address &&
+	       inner.End() <= outer_address + outer_size;
+}
+
+} // namespace
+
+bool TextureCache::CanKeepOnSuspend(const Image& image, uint64_t address, uint64_t size) const {
+	const auto& info = image.info;
+	// Dirty, buffer-modified and heap-referenced images are rebuilt or re-uploaded on next use
+	// anyway, and a compressed image cannot be refreshed once the CPU has dirtied it.
+	if (!image.registered || image.IsCpuDirty() || image.IsBufferModified() ||
+	    image.heap_refs.load(std::memory_order_relaxed) != 0u ||
+	    info.metadata.compression != VideoOutCompression::Uncompressed) {
+		return false;
+	}
+	// Depth images own HTILE metadata entries that the suspend erases, so they must be rebuilt.
+	if (info.IsDepth() || image.depth_id || !image.stencil_ids.empty() ||
+	    info.metadata.kind == ImageMetadataKind::Htile) {
+		return false;
+	}
+	// The resume re-arms page protection for the range only, so every watched page must be in it.
+	if (!RangeInside(address, size, info.data) ||
+	    (!info.metadata.range.Empty() && !RangeInside(address, size, info.metadata.range))) {
+		return false;
+	}
+	// A partly tracked image would miss CPU writes to its unwatched pages.
+	if (image.track_addr != info.data.address || image.track_addr_end != info.data.End()) {
+		return false;
+	}
+	return !image.binding.is_bound && !image.binding.is_target && !image.binding.needs_rebind;
+}
+
+void TextureCache::SuspendMemory(uint64_t address, uint64_t size) {
+	if (!m_keep_textures_on_suspend) {
+		UnmapMemory(address, size);
+		return;
+	}
+	if (!GuestRange {address, size}.Valid()) {
+		EXIT("TextureCache: invalid suspend range\n");
+	}
+	std::scoped_lock lock {m_lock};
+	EraseSurfaceMetas(address, size);
+	uint32_t kept_count  = 0;
+	uint32_t freed_count = 0;
+	uint64_t kept_bytes  = 0;
+	uint64_t freed_bytes = 0;
+	for (const auto id: FindImagesInRegion(address, size, false)) {
+		// Freeing a depth image frees its stencil associations, which may come later in the list.
+		auto* owner = m_slot_images.try_get(id);
+		if (owner == nullptr || !owner->registered) {
 			continue;
 		}
-		FreeImage(id);
+		const auto bytes = owner->info.data.size;
+		if (CanKeepOnSuspend(*owner, address, size)) {
+			owner->suspended = true;
+			++kept_count;
+			kept_bytes += bytes;
+		} else {
+			FreeImage(id);
+			++freed_count;
+			freed_bytes += bytes;
+		}
+	}
+	// Quiet for empty ranges because games can suspend often. The counts cover only the
+	// images found in the region, not stencil associations freed along with a depth image.
+	if (kept_count + freed_count == 0) {
+		return;
+	}
+	LOGF("TextureCache: suspended 0x%010" PRIx64 " size=0x%" PRIx64 " kept=%" PRIu32
+	     " (%" PRIu64 " bytes) freed=%" PRIu32 " (%" PRIu64 " bytes)\n",
+	     address, size, kept_count, kept_bytes, freed_count, freed_bytes);
+}
+
+void TextureCache::ResumeMemory(uint64_t address, uint64_t size) {
+	// No Valid() check is needed because FindImagesInRegion returns nothing for a bad range.
+	std::scoped_lock lock {m_lock};
+	for (const auto id: FindImagesInRegion(address, size, false)) {
+		if (auto* owner = m_slot_images.try_get(id); owner != nullptr) {
+			owner->suspended = false;
+		}
 	}
 }
 
