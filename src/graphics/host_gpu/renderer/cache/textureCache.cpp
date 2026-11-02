@@ -1909,11 +1909,44 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 
 void TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {
 	std::scoped_lock lock {m_lock};
-	const auto       page_begin = Common::AlignDown(address, TRACKER_PAGE_SIZE);
-	const auto       page_end   = Common::AlignUp(address + size, TRACKER_PAGE_SIZE);
+	InvalidateCpuAliases(address, size, false);
+}
+
+void TextureCache::InvalidateSequentialWrite(uint64_t address, uint64_t size) {
+	if (!GuestRange {address, size}.Valid()) {
+		EXIT("TextureCache: invalid sequential-write range\n");
+	}
+	std::scoped_lock lock {m_lock};
+	InvalidateCpuAliases(address, size, true);
+}
+
+namespace {
+
+// True when a front-to-back write reaches a byte of the image the way its faults would.
+// A front-to-back CPU write faults at its first byte on each watched page, so it reaches an
+// image only when it starts inside the image or crosses a page boundary inside it. A write that
+// ends inside the image's first page faulted only before the image, which leaves the image
+// untracked on that page but not CPU dirty, so its GPU-written contents are not re-uploaded.
+bool SequentialWriteReachesImage(const Image& image, uint64_t address, uint64_t size) {
+	const auto begin = image.info.data.address;
+	const auto end   = image.info.data.End();
+	if (address >= begin) {
+		return address < end;
+	}
+	const auto first_boundary = Common::AlignUp(begin, TRACKER_PAGE_SIZE);
+	return first_boundary < end && first_boundary < address + size;
+}
+
+} // namespace
+
+void TextureCache::InvalidateCpuAliases(uint64_t address, uint64_t size, bool sequential_write) {
+	const auto page_begin = Common::AlignDown(address, TRACKER_PAGE_SIZE);
+	const auto page_end   = Common::AlignUp(address + size, TRACKER_PAGE_SIZE);
 	for (const auto id: FindImagesInRegion(page_begin, page_end - page_begin)) {
-		auto& owner = m_slot_images[id];
-		if (owner.Overlaps(address, size)) {
+		auto&      owner   = m_slot_images[id];
+		const bool written = sequential_write ? SequentialWriteReachesImage(owner, address, size)
+		                                     : owner.Overlaps(address, size);
+		if (written) {
 			owner.MarkCpuDirty();
 			UntrackImage(id);
 			continue;
