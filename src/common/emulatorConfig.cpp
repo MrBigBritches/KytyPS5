@@ -263,6 +263,11 @@ bool KeepGpuCacheOnReuse() {
 	return g_config->keep_gpu_cache_on_reuse;
 }
 
+// Reports the opt-in --keep-gpu-textures-on-reuse setting.
+bool KeepGpuTexturesOnReuse() {
+	return g_config->keep_gpu_textures_on_reuse;
+}
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 bool RedZoneProtectionEnabled() {
 	return g_config->red_zone_protection_enabled;

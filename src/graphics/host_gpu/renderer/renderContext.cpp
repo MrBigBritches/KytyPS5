@@ -217,7 +217,13 @@ void RenderContext::SuspendMemory(uint64_t vaddr, uint64_t size) {
 		DrainBeforeUnmap(vaddr, size);
 		// The host view is about to go away, so GPU-written bytes must reach it first.
 		m_buffer_cache.FlushGpuDirtyForSuspend(vaddr, size);
-		m_texture_cache.UnmapMemory(vaddr, size);
+		// Frees the textures unless --keep-gpu-textures-on-reuse keeps the clean ones. Images that
+		// a resident heap references are freed because the heap is unmapped after this call.
+		// Unmapping it first, on the flag-on path only, would let them be kept when their
+		// descriptor tables lie in the same range, which is likely for a big shared heap. That
+		// reorder is not done because freeing an image after its references are dropped has not
+		// been verified.
+		m_texture_cache.SuspendMemory(vaddr, size);
 		m_image_heap.UnmapMemory(vaddr, size);
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Subtract(vaddr, size);
@@ -238,6 +244,8 @@ void RenderContext::ResumeMemory(uint64_t vaddr, uint64_t size) {
 			m_suspended.Subtract(vaddr, size);
 			m_mapped_ranges.Add(vaddr, size);
 		}
+		// Kept textures drop their suspended mark here, with no address-space lock held.
+		m_texture_cache.ResumeMemory(vaddr, size);
 		// The fresh view is read-write, so watched pages need their protection back before the
 		// guest can run. This must not hold the address-space mutex, and no lock is held here.
 		m_page_manager.ReapplyProtection(vaddr, size);
@@ -261,6 +269,8 @@ void RenderContext::CancelSuspendedMemory(uint64_t vaddr, uint64_t size) {
 		for (const auto& [begin, bytes]: parts) {
 			m_buffer_cache.InvalidateMemory(begin, bytes);
 			m_buffer_cache.ForgetReleasedRanges(begin, bytes);
+			// Frees the textures that the suspend kept and erases their metadata.
+			m_texture_cache.UnmapMemory(begin, bytes);
 		}
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_suspended.Subtract(vaddr, size);
