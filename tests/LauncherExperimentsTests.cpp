@@ -28,15 +28,25 @@ void Check(bool value, const char* message) {
 
 // The flags the emulator accepts, written out here rather than taken from the table under test,
 // so a typo in the table fails.
-const QStringList ALL_FLAGS {"--audio-compile-hold", "--structured-jump-tables",
-                             "--select-guarded-loads"};
+const QStringList ALL_FLAGS {"--audio-compile-hold",          "--structured-jump-tables",
+                             "--select-guarded-loads",        "--skip-redundant-unmap-drains",
+                             "--keep-gpu-cache-on-reuse",     "--keep-gpu-textures-on-reuse",
+                             "--partial-buffer-refresh"};
+// The flags of the four memory experiments, in table order after the three above.
+const QStringList MEMORY_FLAGS {"--skip-redundant-unmap-drains", "--keep-gpu-cache-on-reuse",
+                                "--keep-gpu-textures-on-reuse", "--partial-buffer-refresh"};
 
-// Builds settings with each experiment set explicitly.
-ExperimentSettings Make(bool audio, bool structured, bool selected) {
+// Builds settings with each experiment set explicitly. The four memory experiments share one
+// value, off unless asked for, so the checks that name exact flag lists stay about the first three.
+ExperimentSettings Make(bool audio, bool structured, bool selected, bool memory = false) {
 	ExperimentSettings settings;
-	settings.audio_compile_hold     = audio;
-	settings.structured_jump_tables = structured;
-	settings.select_guarded_loads   = selected;
+	settings.audio_compile_hold          = audio;
+	settings.structured_jump_tables      = structured;
+	settings.select_guarded_loads        = selected;
+	settings.skip_redundant_unmap_drains = memory;
+	settings.keep_gpu_cache_on_reuse     = memory;
+	settings.keep_gpu_textures_on_reuse  = memory;
+	settings.partial_buffer_refresh      = memory;
 	return settings;
 }
 
@@ -47,7 +57,7 @@ QStringList Flags(const ExperimentSettings& settings) {
 	return args;
 }
 
-// Every experiment starts on, so a default config passes all three flags in table order.
+// Every experiment starts on, so a default config passes every flag in table order.
 void TestDefaultsPassEveryFlag() {
 	Check(Flags(ExperimentSettings {}) == ALL_FLAGS, "default experiments did not pass every flag");
 }
@@ -62,6 +72,19 @@ void TestEachExperimentPassesOnlyItsFlag() {
 	Check(Flags(Make(false, false, true)) == QStringList {"--select-guarded-loads"},
 	      "selected guarded loads alone did not pass exactly its flag");
 	Check(Flags(Make(false, false, false)).isEmpty(), "experiments all off still passed a flag");
+	// Each memory experiment on alone, set by its field, passes exactly its own flag.
+	const std::pair<bool ExperimentSettings::*, const char*> memory_cases[] = {
+	    {&ExperimentSettings::skip_redundant_unmap_drains, "--skip-redundant-unmap-drains"},
+	    {&ExperimentSettings::keep_gpu_cache_on_reuse, "--keep-gpu-cache-on-reuse"},
+	    {&ExperimentSettings::keep_gpu_textures_on_reuse, "--keep-gpu-textures-on-reuse"},
+	    {&ExperimentSettings::partial_buffer_refresh, "--partial-buffer-refresh"},
+	};
+	for (const auto& [field, flag]: memory_cases) {
+		auto settings   = Make(false, false, false);
+		settings.*field = true;
+		Check(Flags(settings) == QStringList {QString::fromLatin1(flag)},
+		      "a memory experiment alone did not pass exactly its flag");
+	}
 }
 
 // The launcher builds one argument list, so the flags must be appended, not replace it.
@@ -91,7 +114,7 @@ void TestMissingKeysReadAsDefaults() {
 void TestValuesRoundTripThroughIni() {
 	QTemporaryDir dir;
 	Check(dir.isValid(), "temporary directory was not created");
-	for (const auto& written: {Make(true, false, true), Make(false, true, false)}) {
+	for (const auto& written: {Make(true, false, true), Make(false, true, false, true)}) {
 		const auto path = dir.filePath("round_trip.ini");
 		{
 			QSettings ini(path, QSettings::IniFormat);
@@ -101,7 +124,7 @@ void TestValuesRoundTripThroughIni() {
 		}
 		QSettings ini(path, QSettings::IniFormat);
 		auto      read = Make(!written.audio_compile_hold, !written.structured_jump_tables,
-		                      !written.select_guarded_loads);
+		                      !written.select_guarded_loads, !written.skip_redundant_unmap_drains);
 		read.ReadFrom(ini);
 		Check(Flags(read) == Flags(written), "experiments did not round-trip through an INI file");
 	}
@@ -126,9 +149,28 @@ void TestValuesAreStoredAsStrings() {
 // keyed by name, and a round trip through the same table cannot catch two keys swapped in it.
 void TestEachKeyReachesItsOwnExperiment() {
 	const std::pair<const char*, QStringList> cases[] = {
-	    {"experiment_audio_compile_hold", {"--structured-jump-tables", "--select-guarded-loads"}},
-	    {"experiment_structured_jump_tables", {"--audio-compile-hold", "--select-guarded-loads"}},
-	    {"experiment_select_guarded_loads", {"--audio-compile-hold", "--structured-jump-tables"}},
+	    {"experiment_audio_compile_hold",
+	     QStringList {"--structured-jump-tables", "--select-guarded-loads"} + MEMORY_FLAGS},
+	    {"experiment_structured_jump_tables",
+	     QStringList {"--audio-compile-hold", "--select-guarded-loads"} + MEMORY_FLAGS},
+	    {"experiment_select_guarded_loads",
+	     QStringList {"--audio-compile-hold", "--structured-jump-tables"} + MEMORY_FLAGS},
+	    {"experiment_skip_redundant_unmap_drains",
+	     QStringList {"--audio-compile-hold", "--structured-jump-tables", "--select-guarded-loads",
+	                  "--keep-gpu-cache-on-reuse", "--keep-gpu-textures-on-reuse",
+	                  "--partial-buffer-refresh"}},
+	    {"experiment_keep_gpu_cache_on_reuse",
+	     QStringList {"--audio-compile-hold", "--structured-jump-tables", "--select-guarded-loads",
+	                  "--skip-redundant-unmap-drains", "--keep-gpu-textures-on-reuse",
+	                  "--partial-buffer-refresh"}},
+	    {"experiment_keep_gpu_textures_on_reuse",
+	     QStringList {"--audio-compile-hold", "--structured-jump-tables", "--select-guarded-loads",
+	                  "--skip-redundant-unmap-drains", "--keep-gpu-cache-on-reuse",
+	                  "--partial-buffer-refresh"}},
+	    {"experiment_partial_buffer_refresh",
+	     QStringList {"--audio-compile-hold", "--structured-jump-tables", "--select-guarded-loads",
+	                  "--skip-redundant-unmap-drains", "--keep-gpu-cache-on-reuse",
+	                  "--keep-gpu-textures-on-reuse"}},
 	};
 	for (const auto& [key, remaining]: cases) {
 		ExperimentSettings settings;
@@ -139,7 +181,7 @@ void TestEachKeyReachesItsOwnExperiment() {
 
 // The Enable all box shows all, none or some, and turns every experiment on or off together.
 void TestCombinedStateAndSetAll() {
-	Check(Make(true, true, true).CombinedState() == Qt::Checked, "all on was not Checked");
+	Check(Make(true, true, true, true).CombinedState() == Qt::Checked, "all on was not Checked");
 	Check(Make(false, false, false).CombinedState() == Qt::Unchecked, "all off was not Unchecked");
 	Check(Make(true, false, true).CombinedState() == Qt::PartiallyChecked,
 	      "some on was not PartiallyChecked");
@@ -153,8 +195,12 @@ void TestCombinedStateAndSetAll() {
 // The labels, written out here, sit on the boxes of the experiments they name.
 void TestBoxesNameTheirExperiments() {
 	ExperimentsTab tab;
-	const QStringList expected {"Audio compile hold", "Structured jump tables",
-	                            "Selected guarded loads"};
+	const QStringList expected {"Audio compile hold",          "Structured jump tables",
+	                            "Selected guarded loads",      "Skip redundant unmap drains",
+	                            "Keep GPU cache on reuse",     "Keep GPU textures on reuse",
+	                            "Partial buffer refresh"};
+	Check(tab.Boxes().size() == static_cast<std::size_t>(expected.size()),
+	      "the tab does not show one box per experiment");
 	for (std::size_t index = 0; index < tab.Boxes().size(); index++) {
 		Check(tab.Boxes()[index]->text() == expected[static_cast<int>(index)],
 		      "an experiment box shows another experiment's label");
