@@ -230,6 +230,10 @@ bool SkipRedundantUnmapDrainsEnabled() {
 	return g_config->skip_redundant_unmap_drains;
 }
 
+bool PartialBufferRefreshEnabled() {
+	return g_config->partial_buffer_refresh_enabled;
+}
+
 bool TessellationEnabled() {
 	return g_config->tessellation_enabled;
 }
