@@ -682,6 +682,8 @@ if(BUILD_TESTING)
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --structured-jump-tables)
 	add_test(NAME emulator_audio_compile_hold_cli
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --audio-compile-hold)
+	add_test(NAME emulator_skip_redundant_unmap_drains_cli
+	         COMMAND $<TARGET_FILE:kyty_emulator> --help --skip-redundant-unmap-drains)
 	add_test(NAME ime_dialog COMMAND $<TARGET_FILE:ime_dialog_tests>)
 	add_test(NAME shader_cfg COMMAND $<TARGET_FILE:shader_cfg_tests>)
 	add_test(NAME scalar_provenance COMMAND $<TARGET_FILE:scalar_provenance_tests>)
