@@ -19,9 +19,59 @@ struct ExperimentText {
 };
 
 constexpr std::array<ExperimentText, EXPERIMENT_ENTRIES.size()> EXPERIMENT_TEXTS {{
-  	{&ExperimentSettings::example_experiment_name,
-     QT_TRANSLATE_NOOP("ExperimentsTab", "Example label"),
-     QT_TRANSLATE_NOOP("ExperimentsTab", "Example Description")},
+    {&ExperimentSettings::audio_compile_hold,
+     QT_TRANSLATE_NOOP("ExperimentsTab", "Audio compile hold"),
+     QT_TRANSLATE_NOOP("ExperimentsTab",
+                       "Pause game audio while a long shader pipeline compile freezes the game, so "
+                       "audio-paced cutscenes stay in sync.")},
+    {&ExperimentSettings::structured_jump_tables,
+     QT_TRANSLATE_NOOP("ExperimentsTab", "Structured jump tables"),
+     QT_TRANSLATE_NOOP("ExperimentsTab",
+                       "Compile shader jump tables as structured control flow instead of a dispatcher "
+                       "loop, which makes shader compiles much faster. Changing this recompiles the "
+                       "game's shaders.")},
+    {&ExperimentSettings::select_guarded_loads,
+     QT_TRANSLATE_NOOP("ExperimentsTab", "Selected guarded loads"),
+     QT_TRANSLATE_NOOP("ExperimentsTab",
+                       "Emit bounds-checked shader loads as selects instead of branches, which speeds "
+                       "up pipeline compiles. Changing this recompiles the game's shaders.")},
+    {&ExperimentSettings::skip_redundant_unmap_drains,
+     QT_TRANSLATE_NOOP("ExperimentsTab", "Skip redundant unmap drains"),
+     QT_TRANSLATE_NOOP("ExperimentsTab",
+                       "Skip the GPU queue drain when the game unmaps memory that is already unmapped "
+                       "and holds nothing the GPU still uses.")},
+    {&ExperimentSettings::keep_gpu_cache_on_reuse,
+     QT_TRANSLATE_NOOP("ExperimentsTab", "Keep GPU cache on reuse"),
+     QT_TRANSLATE_NOOP("ExperimentsTab",
+                       "Keep the GPU buffer cache when the game releases memory and maps the same "
+                       "memory back at the same address, instead of uploading it all again.")},
+    {&ExperimentSettings::keep_gpu_textures_on_reuse,
+     QT_TRANSLATE_NOOP("ExperimentsTab", "Keep GPU textures on reuse"),
+     QT_TRANSLATE_NOOP("ExperimentsTab",
+                       "Also keep clean textures across that release and remap. Only works together "
+                       "with Keep GPU cache on reuse.")},
+    {&ExperimentSettings::partial_buffer_refresh,
+     QT_TRANSLATE_NOOP("ExperimentsTab", "Partial buffer refresh"),
+     QT_TRANSLATE_NOOP("ExperimentsTab",
+                       "When a shader writes a few bytes at the start of a texture through a buffer, "
+                       "refresh only those bytes instead of re-uploading the whole texture.")},
+    {&ExperimentSettings::gpu_submit_cadence,
+     QT_TRANSLATE_NOOP("ExperimentsTab", "GPU submit cadence"),
+     QT_TRANSLATE_NOOP("ExperimentsTab",
+                       "Send GPU work in pieces while a long command stream is still being recorded, "
+                       "so the GPU starts sooner instead of waiting for the whole stream.")},
+    {&ExperimentSettings::native_float_minmax,
+     QT_TRANSLATE_NOOP("ExperimentsTab", "Native float min/max"),
+     QT_TRANSLATE_NOOP("ExperimentsTab",
+                       "Use the GPU's own float min/max in shaders on non-AMD GPUs, which is faster. "
+                       "Results for mixed-sign zeros and for two NaN inputs can differ from the PS5. "
+                       "Changing this recompiles the game's shaders.")},
+    {&ExperimentSettings::batch_hot_readbacks,
+     QT_TRANSLATE_NOOP("ExperimentsTab", "Batch hot readbacks"),
+     QT_TRANSLATE_NOOP("ExperimentsTab",
+                       "When the game waits for GPU data, also read back, in the same wait, other GPU "
+                       "data that was recently read back or written, so later reads do not have to "
+                       "wait again.")},
 }};
 
 // True when the text table lists the experiments in the same order as the settings table, so a
