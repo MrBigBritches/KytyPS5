@@ -405,6 +405,7 @@ static void SuspendOrUnmapGpuRange(uint64_t vaddr, uint64_t size, uint64_t phys_
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 static uint32_t              g_test_backing_store_unmaps_before_failure = UINT32_MAX;
+static uint32_t              g_test_backing_remaps_before_failure       = UINT32_MAX;
 static callback_func_t       g_test_before_backing_map                  = nullptr;
 static callback_func_t       g_test_backing_read                        = nullptr;
 static uint64_t              g_test_backing_bytes_zeroed                = 0;
@@ -3266,6 +3267,10 @@ void TestFailNextPhysicalMemoryMap() {
 
 size_t TestSuspendedRangeCapacity() {
 	return SUSPENDED_RANGE_CAPACITY;
+}
+
+void TestFailGuestBackingRemapAfter(uint32_t successful_remaps) {
+	g_test_backing_remaps_before_failure = successful_remaps;
 }
 
 void TestFailNextFixedReserveRangeRegistration() {
