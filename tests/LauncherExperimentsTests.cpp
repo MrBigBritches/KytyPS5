@@ -28,15 +28,33 @@ void Check(bool value, const char* message) {
 
 // The flags the emulator accepts, written out here rather than taken from the table under test,
 // so a typo in the table fails.
-const QStringList ALL_FLAGS {"--audio-compile-hold", "--structured-jump-tables",
-                             "--select-guarded-loads"};
+const QStringList ALL_FLAGS {
+    "--audio-compile-hold", "--structured-jump-tables", "--select-guarded-loads",
+    "--skip-redundant-unmap-drains", "--keep-gpu-cache-on-reuse", "--keep-gpu-textures-on-reuse",
+    "--partial-buffer-refresh", "--gpu-submit-cadence", "--native-float-minmax",
+    "--batch-hot-readbacks", "--readback-fault-wait"};
+// The flags of the experiments after the first three, in table order.
+const QStringList LATER_FLAGS {
+    "--skip-redundant-unmap-drains", "--keep-gpu-cache-on-reuse", "--keep-gpu-textures-on-reuse",
+    "--partial-buffer-refresh", "--gpu-submit-cadence", "--native-float-minmax",
+    "--batch-hot-readbacks", "--readback-fault-wait"};
 
-// Builds settings with each experiment set explicitly.
-ExperimentSettings Make(bool audio, bool structured, bool selected) {
+// Builds settings with each experiment set explicitly. The experiments after the first three
+// share one value, off unless asked for, so the checks that name exact flag lists stay about the
+// first three.
+ExperimentSettings Make(bool audio, bool structured, bool selected, bool later = false) {
 	ExperimentSettings settings;
-	settings.audio_compile_hold     = audio;
-	settings.structured_jump_tables = structured;
-	settings.select_guarded_loads   = selected;
+	settings.audio_compile_hold          = audio;
+	settings.structured_jump_tables      = structured;
+	settings.select_guarded_loads        = selected;
+	settings.skip_redundant_unmap_drains = later;
+	settings.keep_gpu_cache_on_reuse     = later;
+	settings.keep_gpu_textures_on_reuse  = later;
+	settings.partial_buffer_refresh      = later;
+	settings.gpu_submit_cadence          = later;
+	settings.native_float_minmax         = later;
+	settings.batch_hot_readbacks         = later;
+	settings.readback_fault_wait         = later;
 	return settings;
 }
 
@@ -47,7 +65,7 @@ QStringList Flags(const ExperimentSettings& settings) {
 	return args;
 }
 
-// Every experiment starts on, so a default config passes all three flags in table order.
+// Every experiment starts on, so a default config passes every flag in table order.
 void TestDefaultsPassEveryFlag() {
 	Check(Flags(ExperimentSettings {}) == ALL_FLAGS, "default experiments did not pass every flag");
 }
@@ -62,6 +80,23 @@ void TestEachExperimentPassesOnlyItsFlag() {
 	Check(Flags(Make(false, false, true)) == QStringList {"--select-guarded-loads"},
 	      "selected guarded loads alone did not pass exactly its flag");
 	Check(Flags(Make(false, false, false)).isEmpty(), "experiments all off still passed a flag");
+	// Each later experiment on alone, set by its field, passes exactly its own flag.
+	const std::pair<bool ExperimentSettings::*, const char*> later_cases[] = {
+	    {&ExperimentSettings::skip_redundant_unmap_drains, "--skip-redundant-unmap-drains"},
+	    {&ExperimentSettings::keep_gpu_cache_on_reuse, "--keep-gpu-cache-on-reuse"},
+	    {&ExperimentSettings::keep_gpu_textures_on_reuse, "--keep-gpu-textures-on-reuse"},
+	    {&ExperimentSettings::partial_buffer_refresh, "--partial-buffer-refresh"},
+	    {&ExperimentSettings::gpu_submit_cadence, "--gpu-submit-cadence"},
+	    {&ExperimentSettings::native_float_minmax, "--native-float-minmax"},
+	    {&ExperimentSettings::batch_hot_readbacks, "--batch-hot-readbacks"},
+	    {&ExperimentSettings::readback_fault_wait, "--readback-fault-wait"},
+	};
+	for (const auto& [field, flag]: later_cases) {
+		auto settings   = Make(false, false, false);
+		settings.*field = true;
+		Check(Flags(settings) == QStringList {QString::fromLatin1(flag)},
+		      "a later experiment alone did not pass exactly its flag");
+	}
 }
 
 // The launcher builds one argument list, so the flags must be appended, not replace it.
@@ -91,7 +126,7 @@ void TestMissingKeysReadAsDefaults() {
 void TestValuesRoundTripThroughIni() {
 	QTemporaryDir dir;
 	Check(dir.isValid(), "temporary directory was not created");
-	for (const auto& written: {Make(true, false, true), Make(false, true, false)}) {
+	for (const auto& written: {Make(true, false, true), Make(false, true, false, true)}) {
 		const auto path = dir.filePath("round_trip.ini");
 		{
 			QSettings ini(path, QSettings::IniFormat);
@@ -101,7 +136,7 @@ void TestValuesRoundTripThroughIni() {
 		}
 		QSettings ini(path, QSettings::IniFormat);
 		auto      read = Make(!written.audio_compile_hold, !written.structured_jump_tables,
-		                      !written.select_guarded_loads);
+		                      !written.select_guarded_loads, !written.skip_redundant_unmap_drains);
 		read.ReadFrom(ini);
 		Check(Flags(read) == Flags(written), "experiments did not round-trip through an INI file");
 	}
@@ -126,9 +161,58 @@ void TestValuesAreStoredAsStrings() {
 // keyed by name, and a round trip through the same table cannot catch two keys swapped in it.
 void TestEachKeyReachesItsOwnExperiment() {
 	const std::pair<const char*, QStringList> cases[] = {
-	    {"experiment_audio_compile_hold", {"--structured-jump-tables", "--select-guarded-loads"}},
-	    {"experiment_structured_jump_tables", {"--audio-compile-hold", "--select-guarded-loads"}},
-	    {"experiment_select_guarded_loads", {"--audio-compile-hold", "--structured-jump-tables"}},
+	    {"experiment_audio_compile_hold",
+	     QStringList {"--structured-jump-tables", "--select-guarded-loads"} + LATER_FLAGS},
+	    {"experiment_structured_jump_tables",
+	     QStringList {"--audio-compile-hold", "--select-guarded-loads"} + LATER_FLAGS},
+	    {"experiment_select_guarded_loads",
+	     QStringList {"--audio-compile-hold", "--structured-jump-tables"} + LATER_FLAGS},
+	    {"experiment_skip_redundant_unmap_drains",
+	     QStringList {"--audio-compile-hold", "--structured-jump-tables", "--select-guarded-loads",
+	                  "--keep-gpu-cache-on-reuse", "--keep-gpu-textures-on-reuse",
+	                  "--partial-buffer-refresh", "--gpu-submit-cadence", "--native-float-minmax",
+	                  "--batch-hot-readbacks",
+	                  "--readback-fault-wait"}},
+	    {"experiment_keep_gpu_cache_on_reuse",
+	     QStringList {"--audio-compile-hold", "--structured-jump-tables", "--select-guarded-loads",
+	                  "--skip-redundant-unmap-drains", "--keep-gpu-textures-on-reuse",
+	                  "--partial-buffer-refresh", "--gpu-submit-cadence", "--native-float-minmax",
+	                  "--batch-hot-readbacks",
+	                  "--readback-fault-wait"}},
+	    {"experiment_keep_gpu_textures_on_reuse",
+	     QStringList {"--audio-compile-hold", "--structured-jump-tables", "--select-guarded-loads",
+	                  "--skip-redundant-unmap-drains", "--keep-gpu-cache-on-reuse",
+	                  "--partial-buffer-refresh", "--gpu-submit-cadence", "--native-float-minmax",
+	                  "--batch-hot-readbacks",
+	                  "--readback-fault-wait"}},
+	    {"experiment_partial_buffer_refresh",
+	     QStringList {"--audio-compile-hold", "--structured-jump-tables", "--select-guarded-loads",
+	                  "--skip-redundant-unmap-drains", "--keep-gpu-cache-on-reuse",
+	                  "--keep-gpu-textures-on-reuse", "--gpu-submit-cadence", "--native-float-minmax",
+	                  "--batch-hot-readbacks",
+	                  "--readback-fault-wait"}},
+	    {"experiment_gpu_submit_cadence",
+	     QStringList {"--audio-compile-hold", "--structured-jump-tables", "--select-guarded-loads",
+	                  "--skip-redundant-unmap-drains", "--keep-gpu-cache-on-reuse",
+	                  "--keep-gpu-textures-on-reuse", "--partial-buffer-refresh",
+	                  "--native-float-minmax", "--batch-hot-readbacks",
+	                  "--readback-fault-wait"}},
+	    {"experiment_native_float_minmax",
+	     QStringList {"--audio-compile-hold", "--structured-jump-tables", "--select-guarded-loads",
+	                  "--skip-redundant-unmap-drains", "--keep-gpu-cache-on-reuse",
+	                  "--keep-gpu-textures-on-reuse", "--partial-buffer-refresh",
+	                  "--gpu-submit-cadence", "--batch-hot-readbacks",
+	                  "--readback-fault-wait"}},
+	    {"experiment_batch_hot_readbacks",
+	     QStringList {"--audio-compile-hold", "--structured-jump-tables", "--select-guarded-loads",
+	                  "--skip-redundant-unmap-drains", "--keep-gpu-cache-on-reuse",
+	                  "--keep-gpu-textures-on-reuse", "--partial-buffer-refresh",
+	                  "--gpu-submit-cadence", "--native-float-minmax", "--readback-fault-wait"}},
+	    {"experiment_readback_fault_wait",
+	     QStringList {"--audio-compile-hold", "--structured-jump-tables", "--select-guarded-loads",
+	                  "--skip-redundant-unmap-drains", "--keep-gpu-cache-on-reuse",
+	                  "--keep-gpu-textures-on-reuse", "--partial-buffer-refresh",
+	                  "--gpu-submit-cadence", "--native-float-minmax", "--batch-hot-readbacks"}},
 	};
 	for (const auto& [key, remaining]: cases) {
 		ExperimentSettings settings;
@@ -139,7 +223,7 @@ void TestEachKeyReachesItsOwnExperiment() {
 
 // The Enable all box shows all, none or some, and turns every experiment on or off together.
 void TestCombinedStateAndSetAll() {
-	Check(Make(true, true, true).CombinedState() == Qt::Checked, "all on was not Checked");
+	Check(Make(true, true, true, true).CombinedState() == Qt::Checked, "all on was not Checked");
 	Check(Make(false, false, false).CombinedState() == Qt::Unchecked, "all off was not Unchecked");
 	Check(Make(true, false, true).CombinedState() == Qt::PartiallyChecked,
 	      "some on was not PartiallyChecked");
@@ -153,8 +237,13 @@ void TestCombinedStateAndSetAll() {
 // The labels, written out here, sit on the boxes of the experiments they name.
 void TestBoxesNameTheirExperiments() {
 	ExperimentsTab tab;
-	const QStringList expected {"Audio compile hold", "Structured jump tables",
-	                            "Selected guarded loads"};
+	const QStringList expected {
+	    "Audio compile hold", "Structured jump tables", "Selected guarded loads",
+	    "Skip redundant unmap drains", "Keep GPU cache on reuse", "Keep GPU textures on reuse",
+	    "Partial buffer refresh", "GPU submit cadence", "Native float min/max", "Batch hot readbacks",
+	    "Readback fault wait"};
+	Check(tab.Boxes().size() == static_cast<std::size_t>(expected.size()),
+	      "the tab does not show one box per experiment");
 	for (std::size_t index = 0; index < tab.Boxes().size(); index++) {
 		Check(tab.Boxes()[index]->text() == expected[static_cast<int>(index)],
 		      "an experiment box shows another experiment's label");

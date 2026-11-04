@@ -17,7 +17,17 @@ struct ExperimentSettings {
 	// This fork exists to try the experiments, so they start on.
 	static constexpr bool DEFAULT_ENABLED = true;
 
-	bool example_experiment_name     = DEFAULT_ENABLED;
+	bool audio_compile_hold          = DEFAULT_ENABLED;
+	bool structured_jump_tables      = DEFAULT_ENABLED;
+	bool select_guarded_loads        = DEFAULT_ENABLED;
+	bool skip_redundant_unmap_drains = DEFAULT_ENABLED;
+	bool keep_gpu_cache_on_reuse     = DEFAULT_ENABLED;
+	bool keep_gpu_textures_on_reuse  = DEFAULT_ENABLED;
+	bool partial_buffer_refresh      = DEFAULT_ENABLED;
+	bool gpu_submit_cadence          = DEFAULT_ENABLED;
+	bool native_float_minmax         = DEFAULT_ENABLED;
+	bool batch_hot_readbacks         = DEFAULT_ENABLED;
+	bool readback_fault_wait         = DEFAULT_ENABLED;
 
 	/// Reads the experiments, using the default for any key an older config does not have.
 	template <class Settings>
@@ -43,8 +53,28 @@ struct ExperimentEntry {
 };
 
 inline constexpr std::array EXPERIMENT_ENTRIES {
-    ExperimentEntry {&ExperimentSettings::example_experiment_name, 
-										"experiment_example_experiment_name","--example_experiment_flag"},
+    ExperimentEntry {&ExperimentSettings::audio_compile_hold, "experiment_audio_compile_hold",
+                     "--audio-compile-hold"},
+    ExperimentEntry {&ExperimentSettings::structured_jump_tables, "experiment_structured_jump_tables",
+                     "--structured-jump-tables"},
+    ExperimentEntry {&ExperimentSettings::select_guarded_loads, "experiment_select_guarded_loads",
+                     "--select-guarded-loads"},
+    ExperimentEntry {&ExperimentSettings::skip_redundant_unmap_drains, "experiment_skip_redundant_unmap_drains",
+                     "--skip-redundant-unmap-drains"},
+    ExperimentEntry {&ExperimentSettings::keep_gpu_cache_on_reuse, "experiment_keep_gpu_cache_on_reuse",
+                     "--keep-gpu-cache-on-reuse"},
+    ExperimentEntry {&ExperimentSettings::keep_gpu_textures_on_reuse, "experiment_keep_gpu_textures_on_reuse",
+                     "--keep-gpu-textures-on-reuse"},
+    ExperimentEntry {&ExperimentSettings::partial_buffer_refresh, "experiment_partial_buffer_refresh",
+                     "--partial-buffer-refresh"},
+    ExperimentEntry {&ExperimentSettings::gpu_submit_cadence, "experiment_gpu_submit_cadence",
+                     "--gpu-submit-cadence"},
+    ExperimentEntry {&ExperimentSettings::native_float_minmax, "experiment_native_float_minmax",
+                     "--native-float-minmax"},
+    ExperimentEntry {&ExperimentSettings::batch_hot_readbacks, "experiment_batch_hot_readbacks",
+                     "--batch-hot-readbacks"},
+    ExperimentEntry {&ExperimentSettings::readback_fault_wait, "experiment_readback_fault_wait",
+                     "--readback-fault-wait"},
 };
 
 // True when no two entries edit the same field, so with the size check below every field has
