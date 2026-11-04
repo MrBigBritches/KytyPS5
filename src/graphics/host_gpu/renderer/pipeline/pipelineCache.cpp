@@ -242,7 +242,8 @@ ShaderRecompiler::Spirv::Profile SpirvProfile(const GraphicContext& graphics) {
 	        .device_clock_period_ps = graphics.device_clock_period_ps,
 	        .robust_buffer_access   = graphics.robust_buffer_access_enabled,
 	        .r8_srgb_views          = graphics.r8_srgb_views,
-	        .r8g8_srgb_views        = graphics.r8g8_srgb_views};
+	        .r8g8_srgb_views        = graphics.r8g8_srgb_views,
+	        .select_guarded_loads   = Config::SelectGuardedLoadsEnabled()};
 }
 
 std::filesystem::path ShaderStorePath() {
