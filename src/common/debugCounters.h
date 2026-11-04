@@ -39,6 +39,8 @@ enum class Counter {
 	ColorMetadataChecks, // GPU clear-key checks of DCC/CMASK metadata.
 	BufferUploadBytes,
 	BufferDownloadBytes,
+	BufferCoDownloads, // Pieces of recent small GPU writes downloaded in another readback's wait.
+	BufferCoDownloadBytes,
 	BufferEvictions,
 	BufferReleases,        // Clean buffers released after going unbound, without memory pressure.
 	BufferReleaseRefaults, // Released ranges a shader read again through BDA, now kept.

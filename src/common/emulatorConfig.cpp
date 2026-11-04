@@ -230,6 +230,10 @@ bool PartialBufferRefreshEnabled() {
 	return g_config->partial_buffer_refresh_enabled;
 }
 
+bool BatchHotReadbacksEnabled() {
+	return g_config->batch_hot_readbacks;
+}
+
 bool TessellationEnabled() {
 	return g_config->tessellation_enabled;
 }
