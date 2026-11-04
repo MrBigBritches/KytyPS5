@@ -104,6 +104,8 @@ struct ConfigOptions {
 	bool                   skip_notice_screen          = false;
 	// Experimental. Keeps GPU buffer caches when direct memory is released and mapped back unchanged.
 	bool                   keep_gpu_cache_on_reuse     = false;
+	// Experimental. Also keeps clean texture-cache images across that release and remap.
+	bool                   keep_gpu_textures_on_reuse  = false;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	bool red_zone_protection_enabled = false;
 #endif
@@ -184,6 +186,8 @@ bool PlayGoHackEnabled();
 bool SkipNoticeScreen();
 // Whether released direct memory keeps its GPU buffer caches for an exact remap. Default off.
 bool KeepGpuCacheOnReuse();
+// Whether that release also keeps clean texture-cache images. Needs KeepGpuCacheOnReuse. Default off.
+bool KeepGpuTexturesOnReuse();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 bool RedZoneProtectionEnabled();
 #endif
