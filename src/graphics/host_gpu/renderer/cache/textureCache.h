@@ -91,6 +91,11 @@ public:
 	[[nodiscard]] bool TouchMeta(uint64_t address, uint32_t slice, bool is_clear);
 
 	void UnmapMemory(uint64_t address, uint64_t size);
+	// Releases a range that the guest is likely to map again. With --keep-gpu-textures-on-reuse it
+	// keeps the clean images in the range and marks them suspended, otherwise it unmaps the range.
+	void SuspendMemory(uint64_t address, uint64_t size);
+	// Clears the suspended mark on the images in a range that was suspended.
+	void ResumeMemory(uint64_t address, uint64_t size);
 	/// Records GPU-to-guest copies for enrolled images. Entries that can never be downloaded are
 	/// dropped.
 	/// @param keep_unready true keeps entries that fail only for now, to retry at the next call.
@@ -194,7 +199,13 @@ private:
 	// Caller holds m_lock. A sequential write marks only the images its per-page faults reach.
 	void InvalidateCpuAliases(uint64_t address, uint64_t size, bool sequential_write);
 
+	// Caller holds m_lock. Whether the collector must skip the image, which it also touches.
+	[[nodiscard]] bool HeldFromCollection(Image& image);
 	[[nodiscard]] bool DownloadImageMemory(ImageId id);
+	// Caller holds m_lock. Erases the surface metadata whose base lies in the range.
+	void EraseSurfaceMetas(uint64_t address, uint64_t size);
+	// Caller holds m_lock. Whether an image can stay registered while its range is suspended.
+	[[nodiscard]] bool CanKeepOnSuspend(const Image& image, uint64_t address, uint64_t size) const;
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
@@ -217,6 +228,7 @@ private:
 	bool             m_readback_tiled_images  = false;
 	// Readbacks recorded by DownloadImageMemory() whose guest write has not run yet.
 	std::atomic<uint32_t> m_readbacks_in_flight {0};
+	bool             m_keep_textures_on_suspend = false;
 
 	friend struct TextureCacheTestAccess;
 	friend class BufferCache;

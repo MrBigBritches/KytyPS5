@@ -64,11 +64,13 @@ public:
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
 	void               MapMemory(uint64_t vaddr, uint64_t size);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
-	// Releases a range but keeps its buffer cache, for a later exact remap of the same memory.
+	// Releases a range but keeps its buffer cache, and with --keep-gpu-textures-on-reuse its clean
+	// textures, for a later exact remap of the same memory. See the call site for heap images.
 	void               SuspendMemory(uint64_t vaddr, uint64_t size);
-	// Maps a suspended range back with a fresh read-write host view and re-arms its protection.
+	// Maps a suspended range back with a fresh read-write host view, un-suspends its kept textures
+	// and re-arms its protection.
 	void               ResumeMemory(uint64_t vaddr, uint64_t size);
-	// Drops a suspended range's cache the way UnmapMemory would have.
+	// Drops a suspended range's buffers and textures the way UnmapMemory would have.
 	void               CancelSuspendedMemory(uint64_t vaddr, uint64_t size);
 	// Whether the whole range is currently suspended.
 	[[nodiscard]] bool IsSuspended(uint64_t vaddr, uint64_t size) const;

@@ -140,7 +140,8 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
       m_tiler(graphics, scheduler, buffer_cache.GetUtilityBuffer(MemoryUsage::Stream)),
       m_buffer_cache(buffer_cache),
       m_readback_linear_images(Config::ReadbackLinearImagesEnabled()),
-      m_readback_tiled_images(Config::ReadbackTiledImagesEnabled()) {
+      m_readback_tiled_images(Config::ReadbackTiledImagesEnabled()),
+      m_keep_textures_on_suspend(Config::KeepGpuTexturesOnReuse()) {
 	if (m_graphics.CanReportMemoryUsage()) {
 		constexpr int64_t GiB = 1024ll * 1024 * 1024;
 		const auto        budget =
@@ -2043,8 +2044,7 @@ bool TextureCache::IsRegionRegistered(uint64_t address, uint64_t size) {
 
 void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 	std::scoped_lock lock {m_lock};
-	m_surface_metas.erase(m_surface_metas.lower_bound(address),
-	                      m_surface_metas.lower_bound(address + size));
+	EraseSurfaceMetas(address, size);
 	auto images = FindImagesInRegion(address, size);
 	for (const auto id: images) {
 		auto owner = m_slot_images.try_get(id);
@@ -2053,6 +2053,110 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 		}
 		FreeImage(id);
 	}
+}
+
+void TextureCache::EraseSurfaceMetas(uint64_t address, uint64_t size) {
+	m_surface_metas.erase(m_surface_metas.lower_bound(address),
+	                      m_surface_metas.lower_bound(address + size));
+}
+
+namespace {
+
+// Whether the inner range lies entirely inside the outer range.
+// Callers pass a nonempty inner range.
+bool RangeInside(uint64_t outer_address, uint64_t outer_size, const GuestRange& inner) {
+	return inner.address >= outer_address &&
+	       inner.End() <= outer_address + outer_size;
+}
+
+} // namespace
+
+bool TextureCache::CanKeepOnSuspend(const Image& image, uint64_t address, uint64_t size) const {
+	const auto& info = image.info;
+	// Dirty, buffer-modified and heap-referenced images are rebuilt or re-uploaded on next use
+	// anyway, and a compressed image cannot be refreshed once the CPU has dirtied it.
+	if (!image.registered || image.IsCpuDirty() || image.IsBufferModified() ||
+	    image.heap_refs.load(std::memory_order_relaxed) != 0u ||
+	    info.metadata.compression != VideoOutCompression::Uncompressed) {
+		return false;
+	}
+	// Depth images own HTILE metadata entries that the suspend erases, so they must be rebuilt.
+	if (info.IsDepth() || image.depth_id || !image.stencil_ids.empty() ||
+	    info.metadata.kind == ImageMetadataKind::Htile) {
+		return false;
+	}
+	// The resume re-arms page protection for the range only, so every watched page must be in it.
+	if (!RangeInside(address, size, info.data) ||
+	    (!info.metadata.range.Empty() && !RangeInside(address, size, info.metadata.range))) {
+		return false;
+	}
+	// A partly tracked image would miss CPU writes to its unwatched pages.
+	if (image.track_addr != info.data.address || image.track_addr_end != info.data.End()) {
+		return false;
+	}
+	return !image.binding.is_bound && !image.binding.is_target && !image.binding.needs_rebind;
+}
+
+void TextureCache::SuspendMemory(uint64_t address, uint64_t size) {
+	if (!m_keep_textures_on_suspend) {
+		UnmapMemory(address, size);
+		return;
+	}
+	if (!GuestRange {address, size}.Valid()) {
+		EXIT("TextureCache: invalid suspend range\n");
+	}
+	std::scoped_lock lock {m_lock};
+	EraseSurfaceMetas(address, size);
+	uint32_t kept_count  = 0;
+	uint32_t freed_count = 0;
+	uint64_t kept_bytes  = 0;
+	uint64_t freed_bytes = 0;
+	for (const auto id: FindImagesInRegion(address, size)) {
+		// Freeing a depth image frees its stencil associations, which may come later in the list.
+		auto* owner = m_slot_images.try_get(id);
+		if (owner == nullptr || !owner->registered) {
+			continue;
+		}
+		const auto bytes = owner->info.data.size;
+		if (CanKeepOnSuspend(*owner, address, size)) {
+			owner->suspended = true;
+			++kept_count;
+			kept_bytes += bytes;
+		} else {
+			FreeImage(id);
+			++freed_count;
+			freed_bytes += bytes;
+		}
+	}
+	// Quiet for empty ranges because games can suspend often. The counts cover only the
+	// images found in the region, not stencil associations freed along with a depth image.
+	if (kept_count + freed_count == 0) {
+		return;
+	}
+	LOGF("TextureCache: suspended 0x%010" PRIx64 " size=0x%" PRIx64 " kept=%" PRIu32
+	     " (%" PRIu64 " bytes) freed=%" PRIu32 " (%" PRIu64 " bytes)\n",
+	     address, size, kept_count, kept_bytes, freed_count, freed_bytes);
+}
+
+void TextureCache::ResumeMemory(uint64_t address, uint64_t size) {
+	// No Valid() check is needed because FindImagesInRegion returns nothing for a bad range.
+	std::scoped_lock lock {m_lock};
+	for (const auto id: FindImagesInRegion(address, size)) {
+		if (auto* owner = m_slot_images.try_get(id); owner != nullptr) {
+			owner->suspended = false;
+		}
+	}
+}
+
+bool TextureCache::HeldFromCollection(Image& image) {
+	// Resident heaps sample an image without touching it. A suspended image has no host mapping
+	// to read back from and its range is expected to return, so neither may be freed or
+	// downloaded. Touching it keeps it young for when the hold ends.
+	if (image.heap_refs.load(std::memory_order_relaxed) == 0u && !image.suspended) {
+		return false;
+	}
+	TouchImage(image);
+	return true;
 }
 
 void TextureCache::RunGarbageCollector() {
@@ -2094,9 +2198,7 @@ void TextureCache::RunGarbageCollector() {
 			if (owner == nullptr || !owner->registered || owner->depth_id) {
 				continue;
 			}
-			if (owner->heap_refs.load(std::memory_order_relaxed) != 0u) {
-				// Resident heaps sample it without touching it.
-				TouchImage(*owner);
+			if (HeldFromCollection(*owner)) {
 				continue;
 			}
 			if (owner->IsGpuModified()) {
@@ -2144,6 +2246,11 @@ bool TextureCache::ProcessDownloadImages(bool keep_unready) {
 		if (owner == nullptr || !owner->registered || !owner->IsGpuModified() || owner->depth_id ||
 		    !CanDownload(*owner)) {
 			// Gone, already current, or never downloadable, so there is nothing to retry.
+			it = m_download_images.erase(it);
+		} else if (owner->suspended && keep_unready) {
+			// Its range has no host view until the resume, so the readback waits for it.
+			++it;
+		} else if (owner->suspended) {
 			it = m_download_images.erase(it);
 		} else if (DownloadImageMemory(id)) {
 			queued = true;
