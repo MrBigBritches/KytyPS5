@@ -115,6 +115,9 @@ static void PrintUsage() {
 	::printf("  --sync-raw-image-buffers             Synchronize raw reads of GPU images.\n");
 	::printf("  --skip-redundant-unmap-drains        Skip the GPU drain when unmapping an already unmapped range.\n");
 	::printf("  --partial-buffer-refresh             Refresh only the buffer-written part of an image.\n");
+	::printf("  --batch-hot-readbacks                When a fault readback waits for the GPU, also read\n"
+	         "                                       back recently faulted buffers and finished small\n"
+	         "                                       GPU writes.\n");
 	::printf("  --no-trophy-notifications            Disable trophy unlock toasts and their sound.\n");
 	::printf(
 	    "  --trophy-duration <seconds>          Trophy toast duration, 5-10. Default: 6.\n");
@@ -251,6 +254,7 @@ static constexpr Flag FLAGS[] = {
     {"--sync-raw-image-buffers", &ConfigOptions::sync_raw_image_buffers},
     {"--skip-redundant-unmap-drains", &ConfigOptions::skip_redundant_unmap_drains},
     {"--partial-buffer-refresh", &ConfigOptions::partial_buffer_refresh_enabled},
+    {"--batch-hot-readbacks", &ConfigOptions::batch_hot_readbacks},
     {"--no-trophy-notifications", &ConfigOptions::trophy_enabled, false},
     {"--perf-overlay", &ConfigOptions::perf_overlay_enabled},
     {"--playgo-hack", &ConfigOptions::playgo_hack_enabled},
