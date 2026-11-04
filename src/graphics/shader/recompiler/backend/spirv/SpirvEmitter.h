@@ -20,6 +20,9 @@ struct Profile {
 	// 8 and 8_8 sRGB textures sample through sRGB views; without one the shader decodes them.
 	bool r8_srgb_views   = false;
 	bool r8g8_srgb_views = false;
+	// Opts in to running safe guarded loads unconditionally and selecting the result, instead of
+	// branching around them. Off by default while it is new.
+	bool select_guarded_loads = false;
 };
 
 inline constexpr Profile DefaultProfile {};
