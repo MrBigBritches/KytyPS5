@@ -92,6 +92,7 @@ struct ConfigOptions {
 	bool                   renderdoc_enabled           = false;
 	bool                   readback_linear_images      = false;
 	bool                   readback_tiled_images       = false;
+	bool                   readback_fault_wait         = false;
 	bool                   sync_raw_image_buffers      = false;
 	bool                   skip_redundant_unmap_drains = false;
 	bool                   partial_buffer_refresh_enabled = false;
@@ -181,6 +182,8 @@ bool GpuAssistedValidationEnabled();
 bool RenderDocEnabled();
 bool ReadbackLinearImagesEnabled();
 bool ReadbackTiledImagesEnabled();
+/// @return true if guest access to a pending readback's pages should wait for its data.
+bool ReadbackFaultWaitEnabled();
 bool SyncRawImageBuffersEnabled();
 // Skips the GPU drain when a range that is already unmapped is unmapped again.
 bool SkipRedundantUnmapDrainsEnabled();

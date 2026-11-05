@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionManager.h"
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
+#include "graphics/host_gpu/renderer/cache/readbackGuard.h"
 #include "graphics/host_gpu/renderer/image/blitHelper.h"
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
@@ -48,6 +49,7 @@ public:
 		bool          heap = false; // PS5: resolved for a resident image heap.
 	};
 
+	/// Reads the readback options once. Fault waits need their own flag and a readback option.
 	TextureCache(GraphicContext& graphics, CommandScheduler& scheduler, PageManager& page_manager,
 	             BufferCache& buffer_cache);
 	~TextureCache();
@@ -116,6 +118,11 @@ public:
 	[[nodiscard]] bool HasReadbacksInFlight() const noexcept {
 		return m_readbacks_in_flight.load(std::memory_order_acquire) != 0;
 	}
+	/// @return true if qualifying readbacks hold their guest pages. It is set at construction (only
+	/// tests change it later), so it needs no lock.
+	[[nodiscard]] bool ReadbackFaultWaitEnabled() const noexcept { return m_readback_fault_wait; }
+	/// @return the guard holding the guest pages of pending readbacks.
+	[[nodiscard]] ReadbackGuard& GetReadbackGuard() noexcept { return m_readback_guard; }
 	void RunGarbageCollector();
 
 private:
@@ -259,6 +266,7 @@ private:
 	BlitHelper                                        m_blit_helper;
 	TileManager                                       m_tiler;
 	BufferCache&                                      m_buffer_cache;
+	ReadbackGuard                                     m_readback_guard;
 	Common::SlotVector<Image>                         m_slot_images;
 	ImagePageTable                                    m_image_page_table;
 	// Indexed by ImageId. Written only by RegisterImage and UnregisterImage, under m_lock.
@@ -274,10 +282,19 @@ private:
 	uint64_t         m_gc_tick                = 0;
 	bool             m_readback_linear_images = false;
 	bool             m_readback_tiled_images  = false;
+	bool             m_readback_fault_wait    = false;
 	// Readbacks recorded by DownloadImageMemory() whose guest write has not run yet.
 	std::atomic<uint32_t> m_readbacks_in_flight {0};
 	bool             m_keep_textures_on_suspend = false;
 	bool             m_partial_buffer_refresh = false;
+
+	/// Holds a readback's guest pages if it qualifies, and returns what was held, which may be
+	/// nothing. Needs a successful backing read first, so private mappings are never held. A thread
+	/// copying from one keeps the address-space lock while it reads, so a fault there could wait
+	/// with that lock held, and the landing needs it.
+	[[nodiscard]] GuestRange HoldReadback(const Image& image);
+	/// Records the copy of an image's bytes to the download buffer.
+	void RecordReadbackCopy(Image& image, Buffer& download, uint64_t offset, GuestRange range);
 
 	friend struct TextureCacheTestAccess;
 	friend class BufferCache;

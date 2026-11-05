@@ -25,11 +25,21 @@ public:
 
 	/// Re-arms host protection for [vaddr, vaddr+size) from the current watcher counts.
 	/// Use it after the host view was replaced with a fresh read-write mapping while the
-	/// counts were kept. Counts are never changed. Pages with a read watcher become
-	/// no-access, pages with only write watchers become read-only and unwatched pages are
+	/// counts were kept. Counts are never changed. Pages with a read watcher or a readback
+	/// hold become no-access, pages with only write watchers become read-only and others are
 	/// left alone. Contiguous pages needing the same protection share one host call.
 	/// A size of 0 is accepted as a no-op, unlike UpdatePageWatchers.
 	void ReapplyProtection(uint64_t vaddr, uint64_t size);
+	/// Blocks all guest access to a range until the matching RemoveReadbackHold. Holds are counted
+	/// apart from watchers, so a pending readback can share a page with a cache's read watch.
+	void AddReadbackHold(uint64_t vaddr, uint64_t size);
+	/// Releases one hold taken by AddReadbackHold on the same range.
+	void RemoveReadbackHold(uint64_t vaddr, uint64_t size);
+	/// Returns whether no watcher or hold blocks a read or write of the page holding vaddr. A page
+	/// in a tracked region with no watchers returns true whether or not it was ever watched or is
+	/// even mapped, so a caller treating true as a stale fault must first check that the guest may
+	/// make this access. A page in no tracked region and any execute access return false.
+	[[nodiscard]] bool WatchersAllowAccess(uint64_t vaddr, PageFaultAccess access) const noexcept;
 
 private:
 	struct Impl;

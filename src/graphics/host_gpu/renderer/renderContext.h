@@ -57,6 +57,12 @@ public:
 	OcclusionQueries&   GetOcclusionQueries() { return m_occlusion_queries; }
 
 	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept;
+	/// Waits until no pending readback holds this range, for host calls that can't take a fault.
+	/// Only guest threads may wait on a held range. The GPU thread submits the landing, the priority
+	/// thread runs it, and a pending operation can't wait on it, so those would only time out.
+	void               WaitForReadbacks(uint64_t vaddr, uint64_t size) noexcept;
+	/// Tells the caches the host is about to write this range. It waits first as WaitForReadbacks
+	/// does, so the same rule applies when part of the range may be held.
 	[[nodiscard]] bool InvalidateMemory(uint64_t vaddr, uint64_t size);
 	/// Like InvalidateMemory for a CPU write treated as running front to back over the range, so
 	/// images end up as its page-by-page faults would have left them. False if not fully mapped.
@@ -93,6 +99,10 @@ private:
 	// Suspends a range, or unmaps it like UnmapNow once shutdown has begun.
 	void SuspendNow(uint64_t vaddr, uint64_t size);
 
+	/// Handles a fault on a page a pending readback is holding, by waiting for the data if this
+	/// thread may block. Also recognises a fault whose hold ended just before it got here.
+	/// @return true when the access should simply retry, without the normal fault handling.
+	[[nodiscard]] bool ResolveReadbackFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept;
 	struct InterruptEqRegistration {
 		LibKernel::EventQueue::KernelEqueue eq       = LibKernel::EventQueue::KERNEL_EQUEUE_INVALID;
 		int                                 event_id = 0;

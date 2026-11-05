@@ -218,6 +218,10 @@ bool ReadbackTiledImagesEnabled() {
 	return g_config->readback_tiled_images;
 }
 
+bool ReadbackFaultWaitEnabled() {
+	return g_config->readback_fault_wait;
+}
+
 bool SyncRawImageBuffersEnabled() {
 	return g_config->sync_raw_image_buffers;
 }

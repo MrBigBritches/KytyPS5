@@ -1161,6 +1161,12 @@ static void CancelAllSuspendedRangesIfUsed() {
 	CancelAllSuspendedRanges();
 }
 
+void WaitForGpuReadbacks(uint64_t vaddr, uint64_t size) noexcept {
+	if (g_gpu_resources != nullptr) {
+		g_gpu_resources->WaitForReadbacks(vaddr, size);
+	}
+}
+
 void InstallGpuResources(Graphics::RenderContext* resources) noexcept {
 	EXIT_IF(resources != nullptr && g_gpu_resources != nullptr);
 	// Suspended caches belong to the GPU that is going away. Left behind, they would keep page
