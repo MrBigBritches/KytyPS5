@@ -236,6 +236,8 @@ file(GLOB kyty_emulator_src CONFIGURE_DEPENDS
 	"${KYTY_SOURCE_DIR}/graphics/presentation/window/*.h"
 	"${KYTY_SOURCE_DIR}/graphics/presentation/system/core/*.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/presentation/system/core/*.h"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/layout/*.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/layout/*.h"
 	"${KYTY_SOURCE_DIR}/kernel/*.cpp"
 	"${KYTY_SOURCE_DIR}/kernel/*.h"
 	"${KYTY_SOURCE_DIR}/loader/*.cpp"
@@ -453,6 +455,13 @@ add_executable(system_ui_core_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/graphics/presentation/system/core/scale.cpp"
 )
 target_include_directories(system_ui_core_tests PRIVATE ${inc_headers})
+
+add_executable(system_ui_layout_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/SystemUiLayoutTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/layout/anchor.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/layout/flex.cpp"
+)
+target_include_directories(system_ui_layout_tests PRIVATE ${inc_headers})
 
 # Checks the kit that compares draw lists.
 add_executable(system_ui_drawing_kit_tests EXCLUDE_FROM_ALL
@@ -706,6 +715,7 @@ if(BUILD_TESTING)
 	add_test(NAME lru_cache COMMAND $<TARGET_FILE:lru_cache_tests>)
 	add_test(NAME common COMMAND $<TARGET_FILE:common_tests>)
 	add_test(NAME system_ui_core COMMAND $<TARGET_FILE:system_ui_core_tests>)
+	add_test(NAME system_ui_layout COMMAND $<TARGET_FILE:system_ui_layout_tests>)
 	add_test(NAME system_ui_drawing_kit COMMAND $<TARGET_FILE:system_ui_drawing_kit_tests>)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
 	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)
@@ -823,6 +833,7 @@ if(BUILD_TESTING)
 		lru_cache_tests
 		common_tests
 		system_ui_core_tests
+		system_ui_layout_tests
 		system_ui_drawing_kit_tests
 		shader_vertex_metadata_tests
 		resource_materialization_tests
