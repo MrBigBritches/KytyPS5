@@ -614,6 +614,48 @@ target_compile_definitions(system_ui_components_tests PRIVATE
 	KYTY_TEST_FONT_REGULAR="${KYTY_NOTO_SANS_DIR}/NotoSans-Regular.ttf"
 	KYTY_TEST_FONT_BOLD="${KYTY_NOTO_SANS_DIR}/NotoSans-Bold.ttf")
 
+# Holds the system UI to its budget of heap allocations on a steady frame. It replaces operator new,
+# so it has an executable of its own.
+add_executable(system_ui_allocation_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/SystemUiAllocationTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/animation/easing.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/animation/timeline.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/animation/tween.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/core/scale.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/box.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/card.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/trophyCup.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/image.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/text.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/button.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/toggle.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/slider.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/list.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/tabs.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/modal.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/toast.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/element/frame.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/element/layout.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/element/leaves.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/element/primitives.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/element/interact.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/element/states.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/layout/flex.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/layout/anchor.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/effects/highlight.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/effects/halo.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/effects/shine.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/imgui/interaction.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/imgui/fonts.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/imgui/imageStore.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/views/trophyToast.cpp"
+)
+target_include_directories(system_ui_allocation_tests PRIVATE ${inc_headers})
+target_link_libraries(system_ui_allocation_tests imgui common)
+target_compile_definitions(system_ui_allocation_tests PRIVATE
+	KYTY_TEST_FONT_REGULAR="${KYTY_NOTO_SANS_DIR}/NotoSans-Regular.ttf"
+	KYTY_TEST_FONT_BOLD="${KYTY_NOTO_SANS_DIR}/NotoSans-Bold.ttf")
+
 add_executable(system_ui_views_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/SystemUiViewsTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/presentation/system/animation/easing.cpp"
@@ -821,6 +863,39 @@ add_executable(system_ui_tabs_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(system_ui_tabs_tests PRIVATE ${inc_headers})
 target_link_libraries(system_ui_tabs_tests imgui common)
+
+add_executable(system_ui_token_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/SystemUiTokenTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/animation/easing.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/animation/tween.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/animation/timeline.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/core/scale.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/box.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/button.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/card.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/image.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/list.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/modal.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/slider.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/tabs.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/text.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/toast.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/toggle.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/trophyCup.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/effects/halo.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/effects/highlight.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/effects/shine.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/element/frame.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/element/interact.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/element/layout.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/element/leaves.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/element/primitives.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/element/states.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/layout/flex.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/imgui/interaction.cpp"
+)
+target_include_directories(system_ui_token_tests PRIVATE ${inc_headers})
+target_link_libraries(system_ui_token_tests imgui common)
 
 add_executable(system_ui_modal_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/SystemUiModalTests.cpp"
@@ -1120,6 +1195,8 @@ if(BUILD_TESTING)
 	add_test(NAME system_ui_list COMMAND $<TARGET_FILE:system_ui_list_tests>)
 	add_test(NAME system_ui_tabs COMMAND $<TARGET_FILE:system_ui_tabs_tests>)
 	add_test(NAME system_ui_modal COMMAND $<TARGET_FILE:system_ui_modal_tests>)
+	add_test(NAME system_ui_tokens COMMAND $<TARGET_FILE:system_ui_token_tests>)
+	add_test(NAME system_ui_allocations COMMAND $<TARGET_FILE:system_ui_allocation_tests>)
 	add_test(NAME system_ui_drawing_kit COMMAND $<TARGET_FILE:system_ui_drawing_kit_tests>)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
 	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)
@@ -1254,6 +1331,8 @@ if(BUILD_TESTING)
 		system_ui_list_tests
 		system_ui_tabs_tests
 		system_ui_modal_tests
+		system_ui_token_tests
+		system_ui_allocation_tests
 		system_ui_drawing_kit_tests
 		shader_vertex_metadata_tests
 		resource_materialization_tests
