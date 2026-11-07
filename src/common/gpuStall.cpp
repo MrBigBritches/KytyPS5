@@ -36,6 +36,7 @@ State& GetState() {
 // progress returns without touching the mutex.
 std::atomic<bool>     g_enabled {false};
 std::atomic<uint32_t> g_active_scopes {0};
+std::atomic<uint64_t> g_hold_count {0};
 
 // A thread that owns a Scope would wait on its own release, so it never waits.
 thread_local uint32_t t_owned_scopes = 0;
@@ -100,6 +101,7 @@ Scope::~Scope() {
 	if (stall_first_hold.has_value()) {
 		const auto held_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
 		    Clock::now() - *stall_first_hold);
+		g_hold_count.fetch_add(1, std::memory_order_relaxed);
 		DebugCounters::Add(DebugCounters::Counter::AudioHolds);
 		DebugCounters::Add(DebugCounters::Counter::AudioHoldNs,
 		                   static_cast<uint64_t>(held_ns.count()));
@@ -163,6 +165,10 @@ bool IsStalled() {
 	auto&     state = GetState();
 	LockGuard lock(state.mutex);
 	return state.enabled && state.tracker.IsStalled(Clock::now(), state.threshold);
+}
+
+uint64_t HoldCount() {
+	return g_hold_count.load(std::memory_order_relaxed);
 }
 
 uint32_t WaiterCount() {

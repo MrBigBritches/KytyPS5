@@ -2,6 +2,7 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/firstRunReport.h"
 #include "gpu_tiler_shaders/gpu_tiler_demote_d16_spv.h"
 #include "gpu_tiler_shaders/gpu_tiler_depth_spv.h"
 #include "gpu_tiler_shaders/gpu_tiler_promote_d16_spv.h"
@@ -15,6 +16,7 @@
 #include "gpu_tiler_shaders/gpu_tiler_standard64_spv.h"
 #include "gpu_tiler_shaders/gpu_tiler_color_transform_spv.h"
 #include "gpu_tiler_shaders/gpu_tiler_color_clear_spv.h"
+#include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
@@ -312,6 +314,10 @@ vk::Pipeline TileManager::GetPipeline(uint32_t slot) {
 
 vk::Pipeline TileManager::CreatePipeline(std::span<const uint32_t>     code,
                                          const vk::SpecializationInfo* specialization) const {
+	// Built on first use, which can be mid-game on the GPU thread.
+	Common::FirstRunReport::CompileScope compile_timer(Common::FirstRunReport::Kind::Compute,
+	                                                   Common::FirstRunReport::HELPER_ID_TILER, 0,
+	                                                   GuestGpu::IsGpuThread());
 	const auto                        module = CompileSPV(code, m_graphics.device);
 	vk::PipelineShaderStageCreateInfo stage {};
 	stage.stage               = vk::ShaderStageFlagBits::eCompute;

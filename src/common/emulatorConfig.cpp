@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/debugCounters.h"
+#include "common/firstRunReport.h"
 #include "common/gpuStall.h"
 
 #include <algorithm>
@@ -35,6 +36,7 @@ void Load(const ConfigOptions& cfg) {
 	Common::DebugCounters::SetEnabled(cfg.perf_overlay_enabled);
 	// Pushed here rather than read by the audio code, so audio tests need no config.
 	Common::GpuStall::Configure(cfg.audio_compile_hold_enabled);
+	Common::FirstRunReport::Configure(cfg.first_run_report_enabled, cfg.cold_pipelines_enabled);
 }
 
 uint32_t GetScreenWidth() {
@@ -248,6 +250,14 @@ bool OcclusionQueriesEnabled() {
 
 bool AudioCompileHoldEnabled() {
 	return g_config->audio_compile_hold_enabled;
+}
+
+bool FirstRunReportEnabled() {
+	return g_config->first_run_report_enabled;
+}
+
+bool ColdPipelinesEnabled() {
+	return g_config->cold_pipelines_enabled;
 }
 
 bool GpuSubmitCadenceEnabled() {

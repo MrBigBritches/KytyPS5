@@ -1,0 +1,274 @@
+#ifndef KYTY_COMMON_FIRST_RUN_REPORT_H_
+#define KYTY_COMMON_FIRST_RUN_REPORT_H_
+
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <filesystem>
+#include <mutex>
+#include <span>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+// Measurement of a title's first run, when shaders and pipelines are still compiling. Two opt-in
+// flags drive it. --first-run-report writes one JSON file at clean exit, and --cold-pipelines
+// stamps every SPIR-V module so no driver cache can serve it. With both off, each call site costs
+// one relaxed atomic load.
+namespace Common::FirstRunReport {
+
+enum class Kind : uint8_t { Graphics, Compute };
+enum class Phase : uint8_t { Boot, Play };
+enum class Thread : uint8_t { Gpu, Worker };
+enum class SkipKind : uint8_t { Draw, Dispatch };
+
+/// Pause lengths in ms that start a histogram bucket. A pause counts in the highest bucket whose
+/// bound it reaches, and a shorter one counts as under the first bound.
+inline constexpr std::array<uint32_t, 7> PAUSE_BUCKET_BOUNDS_MS {100, 250, 500, 1000, 2500, 5000, 10000};
+inline constexpr size_t WORST_TRANSLATE_LIMIT = 10;
+inline constexpr size_t LONGEST_PAUSE_LIMIT   = 20;
+
+// Ids for pipelines the renderer builds for itself rather than from a guest shader. The top bits
+// tag the helper and the rest are zero, which a hashed module id is very unlikely to match.
+inline constexpr uint64_t HELPER_ID_TILER = 0xFFFF000100000000ull;
+inline constexpr uint64_t HELPER_ID_BLIT  = 0xFFFF000200000000ull;
+inline constexpr uint64_t HELPER_ID_PSSR  = 0xFFFF000300000000ull;
+
+namespace Detail {
+inline std::atomic<bool> g_report_enabled {false};
+inline std::atomic<bool> g_cold_enabled {false};
+} // namespace Detail
+
+/// True when --first-run-report is on.
+[[nodiscard]] inline bool Enabled() noexcept {
+	return Detail::g_report_enabled.load(std::memory_order_relaxed);
+}
+
+/// True when --cold-pipelines is on.
+[[nodiscard]] inline bool ColdEnabled() noexcept {
+	return Detail::g_cold_enabled.load(std::memory_order_relaxed);
+}
+
+/// Turns the report and cold stamping on or off. Called when the emulator config loads.
+void Configure(bool report_enabled, bool cold_enabled);
+
+/// One shader translation that missed the program cache.
+struct TranslateEntry {
+	std::string stage;
+	uint64_t    hash = 0;
+	double      ms   = 0.0;
+};
+
+/// One pipeline creation. create_ms is the whole creation function, which includes layouts and
+/// helper modules as well as the driver call. For graphics id is the vertex stage id and id_ps the
+/// pixel stage id, which is 0 when there is none. For compute id is the module id.
+struct CompileEntry {
+	Kind     kind      = Kind::Graphics;
+	uint64_t id        = 0;
+	uint64_t id_ps     = 0;
+	double   create_ms = 0.0;
+	Phase    phase     = Phase::Play;
+	Thread   thread    = Thread::Gpu;
+	int64_t  flip      = 0;
+};
+
+/// The GPU thread's blocking within one guest flip, merged into a single pause.
+struct Pause {
+	int64_t  flip   = 0;
+	double   ms     = 0.0;
+	uint32_t events = 0;
+};
+
+/// What the boot-time warm-up replayed from the shader store.
+struct BootInfo {
+	double   warm_up_ms = 0.0;
+	uint32_t programs   = 0;
+	uint32_t modules    = 0;
+	uint32_t pipelines  = 0;
+};
+
+/// Identity of the run, written at the top of the file.
+struct Metadata {
+	std::string                                title_id;
+	std::string                                build;
+	std::vector<std::pair<std::string, bool>> flags;
+	bool                                       cold = false;
+	// True when the process ended early to relaunch itself, so the play is split across reports.
+	bool                                       partial = false;
+};
+
+/// Figures worked out from the raw records, kept apart from JSON so tests can read them.
+struct Summary {
+	double                                                   blocked_graphics_ms = 0.0;
+	double                                                   blocked_compute_ms  = 0.0;
+	double                                                   translate_ms        = 0.0;
+	std::vector<TranslateEntry>                              worst_translate;
+	std::array<uint32_t, PAUSE_BUCKET_BOUNDS_MS.size()>      pause_histogram {};
+	uint32_t                                                 pauses_under_first_bound = 0;
+	double                                                   longest_pause_ms         = 0.0;
+	std::vector<Pause>                                       longest_pauses;
+	uint32_t                                                 pause_count = 0;
+	uint32_t                                                 flips       = 0;
+	uint32_t                                                 stamp_failures = 0;
+	std::array<uint32_t, 2>                                  skips {};
+	std::vector<std::pair<std::string, uint32_t>>            skips_by_target;
+};
+
+/// The raw records of one run. Thread safe, and it never reads a clock, so tests drive it with
+/// made-up durations.
+class Report {
+public:
+	/// Sets the phase that later records are tagged with.
+	void SetPhase(Phase phase);
+	/// Notes the guest flip the next records belong to, and counts the flip.
+	void OnFlip(int64_t flip);
+	/// Stores what the boot warm-up did.
+	void SetBoot(const BootInfo& boot);
+	/// Records a miss-path translation. Only GPU-thread time during play counts as blocked.
+	void AddTranslate(Kind kind, std::string_view stage, uint64_t hash, double ms, Thread thread);
+	/// Records a driver compile. Only GPU-thread time during play counts as blocked.
+	void AddCompile(Kind kind, uint64_t id, uint64_t id_ps, double create_ms, Thread thread);
+	/// Records a skipped draw or dispatch against a target class.
+	void AddSkip(SkipKind kind, std::string_view target_class);
+	/// Records a module that --cold-pipelines could not stamp, so it compiled unstamped.
+	void AddStampFailure();
+	/// Forgets everything recorded. For tests, which share the process-wide report.
+	void Reset();
+	/// What the boot warm-up stored.
+	[[nodiscard]] BootInfo Boot() const;
+
+	/// Works out the totals, histogram and top lists from what was recorded so far.
+	[[nodiscard]] Summary Summarize() const;
+	/// Renders the whole report as JSON text.
+	[[nodiscard]] std::string ToJson(const Metadata& metadata, uint64_t audio_holds,
+	                                 double run_seconds) const;
+	/// Copy of the compile rows, for tests.
+	[[nodiscard]] std::vector<CompileEntry> Compiles() const;
+
+private:
+	// Moves the pause being merged to the finished ones when it belongs to another flip. Caller
+	// holds the lock.
+	void FlushPendingPauseLocked(int64_t current_flip);
+	// Adds GPU-thread blocking to the pause of the current flip. Caller holds the lock.
+	void AddBlockedLocked(Kind kind, double ms);
+	// Pauses including the one still being merged. Caller holds the lock.
+	[[nodiscard]] std::vector<Pause> AllPausesLocked() const;
+
+	mutable std::mutex           m_mutex;
+	Phase                        m_phase = Phase::Play;
+	int64_t                      m_flip  = 0;
+	uint32_t                     m_flips = 0;
+	uint32_t                     m_stamp_failures = 0;
+	BootInfo                     m_boot;
+	std::array<double, 2>        m_blocked_ms {};
+	double                       m_translate_ms = 0.0;
+	std::vector<TranslateEntry>  m_translates;
+	std::vector<CompileEntry>    m_compiles;
+	std::vector<Pause>           m_pauses;
+	bool                         m_has_pending_pause = false;
+	Pause                        m_pending_pause;
+	std::array<uint32_t, 2>      m_skips {};
+	std::vector<std::pair<std::string, uint32_t>> m_skips_by_target;
+};
+
+/// The report of this process.
+Report& Global();
+
+/// Records the identity written to the file, and starts the run clock.
+void Begin(Metadata metadata);
+
+/// Writes the report once into _FirstRunReports beside the working directory. Later calls do
+/// nothing, so every clean exit path may call it. Does nothing unless the report is on.
+void WriteReportOnce();
+
+/// Where a report for this title and time would go, as <dir>/<TITLE_ID>-<UTC yyyymmdd-hhmmss>.json.
+[[nodiscard]] std::filesystem::path ReportPath(std::string_view title_id,
+                                               std::chrono::system_clock::time_point when);
+
+/// Marks the report as partial because the process is about to relaunch itself.
+void MarkPartial();
+
+/// Notes that a module could not be stamped. Logs the first one.
+void RecordStampFailure();
+
+/// Notes that the guest reached a new flip.
+inline void OnFlip(int64_t flip) {
+	if (Enabled()) {
+		Global().OnFlip(flip);
+	}
+}
+
+/// Sets the phase that later records are tagged with.
+inline void SetPhase(Phase phase) {
+	if (Enabled()) {
+		Global().SetPhase(phase);
+	}
+}
+
+/// Stores what the boot warm-up did.
+inline void SetBoot(const BootInfo& boot) {
+	if (Enabled()) {
+		Global().SetBoot(boot);
+	}
+}
+
+/// Records a skipped draw or dispatch. Nothing skips yet, so the counts stay zero until a
+/// strategy calls this.
+inline void AddSkip(SkipKind kind, std::string_view target_class) {
+	if (Enabled()) {
+		Global().AddSkip(kind, target_class);
+	}
+}
+
+/// Times a shader translation from construction to destruction and records it. Declare it where
+/// the cache miss begins. Costs one relaxed load when the report is off.
+class TranslateScope {
+public:
+	TranslateScope(Kind kind, std::string_view stage, uint64_t hash, bool on_gpu_thread);
+	~TranslateScope();
+	TranslateScope(const TranslateScope&)            = delete;
+	TranslateScope& operator=(const TranslateScope&) = delete;
+
+private:
+	bool                                  m_active;
+	Kind                                  m_kind;
+	Thread                                m_thread;
+	uint64_t                              m_hash;
+	std::string                           m_stage;
+	std::chrono::steady_clock::time_point m_start;
+};
+
+/// Times a whole pipeline creation function, not only the driver call inside it, from
+/// construction to destruction and records it.
+class CompileScope {
+public:
+	CompileScope(Kind kind, uint64_t id, uint64_t id_ps, bool on_gpu_thread);
+	~CompileScope();
+	CompileScope(const CompileScope&)            = delete;
+	CompileScope& operator=(const CompileScope&) = delete;
+
+private:
+	bool                                  m_active;
+	Kind                                  m_kind;
+	Thread                                m_thread;
+	uint64_t                              m_id;
+	uint64_t                              m_id_ps;
+	std::chrono::steady_clock::time_point m_start;
+};
+
+/// Returns a copy of a SPIR-V module with an OpSourceExtension carrying nonce placed first in the
+/// debug section, so its bytes differ from every other run. Returns an empty vector when the
+/// input is not a well-formed module, and the caller should then use the original.
+[[nodiscard]] std::vector<uint32_t> StampSpirv(std::span<const uint32_t> code, uint64_t nonce);
+
+/// The nonce for this run. It is picked when --cold-pipelines is configured, so every module of a
+/// run carries it and helper shaders that are rebuilt within a run still match each other, as they
+/// would in a true first run. Another run, or another Configure, picks another.
+[[nodiscard]] uint64_t StampNonce();
+
+} // namespace Common::FirstRunReport
+
+#endif /* KYTY_COMMON_FIRST_RUN_REPORT_H_ */

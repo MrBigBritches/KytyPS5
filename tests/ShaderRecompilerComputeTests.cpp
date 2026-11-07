@@ -4,6 +4,7 @@
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
+#include "common/firstRunReport.h"
 #include "common/hostException.h"
 #include "common/logging/log.h"
 #include "common/subsystems.h"
@@ -45,6 +46,8 @@
 #include "graphics/host_gpu/renderer/sync.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include <vulkan/vulkan_format_traits.hpp>
+#include <fstream>
+#include <iterator>
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window/windowInternal.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
@@ -60,6 +63,7 @@
 #include "graphics/shader/shader.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kernel/eventQueue.h"
+#include "loader/systemContent.h"
 #include "kernel/fileSystem.h"
 #include "kernel/memory.h"
 #include "libs/agc.h"
@@ -898,6 +902,10 @@ struct PipelineCacheTestAccess {
   }
 
   static auto Compiled(const PipelineCache &cache) { return cache.m_compiled; }
+
+  static bool HasDriverCache(const PipelineCache &cache) {
+    return cache.m_driver_cache != nullptr;
+  }
 
   static void StoreLayout(PipelineCache &cache, uint64_t key,
                           const ShaderTessellationInputInfo &layout) {
@@ -58101,7 +58109,24 @@ void CheckShaderStore(VulkanHarness &vulkan) {
     file.Write(&byte, 1);
   };
 
+  // The first-run report sees both pipeline kinds of this session, and turning it on changes
+  // nothing the checks below compare.
+  Config::Load({.printf_direction = Config::LogDirection::Silent,
+                .first_run_report_enabled = true});
+  Common::FirstRunReport::Global().Reset();
   const auto cold = run();
+  {
+    const auto rows = Common::FirstRunReport::Global().Compiles();
+    const auto graphics = std::ranges::count_if(rows, [](const auto &row) {
+      return row.kind == Common::FirstRunReport::Kind::Graphics && row.id != 0 && row.id_ps != 0 &&
+             row.thread == Common::FirstRunReport::Thread::Gpu &&
+             row.phase == Common::FirstRunReport::Phase::Play && row.create_ms > 0.0;
+    });
+    Require(name, "graphics pipeline recorded", graphics == 1 && rows.size() == 2,
+            "the graphics pipeline compile was not recorded once with its stage ids");
+  }
+  Config::Load({.printf_direction = Config::LogDirection::Silent});
+  Common::FirstRunReport::Global().Reset();
   const auto size = std::filesystem::file_size(store);
   Require(name, "cold start",
           cold.output == value && cold.prewarmed == std::array<size_t, 2>{} &&
@@ -58225,6 +58250,289 @@ void CheckShaderStore(VulkanHarness &vulkan) {
               LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) == 0,
           "output memory release failed");
   std::printf("[gpu]     %-32s ok\n", name);
+}
+
+// --cold-pipelines changes only what the driver is handed. Module ids and the shader store keep the
+// unstamped SPIR-V, the driver sees a different valid module on every run, and with the flag off
+// the module is untouched.
+void CheckColdPipelines(VulkanHarness &vulkan) {
+  constexpr const char *name = "ColdPipelines";
+  std::vector<u32> code;
+  AppendVMovU32(&code, 1, 0x5au);
+  code.insert(code.end(), {EncodeMubuf0(0x1c), EncodeMubuf1(1, 0, 0)});
+  AppendEnd(&code);
+  ShaderMapUserData(reinterpret_cast<uint64_t>(code.data()),
+                    {.type = Prospero::ShaderBinaryType::kCs,
+                     .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
+  const auto store_dir = std::filesystem::temp_directory_path() /
+                         fmt::format("kyty_cold_pipelines_{}",
+                                     std::chrono::steady_clock::now().time_since_epoch().count());
+
+  struct Run {
+    uint64_t id = 0;
+    bool pipeline = false;
+    std::vector<std::vector<u32>> handed_to_driver;
+    std::vector<uint8_t> store;
+  };
+  static std::vector<std::vector<u32>> *captured = nullptr;
+  static PFN_vkCreateShaderModule real_create_module = nullptr;
+  const auto run = [&](bool cold, const char *file_name) {
+    Config::Load({.printf_direction = Config::LogDirection::Silent,
+                  .cold_pipelines_enabled = cold});
+    Run result;
+    const auto store = store_dir / file_name;
+    {
+      PipelineCache cache(vulkan.RuntimeContext(), nullptr);
+      cache.WarmUp(store);
+      // Only the shader under test is captured, not the helper modules the cache makes itself.
+      captured = &result.handed_to_driver;
+      real_create_module = VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateShaderModule;
+      VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateShaderModule =
+          [](VkDevice device, const VkShaderModuleCreateInfo *info,
+             const VkAllocationCallbacks *allocator, VkShaderModule *module) {
+            captured->emplace_back(info->pCode, info->pCode + info->codeSize / sizeof(u32));
+            return real_create_module(device, info, allocator, module);
+          };
+      HW::ComputeShaderInfo regs{};
+      regs.cs_regs.data_addr = reinterpret_cast<uint64_t>(code.data());
+      regs.cs_regs.num_thread_x = 1;
+      regs.cs_regs.num_thread_y = 1;
+      regs.cs_regs.num_thread_z = 1;
+      regs.cs_regs.wave_size = 32;
+      regs.cs_regs.user_sgpr = 4;
+      const ShaderBufferResource buffer{{0x10000u, 4u << 16u, 64,
+          DstSel(4, 5, 6, 7) | (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u)}};
+      std::copy_n(buffer.fields, 4, regs.cs_user_sgpr.value);
+      ShaderComputeInputInfo input{};
+      result.id = cache.GetComputeProgram(regs, input)->id;
+      result.pipeline = cache.GetComputePipeline(input).pipeline != nullptr;
+    }
+    VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateShaderModule = real_create_module;
+    Common::File file(store, Common::File::Mode::Read);
+    result.store.resize(file.IsInvalid() ? 0 : file.Size());
+    if (!result.store.empty()) file.Read(result.store.data(), static_cast<u32>(result.store.size()));
+    Config::Load({.printf_direction = Config::LogDirection::Silent});
+    return result;
+  };
+
+  // Two plain runs show which parts are deterministic, so a difference in the cold run can only
+  // come from the flag.
+  const auto plain = run(false, "plain.shaders");
+  const auto plain_again = run(false, "plain_again.shaders");
+  const auto cold = run(true, "cold.shaders");
+  const auto cold_again = run(true, "cold_again.shaders");
+  std::filesystem::remove_all(store_dir);
+
+  Require(name, "baseline compiles",
+          plain.pipeline && plain.handed_to_driver.size() == 1 && plain.store.size() > 0,
+          "the plain run did not create one module, a pipeline and a store");
+  Require(name, "baseline is repeatable",
+          plain.id == plain_again.id && plain.handed_to_driver == plain_again.handed_to_driver &&
+              plain.store == plain_again.store,
+          "two plain runs differed, so the comparison below would prove nothing");
+  Require(name, "module id unchanged", cold.id == plain.id,
+          "the stamp changed the module id");
+  Require(name, "store unchanged", cold.store == plain.store,
+          "the stamp reached the shader store or its records");
+  Require(name, "cold run compiles", cold.pipeline && cold.handed_to_driver.size() == 1,
+          "the cold run did not create one module and a pipeline");
+  const auto &stamped = cold.handed_to_driver[0];
+  const auto &original = plain.handed_to_driver[0];
+  Require(name, "driver gets another module",
+          stamped != original && stamped.size() == original.size() + 4,
+          "the module handed to the driver was not the original plus a four word stamp");
+  // The stamp starts at the first word that differs, and what follows it is the rest of the original.
+  const size_t stamp_at = static_cast<size_t>(
+      std::mismatch(original.begin(), original.end(), stamped.begin()).first - original.begin());
+  Require(name, "stamp is only inserted",
+          stamp_at < original.size() && stamped[stamp_at] == ((4u << 16u) | 4u) &&
+              std::equal(original.begin() + stamp_at, original.end(), stamped.begin() + stamp_at + 4),
+          "removing the stamp did not give back the original module");
+  ValidateSpirv(name, stamped);
+  Require(name, "stamps differ per run", cold_again.handed_to_driver != cold.handed_to_driver,
+          "two cold runs handed the driver the same module, so a cache could serve the second");
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
+// The first-run report is fed from the real compile paths. A cold store run, a warm restart and a
+// run with the report off tell apart a record that is missing from one that is in the wrong place.
+void CheckFirstRunWiring(VulkanHarness &vulkan) {
+  namespace Report = Common::FirstRunReport;
+  constexpr const char *name = "FirstRunWiring";
+  const auto make_code = [](u32 value) {
+    std::vector<u32> code;
+    AppendVMovU32(&code, 1, value);
+    code.insert(code.end(), {EncodeMubuf0(0x1c), EncodeMubuf1(1, 0, 0)});
+    AppendEnd(&code);
+    return code;
+  };
+  const std::array codes{make_code(0x31), make_code(0x32)};
+  for (const auto &code : codes)
+    ShaderMapUserData(reinterpret_cast<uint64_t>(code.data()),
+        {.type = Prospero::ShaderBinaryType::kCs,
+         .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
+  const auto store_dir = std::filesystem::temp_directory_path() /
+                         fmt::format("kyty_first_run_wiring_{}",
+                                     std::chrono::steady_clock::now().time_since_epoch().count());
+  const auto store = store_dir / "TEST00002.shaders";
+
+  // Compiles the first program only, or both, from the GPU thread after one suspend point.
+  const auto run = [&](bool report, size_t program_count) {
+    Config::Load({.printf_direction = Config::LogDirection::Silent,
+                  .first_run_report_enabled = report});
+    Report::Global().Reset();
+    std::array<uint64_t, 2> ids{};
+    RenderContext context(vulkan.RuntimeContext(), store);
+    auto &pipelines = context.GetPipelineCache();
+    context.InitializeGpu(nullptr);
+    context.GetGpu().SuspendPoint();
+    context.GetGpu().WaitForIdle();
+    context.GetGpu().SendCommandSync([&] {
+      for (size_t index = 0; index < program_count; index++) {
+        HW::ComputeShaderInfo regs{};
+        regs.cs_regs.data_addr = reinterpret_cast<uint64_t>(codes[index].data());
+        regs.cs_regs.num_thread_x = 1;
+        regs.cs_regs.num_thread_y = 1;
+        regs.cs_regs.num_thread_z = 1;
+        regs.cs_regs.wave_size = 32;
+        regs.cs_regs.user_sgpr = 4;
+        const ShaderBufferResource buffer{{0x10000u, 4u << 16u, 64,
+            DstSel(4, 5, 6, 7) | (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u)}};
+        std::copy_n(buffer.fields, 4, regs.cs_user_sgpr.value);
+        ShaderComputeInputInfo input{};
+        ids[index] = pipelines.GetComputeProgram(regs, input)->id;
+        (void)pipelines.GetComputePipeline(input);
+      }
+    });
+    context.ShutdownGpu();
+    return ids;
+  };
+
+  const auto first_ids = run(true, 1);
+  const auto cold_rows = Report::Global().Compiles();
+  const auto cold_summary = Report::Global().Summarize();
+  const auto cold_boot = Report::Global().Boot();
+  Require(name, "cold row",
+          cold_rows.size() == 1 && cold_rows[0].kind == Report::Kind::Compute &&
+              cold_rows[0].id == first_ids[0] && cold_rows[0].thread == Report::Thread::Gpu &&
+              cold_rows[0].phase == Report::Phase::Play && cold_rows[0].create_ms > 0.0,
+          "the compute pipeline was not recorded once with its module id, on the GPU thread, in play");
+  Require(name, "flip reaches the row", cold_rows[0].flip == 1 && cold_summary.flips == 1,
+          "the GPU thread's suspend point was not counted before the compile");
+  Require(name, "translate and blocked time",
+          cold_summary.translate_ms > 0.0 && cold_summary.blocked_compute_ms > cold_rows[0].create_ms &&
+              cold_summary.pause_count == 1 && cold_summary.longest_pauses[0].events == 2,
+          "translation was not recorded, or it and the compile were not one blocked pause");
+  Require(name, "empty store boot", cold_boot.programs == 0 && cold_boot.pipelines == 0,
+          "an empty store replayed something");
+
+  const auto second_ids = run(true, 2);
+  const auto warm_rows = Report::Global().Compiles();
+  const auto warm_summary = Report::Global().Summarize();
+  const auto warm_boot = Report::Global().Boot();
+  Require(name, "warm boot counts",
+          warm_boot.programs == 1 && warm_boot.modules == 1 && warm_boot.pipelines == 1 &&
+              warm_boot.warm_up_ms > 0.0 && second_ids[0] == first_ids[0],
+          "the warm-up did not record what it replayed");
+  Require(name, "boot and play rows",
+          warm_rows.size() == 2 && warm_rows[0].phase == Report::Phase::Boot &&
+              warm_rows[0].id == first_ids[0] && warm_rows[0].thread == Report::Thread::Worker &&
+              warm_rows[1].phase == Report::Phase::Play && warm_rows[1].id == second_ids[1] &&
+              warm_rows[1].thread == Report::Thread::Gpu && warm_rows[1].flip == 1,
+          "the replayed pipeline was not a boot row, or the phase did not return to play");
+  Require(name, "boot is not blocked",
+          warm_summary.pause_count == 1 && warm_summary.longest_pauses[0].events == 2,
+          "warm-up work was counted as the GPU thread waiting");
+
+  const auto off_ids = run(false, 2);
+  Require(name, "report off records nothing",
+          Report::Global().Compiles().empty() && Report::Global().Summarize().flips == 0 &&
+              Report::Global().Summarize().translate_ms == 0.0 && off_ids == second_ids,
+          "the report recorded while off, or turning it on changed a module id");
+  Config::Load({.printf_direction = Config::LogDirection::Silent});
+  Report::Global().Reset();
+  std::filesystem::remove_all(store_dir);
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
+// A cold run still has an empty driver pipeline cache, like a first run, but neither reads nor
+// writes the title's .bin. This sets the process-wide title id, so it must run after every check
+// that would otherwise create a real _PipelineCache folder, and it works in a temp folder.
+void CheckColdDriverCache(VulkanHarness &vulkan) {
+  constexpr const char *name = "ColdDriverCache";
+  if (KYTY_BUILD != KYTY_BUILD_RELEASE) {
+    std::printf("[gpu]     %-32s skipped, the driver cache is Release only%s", name, "\n");
+    return;
+  }
+  const auto folder = std::filesystem::temp_directory_path() /
+                      fmt::format("kyty_cold_driver_cache_{}",
+                                  std::chrono::steady_clock::now().time_since_epoch().count());
+  std::filesystem::create_directories(folder / "sce_sys");
+  {
+    Common::File param(folder / "sce_sys" / "param.json");
+    const std::string text = R"({"titleId":"PPSA00099","contentId":"UP0001-PPSA00099_00-0000000000000000"})";
+    param.Write(text.data(), static_cast<u32>(text.size()));
+  }
+  const auto previous = std::filesystem::current_path();
+  std::filesystem::current_path(folder);
+  Loader::SystemContentLoadParamSfo(folder / "sce_sys" / "param.json");
+  const auto bin = [&] {
+    for (const auto &entry : std::filesystem::directory_iterator(folder / "_PipelineCache"))
+      if (entry.path().extension() == ".bin") return entry.path();
+    return std::filesystem::path{};
+  };
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 1, 0x77u);
+  code.insert(code.end(), {EncodeMubuf0(0x1c), EncodeMubuf1(1, 0, 0)});
+  AppendEnd(&code);
+  ShaderMapUserData(reinterpret_cast<uint64_t>(code.data()),
+                    {.type = Prospero::ShaderBinaryType::kCs,
+                     .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
+  // Compiles one pipeline, so the cache is dirty and would be saved if it could be.
+  const auto run = [&](bool cold) {
+    Config::Load({.printf_direction = Config::LogDirection::Silent,
+                  .cold_pipelines_enabled = cold});
+    PipelineCache cache(vulkan.RuntimeContext(), nullptr);
+    HW::ComputeShaderInfo regs{};
+    regs.cs_regs.data_addr = reinterpret_cast<uint64_t>(code.data());
+    regs.cs_regs.num_thread_x = 1;
+    regs.cs_regs.num_thread_y = 1;
+    regs.cs_regs.num_thread_z = 1;
+    regs.cs_regs.wave_size = 32;
+    regs.cs_regs.user_sgpr = 4;
+    const ShaderBufferResource buffer{{0x10000u, 4u << 16u, 64,
+        DstSel(4, 5, 6, 7) | (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u)}};
+    std::copy_n(buffer.fields, 4, regs.cs_user_sgpr.value);
+    ShaderComputeInputInfo input{};
+    (void)cache.GetComputeProgram(regs, input);
+    (void)cache.GetComputePipeline(input);
+    return PipelineCacheTestAccess::HasDriverCache(cache);
+  };
+  const auto read_all = [](const std::filesystem::path &path) {
+    std::ifstream stream(path, std::ios::binary);
+    return std::vector<char>(std::istreambuf_iterator<char>(stream), {});
+  };
+
+  Require(name, "cold has a cache object", run(true),
+          "a cold run had no driver cache object, so its timings would not match a first run");
+  Require(name, "cold leaves no file",
+          !std::filesystem::exists(folder / "_PipelineCache") || bin().empty(),
+          "a cold run wrote the driver cache");
+  Require(name, "plain run has a cache object", run(false), "a plain run had no driver cache");
+  const auto saved = bin();
+  Require(name, "plain run saves", !saved.empty(),
+          "a plain run saved no .bin, so the checks around it prove nothing");
+  const auto before = read_all(saved);
+  Require(name, "cold run has a cache object over a saved one", run(true),
+          "a cold run had no driver cache object");
+  Require(name, "cold leaves the file alone", read_all(saved) == before,
+          "a cold run read or rewrote the saved driver cache");
+
+  Config::Load({.printf_direction = Config::LogDirection::Silent});
+  std::filesystem::current_path(previous);
+  std::filesystem::remove_all(folder);
+  std::printf("[gpu]     %-32s ok%s", name, "\n");
 }
 
 void CheckPs5GameExampleImageClearRuntimeShape() {
@@ -64669,6 +64977,13 @@ int main(int argc, char **argv) {
     CheckStableProgramIds(vulkan);
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--cold-pipelines-only") == 0) {
+    VulkanHarness vulkan;
+    CheckColdPipelines(vulkan);
+    CheckFirstRunWiring(vulkan);
+    CheckColdDriverCache(vulkan);
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--shader-cache-only") == 0) {
     VulkanHarness vulkan;
     CheckShaderStore(vulkan);
@@ -65981,6 +66296,8 @@ int main(int argc, char **argv) {
   CheckComputeLdsLimit(vulkan);
   CheckStableProgramIds(vulkan);
   CheckShaderStore(vulkan);
+  CheckColdPipelines(vulkan);
+  CheckFirstRunWiring(vulkan);
   vulkan.CheckOrderedDispatch();
   vulkan.CheckGpuSubmitCadence();
   vulkan.CheckCadenceTextureAge();
@@ -66058,6 +66375,7 @@ int main(int argc, char **argv) {
     std::printf("ShaderRecompilerComputeTests: %u graphics cases skipped\n",
                 vulkan.SkippedCaseCount());
   }
+  CheckColdDriverCache(vulkan);
   std::printf("ShaderRecompilerComputeTests: all cases passed\n");
   return 0;
 }

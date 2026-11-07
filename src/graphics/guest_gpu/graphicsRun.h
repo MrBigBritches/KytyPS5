@@ -90,6 +90,8 @@ private:
 	std::array<std::unique_ptr<CommandProcessor>, ComputeQueueCount> m_compute_cp;
 
 	std::atomic_int m_done_num = 0;
+	// Suspend points the GPU thread has processed, for the first-run report. GPU thread only.
+	int64_t m_gpu_flip = 0;
 	std::jthread    m_thread;
 
 	friend class CommandProcessor;

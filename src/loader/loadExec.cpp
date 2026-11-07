@@ -1,4 +1,5 @@
 #include "common/file.h"
+#include "common/firstRunReport.h"
 #include "common/logging/log.h"
 #include "emulator.h"
 #include "kernel/fileSystem.h"
@@ -149,6 +150,9 @@ int LoadExec(const char* path, const char* const argv[]) {
 	}
 	CloseHandle(process.hThread);
 	CloseHandle(process.hProcess);
+	// This exit runs the report hook, but the relaunched process carries on the play, so this
+	// report is only the first part.
+	Common::FirstRunReport::MarkPartial();
 	// Nonzero, or the launcher's "cmd /K ... && exit" closes the console the new process shares.
 	std::quick_exit(1);
 #else

@@ -1,6 +1,8 @@
 #include "common/assert.h"
+#include "common/firstRunReport.h"
 #include "common/threads.h"
 #include "gpu_blit_shaders/gpu_pssr_linear_spv.h"
+#include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/pssr.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/image/image.h"
@@ -111,6 +113,10 @@ void RenderExecutor::ProcessPssr(CommandBuffer& buffer, const Pssr::Request& req
 
 	auto& graphics = m_context.GetGraphics();
 	if (m_pssr_pipeline == nullptr) {
+		// Built on first use, which is mid-game on the GPU thread.
+		Common::FirstRunReport::CompileScope compile_timer(
+		    Common::FirstRunReport::Kind::Compute, Common::FirstRunReport::HELPER_ID_PSSR, 0,
+		    GuestGpu::IsGpuThread());
 		const std::array bindings {
 		    vk::DescriptorSetLayoutBinding {0, vk::DescriptorType::eSampledImage, 1,
 		                                    vk::ShaderStageFlagBits::eCompute},

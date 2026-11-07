@@ -1,8 +1,10 @@
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/firstRunReport.h"
 #include "common/profiler.h"
 #include "gpu_blit_shaders/gpu_mesh_indirect_spv.h"
 #include "graphics/guest_gpu/gpu_defs.h"
+#include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
@@ -154,6 +156,12 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	EXIT_NOT_IMPLEMENTED(mesh && !graphics.mesh_shader_enabled);
 	const bool rect_list = static_params.patch_control_points != 0 && stages[1] == nullptr;
 
+	// Times the whole build, including the rect-list shaders and the helper modules, since all of
+	// it is spent before the pipeline can be used. Warm-up and worker threads record it too,
+	// tagged so they are not counted as GPU thread waiting.
+	Common::FirstRunReport::CompileScope compile_timer(
+	    Common::FirstRunReport::Kind::Graphics, vertex.id, pixel != nullptr ? pixel->id : 0,
+	    GuestGpu::IsGpuThread());
 	vk::ShaderModule tess_control_shader_module = nullptr;
 	vk::ShaderModule tess_eval_shader_module    = nullptr;
 	const auto       task_module =
@@ -367,6 +375,9 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const ShaderModule& module, vk::PipelineCache driver_cache) {
+	// Times the layouts as well as the driver call, since both are spent before the pipeline works.
+	Common::FirstRunReport::CompileScope compile_timer(
+	    Common::FirstRunReport::Kind::Compute, module.id, 0, GuestGpu::IsGpuThread());
 	vk::PipelineShaderStageCreateInfo                     comp_shader_stage_info {};
 	vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo comp_subgroup_size {};
 	comp_shader_stage_info.stage  = vk::ShaderStageFlagBits::eCompute;

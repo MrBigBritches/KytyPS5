@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 
 #include "common/emulatorConfig.h"
+#include "common/firstRunReport.h"
 #include "common/logging/log.h"
 #include "common/parallelFor.h"
 #include "common/stringUtils.h"
@@ -150,6 +151,8 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 		return;
 	}
 	const auto           start = std::chrono::steady_clock::now();
+	// Compiles during the replay are boot work, not waiting inside the game.
+	Common::FirstRunReport::SetPhase(Common::FirstRunReport::Phase::Boot);
 	std::vector<uint8_t> bytes;
 	if (Common::File file;
 	    Common::File::IsFileExisting(path) && file.Open(path, Common::File::Mode::Read)) {
@@ -196,6 +199,15 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 	if (!m_graphics_pipelines.empty() || !m_compute_pipelines.empty()) {
 		CheckpointDriverCache();
 	}
+	const auto warm_up_ms = std::chrono::duration<double, std::milli>(
+	                            std::chrono::steady_clock::now() - start)
+	                            .count();
+	Common::FirstRunReport::SetBoot({.warm_up_ms = warm_up_ms,
+	                                 .programs   = static_cast<uint32_t>(m_program_cache.size()),
+	                                 .modules    = static_cast<uint32_t>(modules.size() - 1),
+	                                 .pipelines  = static_cast<uint32_t>(
+	                                     m_graphics_pipelines.size() + m_compute_pipelines.size())});
+	Common::FirstRunReport::SetPhase(Common::FirstRunReport::Phase::Play);
 	Log::WriteToConsoleAndLog(fmt::format(
 	    "Shader cache: loaded {} programs, {} modules, {} pipelines in {} ms\n",
 	    m_program_cache.size(), modules.size() - 1,

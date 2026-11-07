@@ -1,0 +1,395 @@
+#include "common/firstRunReport.h"
+
+#include <array>
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <thread>
+#include <string>
+#include <vector>
+
+namespace {
+
+using Common::FirstRunReport::Kind;
+using Common::FirstRunReport::Phase;
+using Common::FirstRunReport::Report;
+using Common::FirstRunReport::SkipKind;
+using Common::FirstRunReport::Thread;
+
+// Every duration here is a made-up number handed to the report, which never reads a clock, so no
+// case depends on how fast the machine runs.
+constexpr double kEpsilon = 1e-9;
+
+void Check(bool value, const char *message) {
+  if (!value) {
+    std::fprintf(stderr, "FirstRunReportTests: failed: %s\n", message);
+    std::abort();
+  }
+}
+
+bool Near(double left, double right) { return std::abs(left - right) < kEpsilon; }
+
+// Consecutive blocking within one flip is one pause, and the next flip starts another. A baseline
+// of the same blocking spread over distinct flips shows that only the flip number merges them.
+void TestPausesMergeByFlip() {
+  Report merged;
+  merged.OnFlip(5);
+  merged.AddTranslate(Kind::Graphics, "ps", 1, 300.0, Thread::Gpu);
+  merged.AddCompile(Kind::Graphics, 1, 2, 200.0, Thread::Gpu);
+  merged.AddCompile(Kind::Compute, 3, 0, 100.0, Thread::Gpu);
+  merged.OnFlip(6);
+  merged.AddCompile(Kind::Graphics, 4, 5, 700.0, Thread::Gpu);
+  const auto summary = merged.Summarize();
+  Check(summary.pause_count == 2, "same-flip blocking was not merged into one pause");
+  Check(summary.longest_pauses.size() == 2 && Near(summary.longest_pauses[0].ms, 700.0) &&
+            summary.longest_pauses[0].flip == 6 && summary.longest_pauses[0].events == 1,
+        "the longest pause lost its flip or contents");
+  Check(Near(summary.longest_pauses[1].ms, 600.0) && summary.longest_pauses[1].events == 3 &&
+            summary.longest_pauses[1].flip == 5,
+        "the merged pause did not sum its three blocking events");
+
+  Report spread;
+  for (int64_t flip = 1; flip <= 3; ++flip) {
+    spread.OnFlip(flip);
+    spread.AddCompile(Kind::Graphics, 1, 2, 200.0, Thread::Gpu);
+  }
+  Check(spread.Summarize().pause_count == 3, "blocking in different flips merged");
+}
+
+// A pause still being merged when the report is read still counts.
+void TestPendingPauseCounts() {
+  Report report;
+  report.OnFlip(9);
+  report.AddCompile(Kind::Compute, 1, 0, 120.0, Thread::Gpu);
+  const auto summary = report.Summarize();
+  Check(summary.pause_count == 1 && Near(summary.longest_pause_ms, 120.0),
+        "the unfinished pause was left out");
+}
+
+// Only GPU-thread waiting during play is blocked. The same compile on a worker, or during boot,
+// still shows up as a row and as translate time but never as blocked time or a pause.
+void TestOnlyGpuThreadBlocks() {
+  Report gpu;
+  gpu.AddTranslate(Kind::Graphics, "vs", 7, 400.0, Thread::Gpu);
+  gpu.AddCompile(Kind::Compute, 8, 0, 250.0, Thread::Gpu);
+  const auto on_gpu = gpu.Summarize();
+  Check(Near(on_gpu.blocked_graphics_ms, 400.0) && Near(on_gpu.blocked_compute_ms, 250.0),
+        "GPU thread waiting was not split by kind");
+
+  Report worker;
+  worker.AddTranslate(Kind::Graphics, "vs", 7, 400.0, Thread::Worker);
+  worker.AddCompile(Kind::Compute, 8, 0, 250.0, Thread::Worker);
+  const auto off_gpu = worker.Summarize();
+  Check(Near(off_gpu.blocked_graphics_ms, 0.0) && Near(off_gpu.blocked_compute_ms, 0.0) &&
+            off_gpu.pause_count == 0,
+        "worker thread time counted as blocked");
+  Check(Near(off_gpu.translate_ms, 400.0) && worker.Compiles().size() == 1 &&
+            worker.Compiles()[0].thread == Thread::Worker,
+        "worker work was not recorded as worker work");
+
+  Report boot;
+  boot.SetPhase(Phase::Boot);
+  boot.AddCompile(Kind::Graphics, 1, 2, 500.0, Thread::Gpu);
+  boot.SetPhase(Phase::Play);
+  boot.AddCompile(Kind::Graphics, 3, 4, 50.0, Thread::Gpu);
+  const auto rows = boot.Compiles();
+  Check(rows.size() == 2 && rows[0].phase == Phase::Boot && rows[1].phase == Phase::Play,
+        "compile rows were not tagged with their phase");
+  Check(Near(boot.Summarize().blocked_graphics_ms, 50.0), "boot compile counted as blocked");
+}
+
+// Pauses fall in the highest bucket whose bound they reach, so each edge belongs to the upper
+// bucket and anything below the first bound is counted apart.
+void TestHistogramEdges() {
+  struct Case {
+    double   ms;
+    int      bucket; // -1 means under the first bound.
+  };
+  constexpr std::array<Case, 14> cases {{{99.999, -1},  {100.0, 0},    {249.999, 0},  {250.0, 1},
+                                         {499.0, 1},    {500.0, 2},    {999.0, 2},    {1000.0, 3},
+                                         {2499.0, 3},   {2500.0, 4},   {4999.0, 4},   {5000.0, 5},
+                                         {10000.0, 6},  {250000.0, 6}}};
+  Report report;
+  int64_t flip = 0;
+  std::array<uint32_t, 7> expected {};
+  uint32_t expected_under = 0;
+  for (const auto &test : cases) {
+    report.OnFlip(++flip);
+    report.AddCompile(Kind::Graphics, 1, 2, test.ms, Thread::Gpu);
+    if (test.bucket < 0) {
+      ++expected_under;
+    } else {
+      ++expected[static_cast<size_t>(test.bucket)];
+    }
+  }
+  const auto summary = report.Summarize();
+  Check(summary.pause_histogram == expected, "a pause landed in the wrong histogram bucket");
+  Check(summary.pauses_under_first_bound == expected_under, "short pauses were not counted apart");
+  Check(Near(summary.longest_pause_ms, 250000.0), "longest pause is wrong");
+}
+
+// Only the worst ten translations and the longest twenty pauses are kept, longest first.
+void TestTopListsAreCapped() {
+  Report report;
+  for (int index = 1; index <= 15; ++index) {
+    report.AddTranslate(Kind::Graphics, "ps", static_cast<uint64_t>(index), index * 10.0,
+                        Thread::Worker);
+  }
+  for (int64_t flip = 1; flip <= 25; ++flip) {
+    report.OnFlip(flip);
+    report.AddCompile(Kind::Graphics, 1, 2, static_cast<double>(flip), Thread::Gpu);
+  }
+  const auto summary = report.Summarize();
+  Check(summary.worst_translate.size() == Common::FirstRunReport::WORST_TRANSLATE_LIMIT &&
+            summary.worst_translate.front().hash == 15 && summary.worst_translate.back().hash == 6,
+        "the worst translations were not the ten slowest in order");
+  Check(summary.longest_pauses.size() == Common::FirstRunReport::LONGEST_PAUSE_LIMIT &&
+            summary.longest_pauses.front().flip == 25 && summary.longest_pauses.back().flip == 6,
+        "the longest pauses were not the twenty longest in order");
+  Check(summary.pause_count == 25, "the pause count lost pauses that the list dropped");
+}
+
+void TestSkipsAndFlips() {
+  Report report;
+  report.AddSkip(SkipKind::Draw, "color");
+  report.AddSkip(SkipKind::Draw, "color");
+  report.AddSkip(SkipKind::Dispatch, "depth");
+  report.OnFlip(1);
+  report.OnFlip(2);
+  const auto summary = report.Summarize();
+  Check(summary.skips[0] == 2 && summary.skips[1] == 1, "skips were not counted by kind");
+  Check(summary.skips_by_target.size() == 2 && summary.skips_by_target[0].second == 2,
+        "skips were not counted by target class");
+  Check(summary.flips == 2, "flips were not counted");
+  Check(Report().Summarize().skips == std::array<uint32_t, 2> {}, "a new report had skips");
+}
+
+// The text carries the fields a reader of the file needs. This only checks they are present and
+// carry the recorded numbers, since the figures themselves are checked on the summary above.
+void TestJsonContents() {
+  Report report;
+  report.SetBoot({.warm_up_ms = 1234.5, .programs = 3, .modules = 4, .pipelines = 5});
+  report.OnFlip(11);
+  report.AddCompile(Kind::Graphics, 0xab, 0xcd, 321.0, Thread::Gpu);
+  report.AddCompile(Kind::Compute, 0xef, 0, 5.0, Thread::Worker);
+  const Common::FirstRunReport::Metadata metadata {
+      .title_id = "PPSA00000", .build = "test-build", .flags = {{"--a", true}, {"--b", false}},
+      .cold = true, .partial = true};
+  report.AddStampFailure();
+  const auto json = report.ToJson(metadata, 7, 12.5);
+  for (const char *needle :
+       {"\"title_id\": \"PPSA00000\"", "\"build\": \"test-build\"", "\"--a\": true",
+        "\"--b\": false", "\"cold\": true", "\"warm_up_ms\": 1234.5", "\"blocked_ms\"",
+        "\"worst_translate\"", "\"pause_histogram\"", "\"longest_pause_ms\": 321.0",
+        "\"vs\": \"00000000000000ab\"", "\"ps\": \"00000000000000cd\"",
+        "\"id\": \"00000000000000ef\"", "\"thread\": \"worker\"", "\"audio_holds\": 7",
+        "\"run_seconds\": 12.5", "\"flips\": 1,", "\"partial\": true",
+        "\"cold_stamp_failures\": 1"}) {
+    if (json.find(needle) == std::string::npos) {
+      std::fprintf(stderr, "FirstRunReportTests: JSON lacks %s\n", needle);
+      std::abort();
+    }
+  }
+}
+
+// The disabled path records nothing, and the enabled path times the scope it wraps.
+void TestScopesRespectTheFlag() {
+  Common::FirstRunReport::Configure(false, false);
+  const auto before = Common::FirstRunReport::Global().Compiles().size();
+  { Common::FirstRunReport::CompileScope scope(Kind::Compute, 1, 0, true); }
+  Check(Common::FirstRunReport::Global().Compiles().size() == before,
+        "a scope recorded while the report was off");
+  Common::FirstRunReport::Configure(true, false);
+  constexpr auto kSleep = std::chrono::milliseconds(20);
+  constexpr double kLowerBoundMs = 15.0; // Below the sleep, so a loaded machine still passes.
+  {
+    Common::FirstRunReport::CompileScope scope(Kind::Compute, 1, 0, false);
+    std::this_thread::sleep_for(kSleep);
+  }
+  const auto rows = Common::FirstRunReport::Global().Compiles();
+  Check(rows.size() == before + 1 && rows.back().thread == Thread::Worker &&
+            rows.back().create_ms >= kLowerBoundMs,
+        "a scope did not time the work it wrapped");
+  Common::FirstRunReport::Configure(false, false);
+}
+
+// Builds a module with the given instructions after the five header words.
+std::vector<uint32_t> Module(const std::vector<std::vector<uint32_t>> &instructions) {
+  std::vector<uint32_t> code {0x07230203, 0x00010600, 0, 100, 0};
+  for (const auto &instruction : instructions) {
+    code.insert(code.end(), instruction.begin(), instruction.end());
+  }
+  return code;
+}
+
+constexpr uint32_t Op(uint32_t opcode, uint32_t words) { return (words << 16u) | opcode; }
+
+const std::vector<uint32_t> kCapability {Op(17, 2), 1};
+const std::vector<uint32_t> kExtension {Op(10, 3), 0x656d6f73, 0};
+const std::vector<uint32_t> kImport {Op(11, 3), 1, 0x4c534c47};
+const std::vector<uint32_t> kMemoryModel {Op(14, 3), 0, 1};
+const std::vector<uint32_t> kEntryPoint {Op(15, 4), 5, 1, 0x6e69616d};
+const std::vector<uint32_t> kExecutionMode {Op(16, 3), 1, 17};
+const std::vector<uint32_t> kExecutionModeId {Op(331, 3), 1, 2};
+const std::vector<uint32_t> kSource {Op(3, 3), 2, 450};
+const std::vector<uint32_t> kName {Op(5, 3), 1, 0x6e69616d};
+
+// The stamp must sit directly before the first instruction that is not part of the module header,
+// and removing it must give back the original module.
+void TestStampPlacement() {
+  const auto base = Module({kCapability, kExtension, kImport, kMemoryModel, kEntryPoint,
+                            kExecutionMode, kExecutionModeId, kName, kSource});
+  const auto stamped = Common::FirstRunReport::StampSpirv(base, 0x123456789abcdefull);
+  Check(stamped.size() == base.size() + 4, "the stamp is not four words");
+  const size_t at = 5 + 2 + 3 + 3 + 3 + 4 + 3 + 3; // The words before OpName.
+  Check(stamped[at] == Op(4, 4), "the stamp is not an OpSourceExtension of four words");
+  std::vector<uint32_t> without(stamped.begin(), stamped.begin() + at);
+  without.insert(without.end(), stamped.begin() + at + 4, stamped.end());
+  Check(without == base, "removing the stamp did not give back the original module");
+  // The instruction after the stamp is the one that was first after the header.
+  Check(stamped[at + 4] == Op(5, 3), "the stamp is not directly before the first debug word");
+
+  // A module whose first non-header instruction is OpSource gets it there too.
+  const auto source_first = Module({kCapability, kMemoryModel, kEntryPoint, kSource});
+  const auto source_stamped = Common::FirstRunReport::StampSpirv(source_first, 1);
+  Check(source_stamped[5 + 2 + 3 + 4] == Op(4, 4), "the stamp was not placed before OpSource");
+
+  // A module with nothing after its header takes the stamp at the end.
+  const auto header_only = Module({kCapability, kMemoryModel});
+  const auto appended = Common::FirstRunReport::StampSpirv(header_only, 1);
+  Check(appended.size() == header_only.size() + 4 && appended[header_only.size()] == Op(4, 4),
+        "a header-only module did not take the stamp at its end");
+}
+
+// The string must run to its terminator, and two nonces must give two different modules.
+void TestStampText() {
+  const auto base = Module({kCapability, kMemoryModel, kName});
+  for (const uint64_t nonce : {uint64_t {0}, ~uint64_t {0}, uint64_t {0x0123456789abcdef}}) {
+    const auto stamped = Common::FirstRunReport::StampSpirv(base, nonce);
+    const size_t at = 5 + 2 + 3;
+    std::array<unsigned char, 12> bytes {};
+    for (size_t word = 0; word < 3; ++word) {
+      for (size_t byte = 0; byte < 4; ++byte) {
+        bytes[word * 4 + byte] = static_cast<unsigned char>(stamped[at + 1 + word] >> (byte * 8));
+      }
+    }
+    for (size_t index = 0; index < 11; ++index) {
+      Check(bytes[index] >= 0x20 && bytes[index] < 0x7f, "the stamp has a non-text byte early");
+    }
+    Check(bytes[11] == 0, "the stamp has no terminating zero");
+  }
+  Check(Common::FirstRunReport::StampSpirv(base, 1) != Common::FirstRunReport::StampSpirv(base, 2),
+        "two nonces gave the same module");
+  // One nonce serves the whole run, and configuring another run picks a new one.
+  Common::FirstRunReport::Configure(false, true);
+  const auto first = Common::FirstRunReport::StampNonce();
+  Check(first == Common::FirstRunReport::StampNonce(), "the nonce changed within a run");
+  Common::FirstRunReport::Configure(false, true);
+  Check(first != Common::FirstRunReport::StampNonce(), "a second run reused the nonce");
+  Common::FirstRunReport::Configure(false, false);
+}
+
+void TestStampRejectsBadModules() {
+  Check(Common::FirstRunReport::StampSpirv({}, 1).empty(), "an empty module was stamped");
+  auto bad_magic = Module({kCapability});
+  bad_magic[0] = 0;
+  Check(Common::FirstRunReport::StampSpirv(bad_magic, 1).empty(), "a bad magic was stamped");
+  auto zero_length = Module({kCapability});
+  zero_length[5] = 0;
+  Check(Common::FirstRunReport::StampSpirv(zero_length, 1).empty(),
+        "a zero-length instruction was stamped");
+  auto truncated = Module({kCapability, kMemoryModel});
+  truncated.pop_back();
+  Check(Common::FirstRunReport::StampSpirv(truncated, 1).empty(),
+        "a truncated instruction was stamped");
+}
+
+std::string ReadAll(const std::filesystem::path &path) {
+  std::ifstream stream(path, std::ios::binary);
+  return {std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>()};
+}
+
+// Lists the files of a folder by name, so a leftover .tmp would show.
+std::vector<std::string> Names(const std::filesystem::path &folder) {
+  std::vector<std::string> names;
+  for (const auto &entry : std::filesystem::directory_iterator(folder))
+    names.push_back(entry.path().filename().string());
+  return names;
+}
+
+// The file is created, holds the recorded figures and is complete, and a second call writes
+// nothing more. The title id is not valid UTF-8 text, so the writer must not throw on it.
+void TestWriteReportOnce() {
+  const auto folder = std::filesystem::temp_directory_path() /
+                      ("kyty_first_run_report_" +
+                       std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+  std::filesystem::create_directories(folder);
+  const auto previous = std::filesystem::current_path();
+  std::filesystem::current_path(folder);
+
+  Common::FirstRunReport::Configure(true, false);
+  Common::FirstRunReport::Global().Reset();
+  Common::FirstRunReport::Begin({.title_id = std::string("PPSA") + static_cast<char>(0xFF) + "TEST", .build = "b", .flags = {{"--x", true}}});
+  Common::FirstRunReport::MarkPartial();
+  Common::FirstRunReport::Global().AddCompile(Kind::Compute, 0xabc, 0, 12.0, Thread::Gpu);
+  Common::FirstRunReport::WriteReportOnce();
+
+  const auto reports = folder / "_FirstRunReports";
+  Check(std::filesystem::exists(reports), "no report folder was made");
+  auto names = Names(reports);
+  Check(names.size() == 1 && names[0].starts_with("PPSA_TEST-") && names[0].ends_with(".json"),
+        "exactly one finished report file was expected, with no .tmp left");
+  const auto text = ReadAll(reports / names[0]);
+  for (const char *needle : {"\"id\": \"0000000000000abc\"", "\"partial\": true", "\"build\": \"b\"",
+                             "\"--x\": true"})
+    Check(text.find(needle) != std::string::npos, "the written report lacks a recorded value");
+  Check(!text.empty() && text.front() == '{' && text.back() == '}',
+        "the written report is not a whole JSON object");
+
+  // A second call, after more was recorded, must change nothing.
+  Common::FirstRunReport::Global().AddCompile(Kind::Compute, 0xdef, 0, 1.0, Thread::Gpu);
+  Common::FirstRunReport::WriteReportOnce();
+  Check(Names(reports) == names && ReadAll(reports / names[0]) == text,
+        "a second call wrote again");
+
+  Common::FirstRunReport::Configure(false, false);
+  Common::FirstRunReport::Global().Reset();
+  std::filesystem::current_path(previous);
+  std::filesystem::remove_all(folder);
+}
+
+void TestReportPath() {
+  using namespace std::chrono;
+  const auto when = sys_days {year {2026} / November / 7} + hours {13} + minutes {45} + seconds {9};
+  Check(Common::FirstRunReport::ReportPath("PPSA01746", when).generic_string() ==
+            "_FirstRunReports/PPSA01746-20261107-134509.json",
+        "the report path is not <title>-<UTC time>.json");
+  const auto leap = sys_days {year {2024} / February / 29} + hours {0} + minutes {0} + seconds {1};
+  Check(Common::FirstRunReport::ReportPath("", leap).generic_string() ==
+            "_FirstRunReports/UNKNOWN-20240229-000001.json",
+        "a leap day or a missing title id is wrong in the report path");
+}
+
+} // namespace
+
+int main() {
+  TestPausesMergeByFlip();
+  TestPendingPauseCounts();
+  TestOnlyGpuThreadBlocks();
+  TestHistogramEdges();
+  TestTopListsAreCapped();
+  TestSkipsAndFlips();
+  TestJsonContents();
+  TestScopesRespectTheFlag();
+  TestStampPlacement();
+  TestStampText();
+  TestStampRejectsBadModules();
+  TestReportPath();
+  TestWriteReportOnce();
+  std::puts("FirstRunReportTests: all cases passed");
+  return 0;
+}

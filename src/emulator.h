@@ -6,6 +6,9 @@
 #include "common/stringUtils.h"
 
 #include <filesystem>
+#include <string>
+#include <utility>
+#include <vector>
 
 namespace Emulator {
 
@@ -16,6 +19,10 @@ struct RunOptions {
 	std::filesystem::path                game_patch;
 	std::filesystem::path                addcont_dir;
 	std::vector<Common::AddContentEntry> addcont;
+	// This process's own path, so a build without git history can be told apart by file time.
+	std::filesystem::path                executable;
+	// Every boolean command line flag and whether it is on, for the first-run report.
+	std::vector<std::pair<std::string, bool>> flag_states;
 };
 
 void Run(const RunOptions& options);

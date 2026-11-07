@@ -73,6 +73,10 @@ static void PrintUsage() {
 	::printf("  --occlusion-queries                  Count occlusion query samples on the GPU.\n");
 	::printf("  --audio-compile-hold                 Pause game audio while a long pipeline compile\n"
 	         "                                       blocks the GPU.\n");
+	::printf("  --first-run-report                   Write _FirstRunReports/<TITLE_ID>-<UTC time>.json at\n"
+	         "                                       a clean exit, with compile and pause figures.\n");
+	::printf("  --cold-pipelines                     Stamp every SPIR-V module so no shader or driver\n"
+	         "                                       cache serves it. Makes every launch slow.\n");
 	::printf("  --gpu-submit-cadence                 Submit GPU work periodically while a long command\n"
 	         "                                       stream records, so the GPU starts sooner.\n");
 	::printf("  --native-float-minmax                Use the host GPU's float min/max on non-AMD GPUs.\n"
@@ -222,6 +226,8 @@ static constexpr Flag FLAGS[] = {
     {"--tessellation", &ConfigOptions::tessellation_enabled},
     {"--occlusion-queries", &ConfigOptions::occlusion_queries_enabled},
     {"--audio-compile-hold", &ConfigOptions::audio_compile_hold_enabled},
+    {"--first-run-report", &ConfigOptions::first_run_report_enabled},
+    {"--cold-pipelines", &ConfigOptions::cold_pipelines_enabled},
     {"--gpu-submit-cadence", &ConfigOptions::gpu_submit_cadence_enabled},
     {"--native-float-minmax", &ConfigOptions::native_float_min_max_enabled},
     {"--command-buffer-dump", &ConfigOptions::command_buffer_dump_enabled},
@@ -468,6 +474,11 @@ static int Main(int argc, char* argv[]) {
 	if (show_help) {
 		PrintUsage();
 		return 0;
+	}
+
+	options.executable = Common::PathFromUtf8(argv[0]);
+	for (const auto& flag: FLAGS) {
+		options.flag_states.emplace_back(flag.name, options.config.*flag.field == flag.value);
 	}
 
 	Run(options);

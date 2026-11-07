@@ -66,6 +66,10 @@ bool WaitWhileStalled();
 /// WaitWhileStalled it does not exempt the thread that owns the Scope.
 [[nodiscard]] bool IsStalled();
 
+/// Stalls that held at least one thread since the process began. Unlike the performance panel's
+/// counter it always counts, so a run report can read it.
+[[nodiscard]] uint64_t HoldCount();
+
 /// Number of threads waiting in WaitWhileStalled, so tests can tell when a waiter is parked.
 [[nodiscard]] uint32_t WaiterCount();
 

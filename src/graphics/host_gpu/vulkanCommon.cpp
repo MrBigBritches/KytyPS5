@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include "common/assert.h"
+#include "common/firstRunReport.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 
 #include <array>
@@ -123,7 +124,20 @@ void RequireVulkanSuccess(vk::Result result, const char* operation) {
 	}
 }
 
+// Creates a shader module from SPIR-V. With --cold-pipelines the driver is handed a stamped copy
+// so no cache can serve it. Only that copy is stamped, so module ids and the shader store, which
+// hold the original, stay as they are. A module that cannot be stamped compiles as it is and is
+// counted in the report.
 vk::ShaderModule CompileSPV(std::span<const uint32_t> code, vk::Device device) {
+	std::vector<uint32_t> stamped;
+	if (Common::FirstRunReport::ColdEnabled()) {
+		stamped = Common::FirstRunReport::StampSpirv(code, Common::FirstRunReport::StampNonce());
+		if (stamped.empty()) {
+			Common::FirstRunReport::RecordStampFailure();
+		} else {
+			code = stamped;
+		}
+	}
 	vk::ShaderModuleCreateInfo create_info {};
 	create_info.codeSize    = code.size_bytes();
 	create_info.pCode       = code.data();

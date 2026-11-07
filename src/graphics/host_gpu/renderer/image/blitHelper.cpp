@@ -1,8 +1,10 @@
 #include "graphics/host_gpu/renderer/image/blitHelper.h"
 
 #include "common/assert.h"
+#include "common/firstRunReport.h"
 #include "gpu_blit_shaders/gpu_blit_color_to_ms_depth_spv.h"
 #include "gpu_blit_shaders/gpu_blit_fs_triangle_spv.h"
+#include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/image/image.h"
@@ -56,6 +58,10 @@ vk::Pipeline BlitHelper::GetPipeline(PipelineKey key) {
 		return cached->handle;
 	}
 
+	// Built on first use, which can be mid-game on the GPU thread.
+	Common::FirstRunReport::CompileScope compile_timer(Common::FirstRunReport::Kind::Graphics,
+	                                                   Common::FirstRunReport::HELPER_ID_BLIT, 0,
+	                                                   GuestGpu::IsGpuThread());
 	const auto samples = vulkan_sample_count(key.samples);
 	EXIT_IF(samples == vk::SampleCountFlagBits {} || key.format == vk::Format::eUndefined);
 

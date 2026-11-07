@@ -100,6 +100,10 @@ struct ConfigOptions {
 	bool                   tessellation_enabled        = false;
 	bool                   occlusion_queries_enabled   = false;
 	bool                   audio_compile_hold_enabled  = false;
+	// Writes _FirstRunReports/<TITLE_ID>-<UTC time>.json at a clean exit.
+	bool                   first_run_report_enabled    = false;
+	// Stamps each SPIR-V module per run so no shader or driver cache can serve it. Every launch is slow.
+	bool                   cold_pipelines_enabled      = false;
 	// Lets the GPU start on a long command stream instead of idling until the end-of-slice submit.
 	bool                   gpu_submit_cadence_enabled  = false;
 	// Opts in to the host GPU's float min/max on non-AMD GPUs. It is faster, but the sign of a zero
@@ -194,6 +198,8 @@ bool BatchHotReadbacksEnabled();
 bool TessellationEnabled();
 bool OcclusionQueriesEnabled();
 bool AudioCompileHoldEnabled();
+bool FirstRunReportEnabled();
+bool ColdPipelinesEnabled();
 bool GpuSubmitCadenceEnabled();
 /// Returns whether non-AMD GPUs may use the host's float min/max instead of the exact emulation.
 bool NativeFloatMinMaxEnabled();

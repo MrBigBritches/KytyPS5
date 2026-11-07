@@ -4,6 +4,7 @@
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
+#include "common/firstRunReport.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/singleton.h"
@@ -26,6 +27,7 @@
 #include "loader/runtimeLinker.h"
 #include "loader/systemContent.h"
 
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <thread>
@@ -139,6 +141,48 @@ static void Execute(const std::filesystem::path& game_patch) {
 	std::quick_exit(0);
 }
 
+// Names the build for the first-run report. A tree without git history reports "unknown" for its
+// version, and the executable's file time tells such builds apart instead.
+static std::string BuildIdentity(const std::filesystem::path& executable) {
+	if (std::string_view(KYTY_GIT_VERSION) != "unknown") {
+		return KYTY_GIT_VERSION;
+	}
+	std::error_code error;
+	const auto      written = std::filesystem::last_write_time(executable, error);
+	if (error) {
+		return "unknown";
+	}
+	// File clocks have no portable epoch, but the count still differs between builds.
+	const auto seconds =
+	    std::chrono::duration_cast<std::chrono::seconds>(written.time_since_epoch());
+	return fmt::format("exe-mtime-{}", seconds.count());
+}
+
+// Writes the first-run report. Runs from both exit paths, which can each be the clean one.
+static void WriteFirstRunReport() {
+	Common::FirstRunReport::WriteReportOnce();
+}
+
+// Starts the first-run report and the exit hooks that write it. Does nothing when it is off.
+static void StartFirstRunReport(const RunOptions& options, const std::string& title_id) {
+	if (options.config.cold_pipelines_enabled) {
+		Log::WriteToConsoleAndLog(
+		    "WARNING: --cold-pipelines is on. Every shader and pipeline compiles from scratch, so "
+		    "every launch is slow. Use it only for measurements.\n");
+	}
+	if (!options.config.first_run_report_enabled) {
+		return;
+	}
+	Common::FirstRunReport::Begin({.title_id = title_id,
+	                               .build    = BuildIdentity(options.executable),
+	                               .flags    = options.flag_states,
+	                               .cold     = options.config.cold_pipelines_enabled});
+	// A guest exit goes through exit(), and closing the window goes through quick_exit(). Hooks
+	// registered after the closing ones run before them.
+	EXIT_NOT_IMPLEMENTED(atexit(WriteFirstRunReport) != 0);
+	EXIT_NOT_IMPLEMENTED(at_quick_exit(WriteFirstRunReport) != 0);
+}
+
 void Run(const RunOptions& options) {
 	if (options.app0_dir.empty()) {
 		EXIT("app0 directory is required\n");
@@ -172,6 +216,7 @@ void Run(const RunOptions& options) {
 	// Guest threads are still running, so skip KytyClose() and only flush emergency state.
 	ok = at_quick_exit(Common::Subsystems::EmergencyShutdownActive);
 	EXIT_NOT_IMPLEMENTED(ok != 0);
+	StartFirstRunReport(options, title_id);
 
 	Libs::LibKernel::FileSystem::Mount(options.app0_dir, "/app0");
 	Libs::LibKernel::FileSystem::Mount(options.app0_dir, "/hostapp");

@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/debugCounters.h"
+#include "common/firstRunReport.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
@@ -509,6 +510,9 @@ bool GuestGpu::Process(Submission& submission) {
 			cp.PrepareCpuFlip(submission.flip_request_id);
 			break;
 		case SubmissionType::SuspendPoint:
+			// Counted here on the GPU thread, where the blocking it labels happens. The guest
+			// thread runs up to a frame ahead, so its count would split pauses at random points.
+			Common::FirstRunReport::OnFlip(++m_gpu_flip);
 			// Age caches at the frame boundary, not once per command list.
 			m_renderer.RunGarbageCollector();
 			m_renderer.GetCommandScheduler().DeferPriorityOperation(

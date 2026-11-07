@@ -608,6 +608,10 @@ add_executable(gpu_stall_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/GpuStallTests
 target_link_libraries(gpu_stall_tests common fmt::fmt)
 target_include_directories(gpu_stall_tests PRIVATE ${inc_headers})
 
+add_executable(first_run_report_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/FirstRunReportTests.cpp")
+target_link_libraries(first_run_report_tests common fmt::fmt)
+target_include_directories(first_run_report_tests PRIVATE ${inc_headers})
+
 add_executable(sync_on_address_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/SyncOnAddressTests.cpp"
 	"${KYTY_SOURCE_DIR}/kernel/syncOnAddress.cpp"
@@ -697,6 +701,10 @@ if(BUILD_TESTING)
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --structured-jump-tables)
 	add_test(NAME emulator_audio_compile_hold_cli
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --audio-compile-hold)
+	add_test(NAME emulator_first_run_report_cli
+	         COMMAND $<TARGET_FILE:kyty_emulator> --help --first-run-report)
+	add_test(NAME emulator_cold_pipelines_cli
+	         COMMAND $<TARGET_FILE:kyty_emulator> --help --cold-pipelines)
 	add_test(NAME emulator_skip_redundant_unmap_drains_cli
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --skip-redundant-unmap-drains)
 	add_test(NAME emulator_keep_gpu_cache_on_reuse_cli
@@ -735,6 +743,7 @@ if(BUILD_TESTING)
 	add_test(NAME gpu_stall COMMAND $<TARGET_FILE:gpu_stall_tests>)
 	# A missed wakeup shows up as a hang, so fail fast instead of at the default timeout.
 	set_tests_properties(gpu_stall PROPERTIES TIMEOUT 30)
+	add_test(NAME first_run_report COMMAND $<TARGET_FILE:first_run_report_tests>)
 	add_test(NAME sync_on_address COMMAND $<TARGET_FILE:sync_on_address_tests>)
 	add_test(NAME audio_out2_port COMMAND $<TARGET_FILE:audio_out2_port_tests>)
 	# A push or query wrongly held by GpuStall hangs, so fail fast instead of at the default timeout.
@@ -765,6 +774,9 @@ if(BUILD_TESTING)
 	add_test(NAME shader_recompiler_submit_cadence_occlusion
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --submit-cadence-occlusion-only)
 	set_tests_properties(shader_recompiler_submit_cadence_occlusion PROPERTIES TIMEOUT 60)
+	add_test(NAME shader_recompiler_cold_pipelines
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --cold-pipelines-only)
+	set_tests_properties(shader_recompiler_cold_pipelines PROPERTIES TIMEOUT 60)
 	add_test(NAME shader_recompiler_tessellation
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --tessellation-only)
 	add_test(NAME shader_recompiler_float_min_max
@@ -868,6 +880,7 @@ if(BUILD_TESTING)
 		event_queue_lifetime_tests
 		kernel_file_system_tests
 		gpu_stall_tests
+		first_run_report_tests
 		sync_on_address_tests
 		shader_recompiler_compute_tests
 		virtual_memory_allocation_tests

@@ -4,6 +4,7 @@
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
+#include "common/firstRunReport.h"
 #include "common/gpuStall.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -472,6 +473,12 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		if (module != nullptr) return bind(*module);
 	}
 
+	// Everything from here to the driver's pipeline compile is translation, SPIR-V emission and
+	// module creation. It blocks the GPU thread only when this runs on it.
+	Common::FirstRunReport::TranslateScope translate_timer(
+	    options.stage == ShaderType::Compute ? Common::FirstRunReport::Kind::Compute
+	                                         : Common::FirstRunReport::Kind::Graphics,
+	    ShaderRecompiler::StageName(options.stage), params.hash, GuestGpu::IsGpuThread());
 	options.shader_hash     = params.hash;
 	options.user_data       = user_data;
 	options.back_code       = params.back_code;
@@ -561,12 +568,20 @@ void PipelineCache::InitializeDriverCache() {
 		PipelineCacheLog("Vulkan pipeline cache: disabled (non-Release build)");
 		return;
 	}
-	m_driver_cache_path     = std::filesystem::path("_PipelineCache") / (title_id + ".bin");
+	// A cold run must neither read a warm driver cache nor leave its own behind for the next run.
+	// It still gets an empty cache object, as a true first run does, so its timings match. With no
+	// path set, Save has nowhere to write.
+	const bool cold = Common::FirstRunReport::ColdEnabled();
+	if (cold) {
+		PipelineCacheLog("Vulkan pipeline cache: starting empty and unsaved (--cold-pipelines)");
+	} else {
+		m_driver_cache_path = std::filesystem::path("_PipelineCache") / (title_id + ".bin");
+	}
 	const auto path         = Common::PathToString(m_driver_cache_path);
-	const bool cache_exists = Common::File::IsFileExisting(m_driver_cache_path);
+	const bool cache_exists = !cold && Common::File::IsFileExisting(m_driver_cache_path);
 	if (cache_exists) {
 		PipelineCacheLog("Vulkan pipeline cache: loading {}", path);
-	} else {
+	} else if (!cold) {
 		PipelineCacheLog("Vulkan pipeline cache: initializing {}", path);
 	}
 	std::vector<uint8_t> initial_data;
@@ -628,7 +643,7 @@ void PipelineCache::InitializeDriverCache() {
 }
 
 void PipelineCache::CheckpointDriverCache() {
-	if (m_driver_cache == nullptr) {
+	if (m_driver_cache == nullptr || m_driver_cache_path.empty()) {
 		return;
 	}
 	m_driver_cache_dirty = true;
@@ -638,7 +653,7 @@ void PipelineCache::CheckpointDriverCache() {
 }
 
 void PipelineCache::Save() {
-	if (m_driver_cache == nullptr || !m_driver_cache_dirty) {
+	if (m_driver_cache == nullptr || m_driver_cache_path.empty() || !m_driver_cache_dirty) {
 		return;
 	}
 	m_next_driver_cache_save = std::chrono::steady_clock::now() + DriverCacheSaveInterval;
