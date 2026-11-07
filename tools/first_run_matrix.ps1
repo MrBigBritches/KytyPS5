@@ -25,13 +25,21 @@ readback settings and experiments, so without these a run is not comparable with
 
 .PARAMETER Emulator
 Path of kyty_emulator. Its folder is the working directory, so reports and caches live there.
+
+.PARAMETER SeedFolder
+Optional folder of cache files for the title, such as a shader store made offline from the game's
+files. They are copied into the empty cache folder before each arm, so every arm starts from them
+instead of nothing. A cold run reads only the shader store, so a seeded driver cache is ignored.
+The emulator rewrites the store when it quits, so the hold folder keeps the store as each arm left
+it, not the seed. The seed folder itself is never changed, and it can't be the cache folder.
 #>
 param(
     [Parameter(Mandatory = $true)][string]$Game,
     [Parameter(Mandatory = $true)][string[]]$Arms,
     [Parameter(Mandatory = $true)][string]$BaseArgsFile,
     [string]$TitleId = "",
-    [string]$Emulator = (Join-Path $PSScriptRoot "..\_Build\windows\install\kyty_emulator.exe")
+    [string]$Emulator = (Join-Path $PSScriptRoot "..\_Build\windows\install\kyty_emulator.exe"),
+    [string]$SeedFolder = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -114,6 +122,18 @@ $workDir = Split-Path -Parent $Emulator
 $cacheDir = Join-Path $workDir "_PipelineCache"
 $reportDir = Join-Path $workDir "_FirstRunReports"
 
+# The seed is checked before any file moves. Seeding from the cache folder would seed from the
+# originals the script is about to move aside, so that is refused.
+$seedFiles = @()
+if ($SeedFolder) {
+    $SeedFolder = (Resolve-Path -LiteralPath $SeedFolder).ProviderPath
+    if ([IO.Path]::GetFullPath($SeedFolder).TrimEnd('\') -ieq [IO.Path]::GetFullPath($cacheDir).TrimEnd('\')) {
+        throw "The seed folder can't be the cache folder itself. Nothing was started."
+    }
+    $seedFiles = Get-CacheFiles $SeedFolder $TitleId
+    if ($seedFiles.Count -eq 0) { throw "$SeedFolder holds no cache files for $TitleId. Nothing was started." }
+}
+
 # Originals still sitting in an old hold folder mean an earlier run did not restore them.
 if (Test-Path -LiteralPath $cacheDir) {
     foreach ($old in Get-ChildItem -LiteralPath $cacheDir -Directory | Where-Object { $_.Name -like "_matrix-*" }) {
@@ -140,7 +160,12 @@ try {
     for ($index = 0; $index -lt $Arms.Count; $index++) {
         $arm = $Arms[$index]
         $arguments = $baseArguments + @("--game", $Game) + $ArmTable[$arm].Flags + @("--first-run-report", "--cold-pipelines")
+        # The cache folder holds none of the title's files here, so a copy never replaces one.
+        foreach ($seed in $seedFiles) {
+            Copy-Item -LiteralPath $seed.FullName -Destination (Join-Path $cacheDir $seed.Name)
+        }
         Write-Host ""
+        if ($seedFiles.Count -gt 0) { Write-Host "Seeded from ${SeedFolder}: $($seedFiles.Name -join ', ')" }
         Write-Host "Arm '$arm': $($arguments -join ' ')"
         Read-Host "Press Enter to launch, then play the route and quit the game normally"
         $started = Get-Date
