@@ -241,6 +241,12 @@ file(GLOB kyty_emulator_src CONFIGURE_DEPENDS
 	"${KYTY_SOURCE_DIR}/graphics/presentation/system/binding/*.h"
 	"${KYTY_SOURCE_DIR}/graphics/presentation/system/animation/*.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/presentation/system/animation/*.h"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/effects/*.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/effects/*.h"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/imgui/*.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/imgui/*.h"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/*.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/*.h"
 	"${KYTY_SOURCE_DIR}/kernel/*.cpp"
 	"${KYTY_SOURCE_DIR}/kernel/*.h"
 	"${KYTY_SOURCE_DIR}/loader/*.cpp"
@@ -478,6 +484,30 @@ add_executable(system_ui_animation_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/graphics/presentation/system/animation/tween.cpp"
 )
 target_include_directories(system_ui_animation_tests PRIVATE ${inc_headers})
+
+add_executable(system_ui_effects_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/SystemUiEffectsTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/core/scale.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/effects/gradient.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/effects/halo.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/effects/highlight.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/effects/shine.cpp"
+)
+target_include_directories(system_ui_effects_tests PRIVATE ${inc_headers})
+target_link_libraries(system_ui_effects_tests imgui)
+
+add_executable(system_ui_text_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/SystemUiTextTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/core/scale.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/text.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/imgui/fonts.cpp"
+)
+target_include_directories(system_ui_text_tests PRIVATE ${inc_headers})
+target_link_libraries(system_ui_text_tests imgui common)
+# The tests measure real text, so they load the Noto Sans files the build downloads.
+target_compile_definitions(system_ui_text_tests PRIVATE
+	KYTY_TEST_FONT_REGULAR="${KYTY_NOTO_SANS_DIR}/NotoSans-Regular.ttf"
+	KYTY_TEST_FONT_BOLD="${KYTY_NOTO_SANS_DIR}/NotoSans-Bold.ttf")
 
 # Checks the kit that compares draw lists.
 add_executable(system_ui_drawing_kit_tests EXCLUDE_FROM_ALL
@@ -734,6 +764,8 @@ if(BUILD_TESTING)
 	add_test(NAME system_ui_layout COMMAND $<TARGET_FILE:system_ui_layout_tests>)
 	add_test(NAME system_ui_binding COMMAND $<TARGET_FILE:system_ui_binding_tests>)
 	add_test(NAME system_ui_animation COMMAND $<TARGET_FILE:system_ui_animation_tests>)
+	add_test(NAME system_ui_effects COMMAND $<TARGET_FILE:system_ui_effects_tests>)
+	add_test(NAME system_ui_text COMMAND $<TARGET_FILE:system_ui_text_tests>)
 	add_test(NAME system_ui_drawing_kit COMMAND $<TARGET_FILE:system_ui_drawing_kit_tests>)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
 	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)
@@ -854,6 +886,8 @@ if(BUILD_TESTING)
 		system_ui_layout_tests
 		system_ui_binding_tests
 		system_ui_animation_tests
+		system_ui_effects_tests
+		system_ui_text_tests
 		system_ui_drawing_kit_tests
 		shader_vertex_metadata_tests
 		resource_materialization_tests
