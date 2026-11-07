@@ -923,12 +923,129 @@ add_executable(system_ui_modal_tests EXCLUDE_FROM_ALL
 target_include_directories(system_ui_modal_tests PRIVATE ${inc_headers})
 target_link_libraries(system_ui_modal_tests imgui common)
 
+add_executable(system_ui_gallery_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/SystemUiGalleryTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/animation/easing.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/animation/tween.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/core/scale.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/box.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/modal.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/tabs.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/list.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/box.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/image.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/effects/shine.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/element/frame.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/element/layout.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/element/leaves.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/element/primitives.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/element/interact.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/element/states.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/layout/flex.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/text.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/effects/halo.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/effects/highlight.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/gallery/capture.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/gallery/options.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/gallery/registry.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/gallery/toastPage.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/gallery/colourPage.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/gallery/typographyPage.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/gallery/spacingPage.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/gallery/imagesPage.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/gallery/interactivePages.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/gallery/effectsPage.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/gallery/stage.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/gallery/progressPage.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/gallery/passivePages.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/gallery/patternPages.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/imgui/scaledDraw.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/slider.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/toggle.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/gallery/pageParts.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/views/trophyToast.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/toast.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/trophyCup.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/card.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/button.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/imgui/imageStore.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/layout/anchor.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/gallery/shell.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/animation/timeline.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/imgui/interaction.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/imgui/fonts.cpp"
+)
+target_include_directories(system_ui_gallery_tests PRIVATE ${inc_headers})
+target_link_libraries(system_ui_gallery_tests imgui common)
+target_compile_definitions(system_ui_gallery_tests PRIVATE
+	KYTY_TEST_TROPHY_ICON="${CMAKE_CURRENT_SOURCE_DIR}/assets/images/hidden-trophy.png"
+	KYTY_TEST_FONT_REGULAR="${KYTY_NOTO_SANS_DIR}/NotoSans-Regular.ttf"
+	KYTY_TEST_FONT_BOLD="${KYTY_NOTO_SANS_DIR}/NotoSans-Bold.ttf")
+
 # Checks the kit that compares draw lists.
 add_executable(system_ui_drawing_kit_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/SystemUiDrawingKitTests.cpp"
 )
 target_include_directories(system_ui_drawing_kit_tests PRIVATE ${inc_headers})
 target_link_libraries(system_ui_drawing_kit_tests imgui common)
+
+# The gallery as a program, for reviewing the design system in a window. It is not installed.
+add_executable(system_ui_gallery EXCLUDE_FROM_ALL
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/gallery/main.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/gallery/capture.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/gallery/options.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/gallery/registry.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/gallery/toastPage.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/gallery/colourPage.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/gallery/typographyPage.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/gallery/spacingPage.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/gallery/imagesPage.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/gallery/interactivePages.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/gallery/effectsPage.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/gallery/stage.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/gallery/progressPage.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/gallery/passivePages.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/gallery/patternPages.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/imgui/scaledDraw.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/slider.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/toggle.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/gallery/pageParts.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/views/trophyToast.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/toast.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/trophyCup.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/card.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/button.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/imgui/imageStore.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/layout/anchor.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/gallery/shell.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/gallery/offscreen.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/gallery/vulkanHost.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/animation/easing.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/animation/tween.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/core/scale.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/modal.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/list.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/tabs.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/box.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/image.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/effects/shine.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/element/frame.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/element/layout.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/element/leaves.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/element/primitives.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/element/interact.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/element/states.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/layout/flex.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/text.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/effects/halo.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/effects/highlight.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/imgui/fonts.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/animation/timeline.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/imgui/interaction.cpp"
+	"${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/imgui/backends/imgui_impl_sdl3.cpp"
+)
+target_include_directories(system_ui_gallery PRIVATE ${inc_headers})
+target_link_libraries(system_ui_gallery imgui common SDL3::SDL3-static Vulkan::Headers)
 
 add_executable(slot_vector_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/SlotVectorTests.cpp"
@@ -1197,6 +1314,7 @@ if(BUILD_TESTING)
 	add_test(NAME system_ui_modal COMMAND $<TARGET_FILE:system_ui_modal_tests>)
 	add_test(NAME system_ui_tokens COMMAND $<TARGET_FILE:system_ui_token_tests>)
 	add_test(NAME system_ui_allocations COMMAND $<TARGET_FILE:system_ui_allocation_tests>)
+	add_test(NAME system_ui_gallery COMMAND $<TARGET_FILE:system_ui_gallery_tests>)
 	add_test(NAME system_ui_drawing_kit COMMAND $<TARGET_FILE:system_ui_drawing_kit_tests>)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
 	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)
@@ -1333,7 +1451,9 @@ if(BUILD_TESTING)
 		system_ui_modal_tests
 		system_ui_token_tests
 		system_ui_allocation_tests
+		system_ui_gallery_tests
 		system_ui_drawing_kit_tests
+		system_ui_gallery
 		shader_vertex_metadata_tests
 		resource_materialization_tests
 		resource_tracking_tests
@@ -1418,6 +1538,10 @@ add_custom_target(kyty_noto_sans_fonts
 		"$<TARGET_FILE_DIR:kyty_emulator>/assets/fonts"
 	VERBATIM)
 add_dependencies(kyty_emulator kyty_noto_sans_fonts)
+# The gallery is built next to the emulator, so it finds the same fonts.
+add_dependencies(system_ui_gallery kyty_noto_sans_fonts)
+# And the sample trophy icon its Toast page shows.
+add_dependencies(system_ui_gallery kyty_overlay_images)
 install(FILES ${KYTY_NOTO_SANS_FONTS} DESTINATION assets/fonts)
 
 target_link_libraries(kyty_emulator ${kyty_emulator_link_libraries})
