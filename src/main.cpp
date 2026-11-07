@@ -86,6 +86,13 @@ static void PrintUsage() {
 	::printf("  --perf-overlay                       Show the performance panel (F2 or Cmd+P).\n");
 	::printf("  --playgo-hack                       Use the supplied PlayGo stub fallback.\n");
 	::printf("  --skip-notice-screen                 Skip startup logos and notices in supported games.\n");
+	::printf("  --system-ui                          Draw trophy toasts with the new system UI.\n");
+	::printf("  --system-ui-test-toasts              For testing, show a sample trophy toast of each\n"
+	         "                                       grade in turn, with or without --system-ui.\n");
+	::printf("  --system-ui-stats                    Log each trophy toast's draw time and size, to\n"
+	         "                                       compare the old and new toast.\n");
+	::printf("  --system-ui-reduced-motion           With --system-ui, trophy toasts fade without\n"
+	         "                                       sliding or shining.\n");
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	::printf("  --redzone                            Protect the guest SysV red zone.\n");
 #endif
@@ -209,6 +216,10 @@ static constexpr Flag FLAGS[] = {
     {"--perf-overlay", &ConfigOptions::perf_overlay_enabled},
     {"--playgo-hack", &ConfigOptions::playgo_hack_enabled},
     {"--skip-notice-screen", &ConfigOptions::skip_notice_screen},
+    {"--system-ui", &ConfigOptions::system_ui_enabled},
+    {"--system-ui-test-toasts", &ConfigOptions::system_ui_test_toasts},
+    {"--system-ui-stats", &ConfigOptions::system_ui_stats},
+    {"--system-ui-reduced-motion", &ConfigOptions::system_ui_reduced_motion},
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
     {"--redzone", &ConfigOptions::red_zone_protection_enabled},
 #endif

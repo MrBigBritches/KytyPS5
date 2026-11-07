@@ -249,6 +249,8 @@ file(GLOB kyty_emulator_src CONFIGURE_DEPENDS
 	"${KYTY_SOURCE_DIR}/graphics/presentation/system/imgui/*.h"
 	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/*.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/*.h"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/views/*.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/views/*.h"
 	"${KYTY_SOURCE_DIR}/kernel/*.cpp"
 	"${KYTY_SOURCE_DIR}/kernel/*.h"
 	"${KYTY_SOURCE_DIR}/loader/*.cpp"
@@ -467,6 +469,12 @@ add_executable(system_ui_core_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(system_ui_core_tests PRIVATE ${inc_headers})
 
+add_executable(system_ui_stats_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/SystemUiStatsTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/core/frameStats.cpp"
+)
+target_include_directories(system_ui_stats_tests PRIVATE ${inc_headers})
+
 add_executable(system_ui_layout_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/SystemUiLayoutTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/presentation/system/layout/anchor.cpp"
@@ -508,6 +516,108 @@ target_include_directories(system_ui_text_tests PRIVATE ${inc_headers})
 target_link_libraries(system_ui_text_tests imgui common)
 # The tests measure real text, so they load the Noto Sans files the build downloads.
 target_compile_definitions(system_ui_text_tests PRIVATE
+	KYTY_TEST_FONT_REGULAR="${KYTY_NOTO_SANS_DIR}/NotoSans-Regular.ttf"
+	KYTY_TEST_FONT_BOLD="${KYTY_NOTO_SANS_DIR}/NotoSans-Bold.ttf")
+
+add_executable(system_ui_components_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/SystemUiComponentsTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/core/scale.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/box.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/card.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/trophyCup.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/element/frame.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/element/layout.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/element/leaves.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/element/primitives.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/element/interact.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/element/states.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/layout/flex.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/effects/highlight.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/animation/easing.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/animation/tween.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/animation/timeline.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/imgui/interaction.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/image.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/text.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/toast.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/effects/halo.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/effects/shine.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/imgui/fonts.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/imgui/imageStore.cpp"
+)
+target_include_directories(system_ui_components_tests PRIVATE ${inc_headers})
+target_link_libraries(system_ui_components_tests imgui common)
+target_compile_definitions(system_ui_components_tests PRIVATE
+	KYTY_TEST_FONT_REGULAR="${KYTY_NOTO_SANS_DIR}/NotoSans-Regular.ttf"
+	KYTY_TEST_FONT_BOLD="${KYTY_NOTO_SANS_DIR}/NotoSans-Bold.ttf")
+
+add_executable(system_ui_views_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/SystemUiViewsTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/animation/easing.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/animation/timeline.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/core/scale.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/box.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/card.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/trophyCup.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/element/frame.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/element/layout.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/element/leaves.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/element/primitives.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/element/interact.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/element/states.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/layout/flex.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/effects/highlight.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/animation/tween.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/imgui/interaction.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/image.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/text.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/toast.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/effects/halo.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/effects/shine.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/imgui/fonts.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/imgui/imageStore.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/layout/anchor.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/views/trophyToast.cpp"
+)
+target_include_directories(system_ui_views_tests PRIVATE ${inc_headers})
+target_link_libraries(system_ui_views_tests imgui common)
+target_compile_definitions(system_ui_views_tests PRIVATE
+	KYTY_TEST_FONT_REGULAR="${KYTY_NOTO_SANS_DIR}/NotoSans-Regular.ttf"
+	KYTY_TEST_FONT_BOLD="${KYTY_NOTO_SANS_DIR}/NotoSans-Bold.ttf")
+
+# A benchmark of the trophy toast's drawing, run by hand. It is not a ctest.
+add_executable(system_ui_bench EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/SystemUiBench.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/animation/easing.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/animation/timeline.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/core/frameStats.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/core/scale.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/box.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/card.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/trophyCup.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/element/frame.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/element/layout.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/element/leaves.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/element/primitives.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/element/interact.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/element/states.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/layout/flex.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/effects/highlight.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/animation/tween.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/imgui/interaction.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/image.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/text.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/toast.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/effects/halo.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/effects/shine.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/imgui/fonts.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/imgui/imageStore.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/layout/anchor.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/views/trophyToast.cpp"
+)
+target_include_directories(system_ui_bench PRIVATE ${inc_headers})
+target_link_libraries(system_ui_bench imgui common)
+target_compile_definitions(system_ui_bench PRIVATE
 	KYTY_TEST_FONT_REGULAR="${KYTY_NOTO_SANS_DIR}/NotoSans-Regular.ttf"
 	KYTY_TEST_FONT_BOLD="${KYTY_NOTO_SANS_DIR}/NotoSans-Bold.ttf")
 
@@ -761,6 +871,9 @@ if(BUILD_TESTING)
 	add_test(NAME emulator_present_mode_invalid
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --present-mode Invalid)
 	set_tests_properties(emulator_present_mode_invalid PROPERTIES WILL_FAIL TRUE)
+	add_test(NAME emulator_system_ui_cli
+	         COMMAND $<TARGET_FILE:kyty_emulator> --help --system-ui
+	                 --system-ui-test-toasts --system-ui-stats)
 	add_test(NAME ime_dialog COMMAND $<TARGET_FILE:ime_dialog_tests>)
 	add_test(NAME shader_cfg COMMAND $<TARGET_FILE:shader_cfg_tests>)
 	add_test(NAME scalar_provenance COMMAND $<TARGET_FILE:scalar_provenance_tests>)
@@ -776,11 +889,14 @@ if(BUILD_TESTING)
 	add_test(NAME lru_cache COMMAND $<TARGET_FILE:lru_cache_tests>)
 	add_test(NAME common COMMAND $<TARGET_FILE:common_tests>)
 	add_test(NAME system_ui_core COMMAND $<TARGET_FILE:system_ui_core_tests>)
+	add_test(NAME system_ui_stats COMMAND $<TARGET_FILE:system_ui_stats_tests>)
 	add_test(NAME system_ui_layout COMMAND $<TARGET_FILE:system_ui_layout_tests>)
 	add_test(NAME system_ui_binding COMMAND $<TARGET_FILE:system_ui_binding_tests>)
 	add_test(NAME system_ui_animation COMMAND $<TARGET_FILE:system_ui_animation_tests>)
 	add_test(NAME system_ui_effects COMMAND $<TARGET_FILE:system_ui_effects_tests>)
 	add_test(NAME system_ui_text COMMAND $<TARGET_FILE:system_ui_text_tests>)
+	add_test(NAME system_ui_components COMMAND $<TARGET_FILE:system_ui_components_tests>)
+	add_test(NAME system_ui_views COMMAND $<TARGET_FILE:system_ui_views_tests>)
 	add_test(NAME system_ui_interaction COMMAND $<TARGET_FILE:system_ui_interaction_tests>)
 	add_test(NAME system_ui_drawing_kit COMMAND $<TARGET_FILE:system_ui_drawing_kit_tests>)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
@@ -899,11 +1015,14 @@ if(BUILD_TESTING)
 		lru_cache_tests
 		common_tests
 		system_ui_core_tests
+		system_ui_stats_tests
 		system_ui_layout_tests
 		system_ui_binding_tests
 		system_ui_animation_tests
 		system_ui_effects_tests
 		system_ui_text_tests
+		system_ui_components_tests
+		system_ui_views_tests
 		system_ui_interaction_tests
 		system_ui_drawing_kit_tests
 		shader_vertex_metadata_tests
@@ -969,6 +1088,15 @@ add_custom_target(kyty_touch_cursors
 	VERBATIM)
 add_dependencies(kyty_emulator kyty_touch_cursors)
 install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/assets/cursors" DESTINATION assets)
+
+# Images the overlay draws, such as the trophy icon for test toasts.
+add_custom_target(kyty_overlay_images
+	COMMAND ${CMAKE_COMMAND} -E copy_directory
+		"${CMAKE_CURRENT_SOURCE_DIR}/assets/images"
+		"$<TARGET_FILE_DIR:kyty_emulator>/assets/images"
+	VERBATIM)
+add_dependencies(kyty_emulator kyty_overlay_images)
+install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/assets/images" DESTINATION assets)
 
 set(KYTY_NOTO_SANS_FONTS
 	"${KYTY_NOTO_SANS_DIR}/NotoSans-Regular.ttf"

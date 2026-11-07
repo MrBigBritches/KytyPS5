@@ -233,6 +233,22 @@ bool PlayGoHackEnabled() {
 	return g_config->playgo_hack_enabled;
 }
 
+bool SystemUiEnabled() {
+	return g_config->system_ui_enabled;
+}
+
+bool SystemUiTestToasts() {
+	return g_config->system_ui_test_toasts;
+}
+
+bool SystemUiStatsEnabled() {
+	return g_config->system_ui_stats;
+}
+
+bool SystemUiReducedMotion() {
+	return g_config->system_ui_reduced_motion;
+}
+
 bool SkipNoticeScreen() {
 	return g_config->skip_notice_screen;
 }
