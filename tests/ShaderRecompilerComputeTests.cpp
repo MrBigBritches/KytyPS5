@@ -58156,6 +58156,45 @@ void CheckShaderStore(VulkanHarness &vulkan) {
   flip(0);
   Require(name, "stale store", run() == cold && std::filesystem::file_size(store) == size,
           "a store with another header was reused instead of started over");
+  // A replayed pipeline that uses the image heap names its layout as a set layout, so every
+  // replayed layout must be created after the heap published it. The stale store run above gave
+  // the store its records again.
+  {
+    static std::atomic<uint32_t> created_layouts{0};
+    static std::atomic<uint32_t> layouts_before_heap{0};
+    static GraphicContext *observed_graphics = nullptr;
+    static PFN_vkCreatePipelineLayout real_create_layout = nullptr;
+    real_create_layout = VULKAN_HPP_DEFAULT_DISPATCHER.vkCreatePipelineLayout;
+    observed_graphics = &vulkan.RuntimeContext();
+    // The harness's own renderer publishes a layout too, which would hide a replay that runs before
+    // this context's heap exists. The contexts above clear it when they end.
+    Require(name, "no heap before the context", observed_graphics->image_heap_layout == nullptr,
+            "a layout was already published, so this check could not see a replay before the heap");
+    VULKAN_HPP_DEFAULT_DISPATCHER.vkCreatePipelineLayout =
+        [](VkDevice device, const VkPipelineLayoutCreateInfo *info,
+           const VkAllocationCallbacks *allocator, VkPipelineLayout *layout) {
+          created_layouts++;
+          if (observed_graphics->image_heap_layout == nullptr) layouts_before_heap++;
+          return real_create_layout(device, info, allocator, layout);
+        };
+    // Other caches create helper layouts of their own, so a context with no store is the baseline.
+    const auto count_layouts = [&](const std::filesystem::path &path) {
+      created_layouts = 0;
+      layouts_before_heap = 0;
+      RenderContext replay(vulkan.RuntimeContext(), path);
+      return std::array<uint32_t, 2>{created_layouts.load(), layouts_before_heap.load()};
+    };
+    const auto baseline = count_layouts({});
+    const auto replayed = count_layouts(store);
+    VULKAN_HPP_DEFAULT_DISPATCHER.vkCreatePipelineLayout = real_create_layout;
+    Require(name, "replay creates layouts", replayed[0] > baseline[0],
+            "the store replayed no pipelines, so this check would prove nothing");
+    Require(name, "replay after the image heap", replayed[1] == baseline[1],
+            fmt::format("{} replayed pipeline layouts were created before the image heap "
+                        "published its layout",
+                        replayed[1] - baseline[1])
+                .c_str());
+  }
   // Reflecting a layout decodes LS and HS, so a restart takes it from the store. Records land
   // while the cache lives; one still queued at its destruction lands before it is gone.
   const ShaderTessellationInputInfo layout{1, 2, 3, 4, 5, 6, 7, 8, 9};
