@@ -18,12 +18,18 @@ Names of the arms to run, from the table below. The same arm may be listed twice
 .PARAMETER TitleId
 Name used to find the cache files. Read from the game's sce_sys/param.json when left out.
 
+.PARAMETER BaseArgsFile
+Text file holding the settings every arm shares, one argument per line. Blank lines are ignored, so
+a value can't be empty. Leave such a flag out instead. The launcher passes resolution, tessellation,
+readback settings and experiments, so without these a run is not comparable with normal play.
+
 .PARAMETER Emulator
 Path of kyty_emulator. Its folder is the working directory, so reports and caches live there.
 #>
 param(
     [Parameter(Mandatory = $true)][string]$Game,
     [Parameter(Mandatory = $true)][string[]]$Arms,
+    [Parameter(Mandatory = $true)][string]$BaseArgsFile,
     [string]$TitleId = "",
     [string]$Emulator = (Join-Path $PSScriptRoot "..\_Build\windows\install\kyty_emulator.exe")
 )
@@ -110,6 +116,10 @@ if (Test-Path -LiteralPath $cacheDir) {
 
 $holdDir = Join-Path $cacheDir ("_matrix-" + (Get-Date -Format "yyyyMMdd-HHmmss"))
 $originalDir = Join-Path $holdDir "original"
+$baseArguments = @(Get-Content -LiteralPath $BaseArgsFile -Encoding UTF8 | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" })
+if ($baseArguments.Count -eq 0) {
+    throw "$BaseArgsFile holds no arguments, so a run would not match normal play."
+}
 $process = $null
 $originalsMoved = $false
 $leftBehind = $false
@@ -119,7 +129,7 @@ try {
     $originalsMoved = $true
     for ($index = 0; $index -lt $Arms.Count; $index++) {
         $arm = $Arms[$index]
-        $arguments = @("--game", $Game) + $ArmTable[$arm].Flags + @("--first-run-report", "--cold-pipelines")
+        $arguments = $baseArguments + @("--game", $Game) + $ArmTable[$arm].Flags + @("--first-run-report", "--cold-pipelines")
         Write-Host ""
         Write-Host "Arm '$arm': $($arguments -join ' ')"
         Read-Host "Press Enter to launch, then play the route and quit the game normally"
