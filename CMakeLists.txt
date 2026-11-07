@@ -469,6 +469,69 @@ add_executable(system_ui_core_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(system_ui_core_tests PRIVATE ${inc_headers})
 
+add_executable(system_ui_element_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/SystemUiElementTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/core/scale.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/box.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/effects/halo.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/effects/highlight.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/effects/shine.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/element/frame.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/image.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/text.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/element/layout.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/element/leaves.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/element/primitives.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/element/interact.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/element/states.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/animation/easing.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/animation/tween.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/button.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/list.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/animation/timeline.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/imgui/interaction.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/imgui/fonts.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/layout/flex.cpp"
+)
+target_include_directories(system_ui_element_tests PRIVATE ${inc_headers})
+target_link_libraries(system_ui_element_tests imgui common)
+# The tests measure real text, so they load the Noto Sans files the build downloads.
+target_compile_definitions(system_ui_element_tests PRIVATE
+	KYTY_TEST_FONT_REGULAR="${KYTY_NOTO_SANS_DIR}/NotoSans-Regular.ttf"
+	KYTY_TEST_FONT_BOLD="${KYTY_NOTO_SANS_DIR}/NotoSans-Bold.ttf")
+
+add_executable(system_ui_element_interaction_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/SystemUiElementInteractionTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/core/scale.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/box.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/effects/halo.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/effects/highlight.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/effects/shine.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/element/frame.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/image.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/text.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/element/layout.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/element/leaves.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/element/primitives.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/element/interact.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/element/states.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/animation/easing.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/animation/tween.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/button.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/toggle.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/list.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/animation/timeline.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/imgui/interaction.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/imgui/fonts.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/layout/flex.cpp"
+)
+target_include_directories(system_ui_element_interaction_tests PRIVATE ${inc_headers})
+target_link_libraries(system_ui_element_interaction_tests imgui common)
+# The tests measure real text, so they load the Noto Sans files the build downloads.
+target_compile_definitions(system_ui_element_interaction_tests PRIVATE
+	KYTY_TEST_FONT_REGULAR="${KYTY_NOTO_SANS_DIR}/NotoSans-Regular.ttf"
+	KYTY_TEST_FONT_BOLD="${KYTY_NOTO_SANS_DIR}/NotoSans-Bold.ttf")
+
 add_executable(system_ui_stats_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/SystemUiStatsTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/presentation/system/core/frameStats.cpp"
@@ -989,6 +1052,8 @@ if(BUILD_TESTING)
 	add_test(NAME lru_cache COMMAND $<TARGET_FILE:lru_cache_tests>)
 	add_test(NAME common COMMAND $<TARGET_FILE:common_tests>)
 	add_test(NAME system_ui_core COMMAND $<TARGET_FILE:system_ui_core_tests>)
+	add_test(NAME system_ui_element COMMAND $<TARGET_FILE:system_ui_element_tests>)
+	add_test(NAME system_ui_element_interaction COMMAND $<TARGET_FILE:system_ui_element_interaction_tests>)
 	add_test(NAME system_ui_stats COMMAND $<TARGET_FILE:system_ui_stats_tests>)
 	add_test(NAME system_ui_layout COMMAND $<TARGET_FILE:system_ui_layout_tests>)
 	add_test(NAME system_ui_binding COMMAND $<TARGET_FILE:system_ui_binding_tests>)
@@ -1119,6 +1184,8 @@ if(BUILD_TESTING)
 		lru_cache_tests
 		common_tests
 		system_ui_core_tests
+		system_ui_element_tests
+		system_ui_element_interaction_tests
 		system_ui_stats_tests
 		system_ui_layout_tests
 		system_ui_binding_tests
