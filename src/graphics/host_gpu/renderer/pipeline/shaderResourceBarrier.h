@@ -13,6 +13,9 @@ vk::PipelineStageFlags  ShaderPipelineStages(vk::ShaderStageFlags stages);
 vk::MemoryBarrier       MakeShaderWriteDependency();
 vk::BufferMemoryBarrier MakeGdsDependency(vk::Buffer buffer);
 bool HasShaderBufferWrites(const ShaderStageRuntime& runtime);
+/// Whether the stage can change anything besides the draw's render targets, through buffer writes, GDS or
+/// DMA use, or a written storage image. A draw with such a stage must never be skipped.
+bool HasShaderOutputsBeyondTargets(const ShaderStageRuntime& runtime);
 void ShaderAccessBarrier(vk::CommandBuffer vk_buffer, vk::PipelineStageFlags source_stages);
 void ShaderWriteHazardBarrier(vk::CommandBuffer      vk_buffer,
                               vk::PipelineStageFlags destination_stages);

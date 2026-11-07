@@ -532,15 +532,23 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	                          push_data_cursor));
 }
 
+// Opens the driver cache and, with --async-pipelines on, starts the build workers.
 PipelineCache::PipelineCache(GraphicContext&                         graphics,
                              ShaderRecompiler::IR::ImageHeapSource* image_heap)
     : m_graphics(graphics), m_image_heap(image_heap),
       m_next_driver_cache_save(std::chrono::steady_clock::now() + DriverCacheSaveInterval) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
+	// Read once. With the flag off no thread exists and every miss builds on the calling thread.
+	if (Config::AsyncPipelinesEnabled()) {
+		m_build_queue = std::make_unique<PipelineBuildQueue>(PipelineBuildWorkerCount());
+	}
 }
 
+// Stops the builds, saves the driver cache and destroys every pipeline, layout and module.
 PipelineCache::~PipelineCache() {
+	// For a cache made without a render context, which has no one to stop the builds earlier.
+	StopBuilds();
 	Save();
 	auto destroy = [this](const auto& pipelines) {
 		for (const auto& pipeline: pipelines | std::views::values) {
@@ -657,6 +665,9 @@ void PipelineCache::Save() {
 		return;
 	}
 	m_next_driver_cache_save = std::chrono::steady_clock::now() + DriverCacheSaveInterval;
+	// Cleared before the data is read, so a worker that adds to the cache while this runs leaves it
+	// dirty for the next save. A failure below sets it again.
+	m_driver_cache_dirty = false;
 
 	size_t               size = 0;
 	vk::Result           result;
@@ -678,6 +689,7 @@ void PipelineCache::Save() {
 	    size > std::numeric_limits<uint32_t>::max()) {
 		PipelineCacheLog("Vulkan pipeline cache: save failed ({}, {:.2f} MB)",
 		                 vk::to_string(result), static_cast<double>(size) / 1'000'000.0);
+		m_driver_cache_dirty = true;
 		return;
 	}
 	payload.resize(size);
@@ -686,6 +698,7 @@ void PipelineCache::Save() {
 	prefix.append(reinterpret_cast<const char*>(&payload_hash), sizeof(payload_hash));
 	if (!Common::File::CreateDirectories(m_driver_cache_path.parent_path())) {
 		PipelineCacheLog("Vulkan pipeline cache: failed to create cache directory");
+		m_driver_cache_dirty = true;
 		return;
 	}
 	auto temp_path = m_driver_cache_path;
@@ -707,12 +720,12 @@ void PipelineCache::Save() {
 	if (!written || error) {
 		PipelineCacheLog("Vulkan pipeline cache: failed to write {}",
 		                 Common::PathToString(m_driver_cache_path));
+		m_driver_cache_dirty = true;
 		return;
 	}
 	PipelineCacheLog("Vulkan pipeline cache: saved {:.2f} MB to {}",
 	                 static_cast<double>(payload.size()) / 1'000'000.0,
 	                 Common::PathToString(m_driver_cache_path));
-	m_driver_cache_dirty = false;
 }
 
 void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRenderState& state) {
@@ -948,30 +961,205 @@ const ShaderModule* PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo
 	return GetProgram(params, input_info, push_data_cursor);
 }
 
-PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&   command,
-                                                            const DrawRenderState& state) {
-	const auto* colors        = state.color_info;
-	const auto& depth         = state.depth_info;
-	const auto  vertex_info   = state.VertexStages();
-	const auto& ps_input_info = state.ps_input_info;
-	const auto& vs_input_info = vertex_info.front();
-	KYTY_PROFILER_BLOCK("PipelineCache::CreatePipeline(Gfx)", profiler::colors::DeepOrangeA200);
+namespace {
 
-	const bool ps_active    = state.ps_active;
-	const bool tessellation = vertex_info.size() == 3;
+// Fills the blend fields of one color target's key. A mapping the host cannot blend directly drops
+// the blend, with a warning the first time.
+void FillBlendKey(PipelineStaticParameters& params, uint32_t slot, const HW::BlendControl& control,
+                  const Prospero::ColorComponentMapping& mapping,
+                  ShaderAlphaBlendSource alpha_source) {
+	if (params.blend_enable[slot] && alpha_source == ShaderAlphaBlendSource::None &&
+	    ClassifyBlendMapping(control, mapping) != BlendMappingSupport::Direct) {
+		params.blend_enable[slot] = false;
+		static std::atomic_bool warned = false;
+		if (!warned.exchange(true, std::memory_order_relaxed)) {
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "Warning: blending disabled for unsupported color mapping "
+			    "(slot={} mapping=0x{:02x} color={}/{} alpha={}/{} separate={}).\n",
+			    slot, mapping.packed, control.color_srcblend, control.color_destblend,
+			    control.alpha_srcblend, control.alpha_destblend,
+			    control.separate_alpha_blend ? 1 : 0));
+		}
+	}
+	if (!params.blend_enable[slot]) {
+		return;
+	}
+	auto blend = control;
+	switch (alpha_source) {
+		case ShaderAlphaBlendSource::SourceAlpha:
+			blend.color_srcblend       = RemapSourceAlphaFactor(blend.color_srcblend);
+			blend.color_destblend      = RemapSourceAlphaFactor(blend.color_destblend);
+			blend.separate_alpha_blend = false;
+			break;
+		case ShaderAlphaBlendSource::SourceAlphaOne:
+		case ShaderAlphaBlendSource::SourceAlphaZero:
+			// The second source carries the mapped source factor; its alpha stays logical Sa.
+			blend.color_srcblend  = static_cast<uint8_t>(Prospero::BlendFactor::kSrc1Color);
+			blend.color_destblend = static_cast<uint8_t>(Prospero::BlendFactor::kOneMinusSrc1Alpha);
+			blend.separate_alpha_blend = false;
+			break;
+		case ShaderAlphaBlendSource::None: break;
+	}
+	params.color_srcblend[slot]       = blend.color_srcblend;
+	params.color_comb_fcn[slot]       = blend.color_comb_fcn;
+	params.color_destblend[slot]      = blend.color_destblend;
+	params.separate_alpha_blend[slot] = blend.separate_alpha_blend;
+	if (blend.separate_alpha_blend) {
+		params.alpha_srcblend[slot]  = blend.alpha_srcblend;
+		params.alpha_comb_fcn[slot]  = blend.alpha_comb_fcn;
+		params.alpha_destblend[slot] = blend.alpha_destblend;
+	}
+}
+
+// Fills the key's color attachments and returns their sample count, or 0 with none.
+uint32_t FillColorKey(GraphicsPipelineKey& key, const HW::Context& ctx,
+                      const DrawRenderState& state) {
+	auto&    static_params      = key.static_params;
+	auto&    rendering          = key.rendering;
+	uint32_t attachment_samples = 0;
+	for (uint32_t i = 0; i < state.color_count; i++) {
+		const auto& color = state.color_info[i];
+		const auto  slot  = color.target_slot;
+		EXIT_IF(slot >= RENDER_COLOR_ATTACHMENTS_MAX);
+		rendering.color_count = std::max(rendering.color_count, slot + 1);
+		EXIT_IF(!color.image_id || color.desc.view_info.format == vk::Format::eUndefined);
+		static_params.color_mask[slot] = color.export_mapping.ApplyMask(
+		    render_target_mask_slot(ctx.GetRenderTargetMask(), slot));
+		if (color.desc.info.guest_format == Prospero::BufferFormat::k11_11_10UNorm) {
+			static_params.color_mask[slot] = 1u;
+		}
+		rendering.color_formats[slot] = color.desc.view_info.format;
+		if (attachment_samples == 0) {
+			attachment_samples = color.desc.info.samples;
+		} else if (attachment_samples != color.desc.info.samples) {
+			EXIT("mixed color attachment sample counts are unsupported: %u and %u\n",
+			     attachment_samples, color.desc.info.samples);
+		}
+		const auto& control = ctx.GetBlendControl(slot);
+		auto        alpha_source = ShaderAlphaBlendSource::None;
+		if (slot == 0 && state.ps_active) {
+			alpha_source = state.ps_input_info.alpha_blend_source;
+		}
+		static_params.blend_enable[slot] =
+		    control.enable && !ctx.GetRenderTarget(slot).info.blend_bypass;
+		FillBlendKey(static_params, slot, control, color.export_mapping, alpha_source);
+	}
+	return attachment_samples;
+}
+
+// Whether the draw has a depth or stencil attachment.
+bool HasDepthAttachment(const RenderDepthInfo& depth) {
+	return depth.desc.view_info.format != vk::Format::eUndefined &&
+	       static_cast<bool>(depth.image_id);
+}
+
+// Fills the key's depth and stencil formats and returns the sample count shared with the colors.
+uint32_t FillDepthKey(GraphicsPipelineKey& key, const RenderDepthInfo& depth,
+                      uint32_t attachment_samples) {
+	if (!HasDepthAttachment(depth)) {
+		return attachment_samples;
+	}
+	auto&      rendering = key.rendering;
+	const auto aspects   = ImageViewOps::DepthAspectMask(depth.desc.view_info.format);
+	rendering.depth_format = aspects & vk::ImageAspectFlagBits::eDepth
+	                             ? depth.desc.view_info.format
+	                             : vk::Format::eUndefined;
+	rendering.stencil_format = aspects & vk::ImageAspectFlagBits::eStencil
+	                               ? depth.desc.view_info.format
+	                               : vk::Format::eUndefined;
+	if (attachment_samples == 0) {
+		return depth.desc.info.samples;
+	}
+	if (attachment_samples != depth.desc.info.samples) {
+		EXIT("mixed color/depth sample counts are unsupported: %u and %u\n", attachment_samples,
+		     depth.desc.info.samples);
+	}
+	return attachment_samples;
+}
+
+// Fills the key's vertex bindings and attributes from the vertex stage's fetches.
+void FillVertexInputKey(GraphicsPipelineKey& key, const ShaderVertexInputInfo& vs_input_info) {
+	EXIT_IF(vs_input_info.buffers_num < 0 ||
+	        vs_input_info.buffers_num > ShaderVertexInputInfo::RES_MAX ||
+	        vs_input_info.resources_num < 0 ||
+	        vs_input_info.resources_num > ShaderVertexInputInfo::RES_MAX);
+	key.vertex_input.binding_count   = static_cast<uint8_t>(vs_input_info.buffers_num);
+	key.vertex_input.attribute_count = static_cast<uint8_t>(vs_input_info.resources_num);
+	for (int binding = 0; binding < vs_input_info.buffers_num; binding++) {
+		const auto& buffer = vs_input_info.buffers[binding];
+		key.vertex_input.bindings[binding] = {.stride   = buffer.stride,
+		                                      .instance = buffer.fetch_index != 0};
+	}
+	for (int attribute = 0; attribute < vs_input_info.resources_num; attribute++) {
+		const auto binding = vs_input_info.resources_dst[attribute].buffer_index;
+		EXIT_IF(binding < 0 || binding >= vs_input_info.buffers_num);
+		key.vertex_input.attributes[attribute] = {
+		    .offset = static_cast<uint32_t>(vs_input_info.resources[attribute].Base48() -
+		                                    vs_input_info.buffers[binding].addr),
+		    .binding = static_cast<uint8_t>(binding),
+		};
+	}
+}
+
+// The stages of a draw in key order, with null for an absent one.
+std::array<const ShaderModule*, 4> DrawStages(const DrawRenderState& state) {
 	std::array<const ShaderModule*, 4> stages {};
+	const auto                         vertex_info = state.VertexStages();
 	for (uint32_t i = 0; i < vertex_info.size(); i++) {
 		stages[i] = vertex_info[i].stage.module;
 	}
-	if (ps_active) {
-		stages[3] = ps_input_info.stage.module;
+	if (state.ps_active) {
+		stages[3] = state.ps_input_info.stage.module;
 	}
-	const bool mesh        = stages[0]->info.stage == ShaderType::Mesh;
-	const auto color_count = state.color_count;
+	return stages;
+}
 
-	auto&             ctx = command.GetRegisters();
+// Fills the key's fixed-function state from the registers and the draw.
+void FillStaticKey(PipelineStaticParameters& params, const CommandBuffer& command,
+                   const DrawRenderState& state, uint32_t attachment_samples, bool mesh) {
+	const auto& ctx          = command.GetRegisters();
+	const auto& mc           = ctx.GetModeControl();
+	const auto& clip_control = ctx.GetClipControl();
+	params.negative_one_to_one      = !clip_control.dx_clip_space;
+	params.depth_clip_enable        = clip_control.IsZClipEnabled();
+	params.topology                 = state.topology;
+	params.primitive_restart_enable = state.primitive_restart_enable;
+	params.samples                  = attachment_samples;
+	params.sample_shading_enable =
+	    state.ps_active && attachment_samples > 1 && state.ps_input_info.ps_sample_shading;
+	params.alpha_to_coverage_enable = state.ps_active && ctx.GetShaderRegisters().AlphaToMask();
+	const bool rect_list = Prospero::IsRectList(command.GetUserConfig().GetPrimType());
+	params.provoking_vtx_last = mc.provoking_vtx_last;
+	params.polygon_mode =
+	    ResolvePolygonMode(mc, !rect_list && mc.cull_front, !rect_list && mc.cull_back);
+	const auto vertex_info = state.VertexStages();
+	if (vertex_info.size() == 3) {
+		params.patch_control_points = vertex_info.front().tess.input_control_points;
+	} else if (!mesh && params.topology == vk::PrimitiveTopology::ePatchList) {
+		// Rectangle lists expand through generated tessellation stages.
+		params.patch_control_points = 3;
+	}
+}
 
-	const HW::ModeControl& mc = ctx.GetModeControl();
+// Prints the stage inputs of a draw whose pipeline is about to be created, when dumps are on.
+void DumpPipelineInputs(const DrawRenderState& state) {
+	if (!graphics_debug_dump_enabled()) {
+		return;
+	}
+	ShaderDbgDumpInputInfo(state.VertexStages().front());
+	if (state.ps_active) {
+		ShaderDbgDumpInputInfo(state.ps_input_info);
+	}
+}
+
+} // namespace
+
+GraphicsPipelineKey PipelineCache::MakeGraphicsPipelineKey(const CommandBuffer&   command,
+                                                           const DrawRenderState& state,
+                                                           const Stages&          stages) const {
+	const auto  vertex_info = state.VertexStages();
+	const auto& ctx         = command.GetRegisters();
+	const bool  mesh        = stages[0]->info.stage == ShaderType::Mesh;
 
 	GraphicsPipelineKey key {};
 	for (uint32_t i = 0; i < stages.size(); i++) {
@@ -979,92 +1167,9 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 			key.stage_ids[i] = stages[i]->id;
 		}
 	}
-	auto&    static_params      = key.static_params;
-	auto&    rendering          = key.rendering;
-	uint32_t attachment_samples = 0;
-	for (uint32_t i = 0; i < color_count; i++) {
-		const auto slot = colors[i].target_slot;
-		EXIT_IF(slot >= RENDER_COLOR_ATTACHMENTS_MAX);
-		rendering.color_count = std::max(rendering.color_count, slot + 1);
-		EXIT_IF(!colors[i].image_id || colors[i].desc.view_info.format == vk::Format::eUndefined);
-		static_params.color_mask[slot] = colors[i].export_mapping.ApplyMask(
-		    render_target_mask_slot(ctx.GetRenderTargetMask(), colors[i].target_slot));
-		if (colors[i].desc.info.guest_format == Prospero::BufferFormat::k11_11_10UNorm) {
-			static_params.color_mask[slot] = 1u;
-		}
-		rendering.color_formats[slot] = colors[i].desc.view_info.format;
-		if (attachment_samples == 0) {
-			attachment_samples = colors[i].desc.info.samples;
-		} else if (attachment_samples != colors[i].desc.info.samples) {
-			EXIT("mixed color attachment sample counts are unsupported: %u and %u\n",
-			     attachment_samples, colors[i].desc.info.samples);
-		}
-		const auto& rt                        = ctx.GetRenderTarget(colors[i].target_slot);
-		const auto& bc                        = ctx.GetBlendControl(colors[i].target_slot);
-		auto alpha_source = ShaderAlphaBlendSource::None;
-		if (slot == 0 && ps_active) {
-			alpha_source = ps_input_info.alpha_blend_source;
-		}
-		static_params.blend_enable[slot] = bc.enable && !rt.info.blend_bypass;
-		if (static_params.blend_enable[slot] && alpha_source == ShaderAlphaBlendSource::None &&
-		    ClassifyBlendMapping(bc, colors[i].export_mapping) != BlendMappingSupport::Direct) {
-			static_params.blend_enable[slot] = false;
-			static std::atomic_bool warned = false;
-			if (!warned.exchange(true, std::memory_order_relaxed)) {
-				Log::WriteToConsoleAndLog(fmt::format(
-				    "Warning: blending disabled for unsupported color mapping "
-				    "(slot={} mapping=0x{:02x} color={}/{} alpha={}/{} separate={}).\n",
-				    slot, colors[i].export_mapping.packed, bc.color_srcblend, bc.color_destblend,
-				    bc.alpha_srcblend, bc.alpha_destblend, bc.separate_alpha_blend ? 1 : 0));
-			}
-		}
-		if (static_params.blend_enable[slot]) {
-			auto blend = bc;
-			switch (alpha_source) {
-				case ShaderAlphaBlendSource::SourceAlpha:
-					blend.color_srcblend  = RemapSourceAlphaFactor(blend.color_srcblend);
-					blend.color_destblend = RemapSourceAlphaFactor(blend.color_destblend);
-					blend.separate_alpha_blend = false;
-					break;
-				case ShaderAlphaBlendSource::SourceAlphaOne:
-				case ShaderAlphaBlendSource::SourceAlphaZero:
-					// The second source carries the mapped source factor; its alpha stays logical Sa.
-					blend.color_srcblend = static_cast<uint8_t>(Prospero::BlendFactor::kSrc1Color);
-					blend.color_destblend =
-					    static_cast<uint8_t>(Prospero::BlendFactor::kOneMinusSrc1Alpha);
-					blend.separate_alpha_blend = false;
-					break;
-				case ShaderAlphaBlendSource::None: break;
-			}
-			static_params.color_srcblend[slot]       = blend.color_srcblend;
-			static_params.color_comb_fcn[slot]       = blend.color_comb_fcn;
-			static_params.color_destblend[slot]      = blend.color_destblend;
-			static_params.separate_alpha_blend[slot] = blend.separate_alpha_blend;
-			if (blend.separate_alpha_blend) {
-				static_params.alpha_srcblend[slot]  = blend.alpha_srcblend;
-				static_params.alpha_comb_fcn[slot]  = blend.alpha_comb_fcn;
-				static_params.alpha_destblend[slot] = blend.alpha_destblend;
-			}
-		}
-	}
-	const bool with_depth =
-	    depth.desc.view_info.format != vk::Format::eUndefined && static_cast<bool>(depth.image_id);
-	if (with_depth) {
-		const auto aspects       = ImageViewOps::DepthAspectMask(depth.desc.view_info.format);
-		rendering.depth_format   = aspects & vk::ImageAspectFlagBits::eDepth
-		                               ? depth.desc.view_info.format
-		                               : vk::Format::eUndefined;
-		rendering.stencil_format = aspects & vk::ImageAspectFlagBits::eStencil
-		                               ? depth.desc.view_info.format
-		                               : vk::Format::eUndefined;
-		if (attachment_samples == 0) {
-			attachment_samples = depth.desc.info.samples;
-		} else if (attachment_samples != depth.desc.info.samples) {
-			EXIT("mixed color/depth sample counts are unsupported: %u and %u\n", attachment_samples,
-			     depth.desc.info.samples);
-		}
-	}
-	if (color_count == 0 && !with_depth) {
+	auto attachment_samples = FillColorKey(key, ctx, state);
+	attachment_samples      = FillDepthKey(key, state.depth_info, attachment_samples);
+	if (state.color_count == 0 && !HasDepthAttachment(state.depth_info)) {
 		attachment_samples = render_sample_count(ctx.GetAaConfig().msaa_num_samples);
 		EXIT_IF(!static_cast<bool>(
 		    m_graphics.GetPhysicalDeviceProperties().limits.framebufferNoAttachmentsSampleCounts &
@@ -1073,62 +1178,16 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 	EXIT_IF(attachment_samples == 0 ||
 	        vulkan_sample_count(attachment_samples) == vk::SampleCountFlagBits {});
 
-	const auto& clip_control               = ctx.GetClipControl();
-	static_params.negative_one_to_one      = !clip_control.dx_clip_space;
-	static_params.depth_clip_enable        = clip_control.IsZClipEnabled();
-	static_params.topology                 = state.topology;
-	static_params.primitive_restart_enable = state.primitive_restart_enable;
-	static_params.samples                  = attachment_samples;
-	static_params.sample_shading_enable =
-	    ps_active && attachment_samples > 1 && ps_input_info.ps_sample_shading;
-	static_params.alpha_to_coverage_enable = ps_active && ctx.GetShaderRegisters().AlphaToMask();
-	const bool rect_list = Prospero::IsRectList(command.GetUserConfig().GetPrimType());
-	static_params.provoking_vtx_last = mc.provoking_vtx_last;
-	static_params.polygon_mode =
-	    ResolvePolygonMode(mc, !rect_list && mc.cull_front, !rect_list && mc.cull_back);
-	if (tessellation) {
-		static_params.patch_control_points = vs_input_info.tess.input_control_points;
-	} else if (!mesh && static_params.topology == vk::PrimitiveTopology::ePatchList) {
-		// Rectangle lists expand through generated tessellation stages.
-		static_params.patch_control_points = 3;
-	}
-
+	FillStaticKey(key.static_params, command, state, attachment_samples, mesh);
 	if (!mesh) {
-		EXIT_IF(vs_input_info.buffers_num < 0 ||
-		        vs_input_info.buffers_num > ShaderVertexInputInfo::RES_MAX ||
-		        vs_input_info.resources_num < 0 ||
-		        vs_input_info.resources_num > ShaderVertexInputInfo::RES_MAX);
-		key.vertex_input.binding_count   = static_cast<uint8_t>(vs_input_info.buffers_num);
-		key.vertex_input.attribute_count = static_cast<uint8_t>(vs_input_info.resources_num);
-		for (int binding = 0; binding < vs_input_info.buffers_num; binding++) {
-			const auto& buffer = vs_input_info.buffers[binding];
-			key.vertex_input.bindings[binding] = {.stride   = buffer.stride,
-			                                      .instance = buffer.fetch_index != 0};
-		}
-		for (int attribute = 0; attribute < vs_input_info.resources_num; attribute++) {
-			const auto binding = vs_input_info.resources_dst[attribute].buffer_index;
-			EXIT_IF(binding < 0 || binding >= vs_input_info.buffers_num);
-			key.vertex_input.attributes[attribute] = {
-			    .offset = static_cast<uint32_t>(vs_input_info.resources[attribute].Base48() -
-			                                    vs_input_info.buffers[binding].addr),
-			    .binding = static_cast<uint8_t>(binding),
-			};
-		}
+		FillVertexInputKey(key, vertex_info.front());
 	}
+	return key;
+}
 
-	auto [iter, inserted] = m_graphics_pipelines.try_emplace(key);
-	auto& pipeline        = iter->second;
-	if (!inserted) {
-		return pipeline;
-	}
-
-	if (graphics_debug_dump_enabled()) {
-		ShaderDbgDumpInputInfo(vs_input_info);
-		if (ps_active) {
-			ShaderDbgDumpInputInfo(ps_input_info);
-		}
-	}
-
+PipelineCache::Pipeline& PipelineCache::CreateGraphicsPipelineHere(Pipeline&                  slot,
+                                                                   const GraphicsPipelineKey& key,
+                                                                   const Stages&              stages) {
 	{
 		// A compile on the GPU command thread stops all guest rendering, so guest audio may wait
 		// for it. One on any other thread leaves the game running and must not hold audio.
@@ -1139,12 +1198,195 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::PipelinesCreated,
 		                                         Common::DebugCounters::Counter::PipelineCreateNs,
 		                                         Common::DebugCounters::Peak::PipelineCreateNs);
-		CreatePipelineInternal(m_graphics, pipeline, key, stages, m_driver_cache);
+		CreatePipelineInternal(m_graphics, slot, key, stages, m_driver_cache);
 	}
 	StorePipeline(key);
 	CheckpointDriverCache();
+	return slot;
+}
 
-	return pipeline;
+PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&   command,
+                                                            const DrawRenderState& state) {
+	return *AcquireGraphicsPipeline(command, state, nullptr);
+}
+
+PipelineCache::Pipeline* PipelineCache::AcquireGraphicsPipeline(const CommandBuffer&   command,
+                                                                const DrawRenderState& state,
+                                                                const PipelineSkipPolicy* policy) {
+	KYTY_PROFILER_BLOCK("PipelineCache::CreatePipeline(Gfx)", profiler::colors::DeepOrangeA200);
+	const auto stages = DrawStages(state);
+	const auto key    = MakeGraphicsPipelineKey(command, state, stages);
+	if (m_build_queue != nullptr) {
+		// The change in the report's blocked graphics time across the call is what a refused draw
+		// waited, whether it compiled here or waited for a worker.
+		const double blocked_before = Common::FirstRunReport::BlockedMs(Common::FirstRunReport::Kind::Graphics);
+		auto* pipeline = AcquireBuiltPipeline(key, stages, state, policy);
+		if (policy != nullptr && policy->Refusal() != nullptr) {
+			Common::FirstRunReport::AddRefusal(
+			    policy->Refusal(),
+			    Common::FirstRunReport::BlockedMs(Common::FirstRunReport::Kind::Graphics) - blocked_before);
+		}
+		return pipeline;
+	}
+
+	auto [iter, inserted] = m_graphics_pipelines.try_emplace(key);
+	if (!inserted) {
+		return &iter->second;
+	}
+	DumpPipelineInputs(state);
+	return &CreateGraphicsPipelineHere(iter->second, key, stages);
+}
+
+// Starts the clock for a build requested now.
+PipelineCache::GraphicsBuild::GraphicsBuild(const GraphicsPipelineKey& request_key,
+                                            const Stages&              request_stages)
+    : key(request_key), stages(request_stages), requested(std::chrono::steady_clock::now()) {}
+
+PipelineCache::Pipeline* PipelineCache::AcquireBuiltPipeline(const GraphicsPipelineKey& key,
+                                                             const Stages&              stages,
+                                                             const DrawRenderState&     state,
+                                                             const PipelineSkipPolicy*  policy) {
+	// The one cost a pipeline that is already built pays for background builds.
+	if (m_has_published.load(std::memory_order_relaxed)) {
+		DrainPublishedBuilds();
+	}
+	if (const auto found = m_graphics_pipelines.find(key); found != m_graphics_pipelines.end()) {
+		return &found->second;
+	}
+	auto pending = m_pending_graphics.find(key);
+	if (pending != m_pending_graphics.end() &&
+	    pending->second.build->completed.load(std::memory_order_acquire)) {
+		return &AdoptBuild(pending->second.build);
+	}
+	const bool may_skip = policy != nullptr && policy->MaySkip();
+	if (pending == m_pending_graphics.end()) {
+		DumpPipelineInputs(state);
+		if (!may_skip) {
+			return &CreateGraphicsPipelineHere(m_graphics_pipelines[key], key, stages);
+		}
+		RequestBuild(key, stages);
+		pending = m_pending_graphics.find(key);
+	}
+	if (may_skip) {
+		pending->second.build->skipped_draws++;
+		return nullptr;
+	}
+	return &FinishBuild(pending->second.build, pending->second.job);
+}
+
+void PipelineCache::RequestBuild(const GraphicsPipelineKey& key, const Stages& stages) {
+	auto build = std::make_shared<GraphicsBuild>(key, stages);
+	auto job   = m_build_queue->Post([this, build] { RunBuild(build); });
+	EXIT_IF(job == nullptr);
+	m_pending_graphics.emplace(key, PendingBuild {std::move(build), std::move(job)});
+	// Stored when asked for, so a pipeline still pending at exit is rebuilt by the next run.
+	StorePipeline(key);
+}
+
+void PipelineCache::RunBuild(const std::shared_ptr<GraphicsBuild>& build) {
+	// On a worker the compile records itself as worker time, and nothing here counts toward the
+	// GPU thread's compile counters.
+	CreatePipelineInternal(m_graphics, build->pipeline, build->key, build->stages, m_driver_cache);
+	build->ready_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+	                                                            build->requested)
+	                      .count();
+	m_driver_cache_dirty.store(true, std::memory_order_relaxed);
+	build->completed.store(true, std::memory_order_release);
+	{
+		std::scoped_lock lock(m_published_mutex);
+		m_published.push_back(build);
+	}
+	m_has_published.store(true, std::memory_order_relaxed);
+}
+
+PipelineCache::Pipeline& PipelineCache::FinishBuild(const std::shared_ptr<GraphicsBuild>& build,
+                                                    const PipelineBuildQueue::JobPtr&      job) {
+	// Keeps the build alive across the adoption below, which erases it from the pending map.
+	const auto keep_alive = build;
+	{
+		// Both ways of getting the pipeline stop the GPU thread, so guest audio may wait for them.
+		std::optional<Common::GpuStall::Scope> stall;
+		if (GuestGpu::IsGpuThread()) {
+			stall.emplace();
+		}
+		// Running the compile here and waiting for a worker both stop the GPU thread, so both
+		// count as pipeline time and toward its longest hitch.
+		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::Count,
+		                                         Common::DebugCounters::Counter::PipelineCreateNs,
+		                                         Common::DebugCounters::Peak::PipelineCreateNs);
+		const auto start = std::chrono::steady_clock::now();
+		const auto how   = m_build_queue->Acquire(*job);
+		if (how == PipelineBuildQueue::Acquired::RanInline) {
+			Common::DebugCounters::Add(Common::DebugCounters::Counter::PipelinesCreated);
+		} else if (how == PipelineBuildQueue::Acquired::Waited) {
+			const auto waited_ms = std::chrono::duration<double, std::milli>(
+			                           std::chrono::steady_clock::now() - start)
+			                           .count();
+			Common::FirstRunReport::AddWait(Common::FirstRunReport::Kind::Graphics, waited_ms);
+			PipelineCacheLog("Pipeline build: waited {:.1f} ms for a running background compile",
+			                 waited_ms);
+		}
+	}
+	EXIT_IF(!keep_alive->completed.load(std::memory_order_acquire));
+	CheckpointDriverCache();
+	return AdoptBuild(keep_alive);
+}
+
+PipelineCache::Pipeline& PipelineCache::AdoptBuild(std::shared_ptr<GraphicsBuild> build) {
+	EXIT_IF(build->adopted);
+	build->adopted = true;
+	Common::FirstRunReport::AddReady(Common::FirstRunReport::Kind::Graphics, build->key.stage_ids[0],
+	                                 build->key.stage_ids[3], build->ready_ms,
+	                                 build->skipped_draws);
+	// Copy the key first, since erasing the pending entry may release the build.
+	const auto key        = build->key;
+	auto [iter, inserted] = m_graphics_pipelines.try_emplace(key, build->pipeline);
+	EXIT_IF(!inserted);
+	m_pending_graphics.erase(key);
+	return iter->second;
+}
+
+void PipelineCache::DrainPublishedBuilds() {
+	// Clears the flag before taking the list, so a build published after the take sets it again.
+	m_has_published.store(false, std::memory_order_relaxed);
+	std::vector<std::shared_ptr<GraphicsBuild>> finished;
+	{
+		std::scoped_lock lock(m_published_mutex);
+		finished.swap(m_published);
+	}
+	for (const auto& build: finished) {
+		// The GPU thread may have taken it already by waiting for it.
+		if (!build->adopted) {
+			AdoptBuild(build);
+		}
+	}
+	if (!finished.empty()) {
+		CheckpointDriverCache();
+	}
+}
+
+void PipelineCache::StopBuilds() {
+	if (m_build_queue == nullptr) {
+		return;
+	}
+	if (const auto running = m_build_queue->Stop(); running != 0) {
+		PipelineCacheLog("Pipeline build: waiting for {} running background compiles", running);
+	}
+	// Nothing runs now. A finished build nobody took still owns its Vulkan objects, and a build
+	// that never ran owns none.
+	for (const auto& pending: m_pending_graphics | std::views::values) {
+		const auto& pipeline = pending.build->pipeline;
+		m_graphics.device.destroyPipeline(pipeline.pipeline, nullptr);
+		m_graphics.device.destroyPipelineLayout(pipeline.pipeline_layout, nullptr);
+		m_graphics.device.destroyDescriptorSetLayout(pipeline.descriptor_set_layout, nullptr);
+	}
+	m_pending_graphics.clear();
+	{
+		std::scoped_lock lock(m_published_mutex);
+		m_published.clear();
+	}
+	m_has_published.store(false, std::memory_order_relaxed);
+	m_build_queue.reset();
 }
 
 PipelineCache::Pipeline& PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info) {

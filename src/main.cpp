@@ -77,6 +77,12 @@ static void PrintUsage() {
 	         "                                       a clean exit, with compile and pause figures.\n");
 	::printf("  --cold-pipelines                     Stamp every SPIR-V module so no shader or driver\n"
 	         "                                       cache serves it. Makes every launch slow.\n");
+	::printf("  --async-pipelines                    Build graphics pipelines in the background and skip\n"
+	         "                                       draws that wait for one, where their targets are\n"
+	         "                                       redrawn every frame (experimental).\n");
+	::printf("  --async-pipelines-depth-only         Like --async-pipelines, but only draws with no color\n"
+	         "                                       target go without a pipeline (experimental). Wins\n"
+	         "                                       over --async-pipelines when both are given.\n");
 	::printf("  --gpu-submit-cadence                 Submit GPU work periodically while a long command\n"
 	         "                                       stream records, so the GPU starts sooner.\n");
 	::printf("  --native-float-minmax                Use the host GPU's float min/max on non-AMD GPUs.\n"
@@ -228,6 +234,8 @@ static constexpr Flag FLAGS[] = {
     {"--audio-compile-hold", &ConfigOptions::audio_compile_hold_enabled},
     {"--first-run-report", &ConfigOptions::first_run_report_enabled},
     {"--cold-pipelines", &ConfigOptions::cold_pipelines_enabled},
+    {"--async-pipelines", &ConfigOptions::async_pipelines_enabled},
+    {"--async-pipelines-depth-only", &ConfigOptions::async_pipelines_depth_only_enabled},
     {"--gpu-submit-cadence", &ConfigOptions::gpu_submit_cadence_enabled},
     {"--native-float-minmax", &ConfigOptions::native_float_min_max_enabled},
     {"--command-buffer-dump", &ConfigOptions::command_buffer_dump_enabled},

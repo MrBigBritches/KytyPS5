@@ -104,6 +104,12 @@ struct ConfigOptions {
 	bool                   first_run_report_enabled    = false;
 	// Stamps each SPIR-V module per run so no shader or driver cache can serve it. Every launch is slow.
 	bool                   cold_pipelines_enabled      = false;
+	// Builds graphics pipelines on worker threads. A draw whose pipeline is not ready is skipped
+	// only where its targets are redrawn every frame, and otherwise waits for the pipeline.
+	bool                   async_pipelines_enabled     = false;
+	// Like async_pipelines_enabled, which it implies, but only draws with no color target ever go
+	// without their pipeline.
+	bool                   async_pipelines_depth_only_enabled = false;
 	// Lets the GPU start on a long command stream instead of idling until the end-of-slice submit.
 	bool                   gpu_submit_cadence_enabled  = false;
 	// Opts in to the host GPU's float min/max on non-AMD GPUs. It is faster, but the sign of a zero
@@ -200,6 +206,11 @@ bool OcclusionQueriesEnabled();
 bool AudioCompileHoldEnabled();
 bool FirstRunReportEnabled();
 bool ColdPipelinesEnabled();
+/// Whether graphics pipelines are built in the background. The pipeline cache reads it once, when
+/// it is made.
+bool AsyncPipelinesEnabled();
+/// Whether only draws with no color target may go without a pipeline. It implies background builds.
+bool AsyncPipelinesDepthOnly();
 bool GpuSubmitCadenceEnabled();
 /// Returns whether non-AMD GPUs may use the host's float min/max instead of the exact emulation.
 bool NativeFloatMinMaxEnabled();

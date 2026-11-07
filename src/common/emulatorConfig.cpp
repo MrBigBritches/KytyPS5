@@ -260,6 +260,14 @@ bool ColdPipelinesEnabled() {
 	return g_config->cold_pipelines_enabled;
 }
 
+bool AsyncPipelinesDepthOnly() {
+	return g_config->async_pipelines_depth_only_enabled;
+}
+
+bool AsyncPipelinesEnabled() {
+	return g_config->async_pipelines_enabled || g_config->async_pipelines_depth_only_enabled;
+}
+
 bool GpuSubmitCadenceEnabled() {
 	return g_config->gpu_submit_cadence_enabled;
 }

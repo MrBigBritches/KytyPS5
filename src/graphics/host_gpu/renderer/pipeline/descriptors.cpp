@@ -3,6 +3,7 @@
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/firstRunReport.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
@@ -830,6 +831,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	const auto& snapshot      = *prepared.runtime->resources;
 	auto&       images        = prepared.images;
 	auto&       texture_cache = m_context.GetTextureCache();
+	const bool  skips_tracked = m_context.GetPipelineCache().BuildsInBackground();
 	// Acquire each view before a later overlapping descriptor can replace its image.
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
 		if (!images[i].image_id) continue;
@@ -841,6 +843,17 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 			          images[i].desc.type == TextureCache::BindingType::Storage);
 		}
 		auto& binding = images[i];
+		// A draw that was skipped may have left this image short of what it should hold, and now a
+		// shader reads it. This counts the reads of an image with a skip noted since its last
+		// whole-target clear. It cannot tell a read of the missing part from a read of the rest,
+		// and a color image is never cleared in view of the CPU, so it is a signal and not proof.
+		if (binding.desc.type == TextureCache::BindingType::Texture && skips_tracked) {
+			bool depth = false;
+			if (const auto skipped = texture_cache.TakeSkippedDraws(binding.image_id, &depth);
+			    skipped != 0) {
+				Common::FirstRunReport::AddSampledAfterSkip(depth ? "depth" : "color", skipped);
+			}
+		}
 		binding.mip_views.clear();
 		const auto& resource = program.info.images[i];
 		if (resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::Dynamic) {

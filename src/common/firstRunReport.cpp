@@ -149,6 +149,9 @@ void Report::AddTranslate(Kind kind, std::string_view stage, uint64_t hash, doub
 	// A worker thread leaves the GPU thread running, so only its own time is blocked.
 	if (thread == Thread::Gpu && m_phase == Phase::Play) {
 		AddBlockedLocked(kind, ms);
+		if (kind == Kind::Graphics) {
+			m_translate_gpu_graphics_ms += ms;
+		}
 	}
 }
 
@@ -166,6 +169,24 @@ void Report::AddCompile(Kind kind, uint64_t id, uint64_t id_ps, double create_ms
 	}
 }
 
+void Report::AddWait(Kind kind, double ms) {
+	std::lock_guard lock(m_mutex);
+	// The compile itself is recorded by the worker that ran it, as worker time.
+	if (m_phase == Phase::Play) {
+		AddBlockedLocked(kind, ms);
+	}
+}
+
+void Report::AddReady(Kind kind, uint64_t id, uint64_t id_ps, double ready_ms,
+                      uint32_t skipped_draws) {
+	std::lock_guard lock(m_mutex);
+	m_readies.push_back({.kind           = kind,
+	                     .id             = id,
+	                     .id_ps          = id_ps,
+	                     .ready_ms       = ready_ms,
+	                     .skipped_draws  = skipped_draws});
+}
+
 void Report::AddSkip(SkipKind kind, std::string_view target_class) {
 	std::lock_guard lock(m_mutex);
 	m_skips[static_cast<size_t>(kind)]++;
@@ -176,6 +197,33 @@ void Report::AddSkip(SkipKind kind, std::string_view target_class) {
 	} else {
 		found->second++;
 	}
+}
+
+void Report::AddSampledAfterSkip(std::string_view target_class, uint32_t draws) {
+	std::lock_guard lock(m_mutex);
+	const auto found = std::ranges::find(m_sampled_after_skip, target_class,
+	                                     &std::pair<std::string, uint32_t>::first);
+	if (found == m_sampled_after_skip.end()) {
+		m_sampled_after_skip.emplace_back(std::string(target_class), draws);
+	} else {
+		found->second += draws;
+	}
+}
+
+void Report::AddRefusal(std::string_view reason, double blocked_ms) {
+	std::lock_guard lock(m_mutex);
+	const auto found = std::ranges::find(m_refusals, reason, &Refusal::reason);
+	if (found == m_refusals.end()) {
+		m_refusals.push_back({std::string(reason), 1, blocked_ms});
+	} else {
+		found->draws++;
+		found->blocked_ms += blocked_ms;
+	}
+}
+
+double Report::BlockedMs(Kind kind) const {
+	std::lock_guard lock(m_mutex);
+	return m_blocked_ms[static_cast<size_t>(kind)];
 }
 
 void Report::AddStampFailure() {
@@ -192,13 +240,17 @@ void Report::Reset() {
 	m_boot              = {};
 	m_blocked_ms        = {};
 	m_translate_ms      = 0.0;
+	m_translate_gpu_graphics_ms = 0.0;
 	m_translates.clear();
 	m_compiles.clear();
+	m_readies.clear();
 	m_pauses.clear();
 	m_has_pending_pause = false;
 	m_pending_pause     = {};
 	m_skips             = {};
 	m_skips_by_target.clear();
+	m_sampled_after_skip.clear();
+	m_refusals.clear();
 }
 
 std::vector<Pause> Report::AllPausesLocked() const {
@@ -212,6 +264,11 @@ std::vector<Pause> Report::AllPausesLocked() const {
 std::vector<CompileEntry> Report::Compiles() const {
 	std::lock_guard lock(m_mutex);
 	return m_compiles;
+}
+
+std::vector<ReadyEntry> Report::Readies() const {
+	std::lock_guard lock(m_mutex);
+	return m_readies;
 }
 
 namespace {
@@ -236,10 +293,13 @@ Summary Report::Summarize() const {
 	summary.blocked_graphics_ms = m_blocked_ms[static_cast<size_t>(Kind::Graphics)];
 	summary.blocked_compute_ms  = m_blocked_ms[static_cast<size_t>(Kind::Compute)];
 	summary.translate_ms        = m_translate_ms;
+	summary.translate_gpu_graphics_ms = m_translate_gpu_graphics_ms;
 	summary.flips               = m_flips;
 	summary.stamp_failures      = m_stamp_failures;
 	summary.skips               = m_skips;
 	summary.skips_by_target     = m_skips_by_target;
+	summary.sampled_after_skip_by_target = m_sampled_after_skip;
+	summary.refusals                     = m_refusals;
 
 	summary.worst_translate = m_translates;
 	std::ranges::stable_sort(summary.worst_translate,
@@ -281,6 +341,15 @@ nlohmann::json CompileToJson(const CompileEntry& compile) {
 	return row;
 }
 
+// Writes one ready row.
+nlohmann::json ReadyToJson(const ReadyEntry& ready) {
+	return {{"kind", ready.kind == Kind::Graphics ? "graphics" : "compute"},
+	        {"vs", Hex(ready.id)},
+	        {"ps", Hex(ready.id_ps)},
+	        {"ready_ms", Round3(ready.ready_ms)},
+	        {"skipped_draws", ready.skipped_draws}};
+}
+
 nlohmann::json HistogramToJson(const Summary& summary) {
 	nlohmann::json histogram = {
 	    {fmt::format("under_{}", PAUSE_BUCKET_BOUNDS_MS.front()), summary.pauses_under_first_bound}};
@@ -301,6 +370,7 @@ nlohmann::json PlayToJson(const Summary& summary) {
 	          {"compute", Round3(summary.blocked_compute_ms)},
 	          {"total", Round3(blocked_total)}}},
 	        {"translate_ms", Round3(summary.translate_ms)},
+	        {"translate_gpu_graphics_ms", Round3(summary.translate_gpu_graphics_ms)},
 	        {"worst_translate", worst}};
 }
 
@@ -320,9 +390,19 @@ nlohmann::json SkipsToJson(const Summary& summary) {
 	for (const auto& [target, count]: summary.skips_by_target) {
 		by_target[target] = count;
 	}
+	nlohmann::json refused = nlohmann::json::object();
+	for (const auto& entry: summary.refusals) {
+		refused[entry.reason] = {{"draws", entry.draws}, {"blocked_ms", Round3(entry.blocked_ms)}};
+	}
+	nlohmann::json sampled = nlohmann::json::object();
+	for (const auto& [target, count]: summary.sampled_after_skip_by_target) {
+		sampled[target] = count;
+	}
 	return {{"draw", summary.skips[static_cast<size_t>(SkipKind::Draw)]},
 	        {"dispatch", summary.skips[static_cast<size_t>(SkipKind::Dispatch)]},
-	        {"by_target_class", by_target}};
+	        {"by_target_class", by_target},
+	        {"sampled_after_skip_by_target_class", sampled},
+	        {"refused", refused}};
 }
 
 nlohmann::json BootToJson(const BootInfo& boot) {
@@ -348,6 +428,10 @@ std::string Report::ToJson(const Metadata& metadata, uint64_t audio_holds,
 	for (const auto& compile: compiles) {
 		compile_rows.push_back(CompileToJson(compile));
 	}
+	nlohmann::json ready_rows = nlohmann::json::array();
+	for (const auto& ready: Readies()) {
+		ready_rows.push_back(ReadyToJson(ready));
+	}
 	const nlohmann::json report = {
 	    {"title_id", metadata.title_id},
 	    {"build", metadata.build},
@@ -359,6 +443,7 @@ std::string Report::ToJson(const Metadata& metadata, uint64_t audio_holds,
 	    {"play", PlayToJson(summary)},
 	    {"pauses", PausesToJson(summary)},
 	    {"compiles", compile_rows},
+	    {"ready", ready_rows},
 	    {"skips", SkipsToJson(summary)},
 	    {"audio_holds", audio_holds},
 	    {"flips", summary.flips},

@@ -510,7 +510,7 @@ void ImageHeap::Rebind(RenderExecutor& executor) {
 			    m_elements[index].value);
 			if (binding.image_id) {
 				auto& image = textures.GetImage(binding.image_id);
-				image.heap_refs.fetch_add(1u, std::memory_order_relaxed);
+				textures.NoteHeapSelected(binding.image_id);
 				m_elements[index].serial = image.serial;
 				binding.layout     = image.ReadLayout();
 				binding.image_view = textures.FindTexture(binding.image_id, binding.desc);

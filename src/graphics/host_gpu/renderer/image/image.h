@@ -35,6 +35,39 @@ struct ImageUsage {
 	bool video_out     = false;
 };
 
+// The last two frames, as texture cache ticks, in which something happened to an image, with how
+// many times it happened in each. A frame is one tick because the cache ticks once per guest flip.
+struct FrameHistory {
+	static constexpr uint64_t Never = std::numeric_limits<uint64_t>::max();
+
+	uint64_t latest         = Never;
+	uint64_t previous       = Never;
+	uint32_t latest_count   = 0;
+	uint32_t previous_count = 0;
+
+	// Notes one event in `tick`.
+	void Note(uint64_t tick) noexcept {
+		if (latest != tick) {
+			previous       = latest;
+			previous_count = latest_count;
+			latest         = tick;
+			latest_count   = 0;
+		}
+		latest_count++;
+	}
+
+	// Whether the event happened at all in the frame `frame`, whatever else happened.
+	[[nodiscard]] bool HappenedIn(uint64_t frame) const noexcept {
+		return frame != Never && (latest == frame || previous == frame);
+	}
+
+	// Whether the event happened at least `min_count` times in `tick` and in the tick right before.
+	[[nodiscard]] bool InConsecutiveFrames(uint64_t tick, uint32_t min_count) const noexcept {
+		return latest == tick && previous != Never && previous + 1u == tick &&
+		       latest_count >= min_count && previous_count >= min_count;
+	}
+};
+
 struct ImageBinding {
 	vk::ImageLayout  attachment_layout = vk::ImageLayout::eUndefined;
 	vk::AccessFlags2 attachment_access;
@@ -193,6 +226,17 @@ public:
 	// The texture cache's frame count at the same access, for use while ticks are not frames.
 	uint64_t         gc_tick_accessed_last = 0;
 	size_t           lru_id             = 0;
+	// Frames in which draws that ran used the image as a render target, with how many, and frames
+	// in which a register clear of the whole depth target came first. Only the GPU thread writes
+	// them, and only with a background pipeline mode on.
+	FrameHistory     attached_frames;
+	FrameHistory     cleared_frames;
+	// Frames in which an HTILE clear was waiting when a draw reached the image. Not taken as a
+	// clear, but it tells a depth target never cleared from one cleared only that way.
+	FrameHistory     htile_cleared_frames;
+	// Draws skipped into the image since a clear of the whole target, and whether they drew depth.
+	uint32_t         skipped_draws    = 0;
+	bool             skipped_as_depth = false;
 	// Resident image heap elements that select this image.
 	std::atomic<uint32_t> heap_refs {0};
 

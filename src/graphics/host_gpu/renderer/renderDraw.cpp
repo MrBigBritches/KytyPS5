@@ -5,6 +5,7 @@
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
+#include "common/firstRunReport.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
@@ -35,6 +36,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -454,6 +456,192 @@ struct DrawCallInfo {
 	[[nodiscard]] const char* Name() const { return indexed ? "DrawIndex" : "DrawIndexAuto"; }
 };
 
+// Whether an HTILE clear is waiting to be applied to the depth target by the next draw into it.
+static bool HtileClearPending(TextureCache& cache, const RenderDepthInfo& depth) {
+	const auto& metadata = depth.desc.info.metadata;
+	return metadata.kind == ImageMetadataKind::Htile &&
+	       cache.IsMetaCleared(metadata.range.address, depth.desc.view_info.base_layer);
+}
+
+// Whether the render area of the draw is the whole depth target. The area is the smallest of the
+// attachments in width, height and layers, and a load-op clear covers all of it whatever the
+// scissor says. A color target smaller than the depth target in any of them shrinks the area, so
+// the clear no longer covers the depth.
+static bool ClearCoversDepthTarget(const DrawRenderState& state) {
+	const auto&     extent = state.depth_info.desc.info.extent;
+	const auto      layers = state.depth_info.desc.view_info.layer_count;
+	const std::span colors {state.color_info, state.color_count};
+	return std::ranges::all_of(colors, [&](const RenderColorInfo& color) {
+		const auto size = color.Extent();
+		return size.width >= extent.width && size.height >= extent.height &&
+		       color.desc.view_info.layer_count >= layers;
+	});
+}
+
+void NoteDrawTargets(TextureCache& cache, const DrawRenderState& state) {
+	for (uint32_t i = 0; i < state.color_count; i++) {
+		cache.NoteRenderTargetUse(state.color_info[i].image_id, state.color_info[i].desc.view_info,
+		                          false);
+	}
+	const auto& depth = state.depth_info;
+	if (depth.image_id) {
+		// Only the clear register counts. An HTILE clear is a compute fill whose extent the CPU
+		// cannot see, so it may cover a tile or a region and is not taken as a clear.
+		const bool cleared = depth.depth_clear_enable && ClearCoversDepthTarget(state);
+		// An HTILE clear still waiting is noted apart, to tell a target cleared only that way from
+		// one never cleared. It runs before AcquireRenderTargets consumes the clear.
+		cache.NoteRenderTargetUse(depth.image_id, depth.desc.view_info, cleared,
+		                          HtileClearPending(cache, depth));
+	}
+}
+
+// Whether any stage of the draw can change something besides the render targets.
+static bool DrawWritesBeyondTargets(const DrawRenderState& state) {
+	const auto stages = state.VertexStages();
+	return std::ranges::any_of(stages, [](const ShaderVertexInputInfo& stage) {
+		       return HasShaderOutputsBeyondTargets(stage.stage);
+	       }) ||
+	       (state.ps_active && HasShaderOutputsBeyondTargets(state.ps_input_info.stage));
+}
+
+const char* SkipRefusalName(SkipRefusal refusal) {
+	switch (refusal) {
+		case SkipRefusal::None: return "none";
+		case SkipRefusal::NoDepth: return "no_depth_target";
+		case SkipRefusal::Writer: return "writer";
+		case SkipRefusal::DepthOnlyModeColor: return "depth_only_mode_color";
+		case SkipRefusal::PartialView: return "partial_view";
+		case SkipRefusal::HtileOnlyClear: return "htile_only_clear";
+		case SkipRefusal::DepthNotCleared: return "depth_not_cleared";
+		case SkipRefusal::TooFewDraws: return "too_few_draws";
+		case SkipRefusal::TooFewDrawsAlsoUncleared: return "too_few_draws_also_uncleared";
+		case SkipRefusal::ColorHistory: return "color_history";
+	}
+	return "none";
+}
+
+// Turns the verdict on the depth target into the rule it broke.
+static SkipRefusal DepthRefusal(TextureCache::RebuildVerdict verdict) {
+	switch (verdict) {
+		case TextureCache::RebuildVerdict::Rebuilt: return SkipRefusal::None;
+		case TextureCache::RebuildVerdict::PartialView: return SkipRefusal::PartialView;
+		case TextureCache::RebuildVerdict::TooFewDraws: return SkipRefusal::TooFewDraws;
+		case TextureCache::RebuildVerdict::TooFewDrawsUncleared:
+			return SkipRefusal::TooFewDrawsAlsoUncleared;
+		case TextureCache::RebuildVerdict::NotCleared: return SkipRefusal::DepthNotCleared;
+		case TextureCache::RebuildVerdict::HtileClearedOnly: return SkipRefusal::HtileOnlyClear;
+	}
+	return SkipRefusal::None;
+}
+
+SkipRefusal ExplainSkipRefusal(TextureCache& cache, const DrawRenderState& state, bool depth_only) {
+	// A color-only pass shows no sign of being rebuilt, because a color clear is applied by the GPU
+	// and the CPU never sees it. It waits for the pipeline. In depth-only mode so does every draw
+	// that has a color target.
+	if (!state.depth_info.image_id) {
+		return SkipRefusal::NoDepth;
+	}
+	if (DrawWritesBeyondTargets(state)) {
+		return SkipRefusal::Writer;
+	}
+	if (depth_only && state.color_count != 0) {
+		return SkipRefusal::DepthOnlyModeColor;
+	}
+	const auto& depth = state.depth_info;
+	const auto  verdict = cache.JudgeRebuiltEveryFrame(depth.image_id, depth.desc.view_info, true,
+	                                                   MIN_DRAWS_FOR_SKIP);
+	if (const auto refusal = DepthRefusal(verdict); refusal != SkipRefusal::None) {
+		return refusal;
+	}
+	const std::span colors {state.color_info, state.color_count};
+	for (const auto& color: colors) {
+		const auto judged = cache.JudgeRebuiltEveryFrame(color.image_id, color.desc.view_info,
+		                                                 false, MIN_DRAWS_FOR_SKIP);
+		if (judged == TextureCache::RebuildVerdict::PartialView) {
+			return SkipRefusal::PartialView;
+		}
+		if (judged != TextureCache::RebuildVerdict::Rebuilt) {
+			return SkipRefusal::ColorHistory;
+		}
+	}
+	return SkipRefusal::None;
+}
+
+bool DrawMaySkipPipeline(TextureCache& cache, const DrawRenderState& state, bool depth_only) {
+	return ExplainSkipRefusal(cache, state, depth_only) == SkipRefusal::None;
+}
+
+namespace {
+
+// Lets a draw go without its pipeline when the gate allows it, and keeps the rule that refused it.
+class DrawSkipPolicy final: public PipelineSkipPolicy {
+public:
+	/// Remembers the draw and the mode to judge it in.
+	DrawSkipPolicy(TextureCache& cache, const DrawRenderState& state, bool depth_only)
+	    : m_cache(cache), m_state(state), m_depth_only(depth_only) {}
+
+	/// Whether the remembered draw may go without its pipeline. A refusal is kept for Refusal.
+	[[nodiscard]] bool MaySkip() const override {
+		m_refusal = ExplainSkipRefusal(m_cache, m_state, m_depth_only);
+		return m_refusal == SkipRefusal::None;
+	}
+
+	/// The name of the rule that refused the draw at the last question, or null.
+	[[nodiscard]] const char* Refusal() const override {
+		return m_refusal == SkipRefusal::None ? nullptr : SkipRefusalName(m_refusal);
+	}
+
+private:
+	TextureCache&          m_cache;
+	const DrawRenderState& m_state;
+	bool                   m_depth_only;
+	mutable SkipRefusal    m_refusal = SkipRefusal::None;
+};
+
+} // namespace
+
+// Gets the draw's pipeline, or null when a background build is not done and the draw may go
+// without it. Without background builds it always waits, exactly as before. The draw's targets are
+// noted after the answer, and only when the draw will run, so the draw is not evidence for itself
+// and a skipped draw proves nothing. A draw refused a skip is reported by the pipeline cache.
+static PipelineCache::Pipeline* AcquireDrawPipeline(RenderContext& context, CommandBuffer& buffer,
+                                                    const DrawRenderState& state) {
+	auto& pipelines = context.GetPipelineCache();
+	if (!pipelines.BuildsInBackground()) {
+		return &pipelines.GetGraphicsPipeline(buffer, state);
+	}
+	const DrawSkipPolicy policy {context.GetTextureCache(), state, Config::AsyncPipelinesDepthOnly()};
+	auto*                pipeline = pipelines.AcquireGraphicsPipeline(buffer, state, &policy);
+	if (pipeline != nullptr) {
+		NoteDrawTargets(context.GetTextureCache(), state);
+	}
+	return pipeline;
+}
+
+// Leaves out the commands of a draw that has no pipeline yet. A depth or HTILE clear the draw
+// consumed would be lost with it, so the pass still begins when there was one. The targets keep a
+// mark of the skip, which is reported if something samples them before a clear repairs them. A
+// target a resident image heap references gets no mark, and is reported as a possible read at
+// once, since the heap resolves its bindings out of reach of the mark.
+static void SkipDrawWithoutPipeline(RenderContext& context, CommandBuffer& buffer,
+                                    const RenderState& rendering, const DrawRenderState& state) {
+	if (state.depth_info.load_clear_aspects) {
+		buffer.BeginRendering(rendering);
+	}
+	context.GetOcclusionQueries().CountSkippedDraw();
+	auto& textures = context.GetTextureCache();
+	for (uint32_t i = 0; i < state.color_count; i++) {
+		if (textures.NoteSkippedTarget(state.color_info[i].image_id, false)) {
+			Common::FirstRunReport::AddSampledAfterSkip("heap_color", 1);
+		}
+	}
+	if (state.depth_info.image_id && textures.NoteSkippedTarget(state.depth_info.image_id, true)) {
+		Common::FirstRunReport::AddSampledAfterSkip("heap_depth", 1);
+	}
+	Common::FirstRunReport::AddSkip(Common::FirstRunReport::SkipKind::Draw,
+	                                state.color_count != 0 ? "depth_and_color" : "depth_only");
+}
+
 RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
                                                  uint32_t color_count, RenderDepthInfo& depth,
                                                  vk::ImageAspectFlags& feedback_aspects,
@@ -494,9 +682,7 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 	if (depth.image_id) {
 		const auto  image_view = cache.FindDepthTarget(depth.image_id, depth.desc);
 		const auto& metadata   = depth.desc.info.metadata;
-		const bool meta_clear =
-		    metadata.kind == ImageMetadataKind::Htile &&
-		    cache.IsMetaCleared(metadata.range.address, depth.desc.view_info.base_layer);
+		const bool  meta_clear = HtileClearPending(cache, depth);
 		depth.load_clear_aspects = {};
 		if (depth.depth_clear_enable || meta_clear)
 			depth.load_clear_aspects |= vk::ImageAspectFlagBits::eDepth;
@@ -1044,6 +1230,9 @@ bool RenderExecutor::CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo&
 	return true;
 }
 
+// Records one prepared draw. Resources are prepared and the targets acquired for every draw. With
+// background pipeline builds on, a draw whose pipeline is not ready may then stop short of the
+// commands that bind and draw, and still report a normal draw.
 void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallInfo& draw,
                                          DrawRenderState& state, const DrawEmitInfo& emit,
                                          const DrawIndexBufferSource& index_source) {
@@ -1124,11 +1313,20 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		args_buffer = m_context.GetBufferCache().ObtainBuffer(emit.indirect.address, size, false);
 		EXIT_IF((args_buffer.second & 3u) != 0);
 	}
-	auto& pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(buffer, state);
+	auto* pipeline_or_null = AcquireDrawPipeline(m_context, buffer, state);
 	vk::ImageAspectFlags feedback_aspects;
+	// Runs even for a skipped draw, since it applies the clears the draw consumes and moves the
+	// targets to their attachment layouts.
 	const auto rendering =
 	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info,
 	                         feedback_aspects, stages);
+	if (pipeline_or_null == nullptr) {
+		// Returns normally, because the caller treats a false result as a request to replay the
+		// draw on the CPU.
+		SkipDrawWithoutPipeline(m_context, buffer, rendering, state);
+		return;
+	}
+	auto& pipeline = *pipeline_or_null;
 	vk::DeviceAddress task_params = 0;
 	if (mesh_task) {
 		const MeshTaskParams params {

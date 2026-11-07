@@ -8,15 +8,19 @@
 #include "common/uniqueFunction.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineBuildQueue.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/rectListShader.h"
 #include "graphics/shader/shader.h"
 
+#include <array>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
+#include <deque>
 #include <filesystem>
 #include <memory>
 #include <mutex>
@@ -171,6 +175,18 @@ private:
 	std::jthread m_thread;
 };
 
+// Asked when a draw's pipeline is still being built in the background, to say whether the draw may
+// go without it.
+class PipelineSkipPolicy {
+public:
+	virtual ~PipelineSkipPolicy() = default;
+	// Called on the GPU thread, only for a draw that has no pipeline yet.
+	[[nodiscard]] virtual bool MaySkip() const = 0;
+	// The name of the rule that refused the draw at the last MaySkip, or null if it did not. A
+	// draw that missed its pipeline and was refused is counted under that name.
+	[[nodiscard]] virtual const char* Refusal() const { return nullptr; }
+};
+
 // The owning renderer serializes access, including saves while the GPU is running.
 class PipelineCache {
 public:
@@ -200,8 +216,22 @@ public:
 	const ShaderModule* GetComputeProgram(const HW::ComputeShaderInfo& regs,
 	                                      ShaderComputeInputInfo&      input_info);
 
+	// Waits for the pipeline if it is not built yet.
 	Pipeline& GetGraphicsPipeline(const CommandBuffer& command, const DrawRenderState& state);
+	// Like GetGraphicsPipeline, but returns null instead of waiting when a background build has
+	// not finished and `policy` allows the draw to go without. Without a policy, or when builds
+	// are not in the background, it always returns a pipeline. The first miss that may be skipped
+	// starts the build, and a miss that may not be skipped builds on the calling thread.
+	[[nodiscard]] Pipeline* AcquireGraphicsPipeline(const CommandBuffer&   command,
+	                                                const DrawRenderState& state,
+	                                                const PipelineSkipPolicy* policy);
 	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info);
+	// True while graphics pipelines are built in the background.
+	[[nodiscard]] bool BuildsInBackground() const noexcept { return m_build_queue != nullptr; }
+	// Drops queued builds, waits for running ones and destroys finished pipelines nobody has
+	// taken. Later requests build on the calling thread. The owner calls it while the objects the
+	// builds read, such as the image heap's layout, still exist. Calling it again does nothing.
+	void StopBuilds();
 
 private:
 	friend struct PipelineCacheTestAccess;
@@ -211,7 +241,9 @@ private:
 		ShaderRecompiler::IR::ResourcePlan           resource_plan;
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
-		std::vector<ShaderModule>                    modules;
+		// A deque, so a module keeps its address while later ones are added. Queued background
+		// builds point at their stage modules.
+		std::deque<ShaderModule>                     modules;
 		bool                                         skip_dispatch = false;
 
 		[[nodiscard]] std::span<const uint32_t> FunctionCode() const;
@@ -240,8 +272,31 @@ private:
 	};
 
 	using ModuleMap = std::unordered_map<uint64_t, const ShaderModule*>;
+	using Stages    = std::array<const ShaderModule*, 4>;
 
-	GraphicContext&                        m_graphics;
+	// One pipeline built in the background. A worker fills `pipeline` and then sets `completed`.
+	// Everything else is the GPU thread's.
+	struct GraphicsBuild {
+		GraphicsBuild(const GraphicsPipelineKey& request_key, const Stages& request_stages);
+
+		GraphicsPipelineKey                   key;
+		Stages                                stages;
+		Pipeline                              pipeline;
+		std::chrono::steady_clock::time_point requested;
+		// Written by the worker before `completed`, so read it only after seeing that set.
+		double                                ready_ms = 0.0;
+		std::atomic<bool>                     completed {false};
+		bool                                  adopted        = false;
+		uint32_t                              skipped_draws  = 0;
+	};
+
+	// A build that is queued or running, with the handle to wait for it.
+	struct PendingBuild {
+		std::shared_ptr<GraphicsBuild>  build;
+		PipelineBuildQueue::JobPtr      job;
+	};
+
+	GraphicContext&                      m_graphics;
 	ShaderRecompiler::IR::ImageHeapSource* m_image_heap;
 	std::unordered_map<ProgramKey, Program, ProgramKeyHash> m_program_cache;
 	// Modules compiled per stage.
@@ -250,12 +305,24 @@ private:
 	vk::PipelineCache             m_driver_cache = nullptr;
 	std::filesystem::path         m_driver_cache_path;
 	std::chrono::steady_clock::time_point m_next_driver_cache_save;
-	bool                          m_driver_cache_dirty = false;
+	// Set by a worker too, when a background build adds to the driver cache, so the save at exit
+	// that follows StopBuilds writes the builds that finished after the last one.
+	std::atomic<bool>             m_driver_cache_dirty {false};
 	std::unordered_map<GraphicsPipelineKey, Pipeline, GraphicsPipelineKeyHash> m_graphics_pipelines;
 	std::unordered_map<uint64_t, Pipeline>                                     m_compute_pipelines;
 	std::unordered_map<uint64_t, ShaderTessellationInputInfo>                  m_tess_layouts;
 	// Records everything first created; closed without a shader store.
 	ShaderStoreWriter m_store;
+	// Null unless --async-pipelines is on. Only CreatePipelineInternal runs on its workers.
+	std::unique_ptr<PipelineBuildQueue>                                          m_build_queue;
+	// Builds not yet taken into m_graphics_pipelines. Only the GPU thread touches it, like
+	// m_graphics_pipelines.
+	std::unordered_map<GraphicsPipelineKey, PendingBuild, GraphicsPipelineKeyHash> m_pending_graphics;
+	// Finished builds waiting for the GPU thread. Workers add to the list under the mutex and then
+	// set the flag, and the GPU thread clears the flag before it takes the list.
+	std::mutex                                                                   m_published_mutex;
+	std::vector<std::shared_ptr<GraphicsBuild>>                                  m_published;
+	std::atomic<bool>                                                            m_has_published {false};
 
 	template <typename InputInfo>
 	const ShaderModule* GetProgram(const ShaderParams& params, InputInfo& input_info,
@@ -266,6 +333,30 @@ private:
 	                            uint32_t                          push_data_cursor);
 	void InitializeDriverCache();
 	void CheckpointDriverCache();
+
+	// Fills the key a draw's pipeline is stored under. The stages are the draw's compiled modules.
+	[[nodiscard]] GraphicsPipelineKey MakeGraphicsPipelineKey(const CommandBuffer&   command,
+	                                                          const DrawRenderState& state,
+	                                                          const Stages&          stages) const;
+	// Creates the pipeline on this thread and stores it, as every miss does without background builds.
+	Pipeline& CreateGraphicsPipelineHere(Pipeline& slot, const GraphicsPipelineKey& key,
+	                                     const Stages& stages);
+	// The background-build side of AcquireGraphicsPipeline.
+	[[nodiscard]] Pipeline* AcquireBuiltPipeline(const GraphicsPipelineKey& key,
+	                                             const Stages&              stages,
+	                                             const DrawRenderState&     state,
+	                                             const PipelineSkipPolicy*  policy);
+	// Queues the build of a key that has none and stores its record.
+	void RequestBuild(const GraphicsPipelineKey& key, const Stages& stages);
+	// Runs on a worker, or on the GPU thread when it claims the job.
+	void RunBuild(const std::shared_ptr<GraphicsBuild>& build);
+	// Waits for, or runs, a queued build and takes its pipeline.
+	Pipeline& FinishBuild(const std::shared_ptr<GraphicsBuild>& build,
+	                      const PipelineBuildQueue::JobPtr&      job);
+	// Moves a finished build's pipeline into m_graphics_pipelines. GPU thread only.
+	Pipeline& AdoptBuild(std::shared_ptr<GraphicsBuild> build);
+	// Takes every finished build the workers have published.
+	void DrainPublishedBuilds();
 
 	// pipelineSerialization.cpp
 	bool LoadRecord(std::span<const uint8_t>& records);

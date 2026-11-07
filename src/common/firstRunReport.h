@@ -75,6 +75,25 @@ struct CompileEntry {
 	int64_t  flip      = 0;
 };
 
+/// One background pipeline build the GPU thread took. ready_ms runs from the request to the end of
+/// the compile, so it includes the time in the queue, and skipped_draws counts the draws that went
+/// without the pipeline meanwhile.
+struct ReadyEntry {
+	Kind     kind           = Kind::Graphics;
+	uint64_t id             = 0;
+	uint64_t id_ps          = 0;
+	double   ready_ms       = 0.0;
+	uint32_t skipped_draws  = 0;
+};
+
+/// Draws that missed their pipeline and were refused a skip for one reason, with the time they
+/// waited for it.
+struct Refusal {
+	std::string reason;
+	uint32_t    draws      = 0;
+	double      blocked_ms = 0.0;
+};
+
 /// The GPU thread's blocking within one guest flip, merged into a single pause.
 struct Pause {
 	int64_t  flip   = 0;
@@ -105,6 +124,10 @@ struct Summary {
 	double                                                   blocked_graphics_ms = 0.0;
 	double                                                   blocked_compute_ms  = 0.0;
 	double                                                   translate_ms        = 0.0;
+	// The part of translate_ms that blocked the GPU thread in play for graphics shaders, which is
+	// in blocked_graphics_ms with the compiles and waits. The refusal times plus this reconcile
+	// with blocked_graphics_ms, up to compiles and waits that no refused draw made.
+	double                                                   translate_gpu_graphics_ms = 0.0;
 	std::vector<TranslateEntry>                              worst_translate;
 	std::array<uint32_t, PAUSE_BUCKET_BOUNDS_MS.size()>      pause_histogram {};
 	uint32_t                                                 pauses_under_first_bound = 0;
@@ -115,6 +138,8 @@ struct Summary {
 	uint32_t                                                 stamp_failures = 0;
 	std::array<uint32_t, 2>                                  skips {};
 	std::vector<std::pair<std::string, uint32_t>>            skips_by_target;
+	std::vector<std::pair<std::string, uint32_t>>            sampled_after_skip_by_target;
+	std::vector<Refusal>                                     refusals;
 };
 
 /// The raw records of one run. Thread safe, and it never reads a clock, so tests drive it with
@@ -131,8 +156,19 @@ public:
 	void AddTranslate(Kind kind, std::string_view stage, uint64_t hash, double ms, Thread thread);
 	/// Records a driver compile. Only GPU-thread time during play counts as blocked.
 	void AddCompile(Kind kind, uint64_t id, uint64_t id_ps, double create_ms, Thread thread);
+	/// Records GPU-thread time spent waiting for a compile that a worker was running. It counts as
+	/// blocked in play, though no compile ran on the GPU thread.
+	void AddWait(Kind kind, double ms);
+	/// Records how long a background pipeline took from request to ready.
+	void AddReady(Kind kind, uint64_t id, uint64_t id_ps, double ready_ms, uint32_t skipped_draws);
 	/// Records a skipped draw or dispatch against a target class.
 	void AddSkip(SkipKind kind, std::string_view target_class);
+	/// Records skipped draws whose target was then read as a texture, against a target class.
+	void AddSampledAfterSkip(std::string_view target_class, uint32_t draws);
+	/// Records a draw that missed its pipeline and was refused a skip, and how long it waited.
+	void AddRefusal(std::string_view reason, double blocked_ms);
+	/// The GPU-thread time blocked so far in play for the kind.
+	[[nodiscard]] double BlockedMs(Kind kind) const;
 	/// Records a module that --cold-pipelines could not stamp, so it compiled unstamped.
 	void AddStampFailure();
 	/// Forgets everything recorded. For tests, which share the process-wide report.
@@ -147,6 +183,8 @@ public:
 	                                 double run_seconds) const;
 	/// Copy of the compile rows, for tests.
 	[[nodiscard]] std::vector<CompileEntry> Compiles() const;
+	/// Copy of the ready rows, for tests.
+	[[nodiscard]] std::vector<ReadyEntry> Readies() const;
 
 private:
 	// Moves the pause being merged to the finished ones when it belongs to another flip. Caller
@@ -165,13 +203,17 @@ private:
 	BootInfo                     m_boot;
 	std::array<double, 2>        m_blocked_ms {};
 	double                       m_translate_ms = 0.0;
+	double                       m_translate_gpu_graphics_ms = 0.0;
 	std::vector<TranslateEntry>  m_translates;
 	std::vector<CompileEntry>    m_compiles;
+	std::vector<ReadyEntry>      m_readies;
 	std::vector<Pause>           m_pauses;
 	bool                         m_has_pending_pause = false;
 	Pause                        m_pending_pause;
 	std::array<uint32_t, 2>      m_skips {};
 	std::vector<std::pair<std::string, uint32_t>> m_skips_by_target;
+	std::vector<std::pair<std::string, uint32_t>> m_sampled_after_skip;
+	std::vector<Refusal>                          m_refusals;
 };
 
 /// The report of this process.
@@ -215,11 +257,44 @@ inline void SetBoot(const BootInfo& boot) {
 	}
 }
 
-/// Records a skipped draw or dispatch. Nothing skips yet, so the counts stay zero until a
-/// strategy calls this.
+/// Records a skipped draw or dispatch. The counts stay zero until a strategy calls this.
 inline void AddSkip(SkipKind kind, std::string_view target_class) {
 	if (Enabled()) {
 		Global().AddSkip(kind, target_class);
+	}
+}
+
+/// The GPU-thread time blocked so far for the kind, or zero with the report off.
+[[nodiscard]] inline double BlockedMs(Kind kind) {
+	return Enabled() ? Global().BlockedMs(kind) : 0.0;
+}
+
+/// Records a draw that missed its pipeline and was refused a skip, and how long it waited.
+inline void AddRefusal(std::string_view reason, double blocked_ms) {
+	if (Enabled()) {
+		Global().AddRefusal(reason, blocked_ms);
+	}
+}
+
+/// Records skipped draws whose target was then read as a texture, a sign that a skip left damage.
+inline void AddSampledAfterSkip(std::string_view target_class, uint32_t draws) {
+	if (Enabled()) {
+		Global().AddSampledAfterSkip(target_class, draws);
+	}
+}
+
+/// Records GPU-thread time spent waiting for a compile that a worker was running.
+inline void AddWait(Kind kind, double ms) {
+	if (Enabled()) {
+		Global().AddWait(kind, ms);
+	}
+}
+
+/// Records how long a background pipeline took from request to ready.
+inline void AddReady(Kind kind, uint64_t id, uint64_t id_ps, double ready_ms,
+                     uint32_t skipped_draws) {
+	if (Enabled()) {
+		Global().AddReady(kind, id, id_ps, ready_ms, skipped_draws);
 	}
 }
 

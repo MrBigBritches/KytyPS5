@@ -25,8 +25,12 @@ RenderContext::RenderContext(GraphicContext& graphics, const std::filesystem::pa
 	m_pipeline_cache.WarmUp(shader_store);
 }
 
+// Stops the GPU and the background builds before the caches they use go, then lifts the guards.
 RenderContext::~RenderContext() {
 	ShutdownGpu();
+	// Background builds read the image heap's layout, which the heap destroys before the pipeline
+	// cache is gone, so they stop here.
+	m_pipeline_cache.StopBuilds();
 	m_command_scheduler.Shutdown();
 	// Every landing has run by now, so this only lifts what a landing missed.
 	m_texture_cache.GetReadbackGuard().LiftAll();

@@ -5,6 +5,7 @@
 #include "graphics/shader/shader.h"
 #include "graphics/shader/shaderBindings.h"
 
+#include <algorithm>
 #include <cstring>
 
 namespace Libs::Graphics {
@@ -90,6 +91,14 @@ bool HasShaderBufferWrites(const ShaderStageRuntime& runtime) {
 		has_writes |= descriptor.Base48() != 0 && descriptor.NumRecords() != 0;
 	}
 	return has_writes;
+}
+
+bool HasShaderOutputsBeyondTargets(const ShaderStageRuntime& runtime) {
+	const auto& info = runtime.module->info.info;
+	// Any written image counts, without checking its descriptor, because a skipped draw must never
+	// lose a write that a later pass or the guest could read.
+	return HasShaderBufferWrites(runtime) || info.uses_gds || info.uses_dma ||
+	       std::ranges::any_of(info.images, [](const auto& image) { return image.written; });
 }
 
 void ShaderAccessBarrier(vk::CommandBuffer vk_buffer, vk::PipelineStageFlags source_stages) {

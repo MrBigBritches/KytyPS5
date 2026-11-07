@@ -570,6 +570,12 @@ add_executable(occlusion_queries_tests EXCLUDE_FROM_ALL
 target_link_libraries(occlusion_queries_tests common fmt::fmt Vulkan::Headers)
 target_include_directories(occlusion_queries_tests PRIVATE ${inc_headers})
 
+add_executable(pipeline_build_queue_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/PipelineBuildQueueTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/pipelineBuildQueue.cpp")
+target_link_libraries(pipeline_build_queue_tests common fmt::fmt)
+target_include_directories(pipeline_build_queue_tests PRIVATE ${inc_headers})
+
 add_executable(ces_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/CesTests.cpp")
 target_link_libraries(ces_tests common fmt::fmt SDL3::SDL3-static)
 target_include_directories(ces_tests PRIVATE ${inc_headers})
@@ -705,6 +711,10 @@ if(BUILD_TESTING)
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --first-run-report)
 	add_test(NAME emulator_cold_pipelines_cli
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --cold-pipelines)
+	add_test(NAME emulator_async_pipelines_cli
+	         COMMAND $<TARGET_FILE:kyty_emulator> --help --async-pipelines)
+	add_test(NAME emulator_async_pipelines_depth_only_cli
+	         COMMAND $<TARGET_FILE:kyty_emulator> --help --async-pipelines-depth-only)
 	add_test(NAME emulator_skip_redundant_unmap_drains_cli
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --skip-redundant-unmap-drains)
 	add_test(NAME emulator_keep_gpu_cache_on_reuse_cli
@@ -761,6 +771,9 @@ if(BUILD_TESTING)
 	add_test(NAME jpeg_dec COMMAND $<TARGET_FILE:jpeg_dec_tests>)
 	add_test(NAME jpeg_enc COMMAND $<TARGET_FILE:jpeg_enc_tests>)
 	add_test(NAME occlusion_queries COMMAND $<TARGET_FILE:occlusion_queries_tests>)
+	add_test(NAME pipeline_build_queue COMMAND $<TARGET_FILE:pipeline_build_queue_tests>)
+	# A lost wakeup or a job run twice shows up as a hang, so fail fast.
+	set_tests_properties(pipeline_build_queue PROPERTIES TIMEOUT 60)
 	add_test(NAME ces COMMAND $<TARGET_FILE:ces_tests>)
 	add_test(NAME save_data_dialog COMMAND $<TARGET_FILE:save_data_dialog_tests>)
 	add_test(NAME http_uri_parse COMMAND $<TARGET_FILE:http_uri_parse_tests>)
@@ -777,6 +790,10 @@ if(BUILD_TESTING)
 	add_test(NAME shader_recompiler_cold_pipelines
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --cold-pipelines-only)
 	set_tests_properties(shader_recompiler_cold_pipelines PROPERTIES TIMEOUT 60)
+	add_test(NAME shader_recompiler_async_pipelines
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --async-pipelines-only)
+	# A build that never finishes or a worker that is never released shows up as a hang.
+	set_tests_properties(shader_recompiler_async_pipelines PROPERTIES TIMEOUT 120)
 	add_test(NAME shader_recompiler_tessellation
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --tessellation-only)
 	add_test(NAME shader_recompiler_float_min_max
@@ -896,6 +913,7 @@ if(BUILD_TESTING)
 		jpeg_dec_tests
 		jpeg_enc_tests
 		occlusion_queries_tests
+		pipeline_build_queue_tests
 		ces_tests
 		save_data_dialog_tests
 		http_uri_parse_tests

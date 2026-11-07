@@ -102,6 +102,105 @@ void TestOnlyGpuThreadBlocks() {
   Check(Near(boot.Summarize().blocked_graphics_ms, 50.0), "boot compile counted as blocked");
 }
 
+// Waiting for a compile that a worker is running blocks the GPU thread, though no compile ran on
+// it. Like any blocking it counts toward the kind's total and the flip's pause during play only,
+// and it adds no compile row, because the worker recorded its own. The baseline is the same figure
+// recorded as a worker compile counts for nothing.
+void TestWaitingBlocksTheGpuThread() {
+  Report waited;
+  waited.OnFlip(3);
+  waited.AddCompile(Kind::Graphics, 1, 2, 900.0, Thread::Worker);
+  Check(Near(waited.Summarize().blocked_graphics_ms, 0.0), "the worker compile alone blocked");
+  waited.AddWait(Kind::Graphics, 120.0);
+  const auto summary = waited.Summarize();
+  Check(Near(summary.blocked_graphics_ms, 120.0) && Near(summary.blocked_compute_ms, 0.0),
+        "waiting was not counted as blocked graphics time");
+  Check(summary.pause_count == 1 && Near(summary.longest_pause_ms, 120.0) &&
+            summary.longest_pauses[0].flip == 3 && summary.longest_pauses[0].events == 1,
+        "waiting was not merged into the pause of its flip");
+  Check(waited.Compiles().size() == 1, "waiting added a compile row");
+
+  Report boot;
+  boot.SetPhase(Phase::Boot);
+  boot.AddWait(Kind::Graphics, 120.0);
+  Check(Near(boot.Summarize().blocked_graphics_ms, 0.0), "waiting during boot counted as blocked");
+}
+
+// A ready row keeps what the GPU thread learned when it took a background build, and is written
+// to the file.
+void TestReadyRows() {
+  Report report;
+  Check(report.Readies().empty(), "a new report had ready rows");
+  report.AddReady(Kind::Graphics, 0x11, 0x22, 42.5, 3);
+  const auto rows = report.Readies();
+  Check(rows.size() == 1 && rows[0].id == 0x11 && rows[0].id_ps == 0x22 &&
+            Near(rows[0].ready_ms, 42.5) && rows[0].skipped_draws == 3,
+        "the ready row lost a field");
+  const auto json = report.ToJson({}, 0, 1.0);
+  for (const char *needle : {"\"ready\"", "\"ready_ms\": 42.5", "\"skipped_draws\": 3",
+                             "\"vs\": \"0000000000000011\""}) {
+    Check(json.find(needle) != std::string::npos, needle);
+  }
+  report.Reset();
+  Check(report.Readies().empty(), "Reset kept the ready rows");
+}
+
+// Skipped draws that were sampled afterwards are summed per target class, written to the file, and
+// forgotten by Reset. The baseline is a report with skips and no samples, which writes none.
+void TestSampledAfterSkip() {
+  Report quiet;
+  quiet.AddSkip(SkipKind::Draw, "depth_only");
+  Check(quiet.Summarize().sampled_after_skip_by_target.empty(), "skips alone were counted as sampled");
+  Report report;
+  report.AddSampledAfterSkip("depth", 2);
+  report.AddSampledAfterSkip("color", 1);
+  report.AddSampledAfterSkip("depth", 3);
+  const auto summary = report.Summarize();
+  Check(summary.sampled_after_skip_by_target.size() == 2 &&
+            summary.sampled_after_skip_by_target[0].first == "depth" &&
+            summary.sampled_after_skip_by_target[0].second == 5 &&
+            summary.sampled_after_skip_by_target[1].second == 1,
+        "sampled skips were not summed per target class");
+  const auto json = report.ToJson({}, 0, 1.0);
+  Check(json.find("\"sampled_after_skip_by_target_class\"") != std::string::npos &&
+            json.find("\"depth\": 5") != std::string::npos,
+        "the file lacks the sampled skip counts");
+  report.Reset();
+  Check(report.Summarize().sampled_after_skip_by_target.empty(), "Reset kept sampled skips");
+}
+
+// Refused draws are summed per rule with their blocked time, written to the file, and forgotten by
+// Reset. The blocked total is readable while it grows, and the graphics translate that blocked the
+// GPU thread is kept apart. A worker's translate, or one in boot, is in neither.
+void TestRefusalsAndBlockedTotals() {
+  Report report;
+  report.AddRefusal("too_few_draws", 10.0);
+  report.AddRefusal("writer", 1.5);
+  report.AddRefusal("too_few_draws", 5.0);
+  const auto summary = report.Summarize();
+  Check(summary.refusals.size() == 2 && summary.refusals[0].reason == "too_few_draws" &&
+            summary.refusals[0].draws == 2 && Near(summary.refusals[0].blocked_ms, 15.0) &&
+            summary.refusals[1].draws == 1 && Near(summary.refusals[1].blocked_ms, 1.5),
+        "refusals were not summed per rule");
+  const auto json = report.ToJson({}, 0, 1.0);
+  for (const char *needle : {"\"refused\"", "\"too_few_draws\"", "\"draws\": 2",
+                             "\"blocked_ms\": 15.0"}) {
+    Check(json.find(needle) != std::string::npos, needle);
+  }
+  report.Reset();
+  Check(report.Summarize().refusals.empty(), "Reset kept refusals");
+
+  Report totals;
+  totals.AddTranslate(Kind::Graphics, "vs", 1, 40.0, Thread::Gpu);
+  totals.AddTranslate(Kind::Graphics, "vs", 2, 7.0, Thread::Worker);
+  totals.AddTranslate(Kind::Compute, "cs", 3, 9.0, Thread::Gpu);
+  totals.AddCompile(Kind::Graphics, 1, 2, 25.0, Thread::Gpu);
+  Check(Near(totals.BlockedMs(Kind::Graphics), 65.0) && Near(totals.BlockedMs(Kind::Compute), 9.0),
+        "the blocked total was not readable per kind");
+  Check(Near(totals.Summarize().translate_gpu_graphics_ms, 40.0),
+        "the GPU-thread graphics translate was not kept apart from the others");
+}
+
 // Pauses fall in the highest bucket whose bound they reach, so each edge belongs to the upper
 // bucket and anything below the first bound is counted apart.
 void TestHistogramEdges() {
@@ -380,6 +479,10 @@ int main() {
   TestPausesMergeByFlip();
   TestPendingPauseCounts();
   TestOnlyGpuThreadBlocks();
+  TestWaitingBlocksTheGpuThread();
+  TestReadyRows();
+  TestSampledAfterSkip();
+  TestRefusalsAndBlockedTotals();
   TestHistogramEdges();
   TestTopListsAreCapped();
   TestSkipsAndFlips();

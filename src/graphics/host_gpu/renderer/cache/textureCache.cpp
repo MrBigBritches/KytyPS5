@@ -3,6 +3,7 @@
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/debugCounters.h"
+#include "common/firstRunReport.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -1874,6 +1875,89 @@ void TextureCache::MarkGpuWritten(ImageId id) {
 		TrackImage(stencil_id);
 		CommitGpuWrite(m_slot_images[stencil_id]);
 	}
+}
+
+namespace {
+
+// Whether a view is the whole image, which has one level, so one history can speak for it.
+bool ViewIsWholeImage(const Image& image, const ImageViewInfo& view) {
+	const auto& resources = image.info.resources;
+	return resources.levels == 1 && view.base_level == 0 && view.level_count == 1 &&
+	       view.base_layer == 0 && view.layer_count == resources.layers;
+}
+
+} // namespace
+
+void TextureCache::NoteRenderTargetUse(ImageId id, const ImageViewInfo& view, bool cleared,
+                                       bool htile_cleared) {
+	std::scoped_lock lock {m_lock};
+	auto&            image = m_slot_images[id];
+	if (!ViewIsWholeImage(image, view)) {
+		return;
+	}
+	image.attached_frames.Note(m_gc_tick);
+	if (htile_cleared) {
+		image.htile_cleared_frames.Note(m_gc_tick);
+	}
+	if (cleared) {
+		image.cleared_frames.Note(m_gc_tick);
+		// A clear of the whole target repairs what a skipped draw left out of it.
+		image.skipped_draws = 0;
+	}
+}
+
+TextureCache::RebuildVerdict TextureCache::JudgeRebuiltEveryFrame(ImageId id,
+                                                                  const ImageViewInfo& view,
+                                                                  bool needs_clear,
+                                                                  uint32_t min_draws) {
+	std::scoped_lock lock {m_lock};
+	const auto&      image = m_slot_images[id];
+	if (!ViewIsWholeImage(image, view)) {
+		return RebuildVerdict::PartialView;
+	}
+	const bool cleared = image.cleared_frames.InConsecutiveFrames(m_gc_tick, 1);
+	if (!image.attached_frames.InConsecutiveFrames(m_gc_tick, min_draws)) {
+		// The frame before is the evidence that does not depend on this frame's own first draw.
+		const bool cleared_before = m_gc_tick > 0 && image.cleared_frames.HappenedIn(m_gc_tick - 1);
+		return needs_clear && !cleared_before ? RebuildVerdict::TooFewDrawsUncleared
+		                                      : RebuildVerdict::TooFewDraws;
+	}
+	if (needs_clear && !cleared) {
+		return image.htile_cleared_frames.InConsecutiveFrames(m_gc_tick, 1)
+		           ? RebuildVerdict::HtileClearedOnly
+		           : RebuildVerdict::NotCleared;
+	}
+	return RebuildVerdict::Rebuilt;
+}
+
+bool TextureCache::NoteSkippedTarget(ImageId id, bool depth) {
+	std::scoped_lock lock {m_lock};
+	auto&            image = m_slot_images[id];
+	if (image.heap_refs.load(std::memory_order_relaxed) != 0u) {
+		return true;
+	}
+	image.skipped_draws++;
+	image.skipped_as_depth = depth;
+	return false;
+}
+
+void TextureCache::NoteHeapSelected(ImageId id) {
+	auto& image = m_slot_images[id];
+	image.heap_refs.fetch_add(1u, std::memory_order_relaxed);
+	bool depth = false;
+	if (const auto skipped = TakeSkippedDraws(id, &depth); skipped != 0) {
+		Common::FirstRunReport::AddSampledAfterSkip(depth ? "heap_depth" : "heap_color", skipped);
+	}
+}
+
+uint32_t TextureCache::TakeSkippedDraws(ImageId id, bool* depth) {
+	// Reads without the lock, like the other per-draw lookups of the GPU thread's bindings.
+	auto& image = m_slot_images[id];
+	if (image.skipped_draws == 0) {
+		return 0;
+	}
+	*depth               = image.skipped_as_depth;
+	return std::exchange(image.skipped_draws, 0u);
 }
 
 void TextureCache::CommitGpuWrite(Image& image) {

@@ -684,6 +684,11 @@ struct TextureCacheTestAccess {
 };
 
 struct RenderExecutorTestAccess {
+  // Resolves the image views of a stage's prepared bindings, as every draw and dispatch does.
+  static void RebindImages(RenderExecutor &executor, PreparedBindings &bindings) {
+    executor.RebindImages(bindings);
+  }
+
   static bool DrawIndex(RenderExecutor &executor, CommandBuffer &command,
                         const DrawIndexArgs &args) {
     return executor.DrawIndex(command, args);
@@ -923,6 +928,81 @@ struct PipelineCacheTestAccess {
 
   static std::array<size_t, 2> Pipelines(const PipelineCache &cache) {
     return {cache.m_graphics_pipelines.size(), cache.m_compute_pipelines.size()};
+  }
+
+  static bool HasBuildQueue(const PipelineCache &cache) { return cache.m_build_queue != nullptr; }
+
+  static size_t Programs(const PipelineCache &cache) { return cache.m_program_cache.size(); }
+
+  // Marks the driver cache as changed, as a worker does when a background build adds to it.
+  static void SetDriverCacheDirty(PipelineCache &cache, bool value) {
+    cache.m_driver_cache_dirty.store(value);
+  }
+
+  // Whether the driver cache has changes the next save would write.
+  static bool DriverCacheDirty(const PipelineCache &cache) { return cache.m_driver_cache_dirty.load(); }
+
+  // Whether a worker has published a finished build that no request has taken yet.
+  static bool HasPublished(const PipelineCache &cache) { return cache.m_has_published.load(); }
+
+  // Sets the flag that tells the GPU thread a build was published. Clearing it makes the next
+  // request skip the drain and meet a build that has finished but is still pending, as one does
+  // for the instant between a worker's two steps.
+  static void SetHint(PipelineCache &cache, bool value) { cache.m_has_published.store(value); }
+
+  // Whether the build queue has begun to stop.
+  static bool QueueStopping(const PipelineCache &cache) {
+    return cache.m_build_queue != nullptr && cache.m_build_queue->Stopping();
+  }
+
+  // Builds requested and not yet taken into the cache.
+  static size_t PendingBuilds(const PipelineCache &cache) {
+    return cache.m_pending_graphics.size();
+  }
+
+  // How many pending builds a worker has finished.
+  static size_t FinishedBuilds(const PipelineCache &cache) {
+    return static_cast<size_t>(std::ranges::count_if(
+        cache.m_pending_graphics, [](const auto &entry) {
+          return entry.second.build->completed.load();
+        }));
+  }
+
+  // Occupies every build worker until released, or until the queue stops, so builds posted
+  // meanwhile stay queued. Returns once every worker is held.
+  struct BuildHold {
+    std::atomic<bool> release{false};
+    std::vector<PipelineBuildQueue::JobPtr> jobs;
+  };
+  static void HoldBuildQueue(PipelineCache &cache, BuildHold &hold) {
+    auto *queue = cache.m_build_queue.get();
+    for (uint32_t worker = 0; worker < queue->WorkerCount(); worker++) {
+      hold.jobs.push_back(queue->Post([&hold, queue] {
+        while (!hold.release.load() && !queue->Stopping()) std::this_thread::yield();
+      }));
+    }
+    for (const auto &job : hold.jobs) {
+      while (job->GetState() != PipelineBuildQueue::State::Running) std::this_thread::yield();
+    }
+  }
+
+  // Waits until every build posted before has finished. One job per worker is queued behind them,
+  // and all of those run at once only when no worker is still busy with an earlier job.
+  static void DrainBuildQueue(PipelineCache &cache) {
+    std::atomic<uint32_t> arrived{0};
+    std::atomic<bool> go{false};
+    std::vector<PipelineBuildQueue::JobPtr> jobs;
+    for (uint32_t worker = 0; worker < cache.m_build_queue->WorkerCount(); worker++) {
+      jobs.push_back(cache.m_build_queue->Post([&] {
+        arrived++;
+        while (!go.load()) std::this_thread::yield();
+      }));
+    }
+    while (arrived.load() != cache.m_build_queue->WorkerCount()) std::this_thread::yield();
+    go = true;
+    for (const auto &job : jobs) {
+      while (job->GetState() != PipelineBuildQueue::State::Done) std::this_thread::yield();
+    }
   }
 };
 
@@ -2690,6 +2770,54 @@ u32 EncodeD16AsD32(uint16_t value) {
 
 // A clear word that no fixed DCC code produces, so only the register clear can explain it.
 constexpr uint32_t ColorClearRegisterWord = 0x2a5a96a5u;
+
+// How long a test waits for a background build before it fails, so a lost wakeup cannot hang it.
+constexpr auto BUILD_WAIT_LIMIT = std::chrono::seconds(20);
+// How long a held build stays held while the test goes on to wait for it. It only has to be long
+// enough for the other thread to reach its wait, and no assertion depends on its length.
+constexpr auto BUILD_HOLD_DELAY = std::chrono::milliseconds(150);
+
+// Waits for a condition that another thread makes true, and fails instead of hanging.
+template <typename Condition>
+void WaitUntilTrue(const char *name, const char *stage, Condition condition) {
+  const auto deadline = std::chrono::steady_clock::now() + BUILD_WAIT_LIMIT;
+  while (!condition()) {
+    Require(name, stage, std::chrono::steady_clock::now() < deadline,
+            "a background build did not finish in time");
+    std::this_thread::yield();
+  }
+}
+
+// The width and height of the targets the async draw and gate tests make.
+constexpr uint32_t GATE_TARGET_EXTENT = 32;
+
+// How a gate case views its image. The image has `layers` layers of one level, and the view
+// starts at `base_layer` and spans `view_layers` layers of `view_levels` levels from `base_level`.
+struct GateView {
+  uint32_t layers = 1;
+  uint32_t base_layer = 0;
+  uint32_t view_layers = 1;
+  uint32_t base_level = 0;
+  uint32_t view_levels = 1;
+  // The width and height of the color target, which the depth target may be larger than.
+  uint32_t color_extent = GATE_TARGET_EXTENT;
+  // Layers of the color image when they differ from the depth image's, which its view spans.
+  uint32_t color_layers = 0;
+  // Which layered address the case uses, so layered cases with different layouts keep apart.
+  uint32_t slot = 0;
+};
+
+// One frame of a gate case. The color target had `color_draws` draws and the depth target
+// `depth_draws`, and the clear register was set on each draw that reached the depth target if
+// `clear`. A frame with no value is a frame without draws.
+struct GateFrame {
+  bool color = true;
+  bool depth = true;
+  bool clear = true;
+  uint32_t color_draws = MIN_DRAWS_FOR_SKIP;
+  uint32_t depth_draws = MIN_DRAWS_FOR_SKIP;
+};
+using GateScript = std::vector<std::optional<GateFrame>>;
 
 class VulkanHarness {
 public:
@@ -18528,6 +18656,1052 @@ public:
     auto result = ReadBuffer(name, probe, bytes / 4);
     DestroyBuffer(&probe);
     return result;
+  }
+
+  // Draws that go without a pipeline under --async-pipelines, and the rule that lets them.
+
+  static constexpr uint32_t AsyncExtent = GATE_TARGET_EXTENT;
+  static constexpr uintptr_t AsyncBase = 0x0000000205a00000ull;
+  static constexpr uint64_t AsyncSize = 0x400000;
+  static constexpr uint64_t AsyncAlignment = 0x100000;
+  static constexpr uint64_t AsyncColorOffset = 0x10000;
+  static constexpr uint64_t AsyncHtileOffset = 0x30000;
+  static constexpr uint64_t AsyncArgsOffset = 0x40000;
+  static constexpr u32 AsyncSentinelColor = 0x3f000000u;  // 0.5f
+  static constexpr u32 AsyncDrawnRgb = 0x3e800000u;       // 0.25f, from the pixel shader
+  static constexpr u32 AsyncDrawnAlpha = 0x3f800000u;     // 1.0f
+  static constexpr float AsyncSentinelDepth = 0.5f;
+  static constexpr float AsyncClearDepth = 0.75f;
+
+  // One render context drawing a full-screen triangle into a float color target and a depth target.
+  // Frames are texture cache ticks, as at a guest flip.
+  struct AsyncDrawRig {
+    VulkanHarness &harness;
+    std::optional<RenderContext> context;
+    int64_t direct_offset = -1;
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    RenderColorInfo color{};
+    RenderDepthInfo depth{};
+    bool htile = false;
+    // Set while the draws have no color target, which leaves the color image unmade.
+    bool depth_only_draws = false;
+    // Makes the rig. `async` turns on background builds under the default skip rule, and
+    // `depth_only` turns on the second mode instead. `use_htile` gives the depth target HTILE.
+    AsyncDrawRig(VulkanHarness &owner, bool async, bool use_htile = false, bool occlusion = false,
+                 bool depth_only = false)
+        : harness(owner), htile(use_htile) {
+      Config::Load({.printf_direction = Config::LogDirection::Silent,
+                    .occlusion_queries_enabled = occlusion,
+                    .first_run_report_enabled = true,
+                    .async_pipelines_enabled = async,
+                    .async_pipelines_depth_only_enabled = depth_only});
+      Common::FirstRunReport::Global().Reset();
+      harness.EnsureRuntimeContext();
+      context.emplace(harness.m_runtime_context);
+      MapGuestMemory();
+      registers.SetRenderTargetMask(0xf);
+      registers.SetShaderMask(0xf);
+      Scheduler().Begin(registers, user_config, shaders);
+      const auto [vertex_address, pixel_address] = MapShaders();
+      SetUpRegisters(vertex_address, pixel_address);
+    }
+
+    // A vertex shader that covers the target with one triangle and a pixel shader that writes a
+    // constant gray. Returns their addresses, after telling the shader map about them.
+    static std::pair<uint64_t, uint64_t> MapShaders() {
+      static const auto vertex = [] {
+        std::vector<u32> code;
+        AppendVMovLiteral(&code, 1, 0xbf800000u);
+        AppendVMovLiteral(&code, 2, 0x40400000u);
+        code.push_back(EncodeVopc(0xc2, InlineU32(1), 5));
+        code.push_back(EncodeVop2(0x01, 3, Vgpr(1), 2));
+        code.push_back(EncodeVopc(0xc2, InlineU32(2), 5));
+        code.push_back(EncodeVop2(0x01, 4, Vgpr(1), 2));
+        AppendVMovU32(&code, 0, 0);
+        AppendVMovLiteral(&code, 6, 0x3f800000u);
+        code.push_back(EncodeExp0(0x0c, 0xf));
+        code.push_back(EncodeExp1(3, 4, 0, 6));
+        for (u32 parameter = 0; parameter < 8; parameter++) {
+          code.push_back(EncodeExp0(0x20 + parameter, 0xf));
+          code.push_back(EncodeExp1(0, 0, 0, 0));
+        }
+        AppendEnd(&code);
+        return code;
+      }();
+      static const auto pixel = [] {
+        std::vector<u32> code;
+        AppendVMovLiteral(&code, 1, 0x3e800000u);
+        AppendVMovLiteral(&code, 2, 0x3f800000u);
+        code.push_back(EncodeExp0(0x00, 0xf));
+        code.push_back(EncodeExp1(1, 1, 1, 2));
+        AppendEnd(&code);
+        return code;
+      }();
+      static ShaderUserData vertex_user_data{};
+      ShaderMapUserData(reinterpret_cast<uint64_t>(vertex.data()),
+                        {.type = Prospero::ShaderBinaryType::kGs, .user_data = &vertex_user_data,
+                         .code_size_bytes = static_cast<u32>(vertex.size() * sizeof(u32))});
+      ShaderMapUserData(reinterpret_cast<uint64_t>(pixel.data()),
+                        {.type = Prospero::ShaderBinaryType::kPs,
+                         .code_size_bytes = static_cast<u32>(pixel.size() * sizeof(u32))});
+      return {reinterpret_cast<uint64_t>(vertex.data()), reinterpret_cast<uint64_t>(pixel.data())};
+    }
+
+    // Maps zeroed guest memory for the targets and tells the context about it.
+    void MapGuestMemory() {
+      Require("AsyncDraws", "direct allocation",
+              LibKernel::Memory::KernelAllocateDirectMemory(
+                  0, LibKernel::Memory::KernelGetDirectMemorySize(), AsyncSize, AsyncAlignment, 0,
+                  &direct_offset) == 0,
+              "allocation failed");
+      void *mapped = reinterpret_cast<void *>(AsyncBase);
+      Require("AsyncDraws", "direct mapping",
+              LibKernel::Memory::KernelMapDirectMemory(&mapped, AsyncSize, 0x3, 0x10,
+                                                       direct_offset, AsyncAlignment) == 0,
+              "mapping failed");
+      std::memset(mapped, 0, AsyncSize);
+      context->MapMemory(AsyncBase, AsyncSize);
+    }
+
+
+
+    ~AsyncDrawRig() {
+      context->UnmapMemory(AsyncBase, AsyncSize);
+      Scheduler().Finish();
+      context.reset();
+      LibKernel::Memory::KernelMunmap(AsyncBase, AsyncSize);
+      LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, AsyncSize);
+      Config::Load({.printf_direction = Config::LogDirection::Silent});
+    }
+    AsyncDrawRig(const AsyncDrawRig &) = delete;
+    AsyncDrawRig &operator=(const AsyncDrawRig &) = delete;
+
+    CommandScheduler &Scheduler() { return context->GetCommandScheduler(); }
+    PipelineCache &Pipelines() { return context->GetPipelineCache(); }
+    TextureCache &Textures() { return context->GetTextureCache(); }
+
+    void SetUpRegisters(uint64_t vertex_address, uint64_t pixel_address) {
+      constexpr auto extent = AsyncExtent;
+      registers.SetViewportTransformControl(0x300);
+      registers.SetViewportScaleOffset(0, extent / 2, extent / 2, extent / 2, extent / 2, 1, 0);
+      registers.SetViewportZMax(0, 1);
+      registers.SetScreenScissor(0, 0, extent, extent);
+      registers.SetWindowScissor(0, 0, extent, extent, false);
+      registers.SetGenericScissor(0, 0, extent, extent, false);
+      registers.SetPsInControl(0x8000);
+      registers.SetColorBase(0, {.addr = AsyncBase + AsyncColorOffset});
+      registers.SetColorInfo(0, {.format = Prospero::ChannelLayout::k32_32_32_32,
+                                 .channel_type = Prospero::ChannelType::kFloat,
+                                 .channel_order = Prospero::ChannelOrder::kStandard});
+      registers.SetColorAttrib2(0, {.height = extent - 1, .width = extent - 1});
+      registers.SetColorAttrib3(0, {.tile_mode = Prospero::TileMode::kLinear, .dimension = 1});
+      registers.SetTargetOutputMode(0, 4);
+      HW::DepthRenderTarget target{};
+      target.z_info.format = Prospero::DepthFormat::kZ32F;
+      target.z_info.htile_acceleration = htile;
+      target.htile_data_base_addr = htile ? AsyncBase + AsyncHtileOffset : 0;
+      target.z_read_base_addr = target.z_write_base_addr = AsyncBase;
+      target.size = {static_cast<uint16_t>(extent - 1), static_cast<uint16_t>(extent - 1), true};
+      registers.SetDepthRenderTarget(target);
+      registers.SetDepthControl({.z_enable = true, .z_write_enable = true,
+                                 .zfunc = static_cast<uint8_t>(vk::CompareOp::eAlways)});
+      registers.SetDepthClearValue(AsyncClearDepth);
+      user_config.SetPrimitiveType(Prospero::PrimitiveType::kTriList);
+      shaders.SetEsShaderBase(vertex_address);
+      shaders.SetPsShaderBase(pixel_address);
+    }
+
+    // The first pipeline blends nothing and the second blends one over zero, which draws the same
+    // pixels but is another pipeline key.
+    void SetSecondPipeline(bool second) {
+      auto blend = registers.GetBlendControl(0);
+      blend.enable = second;
+      blend.color_srcblend = blend.alpha_srcblend = static_cast<uint8_t>(Prospero::BlendFactor::kOne);
+      blend.color_destblend = blend.alpha_destblend = static_cast<uint8_t>(Prospero::BlendFactor::kZero);
+      registers.SetBlendControl(0, blend);
+      // The strip topology is another key too, which matters when no color target blends.
+      user_config.SetPrimitiveType(second ? Prospero::PrimitiveType::kTriStrip
+                                          : Prospero::PrimitiveType::kTriList);
+    }
+
+    // Draws into the depth target alone, with no color target and no pixel output.
+    void SetDepthOnly(bool on) {
+      depth_only_draws = on;
+      registers.SetRenderTargetMask(on ? 0 : 0xf);
+      registers.SetShaderMask(on ? 0 : 0xf);
+      registers.SetTargetOutputMode(0, on ? 0 : 4);
+    }
+
+    void SetDepthClear(bool on) { registers.SetRenderControl({.depth_clear_enable = on}); }
+
+    bool Draw(const DrawAutoArgs &args = {.vertex_count = 3, .instance_count = 1}) {
+      return RenderExecutorTestAccess::DrawAuto(context->GetRenderExecutor(),
+                                                Scheduler().Current(), args);
+    }
+
+    void NextFrame() { Textures().RunGarbageCollector(); }
+
+    // Finds the target images after a draw has made them.
+    void ResolveTargets() {
+      auto &executor = context->GetRenderExecutor();
+      if (!depth_only_draws) {
+        RenderExecutorTestAccess::ResolveRenderColorTarget(executor, Scheduler().Current(), color, 0);
+      }
+      RenderExecutorTestAccess::ResolveRenderDepthTarget(executor, Scheduler().Current(), depth);
+    }
+
+    // Marks the HTILE clear of the depth target as waiting for the next draw into it.
+    void MarkHtileClear() {
+      ResolveTargets();
+      (void)Textures().FindDepthTarget(depth.image_id, depth.desc);
+      Require("AsyncDraws", "htile registered", Textures().ClearMeta(AsyncBase + AsyncHtileOffset),
+              "the depth target did not register its HTILE metadata");
+    }
+
+    // Fills both targets with values no draw and no clear in these tests produces.
+    void PaintSentinels() {
+      ResolveTargets();
+      vk::ClearValue clear_color{};
+      clear_color.color.float32 = std::array{0.5f, 0.5f, 0.5f, 0.5f};
+      if (!depth_only_draws) {
+        TextureCacheTestAccess::ClearImage(Textures(), Scheduler().Current(), color.image_id,
+                                           {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+                                           clear_color);
+      }
+      vk::ClearValue clear_depth{};
+      clear_depth.depthStencil.depth = AsyncSentinelDepth;
+      TextureCacheTestAccess::ClearImage(Textures(), Scheduler().Current(), depth.image_id,
+                                         {vk::ImageAspectFlagBits::eDepth, 0, 1, 0, 1}, clear_depth);
+    }
+
+    std::vector<u32> ReadColor() {
+      return harness.ReadCachedTexel("AsyncDraws", *context, color.image_id, {},
+                                     {AsyncExtent, AsyncExtent, 1});
+    }
+    std::vector<u32> ReadDepth() {
+      return harness.ReadCachedTexel("AsyncDraws", *context, depth.image_id, {},
+                                     {AsyncExtent, AsyncExtent, 1});
+    }
+
+    // Two frames of the first pipeline, each with MIN_DRAWS_FOR_SKIP draws that clear the depth
+    // target, so the targets look rebuilt every frame. The second frame can have fewer. The caller
+    // is left in the second frame. With
+    // HTILE the target also has its metadata, but the clears are still the register's, because
+    // an HTILE clear does not count as one.
+    void BuildFrameHistory(uint32_t second_frame_draws = MIN_DRAWS_FOR_SKIP) {
+      SetDepthClear(true);
+      for (int frame = 0; frame < 2; frame++) {
+        const uint32_t count = frame == 0 ? MIN_DRAWS_FOR_SKIP : second_frame_draws;
+        for (uint32_t draw = 0; draw < count; draw++) {
+          Require("AsyncDraws", "history draw", Draw(), "a draw with a ready pipeline was refused");
+        }
+        if (frame == 0) NextFrame();
+      }
+    }
+  };
+
+  static bool AllEqual(const std::vector<u32> &pixels, u32 value) {
+    return std::ranges::all_of(pixels, [=](u32 word) { return word == value; });
+  }
+
+  // True when every texel is the expected drawn color (the pixel shader's gray with alpha one).
+  static bool AllDrawn(const std::vector<u32> &pixels) {
+    for (size_t index = 0; index < pixels.size(); index++) {
+      if (pixels[index] != (index % 4 == 3 ? AsyncDrawnAlpha : AsyncDrawnRgb)) return false;
+    }
+    return true;
+  }
+
+  static bool AllSentinelColor(const std::vector<u32> &pixels) {
+    return AllEqual(pixels, AsyncSentinelColor);
+  }
+
+  // With the flag off a draw that wants a new pipeline builds it and writes at once. It is the
+  // baseline for the skipped draw below, which differs only in the flag.
+  void CheckAsyncDrawsOff() {
+    constexpr const char *name = "AsyncDrawsOff";
+    AsyncDrawRig rig(*this, false);
+    rig.BuildFrameHistory();
+    rig.SetSecondPipeline(true);
+    rig.SetDepthClear(false);
+    rig.PaintSentinels();
+    Require(name, "off draws at once", rig.Draw() && AllDrawn(rig.ReadColor()),
+            "with the flag off, the draw did not write its pipeline's output at once");
+    Require(name, "off has no pool", !rig.Pipelines().BuildsInBackground(),
+            "the flag was off, but a pool exists");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // A draw whose pipeline is still being built leaves the targets as they were, then the draw that
+  // follows the build writes them.
+  void CheckAsyncDraws() {
+    constexpr const char *name = "AsyncDraws";
+    auto &report = Common::FirstRunReport::Global();
+    PipelineCacheTestAccess::BuildHold hold;
+    AsyncDrawRig rig(*this, true);
+    rig.BuildFrameHistory();
+    rig.SetSecondPipeline(true);
+    rig.SetDepthClear(false);
+    rig.PaintSentinels();
+    PipelineCacheTestAccess::HoldBuildQueue(rig.Pipelines(), hold);
+    report.Reset();
+    Require(name, "skipped draw reports a normal draw", rig.Draw(),
+            "a skipped draw reported failure, which makes the caller replay it on the CPU");
+    Require(name, "skip leaves the targets",
+            AllSentinelColor(rig.ReadColor()) &&
+                AllEqual(rig.ReadDepth(), std::bit_cast<u32>(AsyncSentinelDepth)),
+            "a draw without its pipeline changed a target");
+    const auto summary = report.Summarize();
+    Require(name, "skip counted by target class",
+            summary.skips[0] == 1 && summary.skips_by_target.size() == 1 &&
+                summary.skips_by_target[0].first == "depth_and_color",
+            "the skip was not counted once under its target class");
+    Require(name, "one build pending", PipelineCacheTestAccess::PendingBuilds(rig.Pipelines()) == 1,
+            "the skipped draw did not leave its pipeline building");
+    // The skip is marked on both targets, to be reported if one is sampled before it is repaired.
+    // Each mark is taken once. A depth clear of the whole target repairs the depth, and the
+    // color, which no clear is visible for, keeps its mark.
+    auto &textures = rig.Textures();
+    bool as_depth = false;
+    Require(name, "color mark",
+            textures.TakeSkippedDraws(rig.color.image_id, &as_depth) == 1 && !as_depth &&
+                textures.TakeSkippedDraws(rig.color.image_id, &as_depth) == 0,
+            "the skipped draw was not marked once on its color target");
+    Require(name, "depth mark",
+            textures.TakeSkippedDraws(rig.depth.image_id, &as_depth) == 1 && as_depth,
+            "the skipped draw was not marked on its depth target");
+    (void)rig.Draw();
+    textures.NoteRenderTargetUse(rig.depth.image_id, rig.depth.desc.view_info, true);
+    Require(name, "clear repairs depth",
+            textures.TakeSkippedDraws(rig.depth.image_id, &as_depth) == 0 &&
+                textures.TakeSkippedDraws(rig.color.image_id, &as_depth) == 1,
+            "a clear of the whole depth target did not clear its skip mark, or cleared the color's");
+    hold.release = true;
+    WaitUntilTrue(name, "build", [&] {
+      return PipelineCacheTestAccess::FinishedBuilds(rig.Pipelines()) == 1;
+    });
+    Require(name, "later draw writes",
+            rig.Draw() && AllDrawn(rig.ReadColor()) &&
+                PipelineCacheTestAccess::PendingBuilds(rig.Pipelines()) == 0,
+            "the draw after the build did not write its pipeline's output");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // A depth target that is only ever cleared through its HTILE metadata has no clear the CPU can
+  // size, so a draw into it waits. The register clear of the skip test above is the baseline.
+  void CheckAsyncHtileIsNotAClear() {
+    constexpr const char *name = "AsyncHtileIsNotAClear";
+    // The baseline has the same target and draws but nothing ever clears its HTILE, so the refusal
+    // is blamed on the missing clear and not on the HTILE rule.
+    for (bool htile_clears : {true, false}) {
+      PipelineCacheTestAccess::BuildHold hold;
+      AsyncDrawRig rig(*this, true, true);
+      rig.SetDepthClear(false);
+      for (int frame = 0; frame < 2; frame++) {
+        for (uint32_t draw = 0; draw < MIN_DRAWS_FOR_SKIP; draw++) {
+          if (htile_clears) rig.MarkHtileClear();
+          Require(name, "history draw", rig.Draw(), "a draw with a ready pipeline was refused");
+        }
+        if (frame == 0) rig.NextFrame();
+      }
+      rig.SetSecondPipeline(true);
+      rig.PaintSentinels();
+      PipelineCacheTestAccess::HoldBuildQueue(rig.Pipelines(), hold);
+      Common::FirstRunReport::Global().Reset();
+      Require(name, "draw waits and writes", rig.Draw() && AllDrawn(rig.ReadColor()),
+              "a draw into a target with no register clear was skipped");
+      const auto refusals = Common::FirstRunReport::Global().Summarize().refusals;
+      const char *expected = htile_clears ? "htile_only_clear" : "depth_not_cleared";
+      Require(name, "blamed on the right rule",
+              refusals.size() == 1 && refusals[0].reason == expected,
+              htile_clears ? "a target cleared only through HTILE was not blamed on that rule"
+                           : "a target nothing clears was blamed on the HTILE rule");
+    }
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // A frame that has one draw fewer than the floor does not let the next draw skip, though that
+  // draw would be the one to make up the number. The skip above, with the full floor, is the
+  // baseline, so the draw asked about is not counted as evidence for itself.
+  void CheckAsyncDrawIsNotItsOwnEvidence() {
+    constexpr const char *name = "AsyncDrawIsNotItsOwnEvidence";
+    PipelineCacheTestAccess::BuildHold hold;
+    AsyncDrawRig rig(*this, true);
+    rig.BuildFrameHistory(MIN_DRAWS_FOR_SKIP - 1);
+    rig.SetSecondPipeline(true);
+    rig.SetDepthClear(false);
+    rig.PaintSentinels();
+    PipelineCacheTestAccess::HoldBuildQueue(rig.Pipelines(), hold);
+    Common::FirstRunReport::Global().Reset();
+    Require(name, "draw waits and writes", rig.Draw() && AllDrawn(rig.ReadColor()),
+            "a draw that would have been the last of the floor was skipped");
+    const auto refusals = Common::FirstRunReport::Global().Summarize().refusals;
+    Require(name, "blamed on the floor",
+            refusals.size() == 1 && refusals[0].reason == "too_few_draws",
+            "the refused draw was not counted against the draw floor");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // What happens to the target of a skipped draw. With no skip, or with a skip of a target no
+  // resident heap references, nothing is reported at once. A heap reference reports the skip as a
+  // possible read at once, under the heap class, and leaves no mark.
+  enum class SkipCase {
+    NoSkip,
+    Skipped,
+    // A heap references the color or the depth target when the draw is skipped.
+    SkippedHeapColor,
+    SkippedHeapDepth,
+    // No heap references the target at the skip, and a heap element selects it afterwards.
+    SkippedThenHeapSelects,
+    // The baseline for the case above, with no skip.
+    HeapSelectsWithoutSkip,
+  };
+
+  // Runs one case and returns the sampled counts the report has, after the stage binds the color
+  // target as a texture twice. The mark on the target is returned in `marks`.
+  std::vector<std::pair<std::string, uint32_t>> RunSampledCase(SkipCase which, uint32_t *marks) {
+    auto &report = Common::FirstRunReport::Global();
+    PipelineCacheTestAccess::BuildHold hold;
+    AsyncDrawRig rig(*this, true);
+    rig.BuildFrameHistory();
+    rig.SetSecondPipeline(true);
+    rig.SetDepthClear(false);
+    rig.PaintSentinels();
+    auto &color_image = rig.Textures().GetImage(rig.color.image_id);
+    auto &depth_image = rig.Textures().GetImage(rig.depth.image_id);
+    if (which == SkipCase::SkippedHeapColor) color_image.heap_refs.fetch_add(1);
+    if (which == SkipCase::SkippedHeapDepth) depth_image.heap_refs.fetch_add(1);
+    if (which != SkipCase::NoSkip && which != SkipCase::HeapSelectsWithoutSkip) {
+      PipelineCacheTestAccess::HoldBuildQueue(rig.Pipelines(), hold);
+      Require("AsyncSampled", "draw", rig.Draw(), "the skipped draw reported failure");
+      Require("AsyncSampled", "skipped", PipelineCacheTestAccess::PendingBuilds(rig.Pipelines()) == 1,
+              "the draw was not skipped");
+    }
+    if (which == SkipCase::SkippedThenHeapSelects || which == SkipCase::HeapSelectsWithoutSkip) {
+      rig.Textures().NoteHeapSelected(rig.color.image_id);
+    }
+    // A stage with one image binding that names the color target as a texture.
+    ShaderModule module{};
+    module.info.info.images.resize(1);
+    ShaderRecompiler::IR::ResourceSnapshot resources;
+    resources.images.resize(1);
+    const ShaderStageRuntime runtime{&module, &resources};
+    PreparedBindings bindings;
+    bindings.runtime = &runtime;
+    bindings.images.resize(1);
+    bindings.images[0].image_id = rig.color.image_id;
+    bindings.images[0].desc = rig.color.desc;
+    bindings.images[0].desc.type = BindingType::Texture;
+    bindings.images[0].desc.view_info.usage = vk::ImageUsageFlagBits::eSampled;
+    auto &executor = rig.context->GetRenderExecutor();
+    RenderExecutorTestAccess::RebindImages(executor, bindings);
+    RenderExecutorTestAccess::RebindImages(executor, bindings);
+    bool as_depth = false;
+    *marks = rig.Textures().TakeSkippedDraws(rig.color.image_id, &as_depth);
+    auto sampled = report.Summarize().sampled_after_skip_by_target;
+    const bool selected = which == SkipCase::SkippedThenHeapSelects ||
+                          which == SkipCase::HeapSelectsWithoutSkip;
+    if (which == SkipCase::SkippedHeapColor || selected) color_image.heap_refs.fetch_sub(1);
+    if (which == SkipCase::SkippedHeapDepth) depth_image.heap_refs.fetch_sub(1);
+    hold.release = true;
+    return sampled;
+  }
+
+  // A skipped draw's target that a shader then binds as a texture is counted once, under its class.
+  // The same bindings with no skip count nothing, which is the baseline.
+  void CheckAsyncSampledAfterSkip() {
+    constexpr const char *name = "AsyncSampledAfterSkip";
+    uint32_t marks = 0;
+    const auto none = RunSampledCase(SkipCase::NoSkip, &marks);
+    Require(name, "baseline counts nothing", none.empty(),
+            "binding a target that was never skipped counted a sampled skip");
+    const auto skipped = RunSampledCase(SkipCase::Skipped, &marks);
+    Require(name, "binding counts the skip once",
+            skipped.size() == 1 && skipped[0].first == "color" && skipped[0].second == 1,
+            "binding the skipped target did not count one skipped draw under color");
+    const auto heap_color = RunSampledCase(SkipCase::SkippedHeapColor, &marks);
+    Require(name, "heap color reports at once",
+            heap_color.size() == 1 && heap_color[0].first == "heap_color" &&
+                heap_color[0].second == 1 && marks == 0,
+            "a color target the image heap references was not reported as a possible read, or "
+            "was marked as well");
+    const auto heap_depth = RunSampledCase(SkipCase::SkippedHeapDepth, &marks);
+    Require(name, "heap depth reports at once",
+            std::ranges::count(heap_depth, std::pair<std::string, uint32_t>{"heap_depth", 1}) == 1,
+            "a depth target the image heap references was not reported under its own class");
+    const auto plain_selection = RunSampledCase(SkipCase::HeapSelectsWithoutSkip, &marks);
+    Require(name, "selection without a skip reports nothing", plain_selection.empty(),
+            "a heap selecting a target that was never skipped counted a sampled skip");
+    const auto selected = RunSampledCase(SkipCase::SkippedThenHeapSelects, &marks);
+    Require(name, "selection after a skip reports the mark",
+            selected.size() == 1 && selected[0].first == "heap_color" && selected[0].second == 1 &&
+                marks == 0,
+            "a target skipped before a heap selected it was not reported when it was selected");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // The two modes judge the same draws differently. A draw with a color and a depth target is
+  // skipped by default and waits in depth-only mode, which is the baseline for the first. A draw
+  // with no color target is skipped in both, and each mode counts its skips under its own class.
+  void CheckAsyncDepthOnlyMode() {
+    constexpr const char *name = "AsyncDepthOnlyMode";
+    auto &report = Common::FirstRunReport::Global();
+    for (bool depth_only_mode : {false, true}) {
+      PipelineCacheTestAccess::BuildHold hold;
+      AsyncDrawRig rig(*this, !depth_only_mode, false, false, depth_only_mode);
+      rig.BuildFrameHistory();
+      rig.SetSecondPipeline(true);
+      rig.SetDepthClear(false);
+      rig.PaintSentinels();
+      PipelineCacheTestAccess::HoldBuildQueue(rig.Pipelines(), hold);
+      report.Reset();
+      Require(name, "color and depth draw", rig.Draw(), "the draw reported failure");
+      const auto summary = report.Summarize();
+      if (depth_only_mode) {
+        Require(name, "color draw waits",
+                AllDrawn(rig.ReadColor()) && summary.skips[0] == 0,
+                "a draw with a color target was skipped in depth-only mode");
+        Require(name, "color draw is blamed on the mode",
+                summary.refusals.size() == 1 &&
+                    summary.refusals[0].reason == "depth_only_mode_color" &&
+                    summary.refusals[0].draws == 1,
+                "the refused draw was not counted once with its reason");
+        // The pipeline exists now, so another draw is a hit and refuses nothing.
+        Require(name, "a hit records no refusal",
+                rig.Draw() && report.Summarize().refusals.size() == 1 &&
+                    report.Summarize().refusals[0].draws == 1,
+                "a draw that found its pipeline was counted as refused");
+      } else {
+        Require(name, "color draw skips",
+                AllSentinelColor(rig.ReadColor()) &&
+                    summary.skips_by_target.size() == 1 &&
+                    summary.skips_by_target[0].first == "depth_and_color",
+                "the default mode did not skip the same color and depth draw");
+      }
+      hold.release = true;
+    }
+    {
+      // With both flags on, depth-only wins, so a color draw waits as it does with that flag alone.
+      PipelineCacheTestAccess::BuildHold hold;
+      AsyncDrawRig rig(*this, true, false, false, true);
+      rig.BuildFrameHistory();
+      rig.SetSecondPipeline(true);
+      rig.SetDepthClear(false);
+      rig.PaintSentinels();
+      PipelineCacheTestAccess::HoldBuildQueue(rig.Pipelines(), hold);
+      report.Reset();
+      Require(name, "both flags: color draw waits", rig.Draw() && AllDrawn(rig.ReadColor()) &&
+                                                       report.Summarize().skips[0] == 0,
+              "with both flags on, a draw with a color target was skipped");
+      hold.release = true;
+    }
+    for (bool depth_only_mode : {false, true}) {
+      PipelineCacheTestAccess::BuildHold hold;
+      AsyncDrawRig rig(*this, !depth_only_mode, false, false, depth_only_mode);
+      rig.SetDepthOnly(true);
+      rig.BuildFrameHistory();
+      rig.SetSecondPipeline(true);
+      rig.SetDepthClear(false);
+      rig.PaintSentinels();
+      PipelineCacheTestAccess::HoldBuildQueue(rig.Pipelines(), hold);
+      report.Reset();
+      Require(name, "depth-only draw", rig.Draw(), "the draw reported failure");
+      const auto summary = report.Summarize();
+      Require(name, "depth-only draw skips",
+              AllEqual(rig.ReadDepth(), std::bit_cast<u32>(AsyncSentinelDepth)) &&
+                  summary.skips_by_target.size() == 1 &&
+                  summary.skips_by_target[0].first == "depth_only" &&
+                  summary.skips_by_target[0].second == 1,
+              "a draw with no color target was not skipped and counted as depth_only");
+      hold.release = true;
+    }
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // A draw that the skip leaves out must still apply the depth clear it carried. With the clear
+  // left off the same skipped draw leaves the depth alone, so only the clear explains the change.
+  void CheckAsyncSkippedClears() {
+    constexpr const char *name = "AsyncSkippedClears";
+    for (bool htile : {false, true}) {
+      for (bool clear_at_skipped : {false, true}) {
+        PipelineCacheTestAccess::BuildHold hold;
+        AsyncDrawRig rig(*this, true, htile);
+        rig.BuildFrameHistory();
+        rig.SetSecondPipeline(true);
+        rig.PaintSentinels();
+        PipelineCacheTestAccess::HoldBuildQueue(rig.Pipelines(), hold);
+        if (htile) {
+          rig.SetDepthClear(false);
+          if (clear_at_skipped) rig.MarkHtileClear();
+        } else {
+          rig.SetDepthClear(clear_at_skipped);
+        }
+        Require(name, "draw", rig.Draw(), "the skipped draw reported failure");
+        Require(name, "skipped", PipelineCacheTestAccess::PendingBuilds(rig.Pipelines()) == 1 &&
+                                     AllSentinelColor(rig.ReadColor()),
+                "the draw was not skipped");
+        const auto expected =
+            std::bit_cast<u32>(clear_at_skipped ? AsyncClearDepth : AsyncSentinelDepth);
+        Require(name, htile ? "htile clear" : "depth clear", AllEqual(rig.ReadDepth(), expected),
+                clear_at_skipped ? "a skipped draw lost the clear it carried"
+                                 : "a skipped draw cleared the depth without being asked to");
+        if (htile) {
+          Require(name, "htile clear consumed",
+                  !rig.Textures().IsMetaCleared(AsyncBase + AsyncHtileOffset, 0),
+                  "the skipped draw left its HTILE clear pending");
+        }
+        hold.release = true;
+      }
+    }
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // An indirect draw that is skipped still reports a normal draw, so the caller does not read the
+  // records and replay it on the CPU, and the draw after the build takes its records from the GPU.
+  void CheckAsyncIndirectSkip() {
+    constexpr const char *name = "AsyncIndirectSkip";
+    PipelineCacheTestAccess::BuildHold hold;
+    AsyncDrawRig rig(*this, true);
+    rig.BuildFrameHistory();
+    rig.SetSecondPipeline(true);
+    rig.PaintSentinels();
+    const vk::DrawIndirectCommand record{3, 1, 0, 0};
+    std::memcpy(reinterpret_cast<void *>(AsyncBase + AsyncArgsOffset), &record, sizeof(record));
+    const DrawIndirectArgs records{AsyncBase + AsyncArgsOffset, 1, sizeof(record), {}};
+    PipelineCacheTestAccess::HoldBuildQueue(rig.Pipelines(), hold);
+    Require(name, "skipped indirect draw is a normal draw", rig.Draw({.indirect = records}),
+            "a skipped indirect draw reported failure, which sends it to the CPU replay");
+    Require(name, "skipped", PipelineCacheTestAccess::PendingBuilds(rig.Pipelines()) == 1 &&
+                                 AllSentinelColor(rig.ReadColor()),
+            "the indirect draw was not skipped");
+    hold.release = true;
+    WaitUntilTrue(name, "build", [&] {
+      return PipelineCacheTestAccess::FinishedBuilds(rig.Pipelines()) == 1;
+    });
+    Require(name, "indirect draw after the build",
+            rig.Draw({.indirect = records}) && AllDrawn(rig.ReadColor()),
+            "the indirect draw after the build did not write its pipeline's output");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // The samples a guest query passed, as the sum over the counters of end minus begin, or -1 before
+  // every counter is written.
+  static int64_t PassedSamples(const std::array<uint64_t, OCCLUSION_QUERY_DBS * 2> &results) {
+    int64_t samples = 0;
+    for (uint32_t db = 0; db < OCCLUSION_QUERY_DBS; db++) {
+      const auto begin = results[db * 2];
+      const auto end = results[db * 2 + 1];
+      if ((begin & end & OCCLUSION_QUERY_READY) == 0) return -1;
+      samples += static_cast<int64_t>(end - begin);
+    }
+    return samples;
+  }
+
+  // A draw skipped inside an open guest query counts as visible, so an occlusion proxy is not
+  // culled for a draw that never ran. A draw skipped outside a query counts nothing.
+  void CheckAsyncSkippedOcclusion() {
+    constexpr const char *name = "AsyncSkippedOcclusion";
+    for (bool open_query : {false, true}) {
+      PipelineCacheTestAccess::BuildHold hold;
+      AsyncDrawRig rig(*this, true, false, true);
+      rig.BuildFrameHistory();
+      rig.SetSecondPipeline(true);
+      rig.PaintSentinels();
+      PipelineCacheTestAccess::HoldBuildQueue(rig.Pipelines(), hold);
+      alignas(16) std::array<uint64_t, OCCLUSION_QUERY_DBS * 2> results{};
+      auto &queries = rig.context->GetOcclusionQueries();
+      const auto address = reinterpret_cast<uint64_t>(results.data());
+      if (open_query) queries.Dump(address);
+      Require(name, "draw", rig.Draw(), "the skipped draw reported failure");
+      Require(name, "skipped", PipelineCacheTestAccess::PendingBuilds(rig.Pipelines()) == 1 &&
+                                   AllSentinelColor(rig.ReadColor()),
+              "the draw was not skipped");
+      // Without an open query during the draw, the pair of dumps encloses nothing.
+      if (!open_query) queries.Dump(address);
+      queries.Dump(address + sizeof(uint64_t));
+      queries.Publish();
+      Require(name, open_query ? "skipped draw is visible" : "no query, no samples",
+              PassedSamples(results) == (open_query ? 1 : 0),
+              open_query ? "a skipped draw in an open query counted no sample"
+                         : "a skipped draw outside a query counted a sample");
+      hold.release = true;
+    }
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // The color and depth targets of one gate case, at addresses of their own so cases never share
+  // a history.
+  struct GateTargets {
+    RenderColorInfo color{};
+    RenderDepthInfo depth{};
+  };
+
+  static constexpr uint64_t GateCaseStride = 0x8000;
+  static constexpr uint64_t GateLayeredOffset = 0x200000;
+  static constexpr uint64_t GateLayeredStride = 0x20000;
+
+  GateTargets MakeGateTargets(TextureCache &cache, uint32_t index, const GateView &view = {}) {
+    // A layered image has room beyond the plain cases, where each layer is a plain case's size.
+    const bool layered = view.layers > 1 || view.color_layers > 1;
+    Require("AsyncGate", "case address",
+            layered || GateCaseStride * (index + 1) <= GateLayeredOffset,
+            "there are more gate cases than room for their targets");
+    const uint64_t address = layered ? AsyncBase + GateLayeredOffset + GateLayeredStride * view.slot
+                                             : AsyncBase + GateCaseStride * index;
+    const uint64_t color_slice = AsyncExtent * AsyncExtent * 16;
+    const uint64_t depth_slice = 256 * AsyncExtent;
+    GateTargets targets;
+    auto &color = targets.color;
+    color.desc.type = BindingType::RenderTarget;
+    const uint32_t color_image_layers = view.color_layers != 0 ? view.color_layers : view.layers;
+    color.desc.info.data = {address, color_slice * color_image_layers};
+    color.desc.info.mip_layout[0] = {0, color_slice, AsyncExtent, AsyncExtent, 0, color_slice,
+                                     AsyncExtent};
+    color.desc.info.tiling.block.bytes_per_element = 16;
+    color.desc.info.linear_slice_stride = color_slice;
+    color.desc.info.resources = {1, color_image_layers};
+    color.desc.info.pixel_format = vk::Format::eR32G32B32A32Sfloat;
+    color.desc.info.guest_format = Prospero::BufferFormat::k32_32_32_32Float;
+    color.desc.info.extent = {view.color_extent, view.color_extent, 1};
+    color.desc.info.pitch = AsyncExtent;
+    color.desc.info.bytes_per_block = 16;
+    color.desc.view_info.format = color.desc.info.pixel_format;
+    color.desc.view_info.usage = vk::ImageUsageFlagBits::eColorAttachment;
+    color.image_id = cache.FindImage(color.desc);
+    auto &depth = targets.depth;
+    depth.desc.type = BindingType::DepthTarget;
+    depth.desc.info.data = {address + (layered ? 0x10000 : GateCaseStride / 2),
+                            depth_slice * view.layers};
+    depth.desc.info.pixel_format = vk::Format::eD32Sfloat;
+    depth.desc.info.guest_format = Prospero::BufferFormat::k32Float;
+    depth.desc.info.extent = {AsyncExtent, AsyncExtent, 1};
+    depth.desc.info.resources = {1, view.layers};
+    depth.desc.info.pitch = 64;
+    depth.desc.info.bytes_per_block = 4;
+    depth.desc.info.tile_mode = Prospero::TileMode::kLinear;
+    depth.desc.info.UpdateSize();
+    depth.desc.view_info.format = depth.desc.info.pixel_format;
+    depth.desc.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
+    depth.desc.view_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+    depth.image_id = cache.FindImage(depth.desc);
+    for (auto *info : {&color.desc.view_info, &depth.desc.view_info}) {
+      info->base_layer = view.base_layer;
+      info->layer_count = view.view_layers;
+      info->base_level = view.base_level;
+      info->level_count = view.view_levels;
+    }
+    if (view.color_layers != 0) {
+      color.desc.view_info.base_layer = 0;
+      color.desc.view_info.layer_count = view.color_layers;
+    }
+    return targets;
+  }
+
+  // A render context with guest memory mapped for the gate cases, and the stages they draw with.
+  struct GateRig {
+    VulkanHarness &harness;
+    std::optional<RenderContext> context;
+    int64_t direct_offset = -1;
+    uint32_t next_case = 0;
+    // Stages for the draws. A draw always has a vertex stage.
+    ShaderModule stage_module{};
+    ShaderRecompiler::IR::ResourceSnapshot stage_resources;
+    ShaderModule other_module{};
+    ShaderRecompiler::IR::ResourceSnapshot other_resources;
+
+    // Makes the context and maps the memory.
+    explicit GateRig(VulkanHarness &owner) : harness(owner) {
+      Config::Load({.printf_direction = Config::LogDirection::Silent});
+      harness.EnsureRuntimeContext();
+      context.emplace(harness.m_runtime_context);
+      Require("AsyncGate", "direct allocation",
+              LibKernel::Memory::KernelAllocateDirectMemory(
+                  0, LibKernel::Memory::KernelGetDirectMemorySize(), AsyncSize, AsyncAlignment, 0,
+                  &direct_offset) == 0,
+              "allocation failed");
+      void *mapped = reinterpret_cast<void *>(AsyncBase);
+      Require("AsyncGate", "direct mapping",
+              LibKernel::Memory::KernelMapDirectMemory(&mapped, AsyncSize, 0x3, 0x10,
+                                                       direct_offset, AsyncAlignment) == 0,
+              "mapping failed");
+      context->MapMemory(AsyncBase, AsyncSize);
+    }
+
+    // Releases the memory.
+    ~GateRig() {
+      context->UnmapMemory(AsyncBase, AsyncSize);
+      context.reset();
+      LibKernel::Memory::KernelMunmap(AsyncBase, AsyncSize);
+      LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, AsyncSize);
+    }
+    GateRig(const GateRig &) = delete;
+    GateRig &operator=(const GateRig &) = delete;
+
+    TextureCache &Cache() { return context->GetTextureCache(); }
+  };
+
+  // Plays the frames on fresh targets and asks whether one more draw in the last frame may skip.
+  // That draw is asked about and not noted, as in the renderer.
+  SkipRefusal GateRefusal(GateRig &rig, const GateScript &frames, const GateView &view = {},
+                          bool depth_only = false) {
+    const auto targets = MakeGateTargets(rig.Cache(), rig.next_case++, view);
+    DrawRenderState state{};
+    for (size_t index = 0; index < frames.size(); index++) {
+      if (frames[index]) {
+        state = {};
+        state.vertex_info[0].stage = {&rig.other_module, &rig.other_resources};
+        state.color_count = frames[index]->color ? 1u : 0u;
+        state.color_info[0] = targets.color;
+        if (frames[index]->depth) state.depth_info = targets.depth;
+        state.depth_info.depth_clear_enable = frames[index]->clear;
+        const auto &frame = *frames[index];
+        for (uint32_t draw = 0; draw < std::max(frame.color_draws, frame.depth_draws); draw++) {
+          auto drawn = state;
+          drawn.color_count = frame.color && draw < frame.color_draws ? 1u : 0u;
+          if (!frame.depth || draw >= frame.depth_draws) drawn.depth_info = {};
+          NoteDrawTargets(rig.Cache(), drawn);
+        }
+      }
+      if (index + 1 < frames.size()) rig.Cache().RunGarbageCollector();
+    }
+    return ExplainSkipRefusal(rig.Cache(), state, depth_only);
+  }
+
+// Whether the draw may skip. The same as GateRefusal finding no rule to refuse it.
+  bool GateAllows(GateRig &rig, const GateScript &frames, const GateView &view = {},
+                  bool depth_only = false) {
+    return GateRefusal(rig, frames, view, depth_only) == SkipRefusal::None;
+  }
+
+  // Which stage of the draw a writer is placed in.
+  enum class GateStage { Vertex, Hull, Pixel };
+
+  // Plays two steady frames and asks about a draw whose given stage has been edited.
+  SkipRefusal GateStageRefusal(GateRig &rig, GateStage where,
+                              const std::function<void(ShaderModule &)> &edit,
+                       const std::function<void(ShaderRecompiler::IR::ResourceSnapshot &)>
+                           &edit_resources = {}) {
+    rig.stage_module = {};
+    rig.stage_resources = {};
+    edit(rig.stage_module);
+    if (edit_resources) edit_resources(rig.stage_resources);
+    const auto targets = MakeGateTargets(rig.Cache(), rig.next_case++);
+    DrawRenderState state{};
+    state.color_count = 1;
+    state.color_info[0] = targets.color;
+    state.depth_info = targets.depth;
+    state.depth_info.depth_clear_enable = true;
+    state.ps_active = true;
+    const ShaderStageRuntime quiet{&rig.other_module, &rig.other_resources};
+    const ShaderStageRuntime loud{&rig.stage_module, &rig.stage_resources};
+    state.vertex_info[0].stage = where == GateStage::Vertex ? loud : quiet;
+    if (where == GateStage::Hull) {
+      // A hull stage makes the draw a tessellation draw, with all three vertex stages present.
+      state.vertex_info[1].stage = loud;
+      state.vertex_info[2].stage = quiet;
+    }
+    state.ps_input_info.stage = where == GateStage::Pixel ? loud : quiet;
+    for (int frame = 0; frame < 2; frame++) {
+      for (uint32_t draw = 0; draw < MIN_DRAWS_FOR_SKIP; draw++) NoteDrawTargets(rig.Cache(), state);
+      if (frame == 0) rig.Cache().RunGarbageCollector();
+    }
+    return ExplainSkipRefusal(rig.Cache(), state, false);
+  }
+
+  // Whether the draw may skip with its stage edited.
+  bool GateStageAllows(GateRig &rig, GateStage where, const std::function<void(ShaderModule &)> &edit,
+                       const std::function<void(ShaderRecompiler::IR::ResourceSnapshot &)>
+                           &edit_resources = {}) {
+    return GateStageRefusal(rig, where, edit, edit_resources) == SkipRefusal::None;
+  }
+
+  // The history rule. A target is rebuilt every frame when it is drawn into enough in this frame and
+  // the one before, as a whole view of one image, and its depth is cleared in both. Every case
+  // below differs from the first in one thing, and only the first may skip.
+  void CheckAsyncGateHistory(GateRig &rig) {
+    constexpr const char *name = "AsyncGate";
+    const GateFrame good;
+    const auto allows = [&](const GateScript &frames, const GateView &view = {},
+                            bool depth_only = false) {
+      return GateAllows(rig, frames, view, depth_only);
+    };
+    Require(name, "rebuilt every frame", allows({good, good}),
+            "a target cleared and rendered in two frames in a row was refused");
+    Require(name, "steady state", allows({good, good, good}),
+            "a target that stays rebuilt every frame was refused later on");
+    Require(name, "first frame", !allows({good}),
+            "a draw in the first frame, with no history, was allowed");
+    Require(name, "not cleared now", !allows({good, GateFrame{.clear = false}}),
+            "a depth target that was not cleared this frame was allowed");
+    Require(name, "not cleared before", !allows({GateFrame{.clear = false}, good}),
+            "a depth target cleared for the first time this frame was allowed");
+    Require(name, "frame gap", !allows({good, std::nullopt, good}),
+            "a depth target cleared every other frame was allowed");
+    Require(name, "color not drawn before", !allows({GateFrame{.color = false}, good}),
+            "a color target first rendered this frame was allowed");
+    Require(name, "no depth",
+            !allows({GateFrame{.depth = false, .clear = false},
+                     GateFrame{.depth = false, .clear = false}}),
+            "a draw with no depth target was allowed");
+    const uint32_t few = MIN_DRAWS_FOR_SKIP - 1;
+    Require(name, "too few depth draws now", !allows({good, GateFrame{.depth_draws = few}}),
+            "a depth target with a few draws this frame was allowed");
+    Require(name, "too few depth draws before", !allows({GateFrame{.depth_draws = few}, good}),
+            "a depth target with a few draws last frame was allowed");
+    Require(name, "too few color draws now", !allows({good, GateFrame{.color_draws = few}}),
+            "a color target with a few draws this frame was allowed");
+    Require(name, "too few color draws before", !allows({GateFrame{.color_draws = few}, good}),
+            "a color target with a few draws last frame was allowed");
+    Require(name, "the draw is not its own evidence",
+            !allows({good, GateFrame{.color_draws = 0, .depth_draws = 0}}),
+            "the draw asked about counted as a draw into its target this frame");
+    // The clear covers the render area, which the smaller color target shrinks below the depth
+    // target. Equal sizes, the first case, are the baseline.
+    Require(name, "clear does not cover the depth",
+            !allows({good, good}, {.color_extent = GATE_TARGET_EXTENT / 2}),
+            "a clear that left part of the depth target alone was taken as a clear");
+    Require(name, "depth-only mode refuses color", !allows({good, good}, {}, true),
+            "depth-only mode allowed a draw with a color target");
+    Require(name, "depth-only mode allows depth alone",
+            allows({GateFrame{.color = false}, GateFrame{.color = false}}, {}, true),
+            "depth-only mode refused a draw with no color target and a steady depth");
+  }
+
+  // The history belongs to the whole image, so a view of part of it never passes. A layered image
+  // viewed whole does, as the baseline.
+  void CheckAsyncGateViews(GateRig &rig) {
+    constexpr const char *name = "AsyncGateViews";
+    const GateFrame good;
+    const GateView whole_array{.layers = 4, .view_layers = 4};
+    Require(name, "whole layered view", GateAllows(rig, {good, good}, whole_array),
+            "a layered target viewed whole, drawn and cleared every frame, was refused");
+    Require(name, "one layer of an array",
+            !GateAllows(rig, {good, good}, {.layers = 4, .view_layers = 1}),
+            "a view of one layer of an array was allowed, so a layer drawn once could pass");
+    Require(name, "a later layer of an array",
+            !GateAllows(rig, {good, good}, {.layers = 4, .base_layer = 3, .view_layers = 1}),
+            "a view of the last layer of an array was allowed");
+    Require(name, "a view of two mips", !GateAllows(rig, {good, good}, {.view_levels = 2}),
+            "a view spanning more levels than the image has was allowed");
+    Require(name, "a later mip", !GateAllows(rig, {good, good}, {.base_level = 1}),
+            "a view of a level past the image's one level was allowed");
+  }
+
+  // A clear covers the render area, which the smallest attachment sets in layers too. A color
+  // target with fewer layers than the depth target shrinks it, so the clear misses layers. A depth
+  // target smaller than its color target is the baseline, and is allowed.
+  void CheckAsyncGateLayers(GateRig &rig) {
+    constexpr const char *name = "AsyncGateLayers";
+    const GateFrame good;
+    Require(name, "color has fewer layers",
+            !GateAllows(rig, {good, good}, {.layers = 4, .view_layers = 4, .color_layers = 1, .slot = 1}),
+            "a clear that reached only one layer of the depth array was taken as a clear");
+    Require(name, "depth has fewer layers",
+            GateAllows(rig, {good, good}, {.layers = 1, .view_layers = 1, .color_layers = 4, .slot = 2}),
+            "a depth target smaller than its color target was refused");
+  }
+
+  // Each rule that can refuse a draw is named, so a run with few skips says which rule cost them.
+  // Every case differs from a draw that is allowed in the one thing its rule looks at.
+  void CheckAsyncGateReasons(GateRig &rig) {
+    constexpr const char *name = "AsyncGateReasons";
+    const GateFrame good;
+    const auto why = [&](const GateScript &frames, const GateView &view = {},
+                         bool depth_only = false) {
+      return GateRefusal(rig, frames, view, depth_only);
+    };
+    const uint32_t few = MIN_DRAWS_FOR_SKIP - 1;
+    Require(name, "allowed", why({good, good}) == SkipRefusal::None, "a steady target was refused");
+    Require(name, "no depth",
+            why({GateFrame{.depth = false, .clear = false}, GateFrame{.depth = false, .clear = false}}) ==
+                SkipRefusal::NoDepth,
+            "a draw with no depth target was not blamed on the missing depth");
+    Require(name, "depth-only mode", why({good, good}, {}, true) == SkipRefusal::DepthOnlyModeColor,
+            "a color draw in depth-only mode was not blamed on the mode");
+    Require(name, "partial view", why({good, good}, {.layers = 4, .view_layers = 1}) ==
+                                      SkipRefusal::PartialView,
+            "a view of one layer was not blamed on the partial view");
+    Require(name, "not cleared", why({good, GateFrame{.clear = false}}) == SkipRefusal::DepthNotCleared,
+            "a depth target without a clear was not blamed on the clear");
+    Require(name, "too few draws", why({good, GateFrame{.depth_draws = few}}) ==
+                                       SkipRefusal::TooFewDraws,
+            "a depth target with few draws was not blamed on the draw floor");
+    Require(name, "few draws and no earlier clear",
+            why({GateFrame{.clear = false}, GateFrame{.clear = false, .depth_draws = few}}) ==
+                SkipRefusal::TooFewDrawsAlsoUncleared,
+            "few draws with no clear the frame before were not told apart from few draws alone");
+    Require(name, "color history", why({good, GateFrame{.color_draws = few}}) ==
+                                       SkipRefusal::ColorHistory,
+            "a color target with few draws was not blamed on its history");
+    Require(name, "names are distinct", [] {
+      std::set<std::string> names;
+      for (size_t index = 0; index < SKIP_REFUSAL_COUNT; index++) {
+        names.insert(SkipRefusalName(static_cast<SkipRefusal>(index)));
+      }
+      return names.size() == SKIP_REFUSAL_COUNT;
+    }(), "two refusal reasons share a name, so a report could not tell them apart");
+  }
+
+  // Stages that write beyond the targets are never skipped, however steady the targets are.
+  void CheckAsyncGateWriters(GateRig &rig) {
+    constexpr const char *name = "AsyncGateWriters";
+    const ShaderBufferResource filled{{0x10000u, 0u, 64u, DstSel(4, 5, 6, 7)}};
+    const ShaderBufferResource empty{{0x10000u, 0u, 0u, DstSel(4, 5, 6, 7)}};
+    const auto written_buffer = [](ShaderModule &module) {
+      module.info.info.buffers.resize(1);
+      module.info.info.buffers[0].written = true;
+    };
+    const auto descriptor_of = [](const ShaderBufferResource &descriptor) {
+      return [&descriptor](ShaderRecompiler::IR::ResourceSnapshot &resources) {
+        resources.buffers.resize(1);
+        std::copy_n(descriptor.fields, 4, resources.buffers[0].dwords.begin());
+        resources.buffers[0].dword_count = 4;
+      };
+    };
+    for (const auto where : {GateStage::Vertex, GateStage::Hull, GateStage::Pixel}) {
+      const char *stage = where == GateStage::Vertex ? "vertex stage"
+                          : where == GateStage::Hull ? "second vertex stage" : "pixel stage";
+      const auto allows = [&](const std::function<void(ShaderModule &)> &edit) {
+        return GateStageAllows(rig, where, edit);
+      };
+      Require(name, stage, allows([](ShaderModule &) {}),
+              "a stage that writes nothing but the targets was refused");
+      Require(name, stage, !allows([](ShaderModule &m) { m.info.has_address_writes = true; }),
+              "a stage with address writes was allowed");
+      Require(name, stage,
+              GateStageRefusal(rig, where, [](ShaderModule &m) { m.info.has_address_writes = true; }) ==
+                  SkipRefusal::Writer,
+              "a draw with a writer was not blamed on the writer");
+      Require(name, stage, !allows([](ShaderModule &m) { m.info.info.uses_gds = true; }),
+              "a stage using GDS was allowed");
+      Require(name, stage, !allows([](ShaderModule &m) { m.info.info.uses_dma = true; }),
+              "a stage using DMA was allowed");
+      Require(name, stage,
+              !allows([](ShaderModule &m) {
+                m.info.info.images.resize(1);
+                m.info.info.images[0].written = true;
+              }),
+              "a stage writing a storage image was allowed");
+      Require(name, stage,
+              !GateStageAllows(rig, where, written_buffer, descriptor_of(filled)),
+              "a stage writing a bound buffer was allowed");
+      // The same stage with an empty descriptor writes nothing, so only the descriptor differs.
+      Require(name, stage, GateStageAllows(rig, where, written_buffer, descriptor_of(empty)),
+              "a written buffer with an empty descriptor was counted as a write");
+    }
+  }
+
+  // Runs the gate checks on one render context.
+  void CheckAsyncGate() {
+    GateRig rig(*this);
+    CheckAsyncGateHistory(rig);
+    CheckAsyncGateViews(rig);
+    CheckAsyncGateLayers(rig);
+    CheckAsyncGateReasons(rig);
+    CheckAsyncGateWriters(rig);
+    std::printf("[gpu]     %-32s ok\n", "AsyncGate");
   }
 
   void CheckNullTextureDescriptors() {
@@ -58006,6 +59180,740 @@ void CheckStableProgramIds(VulkanHarness &vulkan) {
   std::printf("[gpu]     %-32s ok\n", name);
 }
 
+// The pipeline cache and its build queue under --async-pipelines.
+
+// A pipeline cache on the GPU thread with a vertex and a pixel program bound, so a draw state made
+// without targets has stage modules. Each topology is another key over the same modules.
+struct AsyncCacheRig {
+  RenderContext &context;
+  PipelineCache &cache;
+  CommandBuffer &command;
+
+  // Makes a draw state with the bound programs and the given topology, so each topology is
+  // another pipeline key.
+  DrawRenderState State(vk::PrimitiveTopology topology) const {
+    DrawRenderState state{.topology = topology};
+    cache.GetGraphicsPrograms(command, state);
+    return state;
+  }
+};
+
+// A policy that never lets a draw go without its pipeline.
+struct NeverSkip final : PipelineSkipPolicy {
+  bool MaySkip() const override { return false; }
+};
+
+// A policy that lets every draw go without its pipeline.
+struct AlwaysSkip final : PipelineSkipPolicy {
+  bool MaySkip() const override { return true; }
+};
+
+inline const AlwaysSkip ALWAYS_SKIP;
+inline const NeverSkip NEVER_SKIP;
+
+// A policy that refuses every draw and names its rule, as the gate does when it finds a reason.
+// Like the gate, it names its rule only once it has been asked, so each draw needs a policy of its
+// own.
+struct RefusingPolicy final : PipelineSkipPolicy {
+  bool MaySkip() const override {
+    asked = true;
+    return false;
+  }
+  const char *Refusal() const override { return asked ? "test_rule" : nullptr; }
+  mutable bool asked = false;
+};
+
+// Runs `body` on the GPU thread of a fresh render context, with the async flag as given and the
+// first-run report on. The context is destroyed on return, so `body` cannot see teardown.
+template <typename Body>
+void WithAsyncCache(VulkanHarness &vulkan, bool async, const std::filesystem::path &store,
+                    Body &&body) {
+  static const auto vertex = [] {
+    std::vector<u32> code;
+    AppendVMovU32(&code, 0, 0);
+    AppendVMovLiteral(&code, 1, 0x3f800000u);
+    code.insert(code.end(), {EncodeExp0(0x0c, 0xf), EncodeExp1(0, 0, 0, 1)});
+    AppendEnd(&code);
+    return code;
+  }();
+  static const auto pixel = [] {
+    std::vector<u32> code;
+    AppendVMovLiteral(&code, 0, 0x3f800000u);
+    code.insert(code.end(), {EncodeExp0(0x00, 0xf), EncodeExp1(0, 0, 0, 0)});
+    AppendEnd(&code);
+    return code;
+  }();
+  static ShaderUserData vertex_user_data{};
+  ShaderMapUserData(reinterpret_cast<uint64_t>(vertex.data()),
+                    {.type = Prospero::ShaderBinaryType::kGs, .user_data = &vertex_user_data,
+                     .code_size_bytes = static_cast<u32>(vertex.size() * sizeof(u32))});
+  ShaderMapUserData(reinterpret_cast<uint64_t>(pixel.data()),
+                    {.type = Prospero::ShaderBinaryType::kPs,
+                     .code_size_bytes = static_cast<u32>(pixel.size() * sizeof(u32))});
+  Config::Load({.printf_direction = Config::LogDirection::Silent,
+                .first_run_report_enabled = true,
+                .async_pipelines_enabled = async});
+  Common::FirstRunReport::Global().Reset();
+  {
+    RenderContext context(vulkan.RuntimeContext(), store);
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    context.GetGpu().SendCommandSync([&] {
+      CommandProcessor processor(context, 0);
+      processor.BufferInit();
+      auto &registers = processor.GetCtx();
+      auto &shaders = processor.GetShCtx();
+      registers.SetRenderTargetMask(0xf);
+      registers.SetShaderMask(0xf);
+      registers.SetTargetOutputMode(0, 4);
+      registers.SetViewportTransformControl(0x300);
+      processor.GetUcfg().SetPrimitiveType(Prospero::PrimitiveType::kTriList);
+      shaders.SetEsShaderBase(reinterpret_cast<uint64_t>(vertex.data()));
+      shaders.SetPsShaderBase(reinterpret_cast<uint64_t>(pixel.data()));
+      auto &scheduler = context.GetCommandScheduler();
+      body(AsyncCacheRig{context, context.GetPipelineCache(), scheduler.Current()});
+      scheduler.Finish();
+    });
+    context.ShutdownGpu();
+    LibKernel::Memory::InstallGpuResources(nullptr);
+  }
+  Config::Load({.printf_direction = Config::LogDirection::Silent});
+}
+
+// The creation of a graphics pipeline can be held on any thread but the GPU thread, so a test
+// decides how long a background build runs. It also keeps a ledger of the pipelines, pipeline
+// layouts and descriptor set layouts that exist, to see whether a teardown destroys them all.
+struct PipelineCreateHook {
+  static inline std::atomic<bool> block{false};
+  static inline std::atomic<uint32_t> entered{0};
+  static inline std::mutex ledger_mutex;
+  // Handles as numbers, so one set holds the three kinds.
+  static inline std::set<uint64_t> live;
+  static inline PFN_vkCreateGraphicsPipelines real_create = nullptr;
+  static inline PFN_vkDestroyPipeline real_destroy = nullptr;
+  static inline PFN_vkCreatePipelineLayout real_create_layout = nullptr;
+  static inline PFN_vkDestroyPipelineLayout real_destroy_layout = nullptr;
+  static inline PFN_vkCreateDescriptorSetLayout real_create_set = nullptr;
+  static inline PFN_vkDestroyDescriptorSetLayout real_destroy_set = nullptr;
+
+  template <typename Handle> static uint64_t Key(Handle handle) {
+    return reinterpret_cast<uint64_t>(handle);
+  }
+
+  static void Remember(uint64_t handle) {
+    std::scoped_lock lock(ledger_mutex);
+    live.insert(handle);
+  }
+
+  static void Forget(uint64_t handle) {
+    std::scoped_lock lock(ledger_mutex);
+    live.erase(handle);
+  }
+
+  static VkResult VKAPI_CALL Create(VkDevice device, VkPipelineCache cache, uint32_t count,
+                                    const VkGraphicsPipelineCreateInfo *infos,
+                                    const VkAllocationCallbacks *allocator,
+                                    VkPipeline *pipelines) {
+    if (block.load() && !GuestGpu::IsGpuThread()) {
+      entered++;
+      while (block.load()) std::this_thread::yield();
+    }
+    const auto result = real_create(device, cache, count, infos, allocator, pipelines);
+    for (uint32_t i = 0; result == VK_SUCCESS && i < count; i++) Remember(Key(pipelines[i]));
+    return result;
+  }
+
+  static void VKAPI_CALL Destroy(VkDevice device, VkPipeline pipeline,
+                                 const VkAllocationCallbacks *allocator) {
+    Forget(Key(pipeline));
+    real_destroy(device, pipeline, allocator);
+  }
+
+  static VkResult VKAPI_CALL CreateLayout(VkDevice device, const VkPipelineLayoutCreateInfo *info,
+                                          const VkAllocationCallbacks *allocator,
+                                          VkPipelineLayout *layout) {
+    const auto result = real_create_layout(device, info, allocator, layout);
+    if (result == VK_SUCCESS) Remember(Key(*layout));
+    return result;
+  }
+
+  static void VKAPI_CALL DestroyLayout(VkDevice device, VkPipelineLayout layout,
+                                       const VkAllocationCallbacks *allocator) {
+    Forget(Key(layout));
+    real_destroy_layout(device, layout, allocator);
+  }
+
+  static VkResult VKAPI_CALL CreateSet(VkDevice device, const VkDescriptorSetLayoutCreateInfo *info,
+                                       const VkAllocationCallbacks *allocator,
+                                       VkDescriptorSetLayout *layout) {
+    const auto result = real_create_set(device, info, allocator, layout);
+    if (result == VK_SUCCESS) Remember(Key(*layout));
+    return result;
+  }
+
+  static void VKAPI_CALL DestroySet(VkDevice device, VkDescriptorSetLayout layout,
+                                    const VkAllocationCallbacks *allocator) {
+    Forget(Key(layout));
+    real_destroy_set(device, layout, allocator);
+  }
+
+  PipelineCreateHook() {
+    block = false;
+    entered = 0;
+    ResetLedger();
+    auto &table = VULKAN_HPP_DEFAULT_DISPATCHER;
+    real_create = table.vkCreateGraphicsPipelines;
+    real_destroy = table.vkDestroyPipeline;
+    real_create_layout = table.vkCreatePipelineLayout;
+    real_destroy_layout = table.vkDestroyPipelineLayout;
+    real_create_set = table.vkCreateDescriptorSetLayout;
+    real_destroy_set = table.vkDestroyDescriptorSetLayout;
+    table.vkCreateGraphicsPipelines = Create;
+    table.vkDestroyPipeline = Destroy;
+    table.vkCreatePipelineLayout = CreateLayout;
+    table.vkDestroyPipelineLayout = DestroyLayout;
+    table.vkCreateDescriptorSetLayout = CreateSet;
+    table.vkDestroyDescriptorSetLayout = DestroySet;
+  }
+  ~PipelineCreateHook() {
+    block = false;
+    auto &table = VULKAN_HPP_DEFAULT_DISPATCHER;
+    table.vkCreateGraphicsPipelines = real_create;
+    table.vkDestroyPipeline = real_destroy;
+    table.vkCreatePipelineLayout = real_create_layout;
+    table.vkDestroyPipelineLayout = real_destroy_layout;
+    table.vkCreateDescriptorSetLayout = real_create_set;
+    table.vkDestroyDescriptorSetLayout = real_destroy_set;
+  }
+  PipelineCreateHook(const PipelineCreateHook &) = delete;
+  PipelineCreateHook &operator=(const PipelineCreateHook &) = delete;
+
+  // Forgets every object seen so far, so one session's leftovers are not another's.
+  static void ResetLedger() {
+    std::scoped_lock lock(ledger_mutex);
+    live.clear();
+  }
+
+  static size_t Live() {
+    std::scoped_lock lock(ledger_mutex);
+    return live.size();
+  }
+};
+
+// The graphics compile rows of the report, which a cache test counts to see who compiled what.
+std::vector<Common::FirstRunReport::CompileEntry> GraphicsCompileRows() {
+  auto rows = Common::FirstRunReport::Global().Compiles();
+  std::erase_if(rows, [](const auto &row) {
+    return row.kind != Common::FirstRunReport::Kind::Graphics ||
+           row.phase != Common::FirstRunReport::Phase::Play;
+  });
+  return rows;
+}
+
+// With the flag off nothing changes. There is no queue, a policy that would skip is never asked,
+// and the pipeline is built on the spot by the calling thread.
+void CheckAsyncPipelinesOff(VulkanHarness &vulkan) {
+  constexpr const char *name = "AsyncPipelinesOff";
+  WithAsyncCache(vulkan, false, {}, [&](const AsyncCacheRig &rig) {
+    Require(name, "no queue", !rig.cache.BuildsInBackground() &&
+                                  !PipelineCacheTestAccess::HasBuildQueue(rig.cache),
+            "the flag was off, but a build queue exists");
+    const auto state = rig.State(vk::PrimitiveTopology::eTriangleList);
+    Common::FirstRunReport::Global().Reset();
+    Require(name, "builds at once",
+            rig.cache.AcquireGraphicsPipeline(rig.command, state, &ALWAYS_SKIP) != nullptr,
+            "a draw went without its pipeline with the flag off");
+    const auto rows = GraphicsCompileRows();
+    Require(name, "compiled on the calling thread",
+            rows.size() == 1 && rows[0].thread == Common::FirstRunReport::Thread::Gpu &&
+                PipelineCacheTestAccess::Pipelines(rig.cache)[0] == 1 &&
+                PipelineCacheTestAccess::PendingBuilds(rig.cache) == 0,
+            "the pipeline was not built once by the calling thread");
+  });
+}
+
+// A pipeline is built in the background while the draws that want it go without. A worker's
+// compile is recorded as worker time and does not block the GPU thread, and the finished pipeline
+// is taken by the next request.
+void CheckAsyncPipelineBuild(VulkanHarness &vulkan) {
+  constexpr const char *name = "AsyncPipelineBuild";
+  // Outlives the context, since the held workers read it until they finish.
+  PipelineCacheTestAccess::BuildHold hold;
+  WithAsyncCache(vulkan, true, {}, [&](const AsyncCacheRig &rig) {
+    auto &report = Common::FirstRunReport::Global();
+    Require(name, "queue exists", PipelineCacheTestAccess::HasBuildQueue(rig.cache),
+            "the flag was on, but no build queue exists");
+    PipelineCacheTestAccess::HoldBuildQueue(rig.cache, hold);
+    const auto state = rig.State(vk::PrimitiveTopology::eTriangleList);
+    report.Reset();
+    Require(name, "first skip",
+            rig.cache.AcquireGraphicsPipeline(rig.command, state, &ALWAYS_SKIP) == nullptr,
+            "a pipeline that nobody could have built yet was returned");
+    Require(name, "second skip",
+            rig.cache.AcquireGraphicsPipeline(rig.command, state, &ALWAYS_SKIP) == nullptr &&
+                PipelineCacheTestAccess::PendingBuilds(rig.cache) == 1,
+            "a second request did not share the first one's build");
+    Require(name, "driver cache clean", !PipelineCacheTestAccess::DriverCacheDirty(rig.cache),
+            "the driver cache was dirty before any build");
+    Require(name, "nothing yet", PipelineCacheTestAccess::Pipelines(rig.cache)[0] == 0,
+            "the cache held a pipeline before any worker could have built it");
+    hold.release = true;
+    WaitUntilTrue(name, "worker build", [&] {
+      return PipelineCacheTestAccess::FinishedBuilds(rig.cache) == 1;
+    });
+    const auto rows = GraphicsCompileRows();
+    Require(name, "worker marks the driver cache", PipelineCacheTestAccess::DriverCacheDirty(rig.cache),
+            "a background build did not mark the driver cache for the next save");
+    Require(name, "worker row",
+            rows.size() == 1 && rows[0].thread == Common::FirstRunReport::Thread::Worker,
+            "the background compile was not recorded once, as worker time");
+    Require(name, "worker time is not blocking", report.Summarize().blocked_graphics_ms == 0.0,
+            "a compile on a worker counted as GPU-thread blocking");
+    WaitUntilTrue(name, "published", [&] { return PipelineCacheTestAccess::HasPublished(rig.cache); });
+    // A request for some other pipeline takes every finished build the workers published.
+    const auto other = rig.State(vk::PrimitiveTopology::eLineList);
+    Require(name, "other request",
+            rig.cache.AcquireGraphicsPipeline(rig.command, other, &ALWAYS_SKIP) == nullptr,
+            "a request for a new pipeline did not start its own build");
+    Require(name, "drained",
+            PipelineCacheTestAccess::PendingBuilds(rig.cache) == 1 &&
+                PipelineCacheTestAccess::Pipelines(rig.cache)[0] == 1,
+            "the finished build was not taken by a request for another pipeline");
+    const auto ready = report.Readies();
+    Require(name, "ready row",
+            ready.size() == 1 && ready[0].skipped_draws == 2 && ready[0].ready_ms > 0.0,
+            "the ready row lost the two skipped requests or its time");
+    Require(name, "adopted",
+            rig.cache.AcquireGraphicsPipeline(rig.command, state, &ALWAYS_SKIP) != nullptr,
+            "the pipeline taken from the build was not returned for its own key");
+    Require(name, "adoption did not block", report.Summarize().blocked_graphics_ms == 0.0,
+            "taking a finished pipeline counted as blocking");
+  });
+}
+
+// A request that may not skip claims a queued build and compiles it on the calling thread, once.
+// The worker that later reaches the stale queue entry must not compile it again.
+void CheckAsyncPipelineClaim(VulkanHarness &vulkan) {
+  constexpr const char *name = "AsyncPipelineClaim";
+  PipelineCacheTestAccess::BuildHold hold;
+  WithAsyncCache(vulkan, true, {}, [&](const AsyncCacheRig &rig) {
+    auto &report = Common::FirstRunReport::Global();
+    PipelineCacheTestAccess::HoldBuildQueue(rig.cache, hold);
+    const auto state = rig.State(vk::PrimitiveTopology::eTriangleStrip);
+    report.Reset();
+    Require(name, "queued",
+            rig.cache.AcquireGraphicsPipeline(rig.command, state, &ALWAYS_SKIP) == nullptr,
+            "the request was not left queued behind the held workers");
+    Require(name, "claimed",
+            rig.cache.AcquireGraphicsPipeline(rig.command, state, &NEVER_SKIP) != nullptr,
+            "a request that may not skip returned no pipeline");
+    auto rows = GraphicsCompileRows();
+    Require(name, "compiled on the calling thread",
+            rows.size() == 1 && rows[0].thread == Common::FirstRunReport::Thread::Gpu &&
+                report.Summarize().blocked_graphics_ms > 0.0,
+            "the claim did not compile once on the calling thread as blocking time");
+    hold.release = true;
+    PipelineCacheTestAccess::DrainBuildQueue(rig.cache);
+    rows = GraphicsCompileRows();
+    Require(name, "compiled once", rows.size() == 1,
+            "a worker compiled the build again after the calling thread had");
+    // The claim published its own build too. Another request takes the list, and must find that
+    // build already taken instead of taking it a second time, which would abort.
+    Require(name, "published claim is not taken twice",
+            rig.cache.AcquireGraphicsPipeline(rig.command, state, &ALWAYS_SKIP) != nullptr,
+            "a request after the claim did not find the claimed pipeline");
+  });
+}
+
+// A draw refused a skip that misses its pipeline is counted under its rule with the time it was
+// blocked, which is the compile it ran here. That time and the GPU thread's graphics translate
+// make up the blocked graphics total. A draw that finds its pipeline is refused nothing, which the
+// second request shows.
+void CheckAsyncRefusalTime(VulkanHarness &vulkan) {
+  constexpr const char *name = "AsyncRefusalTime";
+  constexpr double tolerance_ms = 0.001;
+  WithAsyncCache(vulkan, true, {}, [&](const AsyncCacheRig &rig) {
+    auto &report = Common::FirstRunReport::Global();
+    report.Reset();
+    const auto state = rig.State(vk::PrimitiveTopology::eTriangleList);
+    const RefusingPolicy first_draw;
+    const RefusingPolicy second_draw;
+    Require(name, "refused draw gets a pipeline",
+            rig.cache.AcquireGraphicsPipeline(rig.command, state, &first_draw) != nullptr,
+            "a refused draw was left without a pipeline");
+    const auto rows = GraphicsCompileRows();
+    auto summary = report.Summarize();
+    Require(name, "one refusal with the compile as its time",
+            rows.size() == 1 && summary.refusals.size() == 1 &&
+                summary.refusals[0].reason == "test_rule" && summary.refusals[0].draws == 1 &&
+                std::abs(summary.refusals[0].blocked_ms - rows[0].create_ms) < tolerance_ms &&
+                rows[0].create_ms > 0.0,
+            "the refusal did not carry the time the compile blocked the thread");
+    Require(name, "refusals and translate make up the blocked total",
+            summary.translate_gpu_graphics_ms > 0.0 &&
+                std::abs(summary.blocked_graphics_ms - summary.refusals[0].blocked_ms -
+                         summary.translate_gpu_graphics_ms) < tolerance_ms,
+            "the refusal time and the graphics translate time did not add up to the blocked total");
+    Require(name, "a hit records no refusal",
+            rig.cache.AcquireGraphicsPipeline(rig.command, state, &second_draw) != nullptr &&
+                report.Summarize().refusals[0].draws == 1,
+            "a draw that found its pipeline was counted as refused");
+  });
+}
+
+// A request that meets a build the worker has finished, before the drain has seen it, takes the
+// pipeline from that build. The drain that follows finds the build already taken and leaves it.
+void CheckAsyncPipelineCompletedShortcut(VulkanHarness &vulkan) {
+  constexpr const char *name = "AsyncPipelineCompletedShortcut";
+  PipelineCacheTestAccess::BuildHold hold;
+  WithAsyncCache(vulkan, true, {}, [&](const AsyncCacheRig &rig) {
+    PipelineCacheTestAccess::HoldBuildQueue(rig.cache, hold);
+    const auto state = rig.State(vk::PrimitiveTopology::eLineStrip);
+    Require(name, "queued",
+            rig.cache.AcquireGraphicsPipeline(rig.command, state, &ALWAYS_SKIP) == nullptr,
+            "the request was not left queued behind the held workers");
+    hold.release = true;
+    WaitUntilTrue(name, "worker build", [&] {
+      return PipelineCacheTestAccess::FinishedBuilds(rig.cache) == 1;
+    });
+    WaitUntilTrue(name, "published", [&] { return PipelineCacheTestAccess::HasPublished(rig.cache); });
+    PipelineCacheTestAccess::SetHint(rig.cache, false);
+    Require(name, "taken by its own request",
+            rig.cache.AcquireGraphicsPipeline(rig.command, state, &ALWAYS_SKIP) != nullptr &&
+                PipelineCacheTestAccess::PendingBuilds(rig.cache) == 0,
+            "a finished build was skipped again because the drain had not seen it");
+    PipelineCacheTestAccess::SetHint(rig.cache, true);
+    Require(name, "drain leaves a taken build",
+            rig.cache.AcquireGraphicsPipeline(rig.command, state, &ALWAYS_SKIP) != nullptr,
+            "the drain took a build that was already taken");
+  });
+}
+
+// A request that may not skip waits for a worker that is running the build, and the wait is
+// GPU-thread blocking even though no compile ran on that thread.
+void CheckAsyncPipelineWait(VulkanHarness &vulkan) {
+  constexpr const char *name = "AsyncPipelineWait";
+  PipelineCreateHook hook;
+  // A request that arrives after the held build is released finds it done and waits for nothing,
+  // which a stalled GPU thread could cause. That outcome cannot show the wait, so the attempt is
+  // made again on another pipeline. A wait that is never counted fails every attempt.
+  constexpr std::array topologies {vk::PrimitiveTopology::eLineList,
+                                   vk::PrimitiveTopology::eTriangleList,
+                                   vk::PrimitiveTopology::eLineStrip,
+                                   vk::PrimitiveTopology::eTriangleStrip};
+  WithAsyncCache(vulkan, true, {}, [&](const AsyncCacheRig &rig) {
+    auto &report = Common::FirstRunReport::Global();
+    bool waited = false;
+    for (size_t attempt = 0; attempt < topologies.size() && !waited; attempt++) {
+      const auto state = rig.State(topologies[attempt]);
+      report.Reset();
+      hook.block = true;
+      Require(name, "started",
+              rig.cache.AcquireGraphicsPipeline(rig.command, state, &ALWAYS_SKIP) == nullptr,
+              "the first request did not leave the build to a worker");
+      WaitUntilTrue(name, "worker running",
+                    [&] { return PipelineCreateHook::entered.load() == attempt + 1; });
+      std::thread releaser([] {
+        std::this_thread::sleep_for(BUILD_HOLD_DELAY);
+        PipelineCreateHook::block = false;
+      });
+      const auto *pipeline = rig.cache.AcquireGraphicsPipeline(rig.command, state, &NEVER_SKIP);
+      releaser.join();
+      Require(name, "pipeline", pipeline != nullptr, "the waiting request returned no pipeline");
+      const auto rows = GraphicsCompileRows();
+      Require(name, "compiled by the worker",
+              rows.size() == 1 && rows[0].thread == Common::FirstRunReport::Thread::Worker,
+              "the compile was not recorded once, on the worker");
+      // No compile ran on this thread, so only a wait can have blocked it.
+      waited = report.Summarize().blocked_graphics_ms > 0.0;
+      Require(name, "published wait is not taken twice",
+              rig.cache.AcquireGraphicsPipeline(rig.command, state, &ALWAYS_SKIP) != nullptr,
+              "a request after the wait did not find the pipeline");
+    }
+    Require(name, "wait is blocking", waited,
+            "the time spent waiting for the worker was not counted as GPU-thread blocking");
+  });
+}
+
+// A pipeline requested while the process exits is stored, so the next run builds it before play.
+// Without the pending request, only the pipeline that was built is stored.
+void CheckAsyncPipelineStore(VulkanHarness &vulkan) {
+  constexpr const char *name = "AsyncPipelineStore";
+  const auto dir = std::filesystem::temp_directory_path() /
+                   fmt::format("kyty_async_store_{}",
+                               std::chrono::steady_clock::now().time_since_epoch().count());
+  const auto session = [&](const std::filesystem::path &store, bool request_second) {
+    // Outlives the context, which stops the held workers when it is destroyed.
+    PipelineCacheTestAccess::BuildHold hold;
+    WithAsyncCache(vulkan, true, store, [&](const AsyncCacheRig &rig) {
+      PipelineCacheTestAccess::HoldBuildQueue(rig.cache, hold);
+      const auto first = rig.State(vk::PrimitiveTopology::eTriangleList);
+      (void)rig.cache.AcquireGraphicsPipeline(rig.command, first, &NEVER_SKIP);
+      if (request_second) {
+        const auto second = rig.State(vk::PrimitiveTopology::eTriangleStrip);
+        Require(name, "pending at exit",
+                rig.cache.AcquireGraphicsPipeline(rig.command, second, &ALWAYS_SKIP) ==
+                    nullptr,
+                "the second pipeline was not left pending");
+      }
+      // The context is destroyed with the build still queued, so it never runs.
+    });
+  };
+  const auto replayed = [&](const std::filesystem::path &store) {
+    size_t count = 0;
+    WithAsyncCache(vulkan, false, store, [&](const AsyncCacheRig &rig) {
+      count = PipelineCacheTestAccess::Pipelines(rig.cache)[0];
+    });
+    return count;
+  };
+  // The first session is read by the second, so each case has a store of its own.
+  session(dir / "plain.shaders", false);
+  session(dir / "pending.shaders", true);
+  Require(name, "built pipeline stored", replayed(dir / "plain.shaders") == 1,
+          "the baseline store did not hold the one built pipeline");
+  Require(name, "pending pipeline stored", replayed(dir / "pending.shaders") == 2,
+          "a pipeline that was only requested at exit was not stored for the next run");
+  std::filesystem::remove_all(dir);
+}
+
+// What a teardown case leaves behind: the Vulkan objects never destroyed, and the graphics
+// pipelines compiled, which shows whether a dropped build ran.
+struct TeardownResult {
+  size_t leaked = 0;
+  size_t compiled = 0;
+};
+
+// What a session leaves for the teardown besides the pipeline it built itself.
+enum class LeftBuild { Nothing, Finished, Running, Queued };
+
+// Leaves a second pipeline's build in the given state, for the destruction of the context to find.
+// A running build is released by `releaser` once the destruction has begun to wait for it.
+void LeaveBuild(const AsyncCacheRig &rig, LeftBuild left,
+                PipelineCacheTestAccess::BuildHold &hold, std::optional<std::thread> &releaser) {
+  constexpr const char *name = "AsyncPipelineTeardown";
+  const auto second = rig.State(vk::PrimitiveTopology::eTriangleStrip);
+  switch (left) {
+    case LeftBuild::Nothing: break;
+    case LeftBuild::Finished:
+      (void)rig.cache.AcquireGraphicsPipeline(rig.command, second, &ALWAYS_SKIP);
+      WaitUntilTrue(name, "finished", [&] {
+        return PipelineCacheTestAccess::FinishedBuilds(rig.cache) == 1;
+      });
+      // Stopping twice is harmless.
+      rig.cache.StopBuilds();
+      rig.cache.StopBuilds();
+      Require(name, "stopped", !rig.cache.BuildsInBackground(),
+              "the builds were still in the background after stopping");
+      break;
+    case LeftBuild::Running:
+      PipelineCreateHook::block = true;
+      (void)rig.cache.AcquireGraphicsPipeline(rig.command, second, &ALWAYS_SKIP);
+      WaitUntilTrue(name, "running", [&] { return PipelineCreateHook::entered.load() == 1; });
+      // The destruction has to wait for the running compile, so something lets it go.
+      releaser.emplace([] {
+        std::this_thread::sleep_for(BUILD_HOLD_DELAY);
+        PipelineCreateHook::block = false;
+      });
+      break;
+    case LeftBuild::Queued:
+      PipelineCacheTestAccess::HoldBuildQueue(rig.cache, hold);
+      (void)rig.cache.AcquireGraphicsPipeline(rig.command, second, &ALWAYS_SKIP);
+      break;
+  }
+}
+
+// Builds one pipeline, leaves another build as asked, destroys the context, and counts what is left.
+TeardownResult RunTeardownCase(VulkanHarness &vulkan, LeftBuild left) {
+  PipelineCreateHook::ResetLedger();
+  std::optional<std::thread> releaser;
+  PipelineCacheTestAccess::BuildHold hold;
+  WithAsyncCache(vulkan, true, {}, [&](const AsyncCacheRig &rig) {
+    const auto first = rig.State(vk::PrimitiveTopology::eTriangleList);
+    (void)rig.cache.AcquireGraphicsPipeline(rig.command, first, &NEVER_SKIP);
+    LeaveBuild(rig, left, hold, releaser);
+  });
+  if (releaser) releaser->join();
+  PipelineCreateHook::entered = 0;
+  return {PipelineCreateHook::Live(), GraphicsCompileRows().size()};
+}
+
+// Stopping the builds frees every Vulkan object that nobody took, whether the build was finished,
+// running or still queued, and can be done twice. The ledger counts the pipelines, pipeline layouts
+// and descriptor set layouts never destroyed, and a session that requests nothing more is the
+// baseline. A queued build never runs, which the compile count shows, because a pipeline that was
+// never created leaves nothing in the ledger either way.
+void CheckAsyncPipelineTeardown(VulkanHarness &vulkan) {
+  constexpr const char *name = "AsyncPipelineTeardown";
+  PipelineCreateHook hook;
+  const auto baseline = RunTeardownCase(vulkan, LeftBuild::Nothing);
+  Require(name, "baseline compiled once", baseline.compiled == 1,
+          "the baseline session did not build exactly its one pipeline");
+  const auto finished = RunTeardownCase(vulkan, LeftBuild::Finished);
+  Require(name, "finished build freed",
+          finished.compiled == 2 && finished.leaked == baseline.leaked,
+          "a finished build nobody took left a pipeline, pipeline layout or set layout behind");
+  const auto running = RunTeardownCase(vulkan, LeftBuild::Running);
+  Require(name, "running build freed", running.compiled == 2 && running.leaked == baseline.leaked,
+          "a build that was running when the context was destroyed left an object behind");
+  const auto queued = RunTeardownCase(vulkan, LeftBuild::Queued);
+  Require(name, "queued build dropped", queued.compiled == 1 && queued.leaked == baseline.leaked,
+          "a queued build ran during the teardown instead of being dropped");
+}
+
+// Holds a background build before it reads the image heap's layout, and notes the layout it reads.
+struct LayoutOrderHook {
+  static inline std::atomic<bool> block{false};
+  static inline std::atomic<bool> entered{false};
+  static inline std::atomic<size_t> held_thread{0};
+  static inline std::atomic<bool> layout_seen{false};
+  static inline std::atomic<uint64_t> heap_layout{0};
+  static inline PFN_vkCreateDescriptorSetLayout real_set_layout = nullptr;
+  static inline PFN_vkCreatePipelineLayout real_pipeline_layout = nullptr;
+
+  static size_t ThisThread() { return std::hash<std::thread::id>{}(std::this_thread::get_id()); }
+
+  static VkResult VKAPI_CALL CreateSetLayout(VkDevice device,
+                                             const VkDescriptorSetLayoutCreateInfo *info,
+                                             const VkAllocationCallbacks *allocator,
+                                             VkDescriptorSetLayout *layout) {
+    if (block.load() && !GuestGpu::IsGpuThread()) {
+      held_thread = ThisThread();
+      entered = true;
+      while (block.load()) std::this_thread::yield();
+    }
+    return real_set_layout(device, info, allocator, layout);
+  }
+
+  // The second set layout is the image heap's, which the thread that was held read just before.
+  static VkResult VKAPI_CALL CreatePipelineLayout(VkDevice device,
+                                                  const VkPipelineLayoutCreateInfo *info,
+                                                  const VkAllocationCallbacks *allocator,
+                                                  VkPipelineLayout *layout) {
+    if (held_thread.load() == ThisThread()) {
+      heap_layout = reinterpret_cast<uint64_t>(info->pSetLayouts[1]);
+      layout_seen = true;
+    }
+    return real_pipeline_layout(device, info, allocator, layout);
+  }
+
+  LayoutOrderHook() {
+    block = entered = layout_seen = false;
+    held_thread = 0;
+    heap_layout = 0;
+    real_set_layout = VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateDescriptorSetLayout;
+    real_pipeline_layout = VULKAN_HPP_DEFAULT_DISPATCHER.vkCreatePipelineLayout;
+    VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateDescriptorSetLayout = CreateSetLayout;
+    VULKAN_HPP_DEFAULT_DISPATCHER.vkCreatePipelineLayout = CreatePipelineLayout;
+  }
+  ~LayoutOrderHook() {
+    block = false;
+    VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateDescriptorSetLayout = real_set_layout;
+    VULKAN_HPP_DEFAULT_DISPATCHER.vkCreatePipelineLayout = real_pipeline_layout;
+  }
+  LayoutOrderHook(const LayoutOrderHook &) = delete;
+  LayoutOrderHook &operator=(const LayoutOrderHook &) = delete;
+};
+
+// A build that is running when the context is destroyed still reads the image heap's layout, so
+// the render context must stop the builds before the heap goes. The destruction here waits for the
+// held build, which then reads the layout.
+void CheckAsyncTeardownOrder(VulkanHarness &vulkan) {
+  constexpr const char *name = "AsyncTeardownOrder";
+  LayoutOrderHook hook;
+  std::optional<std::thread> releaser;
+  WithAsyncCache(vulkan, true, {}, [&](const AsyncCacheRig &rig) {
+    const auto state = rig.State(vk::PrimitiveTopology::eTriangleList);
+    LayoutOrderHook::block = true;
+    Require(name, "started",
+            rig.cache.AcquireGraphicsPipeline(rig.command, state, &ALWAYS_SKIP) == nullptr,
+            "the request did not leave the build to a worker");
+    WaitUntilTrue(name, "worker held", [] { return LayoutOrderHook::entered.load(); });
+    // The held build is let go when the queue begins to stop, which the context's destruction does
+    // before it destroys anything, and not when a timer says. A destruction that stopped it later
+    // would let it go only after the heap was gone. If the queue never stops, the wait gives up.
+    releaser.emplace([cache = &rig.cache] {
+      const auto deadline = std::chrono::steady_clock::now() + BUILD_WAIT_LIMIT;
+      while (!PipelineCacheTestAccess::QueueStopping(*cache) &&
+             std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::yield();
+      }
+      LayoutOrderHook::block = false;
+    });
+  });
+  releaser->join();
+  Require(name, "layout read", LayoutOrderHook::layout_seen.load(),
+          "the held build never reached the pipeline layout");
+  Require(name, "heap layout still there", LayoutOrderHook::heap_layout.load() != 0,
+          "the build read the image heap's layout after the heap was destroyed");
+}
+
+// A module keeps its address while the program gains more, because queued builds point at it.
+void CheckAsyncStableModules(VulkanHarness &vulkan) {
+  constexpr const char *name = "AsyncStableModules";
+  std::vector<u32> code;
+  AppendVMovU32(&code, 1, 7);
+  code.insert(code.end(), {EncodeMubuf0(0x1c), EncodeMubuf1(1, 0, 0)});
+  AppendEnd(&code);
+  ShaderMapUserData(reinterpret_cast<uint64_t>(code.data()),
+                    {.type = Prospero::ShaderBinaryType::kCs,
+                     .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
+  PipelineCache cache(vulkan.RuntimeContext(), nullptr);
+  // The strides are specializations of one program, so each is another module of it.
+  const auto compile = [&](u32 stride) {
+    HW::ComputeShaderInfo regs{};
+    regs.cs_regs.data_addr = reinterpret_cast<uint64_t>(code.data());
+    regs.cs_regs.num_thread_x = 1;
+    regs.cs_regs.num_thread_y = 1;
+    regs.cs_regs.num_thread_z = 1;
+    regs.cs_regs.wave_size = 32;
+    regs.cs_regs.user_sgpr = 4;
+    const ShaderBufferResource buffer{{0x10000u, stride << 16u, 64,
+        DstSel(4, 5, 6, 7) | (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u)}};
+    std::copy_n(buffer.fields, 4, regs.cs_user_sgpr.value);
+    ShaderComputeInputInfo input{};
+    return cache.GetComputeProgram(regs, input);
+  };
+  constexpr u32 module_count = 24;
+  const auto *first = compile(4);
+  const auto first_id = first->id;
+  for (u32 variant = 1; variant < module_count; variant++) (void)compile(4 + 4 * variant);
+  Require(name, "one program of many modules",
+          PipelineCacheTestAccess::Programs(cache) == 1 &&
+              PipelineCacheTestAccess::Compiled(cache)[static_cast<size_t>(ShaderType::Compute)] ==
+                  module_count,
+          "the modules did not all belong to one program");
+  Require(name, "address kept", compile(4) == first && first->id == first_id,
+          "an earlier module moved or changed when the program gained more");
+}
+
+// Every --async-pipelines check, in the order they build on each other.
+void CheckAsyncPipelines(VulkanHarness &vulkan) {
+  const auto run = [](const char *name, const std::function<void()> &check) {
+    check();
+    std::printf("[gpu]     %-32s ok\n", name);
+  };
+  run("AsyncPipelinesOff", [&] { CheckAsyncPipelinesOff(vulkan); });
+  run("AsyncPipelineBuild", [&] { CheckAsyncPipelineBuild(vulkan); });
+  run("AsyncPipelineClaim", [&] { CheckAsyncPipelineClaim(vulkan); });
+  run("AsyncPipelineWait", [&] { CheckAsyncPipelineWait(vulkan); });
+  run("AsyncRefusalTime", [&] { CheckAsyncRefusalTime(vulkan); });
+  run("AsyncPipelineCompletedShortcut", [&] { CheckAsyncPipelineCompletedShortcut(vulkan); });
+  run("AsyncPipelineStore", [&] { CheckAsyncPipelineStore(vulkan); });
+  run("AsyncPipelineTeardown", [&] { CheckAsyncPipelineTeardown(vulkan); });
+  run("AsyncTeardownOrder", [&] { CheckAsyncTeardownOrder(vulkan); });
+  run("AsyncStableModules", [&] { CheckAsyncStableModules(vulkan); });
+  vulkan.CheckAsyncGate();
+  vulkan.CheckAsyncDrawsOff();
+  vulkan.CheckAsyncDraws();
+  vulkan.CheckAsyncDrawIsNotItsOwnEvidence();
+  vulkan.CheckAsyncHtileIsNotAClear();
+  vulkan.CheckAsyncDepthOnlyMode();
+  vulkan.CheckAsyncSampledAfterSkip();
+  vulkan.CheckAsyncSkippedClears();
+  vulkan.CheckAsyncIndirectSkip();
+  vulkan.CheckAsyncSkippedOcclusion();
+}
+
 // With a shader store a restart compiles nothing and creates every pipeline before the first
 // lookup. A damaged record and everything after it are dropped; a stale store starts over.
 void CheckShaderStore(VulkanHarness &vulkan) {
@@ -58453,6 +60361,101 @@ void CheckFirstRunWiring(VulkanHarness &vulkan) {
   Report::Global().Reset();
   std::filesystem::remove_all(store_dir);
   std::printf("[gpu]     %-32s ok\n", name);
+}
+
+// Stands in for the driver's cache read, to change the cache during a save or to fail the read.
+struct DriverSaveHook {
+  static inline std::function<void()> during;
+  static inline bool fail = false;
+  static inline PFN_vkGetPipelineCacheData real_get = nullptr;
+
+  static VkResult VKAPI_CALL Get(VkDevice device, VkPipelineCache cache, size_t *size, void *data) {
+    if (during) during();
+    if (fail) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    return real_get(device, cache, size, data);
+  }
+
+  DriverSaveHook() {
+    during = {};
+    fail = false;
+    real_get = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPipelineCacheData;
+    VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPipelineCacheData = Get;
+  }
+  ~DriverSaveHook() {
+    during = {};
+    fail = false;
+    VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPipelineCacheData = real_get;
+  }
+  DriverSaveHook(const DriverSaveHook &) = delete;
+  DriverSaveHook &operator=(const DriverSaveHook &) = delete;
+};
+
+// The driver cache save clears its dirty flag before it reads the cache, so a change made while it
+// runs, as a background build does, is still saved next time. A save that fails sets the flag
+// again. A plain save clears it, which is the baseline for both.
+void CheckDriverCacheSave(VulkanHarness &vulkan) {
+  constexpr const char *name = "DriverCacheSave";
+  if (KYTY_BUILD != KYTY_BUILD_RELEASE) {
+    std::printf("[gpu]     %-32s skipped, the driver cache is Release only%s", name, "\n");
+    return;
+  }
+  const auto folder = std::filesystem::temp_directory_path() /
+                      fmt::format("kyty_driver_save_{}",
+                                  std::chrono::steady_clock::now().time_since_epoch().count());
+  std::filesystem::create_directories(folder / "sce_sys");
+  {
+    Common::File param(folder / "sce_sys" / "param.json");
+    const std::string text = R"({"titleId":"PPSA00098","contentId":"UP0001-PPSA00098_00-0000000000000000"})";
+    param.Write(text.data(), static_cast<u32>(text.size()));
+  }
+  const auto previous = std::filesystem::current_path();
+  std::filesystem::current_path(folder);
+  Loader::SystemContentLoadParamSfo(folder / "sce_sys" / "param.json");
+  Config::Load({.printf_direction = Config::LogDirection::Silent});
+  std::vector<u32> code;
+  AppendVMovU32(&code, 1, 0x78u);
+  code.insert(code.end(), {EncodeMubuf0(0x1c), EncodeMubuf1(1, 0, 0)});
+  AppendEnd(&code);
+  ShaderMapUserData(reinterpret_cast<uint64_t>(code.data()),
+                    {.type = Prospero::ShaderBinaryType::kCs,
+                     .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
+  {
+    PipelineCache cache(vulkan.RuntimeContext(), nullptr);
+    HW::ComputeShaderInfo regs{};
+    regs.cs_regs.data_addr = reinterpret_cast<uint64_t>(code.data());
+    regs.cs_regs.num_thread_x = 1;
+    regs.cs_regs.num_thread_y = 1;
+    regs.cs_regs.num_thread_z = 1;
+    regs.cs_regs.wave_size = 32;
+    regs.cs_regs.user_sgpr = 4;
+    const ShaderBufferResource buffer{{0x10000u, 4u << 16u, 64,
+        DstSel(4, 5, 6, 7) | (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u)}};
+    std::copy_n(buffer.fields, 4, regs.cs_user_sgpr.value);
+    ShaderComputeInputInfo input{};
+    (void)cache.GetComputeProgram(regs, input);
+    (void)cache.GetComputePipeline(input);
+    Require(name, "has a driver cache", PipelineCacheTestAccess::HasDriverCache(cache),
+            "no driver cache object, so there is nothing to save");
+    DriverSaveHook hook;
+    const auto dirty = [&] { return PipelineCacheTestAccess::DriverCacheDirty(cache); };
+    Require(name, "dirty after a compile", dirty(), "a compile did not mark the driver cache");
+    cache.Save();
+    Require(name, "a plain save clears the flag", !dirty(),
+            "a save that changes nothing during it left the flag set");
+    PipelineCacheTestAccess::SetDriverCacheDirty(cache, true);
+    DriverSaveHook::during = [&] { PipelineCacheTestAccess::SetDriverCacheDirty(cache, true); };
+    cache.Save();
+    DriverSaveHook::during = {};
+    Require(name, "a change during the save stays", dirty(),
+            "a change made while the cache was being read was forgotten by the save");
+    DriverSaveHook::fail = true;
+    cache.Save();
+    DriverSaveHook::fail = false;
+    Require(name, "a failed save stays dirty", dirty(), "a failed save cleared the flag");
+  }
+  std::filesystem::current_path(previous);
+  std::filesystem::remove_all(folder);
+  std::printf("[gpu]     %-32s ok%s", name, "\n");
 }
 
 // A cold run still has an empty driver pipeline cache, like a first run, but neither reads nor
@@ -64982,6 +66985,12 @@ int main(int argc, char **argv) {
     CheckColdPipelines(vulkan);
     CheckFirstRunWiring(vulkan);
     CheckColdDriverCache(vulkan);
+    CheckDriverCacheSave(vulkan);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--async-pipelines-only") == 0) {
+    VulkanHarness vulkan;
+    CheckAsyncPipelines(vulkan);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--shader-cache-only") == 0) {
@@ -66297,6 +68306,7 @@ int main(int argc, char **argv) {
   CheckStableProgramIds(vulkan);
   CheckShaderStore(vulkan);
   CheckColdPipelines(vulkan);
+  CheckAsyncPipelines(vulkan);
   CheckFirstRunWiring(vulkan);
   vulkan.CheckOrderedDispatch();
   vulkan.CheckGpuSubmitCadence();
@@ -66376,6 +68386,7 @@ int main(int argc, char **argv) {
                 vulkan.SkippedCaseCount());
   }
   CheckColdDriverCache(vulkan);
+  CheckDriverCacheSave(vulkan);
   std::printf("ShaderRecompilerComputeTests: all cases passed\n");
   return 0;
 }

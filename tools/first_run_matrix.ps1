@@ -41,10 +41,20 @@ $ErrorActionPreference = "Stop"
 # is touched. Set Ready and fix the flag names here once the strategies exist.
 $ArmTable = [ordered]@{
     "baseline"       = @{ Flags = @();                                                                                     Ready = $true }
-    "async-graphics" = @{ Flags = @("--async-graphics-pipelines");                                                         Ready = $false }
+    "async-graphics" = @{ Flags = @("--async-pipelines");                                                                  Ready = $true }
+    "async-depth-only" = @{ Flags = @("--async-pipelines-depth-only");                                                    Ready = $true }
     "gpl"            = @{ Flags = @("--graphics-pipeline-library");                                                        Ready = $false }
     "lookahead"      = @{ Flags = @("--shader-lookahead");                                                                 Ready = $false }
-    "all"            = @{ Flags = @("--async-graphics-pipelines", "--graphics-pipeline-library", "--shader-lookahead");    Ready = $false }
+}
+
+# "all" turns on every strategy, so it is Ready only once every strategy arm is, and its flags are
+# theirs together. The depth-only arm is left out, because it is the default skip rule with a
+# stricter gate. Both flags can be on at once, and then depth-only wins, so "all" would measure the
+# depth-only mode instead of the default one.
+$StrategyArms = @("async-graphics", "gpl", "lookahead")
+$ArmTable["all"] = @{
+    Flags = @($StrategyArms | ForEach-Object { $ArmTable[$_].Flags })
+    Ready = @($StrategyArms | Where-Object { -not $ArmTable[$_].Ready }).Count -eq 0
 }
 
 # Reads the name the emulator uses for its caches, which is TITLE_ID or else the whole CONTENT_ID.

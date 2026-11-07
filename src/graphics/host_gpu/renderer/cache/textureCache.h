@@ -69,6 +69,58 @@ public:
 	}
 	void MarkGpuWritten(ImageId id);
 
+	/// Notes that a draw in the current frame ran into the view of the image, and that a clear of
+	/// the whole target came first when `cleared`. Called on the GPU thread for the draws that ran,
+	/// while pipelines build in the background. A frame is one guest flip. A view that is not the
+	/// whole image of one level and all its layers is ignored, because the history belongs to the
+	/// image and a layer or mip drawn every frame would vouch for one drawn once.
+	void NoteRenderTargetUse(ImageId id, const ImageViewInfo& view, bool cleared,
+	                         bool htile_cleared = false);
+	/// How a target's recent frames judge it for the gate. Only Rebuilt lets a draw skip.
+	enum class RebuildVerdict : uint8_t {
+		Rebuilt,
+		/// The view is not the whole image, as one level with all its layers.
+		PartialView,
+		/// Fewer than the minimum draws in this frame or in the one before.
+		TooFewDraws,
+		/// Fewer draws too, and the frame before shows no clear either, so more draws would not
+		/// have been enough.
+		TooFewDrawsUncleared,
+		/// Enough draws, but no clear of the whole target in both frames.
+		NotCleared,
+		/// No register clear in both frames, but an HTILE clear waited in both.
+		HtileClearedOnly,
+	};
+	/// Judges the view. It needs at least `min_draws` draws into it in this frame and in the one
+	/// before, and, when `needs_clear`, a clear of the whole target in both. The draws asked about
+	/// are not yet noted, so they are not their own evidence.
+	[[nodiscard]] RebuildVerdict JudgeRebuiltEveryFrame(ImageId id, const ImageViewInfo& view,
+	                                                    bool needs_clear, uint32_t min_draws);
+	/// Notes that a draw into the image was skipped, as a depth target when `depth`. Returns true
+	/// when a resident image heap references the image, which then gets no mark. The heap resolves
+	/// its own bindings out of reach of TakeSkippedDraws, and it could select the image, so the
+	/// caller reports the skip at once as a possible read.
+	/// A skip of an image no heap references yet keeps its mark, and NoteHeapSelected reports it
+	/// when a heap element first selects the image.
+	[[nodiscard]] bool NoteSkippedTarget(ImageId id, bool depth);
+	/// Takes the skipped draws noted for the image since its last whole-target clear, and says
+	/// whether they were depth draws. Called when a shader binding resolves to the image. Zero
+	/// when none are waiting. A color image is never cleared in view of the CPU, so its count only
+	/// resets here, and the same skipped draws are never reported twice.
+	///
+	/// Limits, so a count is read as a signal and nothing more. Zero does not mean safe and
+	/// nonzero does not mean damage. A read through another ImageId is not seen, such as an aliased
+	/// format or a stencil association. Copies are not seen, such as ResolveColorTargets,
+	/// CopyDepthToColor and DepthStencilCopy, nor buffer reads, nor presenting the image. Storage
+	/// bindings are not counted, and an image load that only reads resolves to a Texture binding,
+	/// because Storage means the shader writes the image. The binding is resolved before the draw
+	/// that uses it knows whether it will be skipped, so a draw that is itself skipped can count
+	/// marks of earlier skips for a read that never happens.
+	[[nodiscard]] uint32_t TakeSkippedDraws(ImageId id, bool* depth);
+	/// Called when a resident image heap element selects the image. Counts the heap's reference and
+	/// reports the skips marked on the image so far as possible reads, under a heap class.
+	void NoteHeapSelected(ImageId id);
+
 	[[nodiscard]] bool ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
 	                                        uint32_t packed_clear);
 	void               InvalidateMemory(uint64_t address, uint64_t size);

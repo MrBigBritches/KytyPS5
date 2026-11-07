@@ -47,6 +47,15 @@ public:
 		}
 	}
 
+	// A draw that was skipped, with its pipeline not built yet. If a guest query is open it counts
+	// as one sample, as a draw with no query to count it does, so an occlusion proxy is not culled
+	// for a draw that never ran.
+	void CountSkippedDraw() {
+		if (m_open != 0) {
+			m_uncounted++;
+		}
+	}
+
 	// A PIXEL_PIPE_STAT_DUMP to address, after the draws recorded so far.
 	void Dump(uint64_t address);
 	// Waits for the GPU to run the dumps and writes their counters.
