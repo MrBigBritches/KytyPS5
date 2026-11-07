@@ -234,6 +234,8 @@ file(GLOB kyty_emulator_src CONFIGURE_DEPENDS
 	"${KYTY_SOURCE_DIR}/graphics/presentation/*.h"
 	"${KYTY_SOURCE_DIR}/graphics/presentation/window/*.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/presentation/window/*.h"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/core/*.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/core/*.h"
 	"${KYTY_SOURCE_DIR}/kernel/*.cpp"
 	"${KYTY_SOURCE_DIR}/kernel/*.h"
 	"${KYTY_SOURCE_DIR}/loader/*.cpp"
@@ -445,6 +447,19 @@ add_executable(lru_cache_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/LruCacheTests.cpp"
 )
 target_include_directories(lru_cache_tests PRIVATE ${inc_headers})
+
+add_executable(system_ui_core_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/SystemUiCoreTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/core/scale.cpp"
+)
+target_include_directories(system_ui_core_tests PRIVATE ${inc_headers})
+
+# Checks the kit that compares draw lists.
+add_executable(system_ui_drawing_kit_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/SystemUiDrawingKitTests.cpp"
+)
+target_include_directories(system_ui_drawing_kit_tests PRIVATE ${inc_headers})
+target_link_libraries(system_ui_drawing_kit_tests imgui common)
 
 add_executable(slot_vector_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/SlotVectorTests.cpp"
@@ -690,6 +705,8 @@ if(BUILD_TESTING)
 	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
 	add_test(NAME lru_cache COMMAND $<TARGET_FILE:lru_cache_tests>)
 	add_test(NAME common COMMAND $<TARGET_FILE:common_tests>)
+	add_test(NAME system_ui_core COMMAND $<TARGET_FILE:system_ui_core_tests>)
+	add_test(NAME system_ui_drawing_kit COMMAND $<TARGET_FILE:system_ui_drawing_kit_tests>)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
 	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)
 	add_test(NAME resource_tracking COMMAND $<TARGET_FILE:resource_tracking_tests>)
@@ -805,6 +822,8 @@ if(BUILD_TESTING)
 		bit_array_tests
 		lru_cache_tests
 		common_tests
+		system_ui_core_tests
+		system_ui_drawing_kit_tests
 		shader_vertex_metadata_tests
 		resource_materialization_tests
 		resource_tracking_tests
