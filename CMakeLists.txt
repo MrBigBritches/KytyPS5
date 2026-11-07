@@ -236,6 +236,8 @@ file(GLOB kyty_emulator_src CONFIGURE_DEPENDS
 	"${KYTY_SOURCE_DIR}/graphics/presentation/window/*.h"
 	"${KYTY_SOURCE_DIR}/graphics/presentation/system/core/*.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/presentation/system/core/*.h"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/element/*.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/element/*.h"
 	"${KYTY_SOURCE_DIR}/graphics/presentation/system/layout/*.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/presentation/system/layout/*.h"
 	"${KYTY_SOURCE_DIR}/graphics/presentation/system/binding/*.h"
@@ -509,6 +511,19 @@ target_compile_definitions(system_ui_text_tests PRIVATE
 	KYTY_TEST_FONT_REGULAR="${KYTY_NOTO_SANS_DIR}/NotoSans-Regular.ttf"
 	KYTY_TEST_FONT_BOLD="${KYTY_NOTO_SANS_DIR}/NotoSans-Bold.ttf")
 
+add_executable(system_ui_interaction_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/SystemUiInteractionTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/components/text.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/element/frame.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/animation/easing.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/animation/tween.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/core/scale.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/animation/timeline.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/system/imgui/interaction.cpp"
+)
+target_include_directories(system_ui_interaction_tests PRIVATE ${inc_headers})
+target_link_libraries(system_ui_interaction_tests imgui common)
+
 # Checks the kit that compares draw lists.
 add_executable(system_ui_drawing_kit_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/SystemUiDrawingKitTests.cpp"
@@ -766,6 +781,7 @@ if(BUILD_TESTING)
 	add_test(NAME system_ui_animation COMMAND $<TARGET_FILE:system_ui_animation_tests>)
 	add_test(NAME system_ui_effects COMMAND $<TARGET_FILE:system_ui_effects_tests>)
 	add_test(NAME system_ui_text COMMAND $<TARGET_FILE:system_ui_text_tests>)
+	add_test(NAME system_ui_interaction COMMAND $<TARGET_FILE:system_ui_interaction_tests>)
 	add_test(NAME system_ui_drawing_kit COMMAND $<TARGET_FILE:system_ui_drawing_kit_tests>)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
 	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)
@@ -888,6 +904,7 @@ if(BUILD_TESTING)
 		system_ui_animation_tests
 		system_ui_effects_tests
 		system_ui_text_tests
+		system_ui_interaction_tests
 		system_ui_drawing_kit_tests
 		shader_vertex_metadata_tests
 		resource_materialization_tests
