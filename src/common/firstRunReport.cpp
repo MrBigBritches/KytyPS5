@@ -44,6 +44,11 @@ constexpr uint64_t         MIX_TWO        = 0x94D049BB133111EBull;
 
 constexpr std::string_view REPORT_DIRECTORY = "_FirstRunReports";
 constexpr int              JSON_INDENT      = 1;
+constexpr double           NS_PER_MS        = 1.0e6;
+
+int64_t ToNs(std::chrono::steady_clock::time_point point) {
+	return std::chrono::duration_cast<std::chrono::nanoseconds>(point.time_since_epoch()).count();
+}
 
 double Round3(double value) {
 	return std::round(value * ROUNDING_SCALE) / ROUNDING_SCALE;
@@ -84,6 +89,7 @@ Output& GetOutput() {
 std::atomic<bool>     g_written {false};
 std::atomic<bool>     g_partial {false};
 std::atomic<uint64_t> g_run_nonce {0};
+std::atomic<uint64_t> g_last_submission {0};
 
 } // namespace
 
@@ -116,6 +122,8 @@ void Report::OnFlip(int64_t flip) {
 	std::lock_guard lock(m_mutex);
 	m_flip = flip;
 	m_flips++;
+	m_submissions_per_flip.push_back(m_submissions_this_flip);
+	m_submissions_this_flip = 0;
 	// Blocking in an earlier flip is over once the game moves on, so its pause is complete.
 	FlushPendingPauseLocked(flip);
 }
@@ -155,15 +163,45 @@ void Report::AddTranslate(Kind kind, std::string_view stage, uint64_t hash, doub
 	}
 }
 
-void Report::AddCompile(Kind kind, uint64_t id, uint64_t id_ps, double create_ms, Thread thread) {
+void Report::BeginSubmission(const SubmissionStamp& stamp, bool count) {
 	std::lock_guard lock(m_mutex);
-	m_compiles.push_back({.kind      = kind,
-	                      .id        = id,
-	                      .id_ps     = id_ps,
-	                      .create_ms = create_ms,
-	                      .phase     = m_phase,
-	                      .thread    = thread,
-	                      .flip      = m_flip});
+	m_stamp = stamp;
+	if (count) {
+		m_submissions++;
+		m_submissions_this_flip++;
+	}
+}
+
+void Report::EndSubmission() {
+	std::lock_guard lock(m_mutex);
+	m_stamp.id = NO_SUBMISSION;
+}
+
+void Report::SetEpoch(int64_t epoch_ns) {
+	std::lock_guard lock(m_mutex);
+	m_epoch_ns = epoch_ns;
+}
+
+void Report::AddCompile(Kind kind, uint64_t id, uint64_t id_ps, double create_ms, Thread thread,
+                        int64_t start_ns) {
+	std::lock_guard lock(m_mutex);
+	CompileEntry    entry {.kind      = kind,
+	                       .id        = id,
+	                       .id_ps     = id_ps,
+	                       .create_ms = create_ms,
+	                       .phase     = m_phase,
+	                       .thread    = thread,
+	                       .flip      = m_flip};
+	// Only the GPU thread works through submissions, so a worker row never takes the current one.
+	if (thread == Thread::Gpu && m_phase == Phase::Play && m_stamp.id != NO_SUBMISSION &&
+	    start_ns != NO_TIME_NS) {
+		entry.submission = m_stamp.id;
+		entry.queue      = m_stamp.queue;
+		entry.start_ns   = start_ns;
+		entry.visible_ms = static_cast<double>(start_ns - m_stamp.enqueued_ns) / NS_PER_MS;
+		entry.picked_ms  = static_cast<double>(start_ns - m_stamp.picked_ns) / NS_PER_MS;
+	}
+	m_compiles.push_back(entry);
 	if (thread == Thread::Gpu && m_phase == Phase::Play) {
 		AddBlockedLocked(kind, create_ms);
 	}
@@ -236,6 +274,11 @@ void Report::Reset() {
 	m_phase             = Phase::Play;
 	m_flip              = 0;
 	m_flips             = 0;
+	m_stamp             = {};
+	m_epoch_ns          = NO_TIME_NS;
+	m_submissions       = 0;
+	m_submissions_this_flip = 0;
+	m_submissions_per_flip.clear();
 	m_stamp_failures    = 0;
 	m_boot              = {};
 	m_blocked_ms        = {};
@@ -295,6 +338,8 @@ Summary Report::Summarize() const {
 	summary.translate_ms        = m_translate_ms;
 	summary.translate_gpu_graphics_ms = m_translate_gpu_graphics_ms;
 	summary.flips               = m_flips;
+	summary.submissions         = m_submissions;
+	summary.submissions_per_flip = m_submissions_per_flip;
 	summary.stamp_failures      = m_stamp_failures;
 	summary.skips               = m_skips;
 	summary.skips_by_target     = m_skips_by_target;
@@ -326,7 +371,7 @@ Summary Report::Summarize() const {
 
 namespace {
 
-nlohmann::json CompileToJson(const CompileEntry& compile) {
+nlohmann::json CompileToJson(const CompileEntry& compile, int64_t epoch_ns) {
 	nlohmann::json row = {{"kind", compile.kind == Kind::Graphics ? "graphics" : "compute"}};
 	if (compile.kind == Kind::Graphics) {
 		row["vs"] = Hex(compile.id);
@@ -338,6 +383,16 @@ nlohmann::json CompileToJson(const CompileEntry& compile) {
 	row["phase"]     = compile.phase == Phase::Boot ? "boot" : "play";
 	row["thread"]    = compile.thread == Thread::Gpu ? "gpu" : "worker";
 	row["flip"]      = compile.flip;
+	// Left out when unset, so older readers and worker rows see no new keys.
+	if (compile.submission != NO_SUBMISSION) {
+		row["submission"] = compile.submission;
+		row["queue"]      = compile.queue;
+		row["visible_ms"] = Round3(compile.visible_ms);
+		row["picked_ms"]  = Round3(compile.picked_ms);
+		// With no epoch the time is on the raw steady clock, which only tests see.
+		const int64_t base = epoch_ns == NO_TIME_NS ? 0 : epoch_ns;
+		row["start_ms"]    = Round3(static_cast<double>(compile.start_ns - base) / NS_PER_MS);
+	}
 	return row;
 }
 
@@ -419,6 +474,11 @@ std::string Report::ToJson(const Metadata& metadata, uint64_t audio_holds,
 	const auto summary  = Summarize();
 	const auto compiles = Compiles();
 	const auto boot     = Boot();
+	int64_t    epoch_ns = NO_TIME_NS;
+	{
+		std::lock_guard lock(m_mutex);
+		epoch_ns = m_epoch_ns;
+	}
 
 	nlohmann::json flags = nlohmann::json::object();
 	for (const auto& [name, on]: metadata.flags) {
@@ -426,7 +486,7 @@ std::string Report::ToJson(const Metadata& metadata, uint64_t audio_holds,
 	}
 	nlohmann::json compile_rows = nlohmann::json::array();
 	for (const auto& compile: compiles) {
-		compile_rows.push_back(CompileToJson(compile));
+		compile_rows.push_back(CompileToJson(compile, epoch_ns));
 	}
 	nlohmann::json ready_rows = nlohmann::json::array();
 	for (const auto& ready: Readies()) {
@@ -447,6 +507,8 @@ std::string Report::ToJson(const Metadata& metadata, uint64_t audio_holds,
 	    {"skips", SkipsToJson(summary)},
 	    {"audio_holds", audio_holds},
 	    {"flips", summary.flips},
+	    {"submissions",
+	     {{"total", summary.submissions}, {"per_flip", summary.submissions_per_flip}}},
 	    {"run_seconds", Round3(run_seconds)},
 	};
 	// The title id is not filtered, so bytes that are not UTF-8 are replaced instead of throwing.
@@ -464,6 +526,7 @@ void Begin(Metadata metadata) {
 	std::lock_guard lock(output.mutex);
 	output.metadata = std::move(metadata);
 	output.start    = std::chrono::steady_clock::now();
+	Global().SetEpoch(ToNs(output.start));
 }
 
 void MarkPartial() {
@@ -567,6 +630,44 @@ void WriteReportOnce() {
 	}
 }
 
+int64_t NowNs() {
+	return ToNs(std::chrono::steady_clock::now());
+}
+
+uint64_t NextSubmissionId() {
+	return Enabled() ? g_last_submission.fetch_add(1, std::memory_order_relaxed) + 1
+	                 : NO_SUBMISSION;
+}
+
+SubmissionStamp SubmissionStamp::New(uint32_t queue) {
+	SubmissionStamp stamp;
+	stamp.id = NextSubmissionId();
+	if (stamp.id != NO_SUBMISSION) {
+		stamp.enqueued_ns = NowNs();
+		stamp.queue       = queue;
+	}
+	return stamp;
+}
+
+SubmissionScope::SubmissionScope(SubmissionStamp& stamp, bool is_commands)
+    : m_active(stamp.id != NO_SUBMISSION && Enabled()) {
+	if (!m_active) {
+		return;
+	}
+	if (stamp.picked_ns == NO_TIME_NS) {
+		stamp.picked_ns = NowNs();
+	}
+	const bool count = is_commands && !stamp.counted;
+	stamp.counted    = stamp.counted || is_commands;
+	Global().BeginSubmission(stamp, count);
+}
+
+SubmissionScope::~SubmissionScope() {
+	if (m_active) {
+		Global().EndSubmission();
+	}
+}
+
 TranslateScope::TranslateScope(Kind kind, std::string_view stage, uint64_t hash, bool on_gpu_thread)
     : m_active(Enabled()), m_kind(kind), m_thread(on_gpu_thread ? Thread::Gpu : Thread::Worker),
       m_hash(hash) {
@@ -586,13 +687,14 @@ CompileScope::CompileScope(Kind kind, uint64_t id, uint64_t id_ps, bool on_gpu_t
     : m_active(Enabled()), m_kind(kind), m_thread(on_gpu_thread ? Thread::Gpu : Thread::Worker),
       m_id(id), m_id_ps(id_ps) {
 	if (m_active) {
-		m_start = std::chrono::steady_clock::now();
+		m_start    = std::chrono::steady_clock::now();
+		m_start_ns = ToNs(m_start);
 	}
 }
 
 CompileScope::~CompileScope() {
 	if (m_active) {
-		Global().AddCompile(m_kind, m_id, m_id_ps, ElapsedMs(m_start), m_thread);
+		Global().AddCompile(m_kind, m_id, m_id_ps, ElapsedMs(m_start), m_thread, m_start_ns);
 	}
 }
 

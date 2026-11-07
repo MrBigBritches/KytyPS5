@@ -31,6 +31,29 @@ inline constexpr std::array<uint32_t, 7> PAUSE_BUCKET_BOUNDS_MS {100, 250, 500, 
 inline constexpr size_t WORST_TRANSLATE_LIMIT = 10;
 inline constexpr size_t LONGEST_PAUSE_LIMIT   = 20;
 
+/// Submission id of a compile that no guest submission caused. Ids start at 1.
+inline constexpr uint64_t NO_SUBMISSION = 0;
+/// Start time that is not known, so the row gets no submission or timing fields.
+inline constexpr int64_t NO_TIME_NS = INT64_MIN;
+
+/// What the report keeps about one guest submission, made when it is enqueued and carried with it
+/// through every resume. Times are on the NowNs clock.
+struct SubmissionStamp {
+	uint64_t id          = NO_SUBMISSION;
+	// When the guest thread enqueued it. A blocked submission goes back to its queue with this
+	// unchanged, so later resumes do not move it.
+	int64_t  enqueued_ns = 0;
+	// When the GPU thread first picked it up. Set once, by the first SubmissionScope.
+	int64_t  picked_ns   = NO_TIME_NS;
+	// The queue it was enqueued on, where 0 is graphics and the others are compute.
+	uint32_t queue       = 0;
+	// True once a command list has been counted, so a resume is not counted again.
+	bool     counted     = false;
+
+	/// A stamp for a submission enqueued now, or an inert one (id NO_SUBMISSION) with the report off.
+	[[nodiscard]] static SubmissionStamp New(uint32_t queue);
+};
+
 // Ids for pipelines the renderer builds for itself rather than from a guest shader. The top bits
 // tag the helper and the rest are zero, which a hashed module id is very unlikely to match.
 inline constexpr uint64_t HELPER_ID_TILER = 0xFFFF000100000000ull;
@@ -65,6 +88,13 @@ struct TranslateEntry {
 /// One pipeline creation. create_ms is the whole creation function, which includes layouts and
 /// helper modules as well as the driver call. For graphics id is the vertex stage id and id_ps the
 /// pixel stage id, which is 0 when there is none. For compute id is the module id.
+/// submission is the guest submission being processed on the GPU thread when the compile began, or
+/// NO_SUBMISSION for worker compiles, boot warm-up and compiles outside any submission. The fields
+/// after it are meaningful only when it is set. queue is the submission's queue. visible_ms is the
+/// compile start minus the time the submission was first enqueued. It includes time the submission
+/// sat in its queue, waited on labels, or was blocked and resumed, and the GPU thread could not
+/// have looked at it during a compile or a wait. picked_ms is the compile start minus the time the
+/// GPU thread first picked the submission up. start_ns is the compile start on the NowNs clock.
 struct CompileEntry {
 	Kind     kind      = Kind::Graphics;
 	uint64_t id        = 0;
@@ -73,6 +103,11 @@ struct CompileEntry {
 	Phase    phase     = Phase::Play;
 	Thread   thread    = Thread::Gpu;
 	int64_t  flip      = 0;
+	uint64_t submission = NO_SUBMISSION;
+	uint32_t queue      = 0;
+	double   visible_ms = 0.0;
+	double   picked_ms  = 0.0;
+	int64_t  start_ns   = NO_TIME_NS;
 };
 
 /// One background pipeline build the GPU thread took. ready_ms runs from the request to the end of
@@ -135,6 +170,12 @@ struct Summary {
 	std::vector<Pause>                                       longest_pauses;
 	uint32_t                                                 pause_count = 0;
 	uint32_t                                                 flips       = 0;
+	// Command submissions the GPU thread began, counted once each even when one was resumed.
+	uint32_t                                                 submissions = 0;
+	// Entry F counts the submissions begun while the flip counter was F, so entry 0 is before the first flip and
+	// the counts run from flip 0. Only finished flips are listed. The flip still running is only
+	// in the total.
+	std::vector<uint32_t>                                    submissions_per_flip;
 	uint32_t                                                 stamp_failures = 0;
 	std::array<uint32_t, 2>                                  skips {};
 	std::vector<std::pair<std::string, uint32_t>>            skips_by_target;
@@ -154,8 +195,18 @@ public:
 	void SetBoot(const BootInfo& boot);
 	/// Records a miss-path translation. Only GPU-thread time during play counts as blocked.
 	void AddTranslate(Kind kind, std::string_view stage, uint64_t hash, double ms, Thread thread);
-	/// Records a driver compile. Only GPU-thread time during play counts as blocked.
-	void AddCompile(Kind kind, uint64_t id, uint64_t id_ps, double create_ms, Thread thread);
+	/// Records a driver compile. Only GPU-thread time during play counts as blocked. start_ns is
+	/// when the compile began, on the NowNs clock, and links GPU-thread rows to the submission.
+	/// Without it the row is left unlinked.
+	void AddCompile(Kind kind, uint64_t id, uint64_t id_ps, double create_ms, Thread thread,
+	                int64_t start_ns = NO_TIME_NS);
+	/// Notes the submission the GPU thread is processing. count is true when it should join the
+	/// submission totals, which the caller does once per command list.
+	void BeginSubmission(const SubmissionStamp& stamp, bool count);
+	/// Sets the point in the run that start_ms is counted from, on the NowNs clock.
+	void SetEpoch(int64_t epoch_ns);
+	/// Notes that the GPU thread is outside any submission.
+	void EndSubmission();
 	/// Records GPU-thread time spent waiting for a compile that a worker was running. It counts as
 	/// blocked in play, though no compile ran on the GPU thread.
 	void AddWait(Kind kind, double ms);
@@ -199,6 +250,11 @@ private:
 	Phase                        m_phase = Phase::Play;
 	int64_t                      m_flip  = 0;
 	uint32_t                     m_flips = 0;
+	SubmissionStamp              m_stamp;
+	int64_t                      m_epoch_ns = NO_TIME_NS;
+	uint32_t                     m_submissions = 0;
+	uint32_t                     m_submissions_this_flip = 0;
+	std::vector<uint32_t>        m_submissions_per_flip;
 	uint32_t                     m_stamp_failures = 0;
 	BootInfo                     m_boot;
 	std::array<double, 2>        m_blocked_ms {};
@@ -235,6 +291,26 @@ void MarkPartial();
 
 /// Notes that a module could not be stamped. Logs the first one.
 void RecordStampFailure();
+
+/// Nanoseconds on the steady clock that the report times use.
+[[nodiscard]] int64_t NowNs();
+
+/// A fresh submission id, or NO_SUBMISSION with the report off.
+[[nodiscard]] uint64_t NextSubmissionId();
+
+/// Marks the GPU thread as processing one submission for the scope. Inert when the stamp is
+/// NO_SUBMISSION or the report is off. The first scope for a stamp sets its picked_ns. A command
+/// list is counted once, on the first scope that has is_commands set.
+class SubmissionScope {
+public:
+	SubmissionScope(SubmissionStamp& stamp, bool is_commands);
+	~SubmissionScope();
+	SubmissionScope(const SubmissionScope&)            = delete;
+	SubmissionScope& operator=(const SubmissionScope&) = delete;
+
+private:
+	bool m_active;
+};
 
 /// Notes that the guest reached a new flip.
 inline void OnFlip(int64_t flip) {
@@ -332,6 +408,7 @@ private:
 	uint64_t                              m_id;
 	uint64_t                              m_id_ps;
 	std::chrono::steady_clock::time_point m_start;
+	int64_t                               m_start_ns = NO_TIME_NS;
 };
 
 /// Returns a copy of a SPIR-V module with an OpSourceExtension carrying nonce placed first in the

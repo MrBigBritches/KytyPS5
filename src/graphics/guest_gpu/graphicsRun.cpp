@@ -375,6 +375,8 @@ void CommandProcessor::DmaData(uint8_t dst_sel, uint64_t dst_address_or_offset, 
 }
 
 void GuestGpu::Enqueue(Submission submission) {
+	// Stamped before the lock, so the enqueue time does not include waiting for it.
+	submission.report = Common::FirstRunReport::SubmissionStamp::New(submission.queue_id);
 	Common::LockGuard lock(m_queue_mutex);
 	EXIT_IF(!m_accepting);
 	m_queues[submission.queue_id].push_back(std::move(submission));
@@ -494,6 +496,10 @@ bool GuestGpu::Process(Submission& submission) {
 	// reach the BDA draws it records.
 	m_renderer.GetBufferCache().PromoteBdaSync();
 	auto& cp = GetProcessor(submission.queue_id);
+
+	// Only command lists count toward submissions per flip, and only on their first run.
+	Common::FirstRunReport::SubmissionScope report_scope(submission.report,
+	                                                     submission.type == SubmissionType::Commands);
 
 	cp.BufferInit();
 	bool complete = true;

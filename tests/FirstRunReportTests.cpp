@@ -316,6 +316,182 @@ void TestScopesRespectTheFlag() {
   Common::FirstRunReport::Configure(false, false);
 }
 
+constexpr int64_t kMs = 1000000; // Nanoseconds per millisecond.
+constexpr double kMaxPlausibleMs = 60.0 * 1000.0; // No test here runs for a minute.
+
+using Common::FirstRunReport::NO_SUBMISSION;
+using Common::FirstRunReport::NO_TIME_NS;
+using Common::FirstRunReport::SubmissionScope;
+using Common::FirstRunReport::SubmissionStamp;
+
+// Strips spaces and newlines so a JSON fragment can be compared whatever the indent.
+std::string Compact(const std::string &text) {
+  std::string out;
+  for (const char letter : text)
+    if (letter != ' ' && letter != '\n') out.push_back(letter);
+  return out;
+}
+
+// A GPU-thread compile inside a submission keeps the submission id, queue and both times. Each
+// baseline row differs from it in one way only and has none of the fields, so the fields cannot
+// come from anywhere but the submission context.
+void TestCompileRowsKeepSubmission() {
+  Report report;
+  report.SetEpoch(250 * kMs);
+  report.OnFlip(1);
+  report.BeginSubmission({.id = 7, .enqueued_ns = 1000 * kMs, .picked_ns = 1100 * kMs, .queue = 1}, true);
+  report.AddCompile(Kind::Compute, 1, 0, 5.0, Thread::Gpu, 1250 * kMs);
+  report.AddCompile(Kind::Compute, 2, 0, 5.0, Thread::Worker, 1250 * kMs); // Baseline, a worker.
+  report.AddCompile(Kind::Compute, 3, 0, 5.0, Thread::Gpu);                // Baseline, no start.
+  report.SetPhase(Phase::Boot);
+  report.AddCompile(Kind::Compute, 4, 0, 5.0, Thread::Gpu, 1250 * kMs); // Baseline, warm-up.
+  report.SetPhase(Phase::Play);
+  report.EndSubmission();
+  report.AddCompile(Kind::Compute, 5, 0, 5.0, Thread::Gpu, 1250 * kMs); // Baseline, between.
+  const auto rows = report.Compiles();
+  Check(rows.size() == 5, "a compile row went missing");
+  Check(rows[0].submission == 7 && rows[0].queue == 1 && Near(rows[0].visible_ms, 250.0) &&
+            Near(rows[0].picked_ms, 150.0) && rows[0].start_ns == 1250 * kMs,
+        "the row lost its submission, queue or timing");
+  for (size_t index = 1; index < rows.size(); ++index) {
+    Check(rows[index].submission == NO_SUBMISSION && rows[index].start_ns == NO_TIME_NS,
+          "a worker, boot, untimed or between-submission row took a submission");
+  }
+  const auto json = report.ToJson({}, 0, 1.0);
+  for (const char *needle : {"\"submission\": 7", "\"queue\": 1", "\"visible_ms\": 250.0",
+                             "\"picked_ms\": 150.0", "\"start_ms\": 1000.0"}) {
+    Check(json.find(needle) != std::string::npos, needle);
+  }
+  // Four unset rows and one set row, so each key appears exactly once.
+  for (const char *key : {"\"visible_ms\"", "\"picked_ms\"", "\"start_ms\"", "\"submission\":"}) {
+    Check(json.find(key, json.find(key) + 1) == std::string::npos,
+          "an unset row wrote a submission field");
+  }
+}
+
+// A submission that blocks, lets another run, and resumes in a later flip keeps the enqueue and
+// first-pickup times of its stamp and is counted once. This drives the real scope and stamp logic.
+// Submission 8 never resumes and is the baseline for the counts and the row times.
+void TestResumeKeepsStampAndCountsOnce() {
+  Common::FirstRunReport::Configure(true, false);
+  auto &global = Common::FirstRunReport::Global();
+  global.Reset();
+  const int64_t base = Common::FirstRunReport::NowNs() - 1000 * kMs;
+  SubmissionStamp seven {.id = 7, .enqueued_ns = base, .queue = 1};
+  SubmissionStamp eight {.id = 8, .enqueued_ns = base + 500 * kMs};
+  global.OnFlip(1);
+  int64_t first_pickup = NO_TIME_NS;
+  {
+    SubmissionScope scope(seven, true);
+    first_pickup = seven.picked_ns;
+    global.AddCompile(Kind::Compute, 1, 0, 1.0, Thread::Gpu, first_pickup + 100 * kMs);
+  }
+  {
+    SubmissionScope scope(eight, true);
+    global.AddCompile(Kind::Compute, 2, 0, 1.0, Thread::Gpu, eight.picked_ns + 10 * kMs);
+  }
+  global.OnFlip(2);
+  {
+    SubmissionScope scope(seven, true); // The resume.
+    global.AddCompile(Kind::Compute, 3, 0, 1.0, Thread::Gpu, first_pickup + 900 * kMs);
+  }
+  global.OnFlip(3);
+  const auto rows = global.Compiles();
+  const auto summary = global.Summarize();
+  Common::FirstRunReport::Configure(false, false);
+  global.Reset();
+  Check(first_pickup != NO_TIME_NS && seven.picked_ns == first_pickup,
+        "the resume moved the first pickup time");
+  Check(rows.size() == 3 && rows[0].submission == 7 && rows[2].submission == 7 && rows[2].flip == 2,
+        "the resumed submission lost its rows");
+  Check(Near(rows[0].picked_ms, 100.0) && Near(rows[2].picked_ms, 900.0),
+        "picked_ms did not count from the first pickup");
+  // Visible minus picked is the constant gap between the enqueue and the first pickup.
+  const double gap = static_cast<double>(first_pickup - base) / static_cast<double>(kMs);
+  Check(Near(rows[0].visible_ms - rows[0].picked_ms, gap) &&
+            Near(rows[2].visible_ms - rows[2].picked_ms, gap),
+        "visible_ms did not count from the first enqueue");
+  Check(Near(rows[1].visible_ms - rows[1].picked_ms,
+             static_cast<double>(eight.picked_ns - eight.enqueued_ns) / static_cast<double>(kMs)),
+        "the baseline submission's times are off");
+  Check(summary.submissions == 2, "a resumed submission was counted twice");
+  Check(summary.submissions_per_flip == std::vector<uint32_t> {0, 2, 0},
+        "submissions were not counted by the flip counter they began under");
+}
+
+// The fragment of the file with the counts, with the values asserted, not only the key.
+void TestSubmissionCountsInJson() {
+  Report report;
+  report.OnFlip(1);
+  report.BeginSubmission({.id = 1}, true);
+  report.BeginSubmission({.id = 2}, true);
+  report.OnFlip(2);
+  report.BeginSubmission({.id = 3}, false); // A resume is not counted.
+  report.OnFlip(3);
+  const auto json = Compact(report.ToJson({}, 0, 1.0));
+  Check(json.find("\"submissions\":{\"per_flip\":[0,2,0],\"total\":2}") != std::string::npos,
+        "the file lacks the submission counts");
+  report.Reset();
+  Check(report.Summarize().submissions == 0 && report.Summarize().submissions_per_flip.empty(),
+        "Reset kept the submission counts");
+}
+
+// The scopes the emulator really uses carry the context to the row, and the enqueue time comes
+// from the stamp factory.
+void TestScopesCarrySubmission() {
+  Common::FirstRunReport::Configure(true, false);
+  Common::FirstRunReport::Global().Reset();
+  constexpr auto kSleep = std::chrono::milliseconds(20);
+  constexpr double kLowerBoundMs = 15.0; // Below the sleep, so a loaded machine still passes.
+  auto stamp = SubmissionStamp::New(2);
+  std::this_thread::sleep_for(kSleep);
+  {
+    SubmissionScope submission(stamp, true);
+    Common::FirstRunReport::CompileScope scope(Kind::Compute, 1, 0, true);
+  }
+  { Common::FirstRunReport::CompileScope scope(Kind::Compute, 2, 0, true); }
+  const auto rows = Common::FirstRunReport::Global().Compiles();
+  Check(rows.size() == 2 && rows[0].submission == stamp.id && rows[0].queue == 2 &&
+            rows[1].submission == NO_SUBMISSION,
+        "the scopes did not link a compile to its submission");
+  // The upper bound catches an enqueue time of zero, which would read as the host's uptime.
+  Check(rows[0].visible_ms >= kLowerBoundMs && rows[0].visible_ms < kMaxPlausibleMs,
+        "visible_ms is not the time since the stamp was made");
+  Check(rows[0].picked_ms >= 0.0 && rows[0].picked_ms <= rows[0].visible_ms,
+        "the first pickup is not between the enqueue and the compile");
+  Check(Common::FirstRunReport::Global().Summarize().submissions == 1,
+        "the submission scope did not count");
+  Common::FirstRunReport::Global().Reset();
+}
+
+// A scope does nothing for a real id with the report off, and for NO_SUBMISSION with it on. Each
+// is the baseline of the other, since only one of the two conditions differs, and a real id with
+// the report on shows the scope can act at all.
+void TestScopeIsInert() {
+  Common::FirstRunReport::Configure(false, false);
+  Common::FirstRunReport::Global().Reset();
+  Check(SubmissionStamp::New(1).id == NO_SUBMISSION, "a stamp was made with the report off");
+  SubmissionStamp real {.id = 5, .enqueued_ns = 1};
+  { SubmissionScope scope(real, true); }
+  Check(real.picked_ns == NO_TIME_NS && !real.counted &&
+            Common::FirstRunReport::Global().Summarize().submissions == 0,
+        "a scope acted with the report off");
+
+  Common::FirstRunReport::Configure(true, false);
+  SubmissionStamp none;
+  { SubmissionScope scope(none, true); }
+  Check(none.picked_ns == NO_TIME_NS && !none.counted &&
+            Common::FirstRunReport::Global().Summarize().submissions == 0,
+        "a scope acted for NO_SUBMISSION");
+  SubmissionStamp live {.id = 5, .enqueued_ns = 1};
+  { SubmissionScope scope(live, true); }
+  Check(live.picked_ns != NO_TIME_NS && live.counted &&
+            Common::FirstRunReport::Global().Summarize().submissions == 1,
+        "a scope did nothing for a real id with the report on");
+  Common::FirstRunReport::Configure(false, false);
+  Common::FirstRunReport::Global().Reset();
+}
+
 // Builds a module with the given instructions after the five header words.
 std::vector<uint32_t> Module(const std::vector<std::vector<uint32_t>> &instructions) {
   std::vector<uint32_t> code {0x07230203, 0x00010600, 0, 100, 0};
@@ -434,6 +610,12 @@ void TestWriteReportOnce() {
   Common::FirstRunReport::Global().Reset();
   Common::FirstRunReport::Begin({.title_id = std::string("PPSA") + static_cast<char>(0xFF) + "TEST", .build = "b", .flags = {{"--x", true}}});
   Common::FirstRunReport::MarkPartial();
+  {
+    // Begin sets the point start_ms counts from, so a row stamped just after it starts near zero.
+    auto stamp = SubmissionStamp::New(0);
+    SubmissionScope submission(stamp, true);
+    Common::FirstRunReport::CompileScope scope(Kind::Compute, 0xaaa, 0, true);
+  }
   Common::FirstRunReport::Global().AddCompile(Kind::Compute, 0xabc, 0, 12.0, Thread::Gpu);
   Common::FirstRunReport::WriteReportOnce();
 
@@ -448,6 +630,10 @@ void TestWriteReportOnce() {
     Check(text.find(needle) != std::string::npos, "the written report lacks a recorded value");
   Check(!text.empty() && text.front() == '{' && text.back() == '}',
         "the written report is not a whole JSON object");
+  const auto start_key = text.find("\"start_ms\": ");
+  Check(start_key != std::string::npos, "the written report lacks start_ms");
+  const double start_ms = std::stod(text.substr(start_key + std::string("\"start_ms\": ").size()));
+  Check(start_ms >= 0.0 && start_ms < kMaxPlausibleMs, "start_ms is not counted from the start of the run");
 
   // A second call, after more was recorded, must change nothing.
   Common::FirstRunReport::Global().AddCompile(Kind::Compute, 0xdef, 0, 1.0, Thread::Gpu);
@@ -488,6 +674,11 @@ int main() {
   TestSkipsAndFlips();
   TestJsonContents();
   TestScopesRespectTheFlag();
+  TestCompileRowsKeepSubmission();
+  TestResumeKeepsStampAndCountsOnce();
+  TestSubmissionCountsInJson();
+  TestScopesCarrySubmission();
+  TestScopeIsInert();
   TestStampPlacement();
   TestStampText();
   TestStampRejectsBadModules();

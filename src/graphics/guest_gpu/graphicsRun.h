@@ -3,6 +3,7 @@
 
 #include "common/abi.h"
 #include "common/common.h"
+#include "common/firstRunReport.h"
 #include "common/threads.h"
 #include "common/uniqueFunction.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
@@ -60,6 +61,10 @@ private:
 		Pm4Execution              execution;
 		bool                      blocked         = false;
 		uint64_t                  flip_request_id = 0;
+		// First-run report context. Set in Enqueue and kept when a blocked submission goes back
+		// to the queue, so its times stay those of the first enqueue. Its id is NO_SUBMISSION
+		// with the report off.
+		Common::FirstRunReport::SubmissionStamp report;
 	};
 
 	void              Enqueue(Submission submission);
