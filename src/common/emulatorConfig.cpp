@@ -272,6 +272,10 @@ bool BackgroundWarmUpEnabled() {
 	return g_config->background_warm_up_enabled;
 }
 
+bool DeferredPipelineDrawsEnabled() {
+	return g_config->deferred_pipeline_draws_enabled;
+}
+
 bool GpuSubmitCadenceEnabled() {
 	return g_config->gpu_submit_cadence_enabled;
 }

@@ -113,6 +113,9 @@ struct ConfigOptions {
 	// Builds the compute pipelines of the shader store on low priority workers while the game runs,
 	// instead of making boot wait for all of them.
 	bool                   background_warm_up_enabled  = false;
+	// Lets a draw that misses its graphics pipeline carry on while the pipeline builds, with the
+	// draw recorded afterwards. Stands alone and enables no draw skips.
+	bool                   deferred_pipeline_draws_enabled = false;
 	// Lets the GPU start on a long command stream instead of idling until the end-of-slice submit.
 	bool                   gpu_submit_cadence_enabled  = false;
 	// Opts in to the host GPU's float min/max on non-AMD GPUs. It is faster, but the sign of a zero
@@ -216,6 +219,8 @@ bool AsyncPipelinesEnabled();
 bool AsyncPipelinesDepthOnly();
 /// True when --background-warm-up builds the shader store's compute pipelines after boot.
 bool BackgroundWarmUpEnabled();
+/// True when --deferred-pipeline-draws lets draws wait for their pipeline out of line.
+bool DeferredPipelineDrawsEnabled();
 bool GpuSubmitCadenceEnabled();
 /// Returns whether non-AMD GPUs may use the host's float min/max instead of the exact emulation.
 bool NativeFloatMinMaxEnabled();

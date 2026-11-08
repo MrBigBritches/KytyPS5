@@ -615,7 +615,7 @@ target_link_libraries(gpu_stall_tests common fmt::fmt)
 target_include_directories(gpu_stall_tests PRIVATE ${inc_headers})
 
 add_executable(first_run_report_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/FirstRunReportTests.cpp")
-target_link_libraries(first_run_report_tests common fmt::fmt)
+target_link_libraries(first_run_report_tests common fmt::fmt nlohmann_json::nlohmann_json)
 target_include_directories(first_run_report_tests PRIVATE ${inc_headers})
 
 add_executable(sync_on_address_tests EXCLUDE_FROM_ALL
@@ -717,6 +717,8 @@ if(BUILD_TESTING)
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --async-pipelines-depth-only)
 	add_test(NAME emulator_background_warm_up_cli
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --background-warm-up)
+	add_test(NAME emulator_deferred_pipeline_draws_cli
+	         COMMAND $<TARGET_FILE:kyty_emulator> --help --deferred-pipeline-draws)
 	add_test(NAME emulator_skip_redundant_unmap_drains_cli
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --skip-redundant-unmap-drains)
 	add_test(NAME emulator_keep_gpu_cache_on_reuse_cli

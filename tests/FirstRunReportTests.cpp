@@ -1,5 +1,7 @@
 #include "common/firstRunReport.h"
 
+#include <nlohmann/json.hpp>
+
 #include <array>
 #include <chrono>
 #include <cmath>
@@ -293,6 +295,76 @@ void TestJsonContents() {
       std::abort();
     }
   }
+}
+
+// The deferred-draw section is written with every figure empty or zero when nothing was recorded,
+// which is the baseline. Recorded resolves, ineligible reasons and would-skip draws then appear
+// with their own numbers, so only the recording can have put them there, and Reset forgets them.
+void TestDeferredDrawsSection() {
+  Report report;
+  const auto empty = nlohmann::json::parse(report.ToJson({}, 0, 1.0))["deferred_draws"];
+  Check(empty["resolves"].empty() && empty["resolves_per_flip"].empty() &&
+            empty["ineligible"].empty() && empty["s2_would_skip"]["draws"] == 0 &&
+            empty["s2_would_skip"]["waited_ms"] == 0.0,
+        "an empty report had deferred-draw figures");
+
+  // The first resolve runs in submission 9 of flip 0, so it carries both.
+  Common::FirstRunReport::SubmissionStamp stamp;
+  stamp.id = 9;
+  report.BeginSubmission(stamp, true);
+  report.AddDeferredResolve({.trigger = "fault", .holes = 3, .distinct_keys = 2,
+                             .resolve_wait_ms = 12.5, .record_ms = 3.5, .pre_resolve_ms = 7.5,
+                             .save_ms = 0.5, .hold_count_change = 4});
+  report.EndSubmission();
+  report.AddDeferredResolve({.trigger = "submit", .holes = 1});
+  report.OnFlip(1);
+  report.OnFlip(2);
+  // Flip 2 is still running, and its resolve has to be reported although no flip follows it.
+  report.AddDeferredResolve({.trigger = "shutdown", .holes = 1});
+  report.AddDeferredIneligible("image_heap");
+  report.AddDeferredIneligible("open_query");
+  report.AddDeferredIneligible("image_heap");
+  report.AddDeferredWouldSkip(4.0);
+  report.AddDeferredWouldSkip(2.5);
+
+  const auto summary = report.Summarize();
+  Check(summary.deferred_resolves.size() == 3 && summary.deferred_resolves[0].holes == 3,
+        "deferred resolves were not kept in order");
+  Check(summary.deferred_resolves_per_flip == std::vector<uint32_t> {2, 0, 1},
+        "deferred resolves were not counted per flip, the running one included");
+  Check(summary.deferred_ineligible.size() == 2 && summary.deferred_ineligible[0].second == 2 &&
+            summary.deferred_ineligible[1].second == 1,
+        "ineligible draws were not counted per reason");
+  Check(summary.deferred_would_skip_draws == 2 && Near(summary.deferred_would_skip_waited_ms, 6.5),
+        "would-skip draws were not summed");
+
+  const auto section = nlohmann::json::parse(report.ToJson({}, 0, 1.0))["deferred_draws"];
+  const auto &rows   = section["resolves"];
+  Check(rows.size() == 3 && rows[0]["holes"] == 3 && rows[0]["distinct_keys"] == 2 &&
+            rows[0]["resolve_wait_ms"] == 12.5 && rows[0]["record_ms"] == 3.5 &&
+            rows[0]["pre_resolve_ms"] == 7.5 && rows[0]["save_ms"] == 0.5 &&
+            rows[0]["hold_count_change"] == 4,
+        "a resolve row lacks its figures");
+  Check(rows[0]["flip"] == 0 && rows[1]["flip"] == 0 && rows[2]["flip"] == 2,
+        "resolve rows lack the flip they ran in");
+  Check(rows[0]["submission"] == 9 && !rows[1].contains("submission"),
+        "only the resolve inside a submission should name it");
+  Check(rows[0]["trigger"] == "fault" && rows[1]["trigger"] == "submit" &&
+            rows[2]["trigger"] == "shutdown",
+        "resolve rows lack their trigger");
+  Check(section["resolves_per_flip"] == nlohmann::json::array({2, 0, 1}),
+        "the JSON lacks the resolves of the running flip");
+  Check(section["ineligible"]["image_heap"] == 2 && section["ineligible"]["open_query"] == 1,
+        "ineligible reasons were not written");
+  Check(section["s2_would_skip"]["draws"] == 2 && section["s2_would_skip"]["waited_ms"] == 6.5,
+        "would-skip figures were not written");
+
+  report.Reset();
+  const auto cleared = report.Summarize();
+  Check(cleared.deferred_resolves.empty() && cleared.deferred_resolves_per_flip.empty() &&
+            cleared.deferred_ineligible.empty() && cleared.deferred_would_skip_draws == 0 &&
+            Near(cleared.deferred_would_skip_waited_ms, 0.0),
+        "Reset kept deferred-draw figures");
 }
 
 // The disabled path records nothing, and the enabled path times the scope it wraps.
@@ -673,6 +745,7 @@ int main() {
   TestTopListsAreCapped();
   TestSkipsAndFlips();
   TestJsonContents();
+  TestDeferredDrawsSection();
   TestScopesRespectTheFlag();
   TestCompileRowsKeepSubmission();
   TestResumeKeepsStampAndCountsOnce();

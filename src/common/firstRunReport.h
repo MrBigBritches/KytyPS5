@@ -129,6 +129,25 @@ struct Refusal {
 	double      blocked_ms = 0.0;
 };
 
+/// One resolve of the draws deferred by --deferred-pipeline-draws. All times are in ms.
+/// pre_resolve_ms runs from the first hole to the start of the resolve, resolve_wait_ms is the wait
+/// for the builds, record_ms the recording of the holes and save_ms the driver cache save inside the
+/// resolve. hold_count_change is how many holds of guest audio the resolve added. flip and
+/// submission are stamped by the report when the resolve is added, as for CompileEntry, and trigger
+/// names what forced the resolve (submit, fault, stream_wrap, cap or shutdown).
+struct DeferredResolve {
+	int64_t     flip              = 0;
+	uint64_t    submission        = NO_SUBMISSION;
+	std::string trigger;
+	uint32_t    holes             = 0;
+	uint32_t    distinct_keys     = 0;
+	double      resolve_wait_ms   = 0.0;
+	double      record_ms         = 0.0;
+	double      pre_resolve_ms    = 0.0;
+	double      save_ms           = 0.0;
+	uint64_t    hold_count_change = 0;
+};
+
 /// The GPU thread's blocking within one guest flip, merged into a single pause.
 struct Pause {
 	int64_t  flip   = 0;
@@ -181,6 +200,19 @@ struct Summary {
 	std::vector<std::pair<std::string, uint32_t>>            skips_by_target;
 	std::vector<std::pair<std::string, uint32_t>>            sampled_after_skip_by_target;
 	std::vector<Refusal>                                     refusals;
+	// Filled only by --deferred-pipeline-draws. Empty or zero otherwise.
+	std::vector<DeferredResolve>                             deferred_resolves;
+	// Entry F counts the resolves that ended while the flip counter was F. Unlike
+	// submissions_per_flip, the flip still running is appended when it has resolves, so the list can
+	// be one longer than flips. Each resolve's own flip field is exact.
+	std::vector<uint32_t>                                    deferred_resolves_per_flip;
+	// Draws that --deferred-pipeline-draws left to block as before, counted per reason.
+	std::vector<std::pair<std::string, uint32_t>>            deferred_ineligible;
+	// Deferred draws that the S2 skip rules would have allowed to go without a pipeline. waited_ms
+	// is the time from the draw's hole creation until its build is ready, counted once per draw, so
+	// it compares with skips.refused.*.blocked_ms.
+	uint32_t                                                 deferred_would_skip_draws = 0;
+	double                                                   deferred_would_skip_waited_ms = 0.0;
 };
 
 /// The raw records of one run. Thread safe, and it never reads a clock, so tests drive it with
@@ -218,6 +250,12 @@ public:
 	void AddSampledAfterSkip(std::string_view target_class, uint32_t draws);
 	/// Records a draw that missed its pipeline and was refused a skip, and how long it waited.
 	void AddRefusal(std::string_view reason, double blocked_ms);
+	/// Records one resolve of deferred draws.
+	void AddDeferredResolve(const DeferredResolve& resolve);
+	/// Records a draw that --deferred-pipeline-draws could not defer, against the reason.
+	void AddDeferredIneligible(std::string_view reason);
+	/// Records a deferred draw that S2 would have skipped, and how long it waited for its pipeline.
+	void AddDeferredWouldSkip(double waited_ms);
 	/// The GPU-thread time blocked so far in play for the kind.
 	[[nodiscard]] double BlockedMs(Kind kind) const;
 	/// Records a module that --cold-pipelines could not stamp, so it compiled unstamped.
@@ -270,6 +308,12 @@ private:
 	std::vector<std::pair<std::string, uint32_t>> m_skips_by_target;
 	std::vector<std::pair<std::string, uint32_t>> m_sampled_after_skip;
 	std::vector<Refusal>                          m_refusals;
+	std::vector<DeferredResolve>                  m_deferred_resolves;
+	std::vector<uint32_t>                         m_deferred_resolves_per_flip;
+	uint32_t                                      m_deferred_resolves_this_flip = 0;
+	std::vector<std::pair<std::string, uint32_t>> m_deferred_ineligible;
+	uint32_t                                      m_deferred_would_skip_draws = 0;
+	double                                        m_deferred_would_skip_waited_ms = 0.0;
 };
 
 /// The report of this process.
@@ -349,6 +393,27 @@ inline void AddSkip(SkipKind kind, std::string_view target_class) {
 inline void AddRefusal(std::string_view reason, double blocked_ms) {
 	if (Enabled()) {
 		Global().AddRefusal(reason, blocked_ms);
+	}
+}
+
+/// Records one resolve of deferred draws.
+inline void AddDeferredResolve(const DeferredResolve& resolve) {
+	if (Enabled()) {
+		Global().AddDeferredResolve(resolve);
+	}
+}
+
+/// Records a draw that could not be deferred, against the reason.
+inline void AddDeferredIneligible(std::string_view reason) {
+	if (Enabled()) {
+		Global().AddDeferredIneligible(reason);
+	}
+}
+
+/// Records a deferred draw that S2 would have skipped, and how long it waited for its pipeline.
+inline void AddDeferredWouldSkip(double waited_ms) {
+	if (Enabled()) {
+		Global().AddDeferredWouldSkip(waited_ms);
 	}
 }
 

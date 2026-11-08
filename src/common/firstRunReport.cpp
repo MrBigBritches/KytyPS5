@@ -124,6 +124,8 @@ void Report::OnFlip(int64_t flip) {
 	m_flips++;
 	m_submissions_per_flip.push_back(m_submissions_this_flip);
 	m_submissions_this_flip = 0;
+	m_deferred_resolves_per_flip.push_back(m_deferred_resolves_this_flip);
+	m_deferred_resolves_this_flip = 0;
 	// Blocking in an earlier flip is over once the game moves on, so its pause is complete.
 	FlushPendingPauseLocked(flip);
 }
@@ -259,6 +261,31 @@ void Report::AddRefusal(std::string_view reason, double blocked_ms) {
 	}
 }
 
+void Report::AddDeferredResolve(const DeferredResolve& resolve) {
+	std::lock_guard lock(m_mutex);
+	m_deferred_resolves.push_back(resolve);
+	m_deferred_resolves.back().flip       = m_flip;
+	m_deferred_resolves.back().submission = m_stamp.id;
+	m_deferred_resolves_this_flip++;
+}
+
+void Report::AddDeferredIneligible(std::string_view reason) {
+	std::lock_guard lock(m_mutex);
+	const auto found = std::ranges::find(m_deferred_ineligible, reason,
+	                                     &std::pair<std::string, uint32_t>::first);
+	if (found == m_deferred_ineligible.end()) {
+		m_deferred_ineligible.emplace_back(std::string(reason), 1);
+	} else {
+		found->second++;
+	}
+}
+
+void Report::AddDeferredWouldSkip(double waited_ms) {
+	std::lock_guard lock(m_mutex);
+	m_deferred_would_skip_draws++;
+	m_deferred_would_skip_waited_ms += waited_ms;
+}
+
 double Report::BlockedMs(Kind kind) const {
 	std::lock_guard lock(m_mutex);
 	return m_blocked_ms[static_cast<size_t>(kind)];
@@ -294,6 +321,12 @@ void Report::Reset() {
 	m_skips_by_target.clear();
 	m_sampled_after_skip.clear();
 	m_refusals.clear();
+	m_deferred_resolves.clear();
+	m_deferred_resolves_per_flip.clear();
+	m_deferred_resolves_this_flip   = 0;
+	m_deferred_ineligible.clear();
+	m_deferred_would_skip_draws     = 0;
+	m_deferred_would_skip_waited_ms = 0.0;
 }
 
 std::vector<Pause> Report::AllPausesLocked() const {
@@ -345,6 +378,15 @@ Summary Report::Summarize() const {
 	summary.skips_by_target     = m_skips_by_target;
 	summary.sampled_after_skip_by_target = m_sampled_after_skip;
 	summary.refusals                     = m_refusals;
+	summary.deferred_resolves            = m_deferred_resolves;
+	summary.deferred_resolves_per_flip   = m_deferred_resolves_per_flip;
+	// The flip still running has not been pushed by OnFlip, so its resolves are added last.
+	if (m_deferred_resolves_this_flip != 0) {
+		summary.deferred_resolves_per_flip.push_back(m_deferred_resolves_this_flip);
+	}
+	summary.deferred_ineligible          = m_deferred_ineligible;
+	summary.deferred_would_skip_draws    = m_deferred_would_skip_draws;
+	summary.deferred_would_skip_waited_ms = m_deferred_would_skip_waited_ms;
 
 	summary.worst_translate = m_translates;
 	std::ranges::stable_sort(summary.worst_translate,
@@ -460,6 +502,37 @@ nlohmann::json SkipsToJson(const Summary& summary) {
 	        {"refused", refused}};
 }
 
+// Writes the deferred-draw figures, which are empty or zero unless --deferred-pipeline-draws ran.
+nlohmann::json DeferredToJson(const Summary& summary) {
+	nlohmann::json resolves = nlohmann::json::array();
+	for (const auto& resolve: summary.deferred_resolves) {
+		nlohmann::json row = {{"flip", resolve.flip},
+		                      {"trigger", resolve.trigger},
+		                      {"holes", resolve.holes},
+		                      {"distinct_keys", resolve.distinct_keys},
+		                      {"resolve_wait_ms", Round3(resolve.resolve_wait_ms)},
+		                      {"record_ms", Round3(resolve.record_ms)},
+		                      {"pre_resolve_ms", Round3(resolve.pre_resolve_ms)},
+		                      {"save_ms", Round3(resolve.save_ms)},
+		                      {"hold_count_change", resolve.hold_count_change}};
+		// Left out when unset, as in a compile row.
+		if (resolve.submission != NO_SUBMISSION) {
+			row["submission"] = resolve.submission;
+		}
+		resolves.push_back(std::move(row));
+	}
+	nlohmann::json ineligible = nlohmann::json::object();
+	for (const auto& [reason, count]: summary.deferred_ineligible) {
+		ineligible[reason] = count;
+	}
+	return {{"resolves", resolves},
+	        {"resolves_per_flip", summary.deferred_resolves_per_flip},
+	        {"ineligible", ineligible},
+	        {"s2_would_skip",
+	         {{"draws", summary.deferred_would_skip_draws},
+	          {"waited_ms", Round3(summary.deferred_would_skip_waited_ms)}}}};
+}
+
 nlohmann::json BootToJson(const BootInfo& boot) {
 	return {{"warm_up_ms", Round3(boot.warm_up_ms)},
 	        {"programs", boot.programs},
@@ -505,6 +578,7 @@ std::string Report::ToJson(const Metadata& metadata, uint64_t audio_holds,
 	    {"compiles", compile_rows},
 	    {"ready", ready_rows},
 	    {"skips", SkipsToJson(summary)},
+	    {"deferred_draws", DeferredToJson(summary)},
 	    {"audio_holds", audio_holds},
 	    {"flips", summary.flips},
 	    {"submissions",

@@ -86,6 +86,9 @@ static void PrintUsage() {
 	::printf("  --background-warm-up                 Build the shader store's compute pipelines on low\n"
 	         "                                       priority workers while the game runs, instead of\n"
 	         "                                       making boot wait for them (experimental).\n");
+	::printf("  --deferred-pipeline-draws            Let a draw that misses its graphics pipeline carry\n"
+	         "                                       on while it builds, and record the draw later\n"
+	         "                                       (experimental). Does not itself enable draw skips.\n");
 	::printf("  --gpu-submit-cadence                 Submit GPU work periodically while a long command\n"
 	         "                                       stream records, so the GPU starts sooner.\n");
 	::printf("  --native-float-minmax                Use the host GPU's float min/max on non-AMD GPUs.\n"
@@ -240,6 +243,7 @@ static constexpr Flag FLAGS[] = {
     {"--async-pipelines", &ConfigOptions::async_pipelines_enabled},
     {"--async-pipelines-depth-only", &ConfigOptions::async_pipelines_depth_only_enabled},
     {"--background-warm-up", &ConfigOptions::background_warm_up_enabled},
+    {"--deferred-pipeline-draws", &ConfigOptions::deferred_pipeline_draws_enabled},
     {"--gpu-submit-cadence", &ConfigOptions::gpu_submit_cadence_enabled},
     {"--native-float-minmax", &ConfigOptions::native_float_min_max_enabled},
     {"--command-buffer-dump", &ConfigOptions::command_buffer_dump_enabled},
