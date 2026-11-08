@@ -38,6 +38,7 @@
 #include "graphics/host_gpu/renderer/image/tiler.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineParts.h"
 #include "graphics/shader/recompiler/ir/Serialize.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/drawRecord.h"
@@ -91,6 +92,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdarg>
 #include <functional>
 #include <atomic>
 #include <bit>
@@ -32624,6 +32626,7 @@ public:
 #include "DrawRecordTests.inc"
 #include "DeferredResolveTests.inc"
 #include "DeferredDrawTests.inc"
+#include "GraphicsCreateInfoTests.inc"
 
 private:
   bool m_rasterization_supported = true;
@@ -68418,6 +68421,11 @@ int main(int argc, char **argv) {
     CheckDriverCacheSave(vulkan);
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--create-info-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckGraphicsCreateInfo();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--draw-record-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckDrawRecord();
@@ -69795,6 +69803,7 @@ int main(int argc, char **argv) {
   CheckColdPipelines(vulkan);
   CheckAsyncPipelines(vulkan);
   vulkan.CheckDrawRecord();
+  vulkan.CheckGraphicsCreateInfo();
   CheckFirstRunWiring(vulkan);
   vulkan.CheckOrderedDispatch();
   vulkan.CheckGpuSubmitCadence();
