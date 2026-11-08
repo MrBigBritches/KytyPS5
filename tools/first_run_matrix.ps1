@@ -51,6 +51,8 @@ $ArmTable = [ordered]@{
     "baseline"       = @{ Flags = @();                                                                                     Ready = $true }
     "async-graphics" = @{ Flags = @("--async-pipelines");                                                                  Ready = $true }
     "async-depth-only" = @{ Flags = @("--async-pipelines-depth-only");                                                    Ready = $true }
+    "warm-up"        = @{ Flags = @("--background-warm-up");                                                               Ready = $true }
+    "async-warm-up"  = @{ Flags = @("--async-pipelines", "--background-warm-up");                                         Ready = $true }
     "gpl"            = @{ Flags = @("--graphics-pipeline-library");                                                        Ready = $false }
     "lookahead"      = @{ Flags = @("--shader-lookahead");                                                                 Ready = $false }
 }
@@ -59,7 +61,7 @@ $ArmTable = [ordered]@{
 # theirs together. The depth-only arm is left out, because it is the default skip rule with a
 # stricter gate. Both flags can be on at once, and then depth-only wins, so "all" would measure the
 # depth-only mode instead of the default one.
-$StrategyArms = @("async-graphics", "gpl", "lookahead")
+$StrategyArms = @("async-graphics", "warm-up", "gpl", "lookahead")
 $ArmTable["all"] = @{
     Flags = @($StrategyArms | ForEach-Object { $ArmTable[$_].Flags })
     Ready = @($StrategyArms | Where-Object { -not $ArmTable[$_].Ready }).Count -eq 0

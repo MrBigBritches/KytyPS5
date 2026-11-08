@@ -23,7 +23,7 @@ import sys
 MEASUREMENT_FLAGS = {"--first-run-report", "--cold-pipelines"}
 # Flags that define an arm. These always show in its name, or a set of reports from one arm would be
 # labelled baseline. Add each new strategy's flag here.
-STRATEGY_FLAGS = {"--async-pipelines", "--async-pipelines-depth-only"}
+STRATEGY_FLAGS = {"--async-pipelines", "--async-pipelines-depth-only", "--background-warm-up"}
 # Histogram buckets whose lower bound is at least one second.
 LONG_PAUSE_BUCKETS = ("1000", "2500", "5000", "10000")
 MS_PER_SECOND = 1000.0
@@ -53,6 +53,11 @@ def arm_name(report, common=frozenset()):
     flags = sorted(name for name, on in report.get("flags", {}).items()
                    if on and name not in MEASUREMENT_FLAGS and name not in common)
     label = " ".join(flags) if flags else "baseline"
+    # A run that started from a seeded store warms modules at boot, which no flag shows, so it must
+    # not be merged with the same arm started from nothing.
+    warmed = report.get("boot", {}).get("modules", 0)
+    if warmed:
+        label += f" (store {warmed})"
     return label if report.get("cold") else label + " (warm)"
 
 
