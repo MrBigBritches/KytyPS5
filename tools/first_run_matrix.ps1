@@ -53,6 +53,9 @@ $ArmTable = [ordered]@{
     "async-depth-only" = @{ Flags = @("--async-pipelines-depth-only");                                                    Ready = $true }
     "warm-up"        = @{ Flags = @("--background-warm-up");                                                               Ready = $true }
     "async-warm-up"  = @{ Flags = @("--async-pipelines", "--background-warm-up");                                         Ready = $true }
+    "deferred"       = @{ Flags = @("--deferred-pipeline-draws");                                                          Ready = $true }
+    "deferred-warm-up" = @{ Flags = @("--deferred-pipeline-draws", "--background-warm-up");                               Ready = $true }
+    "deferred-pause" = @{ Flags = @("--deferred-pipeline-draws", "--background-warm-up", "--pause-warm-up-for-draws");   Ready = $true }
     "gpl"            = @{ Flags = @("--graphics-pipeline-library");                                                        Ready = $false }
     "lookahead"      = @{ Flags = @("--shader-lookahead");                                                                 Ready = $false }
 }
