@@ -214,6 +214,11 @@ void CommandProcessor::BufferFlush() {
 }
 
 void CommandProcessor::FlushForCadence() {
+	// Holes at their cap block every later draw until they are resolved, so the cap asks for a flush
+	// here, which is the one place after a packet where a submit is allowed.
+	if (GetScheduler().FlushIfHoleCapReached()) {
+		return;
+	}
 	if (!GetScheduler().TakeCadenceSubmit()) {
 		return;
 	}
@@ -405,6 +410,8 @@ void GuestGpu::ThreadRun(void* data) {
 		{
 			Common::LockGuard lock(gpu->m_queue_mutex);
 			while (gpu->m_commands.empty() && gpu->m_submission_count == 0 && !gpu->m_stopping) {
+				// Nothing may wait on a pipeline while the thread sleeps.
+				EXIT_IF(gpu->m_renderer.GetCommandScheduler().PendingHoleCount() != 0);
 				gpu->m_processing = false;
 				gpu->m_idle.Signal();
 				gpu->m_work_available.Wait(&gpu->m_queue_mutex);
@@ -428,6 +435,7 @@ void GuestGpu::ThreadRun(void* data) {
 					}
 				}
 				if (selected_queue < 0) {
+					EXIT_IF(gpu->m_renderer.GetCommandScheduler().PendingHoleCount() != 0);
 					gpu->m_processing = false;
 					gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
 					for (auto& queue: gpu->m_queues) {
@@ -530,6 +538,9 @@ bool GuestGpu::Process(Submission& submission) {
 			break;
 	}
 
+	// Every draw that became a hole came from a packet that made progress, and a slice that made
+	// progress was flushed above, so no hole may wait past the end of a submission.
+	EXIT_IF(m_renderer.GetCommandScheduler().PendingHoleCount() != 0);
 	return complete;
 }
 

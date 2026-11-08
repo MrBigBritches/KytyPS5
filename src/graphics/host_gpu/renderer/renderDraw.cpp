@@ -609,7 +609,12 @@ public:
 		if (!m_context.GetCommandScheduler().CanSplitHere()) {
 			return "thread";
 		}
-		return m_context.GetCommandScheduler().HoleCapReached() ? "cap" : nullptr;
+		auto& scheduler = m_context.GetCommandScheduler();
+		if (!scheduler.HoleCapReached()) {
+			return nullptr;
+		}
+		scheduler.RequestHoleFlush();
+		return "cap";
 	}
 
 	/// The name of the rule that refused the draw at the last question, or null.

@@ -473,6 +473,32 @@ void CommandScheduler::RecordHoles(std::span<const PipelineCache::Pipeline> buil
 	}
 }
 
+bool CommandScheduler::FlushIfHoleCapReached() {
+	if (!HoleFlushRequested()) {
+		return false;
+	}
+	const TriggerScope trigger(*this, ResolveTrigger::Cap);
+	Flush();
+	return true;
+}
+
+void CommandScheduler::ResolveHolesForShutdown() {
+	if (m_pending_holes == 0) {
+		return;
+	}
+	// A hole needs a scheduler that is running to be recorded into.
+	EXIT_IF(!Active() || m_command.IsInvalid());
+	// The destroying thread is not the GPU thread, which has stopped, and must be allowed to resolve.
+	const auto previous = m_extra_hole_thread;
+	m_extra_hole_thread = std::this_thread::get_id();
+	{
+		const TriggerScope trigger(*this, ResolveTrigger::Shutdown);
+		Finish();
+	}
+	m_extra_hole_thread = previous;
+	EXIT_IF(m_pending_holes != 0);
+}
+
 void CommandScheduler::ResolveHoles() {
 	if (m_pending_holes == 0) {
 		return;
@@ -494,7 +520,8 @@ void CommandScheduler::ResolveHoles() {
 	row.record_ms         = ElapsedMs(record_from, Clock::now());
 	row.hold_count_change = Common::GpuStall::HoldCount() - holds_before;
 
-	m_pending_holes = 0;
+	m_pending_holes        = 0;
+	m_hole_flush_requested = false;
 	m_first_hole_time.reset();
 	Common::FirstRunReport::AddDeferredResolve(row);
 	// Log file only, since a cold burst resolves often and would flood the console.

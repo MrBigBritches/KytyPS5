@@ -284,6 +284,11 @@ struct RenderContextTestAccess {
 };
 
 struct StreamBufferTestAccess {
+  // Moves the ring's write position to `left` bytes before its end, so the next reservation larger
+  // than that wraps and waits for what was written since the last wrap, as a ring this small would.
+  static uint64_t Offset(const StreamBuffer &stream) { return stream.m_offset; }
+  static void NearEnd(StreamBuffer &stream, uint64_t left) { stream.m_offset = stream.Size() - left; }
+
   static bool NormalizeReservation(bool coherent, uint64_t atom, uint64_t &size,
                                    uint64_t &alignment) {
     return StreamBuffer::NormalizeReservation(coherent, atom, size, alignment);
@@ -19264,9 +19269,12 @@ public:
 
 
     ~AsyncDrawRig() {
-      context->UnmapMemory(AsyncBase, AsyncSize);
-      Scheduler().Finish();
-      context.reset();
+      // A test that destroyed the context itself, to see what its teardown does, has nothing to flush.
+      if (context) {
+        context->UnmapMemory(AsyncBase, AsyncSize);
+        Scheduler().Finish();
+        context.reset();
+      }
       harness.SetOcclusionQueries(false);
       LibKernel::Memory::KernelMunmap(AsyncBase, AsyncSize);
       LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, AsyncSize);
@@ -68220,6 +68228,21 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--deferred-draws-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckDeferredDraws();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--deferred-cap-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckDeferredHoleCap();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--deferred-shutdown-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckDeferredShutdownResolve();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--deferred-wrap-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckDeferredStreamWrap();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--deferred-stencil-only") == 0) {

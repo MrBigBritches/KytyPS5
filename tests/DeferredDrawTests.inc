@@ -793,6 +793,8 @@
     RunUnderValidation("DeferredDepthClear", [&] { CheckDeferredDepthClear(); });
     RunUnderValidation("DeferredStencilClear", [&] { CheckDeferredStencilClear(); });
     RunUnderValidation("DeferredHtileClear", [&] { CheckDeferredHtileClear(); });
+    RunUnderValidation("DeferredHoleCap", [&] { CheckDeferredHoleCap(); });
+    RunUnderValidation("DeferredStreamWrap", [&] { CheckDeferredStreamWrap(); });
     RunUnderValidation("DeferredRegisters", [&] { CheckDeferredRegistersAfterHole(); });
     RunUnderValidation("DeferredQueryAfterHole", [&] { CheckDeferredQueryOpenedAfterHole(); });
     std::printf("[gpu]     %-32s ok\n", name);
@@ -1058,6 +1060,218 @@
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  // The scheduler's cap on pending holes. A run of draws that miss one pipeline makes holes up to
+  // the cap, the next draw that would be a hole blocks and is counted as "cap", and the cap asks for
+  // a flush. The flush resolves under the cap trigger, clears the request, and the draw after it
+  // defers again. Draws up to the cap defer, and a flush asked for with no cap reached does nothing,
+  // which are the baselines for the same draws and the same flush.
+  void CheckDeferredHoleCap() {
+    constexpr const char *name = "DeferredHoleCap";
+    constexpr size_t cap = CommandScheduler::MAX_PENDING_HOLES;
+    PipelineCacheTestAccess::BuildHold hold;
+    AsyncDrawRig rig(*this, false, false, false, false, true);
+    auto &scheduler = rig.Scheduler();
+    CommandSchedulerTestAccess::AllowThisThread(scheduler);
+    rig.PaintSentinels();
+    PipelineCacheTestAccess::HoldBuildQueue(rig.Pipelines(), hold);
+    Common::FirstRunReport::Global().Reset();
+    for (size_t draw = 0; draw < cap; ++draw) {
+      Require(name, "draw below the cap", rig.Draw(), "a draw reported failure");
+    }
+    Require(name, "holes up to the cap",
+            scheduler.PendingHoleCount() == cap && !scheduler.HoleFlushRequested() &&
+                DeferredIneligible().empty(),
+            "the draws up to the cap were not all deferred, or one was counted as ineligible");
+    // The packet loop flushes a requested cap after any packet that is not skipped. A two dword NOP is
+    // one, and it does nothing else. The registers stay bound, so the processor never begins a buffer.
+    CommandProcessor processor(*rig.context, 0);
+    const std::array<uint32_t, 2> nop{KYTY_PM4(2, Pm4::IT_NOP, 0), 0};
+    const auto run_nop = [&] {
+      Pm4Execution execution;
+      (void)processor.Process(execution, nop);
+    };
+    run_nop();
+    Require(name, "no request, no flush",
+            scheduler.PendingHoleCount() == cap &&
+                Common::FirstRunReport::Global().Summarize().deferred_resolves.empty(),
+            "a packet flushed the holes though no draw had found the cap reached");
+    rig.SetSecondPipeline(true);
+    Require(name, "draw at the cap", rig.Draw(), "the draw at the cap reported failure");
+    Require(name, "blocked by the cap",
+            scheduler.PendingHoleCount() == cap && scheduler.HoleFlushRequested() &&
+                DeferredIneligible() == IneligibleCounts{{"cap", 1}},
+            "the draw past the cap was deferred, or not counted under the cap, or asked for no flush");
+    run_nop();
+    const auto rows = Common::FirstRunReport::Global().Summarize().deferred_resolves;
+    Require(name, "resolved under the cap trigger",
+            scheduler.PendingHoleCount() == 0 && !scheduler.HoleFlushRequested() && rows.size() == 1 &&
+                rows[0].trigger == "cap" && rows[0].holes == cap,
+            "the flush did not resolve every hole under the cap trigger, or left the request set");
+    UsePixelColor(rig, {0.3f, 0.6f, 0.9f, 1.0f});
+    Require(name, "defers again", rig.Draw() && scheduler.PendingHoleCount() == 1 &&
+                                      !scheduler.HoleFlushRequested() &&
+                                      DeferredIneligible() == IneligibleCounts{{"cap", 1}},
+            "the draw after the flush was not deferred, or the cap's request outlived the resolve");
+    hold.release = true;
+    scheduler.Finish();
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // Passes the submits of the queue to a count, and notes whether the pipeline builds had stopped
+  // when each one went out.
+  struct SubmitSpy {
+    static inline PFN_vkQueueSubmit real = nullptr;
+    static inline PipelineCache *cache = nullptr;
+    static inline std::vector<bool> stopped;
+    static VkResult VKAPI_CALL Submit(VkQueue queue, uint32_t count, const VkSubmitInfo *infos, VkFence fence) {
+      stopped.push_back(PipelineCacheTestAccess::QueueStopping(*cache));
+      return real(queue, count, infos, fence);
+    }
+    SubmitSpy(PipelineCache *watched) {
+      cache = watched;
+      stopped.clear();
+      auto &table = VULKAN_HPP_DEFAULT_DISPATCHER;
+      real = table.vkQueueSubmit;
+      table.vkQueueSubmit = Submit;
+    }
+    ~SubmitSpy() { VULKAN_HPP_DEFAULT_DISPATCHER.vkQueueSubmit = real; }
+    SubmitSpy(const SubmitSpy &) = delete;
+    SubmitSpy &operator=(const SubmitSpy &) = delete;
+  };
+
+  // What happened while a context holding pending holes was destroyed. `draws` counts the draw
+  // commands recorded during the teardown and `late` those recorded after the builds began to stop.
+  struct TeardownRun {
+    size_t holes_before = 0;
+    size_t draws = 0;
+    size_t late = 0;
+    size_t submits = 0;
+    size_t late_submits = 0;
+  };
+
+  TeardownRun DestroyContextWithHoles(const char *name, bool deferred) {
+    TeardownRun run;
+    PipelineCacheTestAccess::BuildHold hold;
+    CommandStream::Scope hooks;
+    AsyncDrawRig rig(*this, false, false, false, false, deferred);
+    auto &scheduler = rig.Scheduler();
+    CommandSchedulerTestAccess::AllowThisThread(scheduler);
+    rig.PaintSentinels();
+    if (deferred) PipelineCacheTestAccess::HoldBuildQueue(rig.Pipelines(), hold);
+    for (int draw = 0; draw < 3; ++draw) {
+      rig.SetSecondPipeline(draw == 1);
+      Require(name, "draw", rig.Draw(), "a draw reported failure");
+    }
+    run.holes_before = scheduler.PendingHoleCount();
+    PipelineCache *cache = &rig.Pipelines();
+    {
+      const SubmitSpy spy(cache);
+      CommandStream::Recorder::Reset(true);
+      CommandStream::Recorder::probe = [&] {
+        if (CommandStream::Recorder::rows.back().find("vkCmdDraw(") == std::string::npos) return;
+        ++run.draws;
+        if (PipelineCacheTestAccess::QueueStopping(*cache)) ++run.late;
+      };
+      rig.context.reset();
+      CommandStream::Recorder::probe = nullptr;
+      CommandStream::Recorder::active = false;
+      run.submits = SubmitSpy::stopped.size();
+      run.late_submits = static_cast<size_t>(std::ranges::count(SubmitSpy::stopped, true));
+    }
+    hold.release = true;
+    return run;
+  }
+
+  // Test 10. A context destroyed with holes pending records and submits them before it stops the
+  // pipeline builds they wait for. The draws a hole records show up while the builds still run, and
+  // a submit carries them out. The blocking run is the baseline for the same draws, which record
+  // none during the teardown.
+  void CheckDeferredShutdownResolve() {
+    constexpr const char *name = "DeferredShutdown";
+    const auto baseline = DestroyContextWithHoles(name, false);
+    const auto deferred = DestroyContextWithHoles(name, true);
+    Require(name, "baseline", baseline.holes_before == 0 && baseline.draws == 0,
+            "the blocking run recorded draws during its teardown, so it is no baseline");
+    Require(name, "holes pending", deferred.holes_before == 3, "the draws were not deferred");
+    Require(name, "holes recorded", deferred.draws == 3,
+            "the teardown did not record every pending hole");
+    Require(name, "before the builds stop", deferred.late == 0 && deferred.submits >= 1 &&
+                                                deferred.late_submits == 0,
+            "a hole was recorded, or the submit was made, after the pipeline builds had stopped");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  struct WrapRun {
+    std::vector<u32> color;
+    std::vector<u32> depth;
+    bool wrapped = false;
+    size_t holes_after_wrap = 0;
+    std::vector<Common::FirstRunReport::DeferredResolve> resolves;
+  };
+
+  // Two draws with a stream ring that is nearly full when the second is prepared. The first draw is a
+  // hole in the deferred run. The second needs stream space, so its preparation waits for the ring and
+  // submits in the middle of the draw, which resolves the first.
+  WrapRun RunStreamWrapScene(const char *name, bool deferred) {
+    WrapRun run;
+    PipelineCacheTestAccess::BuildHold hold;
+    AsyncDrawRig rig(*this, false, false, false, false, deferred);
+    auto &scheduler = rig.Scheduler();
+    CommandSchedulerTestAccess::AllowThisThread(scheduler);
+    rig.PaintSentinels();
+    if (deferred) PipelineCacheTestAccess::HoldBuildQueue(rig.Pipelines(), hold);
+    auto &stream = rig.context->GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream);
+    const uint32_t word = 0;
+    (void)stream.Copy(&word, sizeof(word));
+    Require(name, "first draw", rig.Draw(), "the first draw reported failure");
+    Common::FirstRunReport::Global().Reset();
+    StreamBufferTestAccess::NearEnd(stream, 4);
+    const auto tick = scheduler.CurrentTick();
+    // Eight bit indices are widened on the host and go through the stream ring.
+    auto *indices = reinterpret_cast<uint8_t *>(AsyncBase + DrawStreamIndexOffset + 0x200);
+    for (uint8_t index = 0; index < 3; ++index) indices[index] = index;
+    rig.SetSecondPipeline(true);
+    Require(name, "second draw",
+            RenderExecutorTestAccess::DrawIndex(
+                rig.context->GetRenderExecutor(), scheduler.Current(),
+                {.index_count = 3,
+                 .index_addr = reinterpret_cast<const void *>(AsyncBase + DrawStreamIndexOffset + 0x200),
+                 .instance_count = 1,
+                 .index_type_and_size = static_cast<uint32_t>(Prospero::IndexType::kIndex8)}),
+            "the second draw reported failure");
+    run.wrapped = scheduler.CurrentTick() > tick;
+    run.holes_after_wrap = scheduler.PendingHoleCount();
+    run.resolves = Common::FirstRunReport::Global().Summarize().deferred_resolves;
+    hold.release = true;
+    scheduler.Finish();
+    run.color = rig.ReadColor();
+    run.depth = rig.ReadDepth();
+    return run;
+  }
+
+  // Test 11. A submit in the middle of a draw's preparation, forced by a stream ring with no room,
+  // resolves the holes before it under the stream wrap trigger, and the pictures match those of the
+  // blocking run, whose second draw waits for the ring in the same way. The draw being prepared is
+  // recorded after the wait. A resolve touches only the scheduler and the pipeline cache, which the
+  // wait is reached through the buffer caches, so it must not need them.
+  void CheckDeferredStreamWrap() {
+    constexpr const char *name = "DeferredStreamWrap";
+    const auto baseline = RunStreamWrapScene(name, false);
+    const auto deferred = RunStreamWrapScene(name, true);
+    Require(name, "baseline wraps", baseline.wrapped && baseline.resolves.empty(),
+            "the blocking run did not wait for the ring, so the scene forces nothing");
+    Require(name, "deferred wraps", deferred.wrapped, "the nearly full ring did not make the draw wait");
+    Require(name, "resolved by the wrap",
+            deferred.resolves.size() >= 1 && deferred.resolves[0].trigger == "stream_wrap" &&
+                deferred.resolves[0].holes == 1,
+            "the wait in the middle of the draw did not resolve the hole before it");
+    Require(name, "second draw deferred", deferred.holes_after_wrap == 1,
+            "the draw whose preparation waited was not deferred afterwards");
+    Require(name, "color", deferred.color == baseline.color, "the colour target differs");
+    Require(name, "depth", deferred.depth == baseline.depth, "the depth target differs");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckDeferredDraws() {
     CheckDeferredOrderEquivalence();
     CheckDeferredDepthClear();
@@ -1071,4 +1285,7 @@
     CheckDeferredWorkerCount();
     CheckDeferredNotesWork();
     CheckDeferredNeedsGpuThread();
+    CheckDeferredHoleCap();
+    CheckDeferredShutdownResolve();
+    CheckDeferredStreamWrap();
   }

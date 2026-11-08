@@ -91,9 +91,25 @@ public:
 	/// Whether the calling thread may split now. That is the GPU thread, any thread once shutdown
 	/// began, and never from inside a submit or a resolve. A draw on another thread blocks instead.
 	[[nodiscard]] bool CanSplitHere() const { return OnHoleThread() && !m_in_submit && !m_in_resolve; }
-	/// Whether so many holes wait that another draw must block instead. Nothing limits them yet, the
-	/// cap and the flush it asks for come with the pending hole checks.
-	[[nodiscard]] bool HoleCapReached() const noexcept { return false; }
+	/// The most holes that may wait for one submission. The command buffer pool never shrinks, and a
+	/// buffer is reserved for each hole, so a long run of misses must not grow it without bound.
+	static constexpr size_t MAX_PENDING_HOLES = 256;
+	/// Whether so many holes wait that another draw must block instead. Only a question.
+	[[nodiscard]] bool HoleCapReached() const noexcept { return m_pending_holes >= MAX_PENDING_HOLES; }
+	/// Asks for a flush at the next packet boundary, since a handler must not submit. A draw that
+	/// found the cap reached calls this. The request stays until a resolve has run.
+	void RequestHoleFlush() noexcept { m_hole_flush_requested = true; }
+	/// Whether a draw found the cap reached and the holes have not been resolved since.
+	[[nodiscard]] bool HoleFlushRequested() const noexcept {
+		return m_hole_flush_requested && m_pending_holes != 0;
+	}
+	/// Submits, and so resolves, if the cap asked for it. Called at a packet boundary, where a flush
+	/// is allowed. The report names the cap as the trigger. Returns whether it submitted.
+	bool FlushIfHoleCapReached();
+	/// Resolves the holes that are still pending when the context is destroyed, on the destroying
+	/// thread and before the builds they wait for are stopped, and waits for the GPU to finish them.
+	/// Does nothing when no hole waits.
+	void ResolveHolesForShutdown();
 	/// Holes split off and not yet recorded. Every Flush, Finish and Wait leaves none.
 	[[nodiscard]] size_t PendingHoleCount() const noexcept { return m_pending_holes; }
 	/// Tells the submit cadence that a draw or dispatch went into the current command buffer.
@@ -226,6 +242,9 @@ private:
 	std::thread::id                m_extra_hole_thread;
 	// Set by tests so a resolve on their thread holds guest audio as the GPU thread's would.
 	bool                           m_hold_audio_extra_thread = false;
+	// Set when a draw found the cap reached, so the next packet boundary flushes. Cleared by the resolve
+	// that follows, which is also what makes a flush with no request do nothing.
+	bool                           m_hole_flush_requested    = false;
 	// When the first pending hole was split in, for the report's time before the resolve.
 	std::optional<std::chrono::steady_clock::time_point> m_first_hole_time;
 	ResolveTrigger                 m_trigger = ResolveTrigger::Submit;

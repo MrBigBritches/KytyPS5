@@ -28,6 +28,9 @@ RenderContext::RenderContext(GraphicContext& graphics, const std::filesystem::pa
 // Stops the GPU and the background builds before the caches they use go, then lifts the guards.
 RenderContext::~RenderContext() {
 	ShutdownGpu();
+	// A hole that still waits needs the builds it waits for, which stop below. Resolving here records
+	// and submits it first.
+	m_command_scheduler.ResolveHolesForShutdown();
 	// Background builds read the image heap's layout, which the heap destroys before the pipeline
 	// cache is gone, so they stop here.
 	m_pipeline_cache.StopBuilds();
