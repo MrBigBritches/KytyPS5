@@ -1525,6 +1525,23 @@ void PipelineCache::StartWarmCompute(const ShaderModule& module) {
 	});
 }
 
+namespace {
+
+/// Records a dispatch's first use of a warm-up module for the report. The report lives in common,
+/// which cannot see the queue, so it has its own names for how the build was handed over.
+void RecordWarmTake(uint64_t id, PipelineBuildQueue::Acquired how, double stopped_ms,
+                    int64_t at_ns) {
+	using Common::FirstRunReport::WarmTakeHow;
+	using Acquired               = PipelineBuildQueue::Acquired;
+	const WarmTakeHow report_how = how == Acquired::AlreadyDone ? WarmTakeHow::Done
+	                               : how == Acquired::Waited    ? WarmTakeHow::Waited
+	                                                            : WarmTakeHow::Inline;
+	Common::FirstRunReport::AddWarmTake(
+	    {.id = id, .how = report_how, .stopped_ms = stopped_ms, .at_ns = at_ns});
+}
+
+} // namespace
+
 PipelineCache::Pipeline* PipelineCache::TakeWarmCompute(const ShaderComputeInputInfo& input_info) {
 	const auto id = input_info.stage.module->id;
 	if (m_warm_compute == nullptr || !m_warm_compute->IsPending(id)) {
@@ -1538,6 +1555,11 @@ PipelineCache::Pipeline* PipelineCache::TakeWarmCompute(const ShaderComputeInput
 	std::optional<WarmBuildSet<uint64_t, Pipeline>::Taken> taken;
 	if (m_warm_compute->IsDone(id)) {
 		taken = m_warm_compute->Take(id);
+		EXIT_IF(!taken);
+		// The clock is read only for the report, so a run without it does exactly what it did.
+		const int64_t at_ns = Common::FirstRunReport::Enabled() ? Common::FirstRunReport::NowNs()
+		                                                        : Common::FirstRunReport::NO_TIME_NS;
+		RecordWarmTake(id, taken->how, 0.0, at_ns);
 	} else {
 		taken = TakeUnfinishedWarmCompute(id);
 	}
@@ -1567,6 +1589,11 @@ PipelineCache::TakeUnfinishedWarmCompute(uint64_t id) {
 	                            std::chrono::steady_clock::now() - start)
 	                            .count();
 	NoteWarmComputeStop(taken->how, stopped_ms, paused);
+	// The row's time is the start of this stop, on the steady clock that NowNs reads, so it and
+	// stopped_ms come from the same reading.
+	const int64_t start_ns =
+	    std::chrono::duration_cast<std::chrono::nanoseconds>(start.time_since_epoch()).count();
+	RecordWarmTake(id, taken->how, stopped_ms, start_ns);
 	return taken;
 }
 

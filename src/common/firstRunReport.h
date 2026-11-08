@@ -157,6 +157,30 @@ struct DeferredResolve {
 	double      window_held_ms    = 0.0;
 };
 
+/// How a dispatch got a module the background warm-up had queued, the first time it used it.
+enum class WarmTakeHow : uint8_t {
+	// A worker had already built it.
+	Done,
+	// A worker was building it, and the dispatch waited.
+	Waited,
+	// No worker had started it, so the dispatch built it itself.
+	Inline,
+};
+
+/// The first use of one module the background warm-up had queued. at_ns is when the dispatch asked
+/// for it, before any wait, on the NowNs clock, or NO_TIME_NS when no time was taken. stopped_ms is
+/// how long the dispatch was stopped for it, which is about 0 for a finished build. It is not
+/// exactly 0 when a worker finished just as the dispatch began to wait. Comparing the rows of a
+/// shader's variants shows how far ahead of one variant another was first used. flip is stamped by
+/// the report when the row is added.
+struct WarmTake {
+	uint64_t    id         = 0;
+	WarmTakeHow how        = WarmTakeHow::Done;
+	double      stopped_ms = 0.0;
+	int64_t     at_ns      = NO_TIME_NS;
+	int64_t     flip       = 0;
+};
+
 /// The GPU thread's blocking within one guest flip, merged into a single pause.
 struct Pause {
 	int64_t  flip   = 0;
@@ -290,6 +314,9 @@ public:
 	/// it waited for on a worker. `ms` is how long the dispatch was stopped, and the last argument
 	/// whether that was long enough to hold guest audio.
 	void AddWarmCompute(bool waited, double ms, bool over_hold_threshold);
+	/// Records the first use of a module the background warm-up had queued. The flip field is
+	/// ignored and replaced by the current flip.
+	void AddWarmTake(const WarmTake& take);
 	/// The GPU-thread time blocked so far in play for the kind.
 	[[nodiscard]] double BlockedMs(Kind kind) const;
 	/// Records a module that --cold-pipelines could not stamp, so it compiled unstamped.
@@ -309,6 +336,8 @@ public:
 	[[nodiscard]] std::vector<CompileEntry> Compiles() const;
 	/// Copy of the ready rows, for tests.
 	[[nodiscard]] std::vector<ReadyEntry> Readies() const;
+	/// Copy of the warm-up take rows, for tests.
+	[[nodiscard]] std::vector<WarmTake> WarmTakes() const;
 
 private:
 	// Moves the pause being merged to the finished ones when it belongs to another flip. Caller
@@ -357,6 +386,7 @@ private:
 	uint32_t                                      m_warm_waited_count = 0;
 	double                                        m_warm_waited_ms = 0.0;
 	uint32_t                                      m_warm_waited_over = 0;
+	std::vector<WarmTake>                         m_warm_takes;
 };
 
 /// The report of this process.
@@ -457,6 +487,13 @@ inline void AddDeferredWarmInline(bool over_hold_threshold) {
 inline void AddWarmCompute(bool waited, double ms, bool over_hold_threshold) {
 	if (Enabled()) {
 		Global().AddWarmCompute(waited, ms, over_hold_threshold);
+	}
+}
+
+/// Records the first use of a module the background warm-up had queued.
+inline void AddWarmTake(const WarmTake& take) {
+	if (Enabled()) {
+		Global().AddWarmTake(take);
 	}
 }
 

@@ -307,6 +307,12 @@ void Report::AddWarmCompute(bool waited, double ms, bool over_hold_threshold) {
 	}
 }
 
+void Report::AddWarmTake(const WarmTake& take) {
+	std::lock_guard lock(m_mutex);
+	m_warm_takes.push_back(take);
+	m_warm_takes.back().flip = m_flip;
+}
+
 double Report::BlockedMs(Kind kind) const {
 	std::lock_guard lock(m_mutex);
 	return m_blocked_ms[static_cast<size_t>(kind)];
@@ -356,6 +362,7 @@ void Report::Reset() {
 	m_warm_waited_count             = 0;
 	m_warm_waited_ms                = 0.0;
 	m_warm_waited_over              = 0;
+	m_warm_takes.clear();
 }
 
 std::vector<Pause> Report::AllPausesLocked() const {
@@ -374,6 +381,11 @@ std::vector<CompileEntry> Report::Compiles() const {
 std::vector<ReadyEntry> Report::Readies() const {
 	std::lock_guard lock(m_mutex);
 	return m_readies;
+}
+
+std::vector<WarmTake> Report::WarmTakes() const {
+	std::lock_guard lock(m_mutex);
+	return m_warm_takes;
 }
 
 namespace {
@@ -583,6 +595,27 @@ nlohmann::json DeferredToJson(const Summary& summary) {
 	          {"over_hold_threshold", summary.warm_waited_over_hold_threshold}}}};
 }
 
+// Writes one row per first use of a warm-up module, in the order they happened.
+nlohmann::json WarmTakesToJson(const std::vector<WarmTake>& takes, int64_t epoch_ns) {
+	nlohmann::json rows = nlohmann::json::array();
+	for (const auto& take: takes) {
+		const char* how = take.how == WarmTakeHow::Done     ? "done"
+		                  : take.how == WarmTakeHow::Waited ? "waited"
+		                                                    : "inline";
+		nlohmann::json row = {{"id", Hex(take.id)},
+		                      {"how", how},
+		                      {"flip", take.flip},
+		                      {"stopped_ms", Round3(take.stopped_ms)}};
+		// Counted from the run start like a compile's start_ms, and left out when no time was given.
+		if (take.at_ns != NO_TIME_NS) {
+			const int64_t base = epoch_ns == NO_TIME_NS ? 0 : epoch_ns;
+			row["at_ms"]       = Round3(static_cast<double>(take.at_ns - base) / NS_PER_MS);
+		}
+		rows.push_back(std::move(row));
+	}
+	return rows;
+}
+
 nlohmann::json BootToJson(const BootInfo& boot) {
 	return {{"warm_up_ms", Round3(boot.warm_up_ms)},
 	        {"programs", boot.programs},
@@ -627,6 +660,7 @@ std::string Report::ToJson(const Metadata& metadata, uint64_t audio_holds, doubl
 	    {"pauses", PausesToJson(summary)},
 	    {"compiles", compile_rows},
 	    {"ready", ready_rows},
+	    {"warm_takes", WarmTakesToJson(WarmTakes(), epoch_ns)},
 	    {"skips", SkipsToJson(summary)},
 	    {"deferred_draws", DeferredToJson(summary)},
 	    {"audio_holds", audio_holds},

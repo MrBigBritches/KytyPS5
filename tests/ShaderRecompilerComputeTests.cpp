@@ -60914,18 +60914,35 @@ void CheckWarmComputePause(VulkanHarness &vulkan) {
                   .pause_warm_up_for_draws_enabled = pause});
     Common::FirstRunReport::Global().Reset();
   };
+  // The report gets exactly one take row for the module, handed over the given way. set_flags
+  // resets the report before each case and only a take adds these rows, so none can come from
+  // earlier cases or other lookups.
+  const auto one_take = [](const ShaderComputeInputInfo &input, Common::FirstRunReport::WarmTakeHow how) {
+    const auto takes = Common::FirstRunReport::Global().WarmTakes();
+    return takes.size() == 1 && takes[0].id == input.stage.module->id && takes[0].how == how;
+  };
   ComputeCreateHook hook;
   WithWarmComputeCache(vulkan, true, [&](PipelineCache &cache, const ShaderComputeInputInfo &input) {
     set_flags(true, true, true);
     const auto before = ComputeCreateHook::Created();
     PipelineCacheTestAccess::StartWarmCompute(cache, *input.stage.module);
     PipelineCacheTestAccess::DrainWarmQueue(cache);
+    const int64_t done_before_ns = Common::FirstRunReport::NowNs();
     (void)cache.GetComputePipeline(input);
+    const int64_t done_after_ns = Common::FirstRunReport::NowNs();
     Require(name, "baseline", ComputeCreateHook::Created() == before + 1 &&
                                   ComputeCreateHook::CreatedOn(before) != caller &&
                                   cache.WarmInlineDuringPause() == 0 &&
                                   Common::FirstRunReport::Global().Summarize().deferred_warm_inline == 0,
             "an unpaused warm build was not built by a worker, or was counted as inline");
+    // A second lookup finds the pipeline in the map, so only the first use is a take. The time has
+    // to fall inside the first lookup, which a constant, another clock or another unit would not.
+    (void)cache.GetComputePipeline(input);
+    const auto takes = Common::FirstRunReport::Global().WarmTakes();
+    Require(name, "finished take is recorded once",
+            one_take(input, Common::FirstRunReport::WarmTakeHow::Done) && takes[0].stopped_ms == 0.0 &&
+                done_before_ns <= takes[0].at_ns && takes[0].at_ns <= done_after_ns,
+            "taking a finished warm build did not record one done row timed during the lookup");
   });
   // A build that ran inline while the queue was held is counted, and counted again when it lasted
   // as long as a hold of guest audio. A short build is the baseline for the long one.
@@ -60947,6 +60964,8 @@ void CheckWarmComputePause(VulkanHarness &vulkan) {
       Require(name, "over the hold threshold",
               summary.deferred_warm_inline_over_hold_threshold == (delay > 0 ? 1u : 0u),
               "a build was not split by whether it ran as long as an audio hold");
+      Require(name, "inline take is recorded", one_take(input, Common::FirstRunReport::WarmTakeHow::Inline),
+              "a build the dispatch ran itself was not recorded as one inline take");
     });
   }
   // Every build a dispatch takes before it finishes is counted for the report, held or not. The build
@@ -60985,7 +61004,9 @@ void CheckWarmComputePause(VulkanHarness &vulkan) {
       std::this_thread::sleep_for(std::chrono::seconds(1));
       ComputeCreateHook::release = true;
     });
+    const int64_t wait_before_ns = Common::FirstRunReport::NowNs();
     (void)cache.GetComputePipeline(input);
+    const int64_t wait_after_ns = Common::FirstRunReport::NowNs();
     releaser.join();
     ComputeCreateHook::block = false;
     const auto summary = Common::FirstRunReport::Global().Summarize();
@@ -60993,6 +61014,20 @@ void CheckWarmComputePause(VulkanHarness &vulkan) {
             summary.warm_waited_count == 1 && summary.warm_inline_total == 0 &&
                 summary.warm_waited_over_hold_threshold == 1 && summary.warm_waited_ms >= 250.0,
             "a build a worker was running was not counted as waited for, or not by its length");
+    // The dispatch waited about a second, so a row that kept 0 or another case's time fails. The
+    // row's time plus its stop has to end inside the lookup, which holds only when the time is the
+    // start of the stop. A time taken at the end would overrun the lookup by the whole wait.
+    const auto waited_takes = Common::FirstRunReport::Global().WarmTakes();
+    const auto stop_ns = [](double ms) {
+      return std::chrono::duration_cast<std::chrono::nanoseconds>(
+                 std::chrono::duration<double, std::milli>(ms))
+          .count();
+    };
+    Require(name, "waited take is recorded",
+            one_take(input, Common::FirstRunReport::WarmTakeHow::Waited) &&
+                waited_takes[0].stopped_ms >= 250.0 && wait_before_ns <= waited_takes[0].at_ns &&
+                waited_takes[0].at_ns + stop_ns(waited_takes[0].stopped_ms) <= wait_after_ns,
+            "a build the dispatch waited for was not recorded as one waited take timed from its start");
   });
   WithWarmComputeCache(vulkan, true, [&](PipelineCache &cache, const ShaderComputeInputInfo &input) {
     set_flags(true, true, true);

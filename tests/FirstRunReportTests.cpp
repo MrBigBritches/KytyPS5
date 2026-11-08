@@ -421,6 +421,38 @@ void TestScopesRespectTheFlag() {
 constexpr int64_t kMs = 1000000; // Nanoseconds per millisecond.
 constexpr double kMaxPlausibleMs = 60.0 * 1000.0; // No test here runs for a minute.
 
+// An empty report writes no warm-up take rows, which is the baseline, so each row below can only
+// come from AddWarmTake. Each row keeps its own id, how and stopped time, the flip is the one
+// running when it was added, whatever the caller passed, at_ms counts from the epoch, and a row
+// with no time has no at_ms. The three rows differ in every field, so a row written from another
+// row's data, or rows out of order, fail. Reset forgets them.
+void TestWarmTakeRows() {
+  Report report;
+  Check(nlohmann::json::parse(report.ToJson({}, 0, 1.0, 0.0))["warm_takes"].empty(),
+        "an empty report had warm-up take rows");
+  report.SetEpoch(250 * kMs);
+  report.AddWarmTake({.id = 0xab, .how = Common::FirstRunReport::WarmTakeHow::Done,
+                      .stopped_ms = 0.0, .at_ns = 1250 * kMs, .flip = 99});
+  report.OnFlip(4);
+  report.AddWarmTake({.id = 0xcd, .how = Common::FirstRunReport::WarmTakeHow::Waited,
+                      .stopped_ms = 12.5, .at_ns = 3250 * kMs});
+  report.AddWarmTake({.id = 0xef, .how = Common::FirstRunReport::WarmTakeHow::Inline,
+                      .stopped_ms = 7000.5});
+  const auto rows = nlohmann::json::parse(report.ToJson({}, 0, 1.0, 0.0))["warm_takes"];
+  Check(rows.size() == 3, "warm-up take rows were lost or added");
+  Check(rows[0]["id"] == "00000000000000ab" && rows[0]["how"] == "done" && rows[0]["flip"] == 0 &&
+            rows[0]["stopped_ms"] == 0.0 && rows[0]["at_ms"] == 1000.0,
+        "the first take row lacks its fields, or kept the caller's flip");
+  Check(rows[1]["id"] == "00000000000000cd" && rows[1]["how"] == "waited" && rows[1]["flip"] == 4 &&
+            rows[1]["stopped_ms"] == 12.5 && rows[1]["at_ms"] == 3000.0,
+        "the waited take row lacks its fields");
+  Check(rows[2]["id"] == "00000000000000ef" && rows[2]["how"] == "inline" && rows[2]["flip"] == 4 &&
+            rows[2]["stopped_ms"] == 7000.5 && !rows[2].contains("at_ms"),
+        "the inline take row lacks its fields, or has a time it was not given");
+  report.Reset();
+  Check(report.WarmTakes().empty(), "Reset kept warm-up take rows");
+}
+
 using Common::FirstRunReport::NO_SUBMISSION;
 using Common::FirstRunReport::NO_TIME_NS;
 using Common::FirstRunReport::SubmissionScope;
@@ -776,6 +808,7 @@ int main() {
   TestSkipsAndFlips();
   TestJsonContents();
   TestDeferredDrawsSection();
+  TestWarmTakeRows();
   TestScopesRespectTheFlag();
   TestCompileRowsKeepSubmission();
   TestResumeKeepsStampAndCountsOnce();
