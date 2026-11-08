@@ -966,6 +966,11 @@ struct PipelineCacheTestAccess {
     cache.StartWarmCompute(module);
   }
 
+  // Makes the warm queue of the next WarmUp run one job at a time, in the order they were posted.
+  static void SetWarmWorkerCount(PipelineCache &cache, uint32_t count) {
+    cache.m_warm_worker_count_override = count;
+  }
+
   // Warm builds started and not yet taken.
   static size_t WarmPending(const PipelineCache &cache) {
     return cache.m_warm_compute == nullptr ? 0 : cache.m_warm_compute->Pending();
@@ -59941,6 +59946,8 @@ void CheckAsyncStableModules(VulkanHarness &vulkan) {
 struct ComputeCreateHook {
   static inline std::mutex mutex;
   static inline std::vector<std::thread::id> created_on;
+  // The shader module of each pipeline, in the order the driver was asked to create them.
+  static inline std::vector<uint64_t> created_modules;
   static inline std::set<uint64_t> live;
   static inline PFN_vkCreateComputePipelines real_create = nullptr;
   static inline PFN_vkDestroyPipeline real_destroy = nullptr;
@@ -59952,6 +59959,7 @@ struct ComputeCreateHook {
     const auto result = real_create(device, cache, count, infos, allocator, pipelines);
     std::scoped_lock lock(mutex);
     created_on.push_back(std::this_thread::get_id());
+    created_modules.push_back(reinterpret_cast<uint64_t>(infos[0].stage.module));
     if (result == VK_SUCCESS)
       for (uint32_t i = 0; i < count; i++) live.insert(reinterpret_cast<uint64_t>(pipelines[i]));
     return result;
@@ -59981,8 +59989,14 @@ struct ComputeCreateHook {
     return live.size();
   }
 
+  static std::vector<uint64_t> CreatedModules() {
+    std::scoped_lock lock(mutex);
+    return created_modules;
+  }
+
   ComputeCreateHook() {
     created_on.clear();
+    created_modules.clear();
     live.clear();
     auto &table = VULKAN_HPP_DEFAULT_DISPATCHER;
     real_create = table.vkCreateComputePipelines;
@@ -60268,6 +60282,91 @@ void CheckBackgroundWarmUp(VulkanHarness &vulkan) {
   std::printf("[gpu]     %-32s ok\n", name);
 }
 
+// Boots the store with the flag on and one warm worker, waits for that worker to finish, and
+// returns which of `codes` each driver pipeline build was for, in the order the builds ran.
+std::vector<size_t> WarmBuildOrder(VulkanHarness &vulkan, const std::filesystem::path &store,
+                                   const std::vector<std::vector<u32>> &codes) {
+  Config::Load({.printf_direction = Config::LogDirection::Silent,
+                .first_run_report_enabled = true,
+                .background_warm_up_enabled = true});
+  ComputeCreateHook hook;
+  PipelineCache cache(vulkan.RuntimeContext(), nullptr);
+  // One worker takes the queue front to back, so the order built is the order posted.
+  PipelineCacheTestAccess::SetWarmWorkerCount(cache, 1);
+  cache.WarmUp(store);
+  PipelineCacheTestAccess::DrainWarmQueue(cache);
+  const auto built = ComputeCreateHook::CreatedModules();
+  // Looking a program up finds the module the store loaded, which names the build it belongs to.
+  std::map<uint64_t, size_t> index_of_module;
+  for (size_t index = 0; index < codes.size(); index++) {
+    HW::ComputeShaderInfo regs{};
+    regs.cs_regs.data_addr = reinterpret_cast<uint64_t>(codes[index].data());
+    regs.cs_regs.num_thread_x = 1;
+    regs.cs_regs.num_thread_y = 1;
+    regs.cs_regs.num_thread_z = 1;
+    regs.cs_regs.wave_size = 32;
+    regs.cs_regs.user_sgpr = 4;
+    const ShaderBufferResource buffer{{0x10000u, 4u << 16u, 64,
+        DstSel(4, 5, 6, 7) | (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u)}};
+    std::copy_n(buffer.fields, 4, regs.cs_user_sgpr.value);
+    ShaderComputeInputInfo input{};
+    (void)cache.GetComputeProgram(regs, input);
+    index_of_module[reinterpret_cast<uint64_t>(static_cast<VkShaderModule>(input.stage.module->module))] =
+        index;
+  }
+  cache.StopBuilds();
+  std::vector<size_t> order;
+  for (const auto module : built) order.push_back(index_of_module.at(module));
+  return order;
+}
+
+// With the flag on, the warm-up posts compute builds in the order the records appear in the store,
+// not in the order of the module ids. The same five programs are stored in three different orders
+// and the builds must follow the file each time. An order that came from the ids alone would be
+// the same for all three stores, so it could match at most one of them.
+void CheckWarmUpRecordOrder(VulkanHarness &vulkan) {
+  constexpr const char *name = "WarmUpRecordOrder";
+  constexpr size_t program_count = 5;
+  std::vector<std::vector<u32>> codes;
+  for (size_t index = 0; index < program_count; index++) {
+    std::vector<u32> code;
+    AppendVMovU32(&code, 1, 0x71u + static_cast<u32>(index));
+    code.insert(code.end(), {EncodeMubuf0(0x1c), EncodeMubuf1(1, 0, 0)});
+    AppendEnd(&code);
+    codes.push_back(std::move(code));
+  }
+  for (const auto &code : codes)
+    ShaderMapUserData(reinterpret_cast<uint64_t>(code.data()),
+                      {.type = Prospero::ShaderBinaryType::kCs,
+                       .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
+  const std::vector<std::vector<size_t>> store_orders = {
+      {0, 1, 2, 3, 4}, {4, 3, 2, 1, 0}, {2, 4, 0, 3, 1}};
+  const auto dir = std::filesystem::temp_directory_path() /
+                   fmt::format("kyty_warm_record_order_{}",
+                               std::chrono::steady_clock::now().time_since_epoch().count());
+  for (size_t run = 0; run < store_orders.size(); run++) {
+    const auto store = dir / fmt::format("TEST0000{}.shaders", run);
+    // The first run records the modules in the order it is asked for them.
+    std::vector<std::vector<u32>> in_store_order;
+    for (const auto index : store_orders[run]) in_store_order.push_back(codes[index]);
+    // The copies sit at new addresses, which the shader map must know.
+    for (const auto &code : in_store_order)
+      ShaderMapUserData(reinterpret_cast<uint64_t>(code.data()),
+                        {.type = Prospero::ShaderBinaryType::kCs,
+                         .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
+    (void)RunWarmBoot(vulkan, store, in_store_order, false);
+    const auto built = WarmBuildOrder(vulkan, store, codes);
+    Require(name, "every build ran once", built.size() == program_count,
+            "the warm-up did not build each stored module exactly once");
+    Require(name, fmt::format("builds follow store {}", run).c_str(), built == store_orders[run],
+            "the warm builds did not run in the order of the records in the store");
+  }
+  Config::Load({.printf_direction = Config::LogDirection::Silent});
+  Common::FirstRunReport::Global().Reset();
+  std::filesystem::remove_all(dir);
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
 // Every --async-pipelines check, in the order they build on each other.
 void CheckAsyncPipelines(VulkanHarness &vulkan) {
   const auto run = [](const char *name, const std::function<void()> &check) {
@@ -60288,6 +60387,7 @@ void CheckAsyncPipelines(VulkanHarness &vulkan) {
   run("WarmComputeClaim", [&] { CheckWarmComputeClaim(vulkan); });
   run("WarmComputeShutdown", [&] { CheckWarmComputeShutdown(vulkan); });
   run("BackgroundWarmUp", [&] { CheckBackgroundWarmUp(vulkan); });
+  run("WarmUpRecordOrder", [&] { CheckWarmUpRecordOrder(vulkan); });
   vulkan.CheckAsyncGate();
   vulkan.CheckAsyncDrawsOff();
   vulkan.CheckAsyncDraws();

@@ -328,6 +328,12 @@ private:
 	// pipelines the warm-up builds, by module id, until a lookup adopts them. Only the GPU thread
 	// takes from it, and a worker writes only into the build's own storage.
 	std::unique_ptr<WarmBuildSet<uint64_t, Pipeline>>                            m_warm_compute;
+	// Module ids in the order their records appear in the shader store, one entry per record. Filled
+	// while WarmUp loads the store and emptied once the warm-up has queued its builds.
+	std::vector<uint64_t>                                                        m_module_record_order;
+	// Zero sizes the warm queue from the hardware threads. A test sets one to make the queue run
+	// jobs strictly in order.
+	uint32_t                                                                     m_warm_worker_count_override = 0;
 
 	template <typename InputInfo>
 	const ShaderModule* GetProgram(const ShaderParams& params, InputInfo& input_info,
@@ -362,7 +368,8 @@ private:
 	Pipeline& AdoptBuild(std::shared_ptr<GraphicsBuild> build);
 	// Takes every finished build the workers have published.
 	void DrainPublishedBuilds();
-	// Creates the compute pipelines of the loaded modules, or with --background-warm-up queues them.
+	// Creates the compute pipelines of the loaded modules, or with --background-warm-up queues them
+	// in the order their records appear in the shader store.
 	void AddComputeWarmUp(const ModuleMap& modules, std::vector<Common::UniqueFunction<void>>& jobs);
 	// Starts the warm-up build of a compute module on the warm queue. It never stores a record,
 	// since the warm-up only builds what the store already holds.

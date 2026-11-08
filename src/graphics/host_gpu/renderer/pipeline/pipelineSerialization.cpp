@@ -146,18 +146,28 @@ void PipelineCache::AddComputeWarmUp(const ModuleMap&                           
                                       std::vector<Common::UniqueFunction<void>>& jobs) {
 	// Read once. With the flag off no warm queue exists and boot builds every compute pipeline.
 	if (Config::BackgroundWarmUpEnabled()) {
-		m_warm_compute = std::make_unique<WarmBuildSet<uint64_t, Pipeline>>(
-		    WarmUpWorkerCount(std::thread::hardware_concurrency()),
-		    PipelineBuildQueueOptions {.low_priority = true});
+		const uint32_t workers = m_warm_worker_count_override != 0
+		                             ? m_warm_worker_count_override
+		                             : WarmUpWorkerCount(std::thread::hardware_concurrency());
+		m_warm_compute         = std::make_unique<WarmBuildSet<uint64_t, Pipeline>>(
+            workers, PipelineBuildQueueOptions {.low_priority = true});
+		// The queue runs jobs in the order they are posted. A store is appended in the order the
+		// title first used each shader, and an offline generator writes the likely ones first, so
+		// the record order puts the builds the game needs soonest at the front. A module with
+		// several records is started at its first, since Start refuses a module already pending.
+		for (const auto id: m_module_record_order) {
+			const auto found = modules.find(id);
+			if (found != modules.end() && found->second != nullptr &&
+			    found->second->info.stage == ShaderType::Compute) {
+				// Boot does not wait for this one. The first lookup claims it or the queue gets to it.
+				StartWarmCompute(*found->second);
+			}
+		}
+		return;
 	}
 	// A compute pipeline depends only on its module.
 	for (const auto* module: modules | std::views::values) {
 		if (module == nullptr || module->info.stage != ShaderType::Compute) {
-			continue;
-		}
-		if (m_warm_compute != nullptr) {
-			// Boot does not wait for this one. The first lookup claims it or the queue gets to it.
-			StartWarmCompute(*module);
 			continue;
 		}
 		jobs.emplace_back([this, module, &pipeline = m_compute_pipelines[module->id]] {
@@ -209,6 +219,7 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 		});
 	}
 	AddComputeWarmUp(modules, jobs);
+	std::vector<uint64_t>().swap(m_module_record_order);
 	Common::ParallelFor(jobs.size(), [&](size_t i) { jobs[i](); });
 	// A key with a stage missing from the store keeps no pipeline.
 	std::erase_if(m_graphics_pipelines,
@@ -277,6 +288,7 @@ bool PipelineCache::LoadRecord(std::span<const uint8_t>& records) {
 				return false;
 			}
 			module.module = CompileSPV(spirv, m_graphics.device);
+			m_module_record_order.push_back(module.id);
 			program->second.modules.push_back(std::move(module));
 			break;
 		}
