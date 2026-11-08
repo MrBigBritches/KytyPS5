@@ -9,6 +9,7 @@
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineBuildQueue.h"
+#include "graphics/host_gpu/renderer/pipeline/warmBuildSet.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
@@ -323,6 +324,10 @@ private:
 	std::mutex                                                                   m_published_mutex;
 	std::vector<std::shared_ptr<GraphicsBuild>>                                  m_published;
 	std::atomic<bool>                                                            m_has_published {false};
+	// Null unless --background-warm-up is on and a shader store started builds. Holds the compute
+	// pipelines the warm-up builds, by module id, until a lookup adopts them. Only the GPU thread
+	// takes from it, and a worker writes only into the build's own storage.
+	std::unique_ptr<WarmBuildSet<uint64_t, Pipeline>>                            m_warm_compute;
 
 	template <typename InputInfo>
 	const ShaderModule* GetProgram(const ShaderParams& params, InputInfo& input_info,
@@ -357,6 +362,20 @@ private:
 	Pipeline& AdoptBuild(std::shared_ptr<GraphicsBuild> build);
 	// Takes every finished build the workers have published.
 	void DrainPublishedBuilds();
+	// Creates the compute pipelines of the loaded modules, or with --background-warm-up queues them.
+	void AddComputeWarmUp(const ModuleMap& modules, std::vector<Common::UniqueFunction<void>>& jobs);
+	// Starts the warm-up build of a compute module on the warm queue. It never stores a record,
+	// since the warm-up only builds what the store already holds.
+	void StartWarmCompute(const ShaderModule& module);
+	// Moves the module's warm-up pipeline into m_compute_pipelines, waiting for it or building it
+	// here if it is not done. Null when no warm-up build is pending for the module.
+	[[nodiscard]] Pipeline* TakeWarmCompute(const ShaderComputeInputInfo& input_info);
+	// The part of TakeWarmCompute for a build that is queued or running. It runs or waits for the
+	// build inside the stall and the timing that the GPU thread owes for that.
+	[[nodiscard]] std::optional<WarmBuildSet<uint64_t, Pipeline>::Taken>
+	TakeUnfinishedWarmCompute(uint64_t id);
+	// Stops the warm queue and destroys the pipelines it built that nobody took.
+	void StopWarmBuilds();
 
 	// pipelineSerialization.cpp
 	bool LoadRecord(std::span<const uint8_t>& records);

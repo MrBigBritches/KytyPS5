@@ -110,6 +110,9 @@ struct ConfigOptions {
 	// Like async_pipelines_enabled, which it implies, but only draws with no color target ever go
 	// without their pipeline.
 	bool                   async_pipelines_depth_only_enabled = false;
+	// Builds the compute pipelines of the shader store on low priority workers while the game runs,
+	// instead of making boot wait for all of them.
+	bool                   background_warm_up_enabled  = false;
 	// Lets the GPU start on a long command stream instead of idling until the end-of-slice submit.
 	bool                   gpu_submit_cadence_enabled  = false;
 	// Opts in to the host GPU's float min/max on non-AMD GPUs. It is faster, but the sign of a zero
@@ -211,6 +214,8 @@ bool ColdPipelinesEnabled();
 bool AsyncPipelinesEnabled();
 /// Whether only draws with no color target may go without a pipeline. It implies background builds.
 bool AsyncPipelinesDepthOnly();
+/// True when --background-warm-up builds the shader store's compute pipelines after boot.
+bool BackgroundWarmUpEnabled();
 bool GpuSubmitCadenceEnabled();
 /// Returns whether non-AMD GPUs may use the host's float min/max instead of the exact emulation.
 bool NativeFloatMinMaxEnabled();

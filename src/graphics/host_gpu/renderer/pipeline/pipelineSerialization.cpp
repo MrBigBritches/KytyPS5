@@ -142,6 +142,30 @@ void ShaderStoreWriter::Post(Common::UniqueFunction<void>&& job) {
 	m_ready.notify_one();
 }
 
+void PipelineCache::AddComputeWarmUp(const ModuleMap&                             modules,
+                                      std::vector<Common::UniqueFunction<void>>& jobs) {
+	// Read once. With the flag off no warm queue exists and boot builds every compute pipeline.
+	if (Config::BackgroundWarmUpEnabled()) {
+		m_warm_compute = std::make_unique<WarmBuildSet<uint64_t, Pipeline>>(
+		    WarmUpWorkerCount(std::thread::hardware_concurrency()),
+		    PipelineBuildQueueOptions {.low_priority = true});
+	}
+	// A compute pipeline depends only on its module.
+	for (const auto* module: modules | std::views::values) {
+		if (module == nullptr || module->info.stage != ShaderType::Compute) {
+			continue;
+		}
+		if (m_warm_compute != nullptr) {
+			// Boot does not wait for this one. The first lookup claims it or the queue gets to it.
+			StartWarmCompute(*module);
+			continue;
+		}
+		jobs.emplace_back([this, module, &pipeline = m_compute_pipelines[module->id]] {
+			CreatePipelineInternal(m_graphics, pipeline, *module, m_driver_cache);
+		});
+	}
+}
+
 void PipelineCache::WarmUp(const std::filesystem::path& path) {
 	if (path.empty()) {
 		return;
@@ -184,14 +208,7 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 			CreateGraphicsPipeline(node.second, node.first, modules);
 		});
 	}
-	// A compute pipeline depends only on its module.
-	for (const auto* module: modules | std::views::values) {
-		if (module != nullptr && module->info.stage == ShaderType::Compute) {
-			jobs.emplace_back([this, module, &pipeline = m_compute_pipelines[module->id]] {
-				CreatePipelineInternal(m_graphics, pipeline, *module, m_driver_cache);
-			});
-		}
-	}
+	AddComputeWarmUp(modules, jobs);
 	Common::ParallelFor(jobs.size(), [&](size_t i) { jobs[i](); });
 	// A key with a stage missing from the store keeps no pipeline.
 	std::erase_if(m_graphics_pipelines,
@@ -202,16 +219,17 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 	const auto warm_up_ms = std::chrono::duration<double, std::milli>(
 	                            std::chrono::steady_clock::now() - start)
 	                            .count();
+	// Pipelines still building in the background count as loaded, since the store holds them.
+	const size_t pipeline_count = m_graphics_pipelines.size() + m_compute_pipelines.size() +
+	                              (m_warm_compute != nullptr ? m_warm_compute->Pending() : 0);
 	Common::FirstRunReport::SetBoot({.warm_up_ms = warm_up_ms,
 	                                 .programs   = static_cast<uint32_t>(m_program_cache.size()),
 	                                 .modules    = static_cast<uint32_t>(modules.size() - 1),
-	                                 .pipelines  = static_cast<uint32_t>(
-	                                     m_graphics_pipelines.size() + m_compute_pipelines.size())});
+	                                 .pipelines  = static_cast<uint32_t>(pipeline_count)});
 	Common::FirstRunReport::SetPhase(Common::FirstRunReport::Phase::Play);
 	Log::WriteToConsoleAndLog(fmt::format(
 	    "Shader cache: loaded {} programs, {} modules, {} pipelines in {} ms\n",
-	    m_program_cache.size(), modules.size() - 1,
-	    m_graphics_pipelines.size() + m_compute_pipelines.size(),
+	    m_program_cache.size(), modules.size() - 1, pipeline_count,
 	    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() -
 	                                                          start)
 	        .count()));

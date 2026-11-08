@@ -1365,7 +1365,89 @@ void PipelineCache::DrainPublishedBuilds() {
 	}
 }
 
+void PipelineCache::StartWarmCompute(const ShaderModule& module) {
+	// The module lives in the program cache, which outlasts the queue because StopBuilds runs first.
+	// A refusal leaves the module to build on first use, as it would without the warm-up.
+	(void)m_warm_compute->Start(module.id, [this, &module](Pipeline& pipeline) {
+		CreatePipelineInternal(m_graphics, pipeline, module, m_driver_cache);
+		// Marked here because this build adds to the driver cache without a checkpoint of its own.
+		m_driver_cache_dirty.store(true, std::memory_order_relaxed);
+	});
+}
+
+PipelineCache::Pipeline* PipelineCache::TakeWarmCompute(const ShaderComputeInputInfo& input_info) {
+	const auto id = input_info.stage.module->id;
+	if (m_warm_compute == nullptr || !m_warm_compute->IsPending(id)) {
+		return nullptr;
+	}
+	if (graphics_debug_dump_enabled()) {
+		ShaderDbgDumpInputInfo(input_info);
+	}
+	// A finished build is just handed over. Once the warm-up is over this is the usual case, and it
+	// needs neither the stall nor a timed sample.
+	std::optional<WarmBuildSet<uint64_t, Pipeline>::Taken> taken;
+	if (m_warm_compute->IsDone(id)) {
+		taken = m_warm_compute->Take(id);
+	} else {
+		taken = TakeUnfinishedWarmCompute(id);
+	}
+	EXIT_IF(!taken);
+	auto [iter, inserted] = m_compute_pipelines.try_emplace(id, std::move(taken->result));
+	EXIT_IF(!inserted);
+	CheckpointDriverCache();
+	return &iter->second;
+}
+
+std::optional<WarmBuildSet<uint64_t, PipelineCache::Pipeline>::Taken>
+PipelineCache::TakeUnfinishedWarmCompute(uint64_t id) {
+	// Running the compile here and waiting for a worker both stop the GPU thread, so guest audio
+	// may wait for them and both count toward its longest hitch.
+	std::optional<Common::GpuStall::Scope> stall;
+	if (GuestGpu::IsGpuThread()) {
+		stall.emplace();
+	}
+	Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::Count,
+	                                         Common::DebugCounters::Counter::PipelineCreateNs,
+	                                         Common::DebugCounters::Peak::PipelineCreateNs);
+	const auto start = std::chrono::steady_clock::now();
+	auto       taken = m_warm_compute->Take(id);
+	EXIT_IF(!taken);
+	if (taken->how == PipelineBuildQueue::Acquired::RanInline) {
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::PipelinesCreated);
+	} else if (taken->how == PipelineBuildQueue::Acquired::Waited) {
+		const auto waited_ms = std::chrono::duration<double, std::milli>(
+		                           std::chrono::steady_clock::now() - start)
+		                           .count();
+		Common::FirstRunReport::AddWait(Common::FirstRunReport::Kind::Compute, waited_ms);
+		// Lets a hold of guest audio be matched to the wait, and shows what a worker at low
+		// priority costs the GPU thread.
+		PipelineCacheLog("Pipeline build: waited {:.1f} ms for a running warm-up compute build",
+		                 waited_ms);
+	}
+	return taken;
+}
+
+void PipelineCache::StopWarmBuilds() {
+	if (m_warm_compute == nullptr) {
+		return;
+	}
+	auto stopped = m_warm_compute->Stop();
+	if (stopped.waited_for != 0) {
+		PipelineCacheLog("Pipeline build: waiting for {} running warm-up compiles", stopped.waited_for);
+	}
+	// Nothing runs now. A finished build nobody took still owns its Vulkan objects, and a build
+	// that never ran owns none. Each finished one marked the driver cache when it was built, so the
+	// save that follows keeps its work.
+	for (const auto& pipeline: stopped.unadopted) {
+		m_graphics.device.destroyPipeline(pipeline.pipeline, nullptr);
+		m_graphics.device.destroyPipelineLayout(pipeline.pipeline_layout, nullptr);
+		m_graphics.device.destroyDescriptorSetLayout(pipeline.descriptor_set_layout, nullptr);
+	}
+	m_warm_compute.reset();
+}
+
 void PipelineCache::StopBuilds() {
+	StopWarmBuilds();
 	if (m_build_queue == nullptr) {
 		return;
 	}
@@ -1393,6 +1475,11 @@ PipelineCache::Pipeline& PipelineCache::GetComputePipeline(const ShaderComputeIn
 	KYTY_PROFILER_BLOCK("PipelineCache::CreatePipeline(Compute)", profiler::colors::RedA100);
 
 	const auto& module = *input_info.stage.module;
+
+	// A warm-up build for this module must be taken before a second one is made.
+	if (auto* warm = TakeWarmCompute(input_info)) {
+		return *warm;
+	}
 
 	auto [iter, inserted] = m_compute_pipelines.try_emplace(module.id);
 	auto& pipeline        = iter->second;

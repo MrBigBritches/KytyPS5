@@ -268,6 +268,10 @@ bool AsyncPipelinesEnabled() {
 	return g_config->async_pipelines_enabled || g_config->async_pipelines_depth_only_enabled;
 }
 
+bool BackgroundWarmUpEnabled() {
+	return g_config->background_warm_up_enabled;
+}
+
 bool GpuSubmitCadenceEnabled() {
 	return g_config->gpu_submit_cadence_enabled;
 }

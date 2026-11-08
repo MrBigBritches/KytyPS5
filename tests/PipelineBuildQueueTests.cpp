@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineBuildQueue.h"
+#include "graphics/host_gpu/renderer/pipeline/warmBuildSet.h"
 
 #include <algorithm>
 #include <atomic>
@@ -417,6 +418,243 @@ void TestLowPriorityQueueRunsJobs() {
 	WaitFor([&] { return job->GetState() == PipelineBuildQueue::State::Done; });
 	CHECK(counted.runs == 1);
 }
+
+// What a warm build produces. The resource stands for the Vulkan objects a pipeline owns, which
+// only a build that ran has made.
+struct Built {
+	std::shared_ptr<int> resource;
+	std::thread::id      ran_on;
+};
+
+using Warm = WarmBuildSet<uint32_t, Built>;
+
+// One warm build, counting its compiles. A held build waits for `release` after it has made its
+// resource, so a test decides when it finishes.
+struct WarmProbe {
+	std::atomic<uint32_t> builds {0};
+	std::atomic<bool>     started {false};
+	std::atomic<bool>     release {false};
+	std::shared_ptr<int>  token = std::make_shared<int>(0);
+
+	Warm::Work Work(bool hold) {
+		return [this, hold](Built& built) {
+			builds++;
+			built.resource = token;
+			built.ran_on   = std::this_thread::get_id();
+			started        = true;
+			if (hold) {
+				WaitFor([this] { return release.load(); });
+			}
+		};
+	}
+};
+
+// What a lookup in the pipeline cache does with a key, in miniature. A pending warm build is taken
+// and anything else is built here, so the number of builds says whether the lookup checked.
+Built LookupOrBuild(Warm& set, uint32_t key, WarmProbe& fallback,
+                    PipelineBuildQueue::Acquired* how = nullptr) {
+	if (auto taken = set.Take(key)) {
+		if (how != nullptr) {
+			*how = taken->how;
+		}
+		return std::move(taken->result);
+	}
+	Built built;
+	fallback.Work(false)(built);
+	return built;
+}
+
+// Holds the only worker of the set until released, so what is started behind it stays queued.
+PipelineBuildQueue::JobPtr HoldWorker(Warm& set, Blocker& blocker) {
+	auto holding = set.Queue().Post(blocker.Work());
+	WaitFor([&] { return blocker.started.load(); });
+	return holding;
+}
+
+// A lookup that meets a warm build a worker is running waits for it and adopts its result. The
+// build is not made a second time. The baseline looks up a key that nobody started, which has to
+// build, so a count of one can only come from the warm build.
+void TestWarmLookupAdoptsRunningBuild() {
+	constexpr uint32_t KEY = 7;
+	// The probes outlive the set, whose worker reads them until it is joined.
+	WarmProbe  warm;
+	WarmProbe  fallback;
+	WarmProbe  other_fallback;
+	Warm       set(1, {});
+	CHECK(set.Start(KEY, warm.Work(true)));
+	WaitFor([&] { return warm.started.load(); });
+	CHECK(set.IsPending(KEY));
+
+	Built       adopted;
+	auto        how = PipelineBuildQueue::Acquired::AlreadyDone;
+	std::thread::id looker_id;
+	std::thread looker([&] {
+		looker_id = std::this_thread::get_id();
+		adopted   = LookupOrBuild(set, KEY, fallback, &how);
+	});
+	// The build is held, so a lookup that returns now did not wait for it.
+	std::this_thread::sleep_for(100ms);
+	CHECK(set.IsPending(KEY));
+	warm.release = true;
+	looker.join();
+	CHECK(warm.builds == 1);
+	CHECK(fallback.builds == 0);
+	CHECK(adopted.resource == warm.token);
+	// The looker waited for the worker's build. A lookup that ran or redid it would say otherwise.
+	CHECK(how == PipelineBuildQueue::Acquired::Waited);
+	CHECK(adopted.ran_on != looker_id && adopted.ran_on != std::this_thread::get_id());
+	CHECK(!set.IsPending(KEY));
+	CHECK(set.Pending() == 0);
+
+	const auto other = LookupOrBuild(set, KEY + 1, other_fallback);
+	CHECK(other_fallback.builds == 1);
+	CHECK(other.resource == other_fallback.token);
+}
+
+// A warm build no worker has started is run by the lookup, once. The worker that later reaches it
+// finds it taken. The baseline lets the worker run an identical build, which differs only in that
+// nobody looked it up.
+void TestWarmLookupClaimsQueuedBuild() {
+	constexpr uint32_t KEY = 3;
+	{
+		Blocker   blocker;
+		WarmProbe warm;
+		Warm      set(1, {});
+		const auto holding = HoldWorker(set, blocker);
+		CHECK(set.Start(KEY, warm.Work(false)));
+		blocker.release = true;
+		// The one worker is free again only when the build is done, which the sentinel waits for.
+		DrainQueue(set.Queue());
+		CHECK(warm.builds == 1);
+		const auto taken = set.Take(KEY);
+		CHECK(taken.has_value());
+		CHECK(taken->how == PipelineBuildQueue::Acquired::AlreadyDone);
+		CHECK(taken->result.ran_on != std::this_thread::get_id());
+	}
+	Blocker   blocker;
+	WarmProbe warm;
+	Warm      set(1, {});
+	const auto holding = HoldWorker(set, blocker);
+	CHECK(set.Start(KEY, warm.Work(false)));
+	auto taken = set.Take(KEY);
+	CHECK(taken.has_value());
+	CHECK(taken->how == PipelineBuildQueue::Acquired::RanInline);
+	CHECK(taken->result.ran_on == std::this_thread::get_id());
+	CHECK(warm.builds == 1);
+	blocker.release = true;
+	DrainQueue(set.Queue());
+	CHECK(warm.builds == 1);
+}
+
+// Starting a key that is already pending, or after the stop, takes no work and runs nothing.
+void TestWarmStartRefusals() {
+	constexpr uint32_t KEY = 1;
+	Blocker   blocker;
+	WarmProbe first;
+	WarmProbe second;
+	WarmProbe late;
+	Warm      set(1, {});
+	const auto holding = HoldWorker(set, blocker);
+	CHECK(set.Start(KEY, first.Work(false)));
+	CHECK(!set.Start(KEY, second.Work(false)));
+	CHECK(set.Pending() == 1);
+	blocker.release = true;
+	CHECK(set.Take(KEY).has_value());
+	CHECK(first.builds == 1 && second.builds == 0);
+	(void)set.Stop();
+	CHECK(!set.Start(KEY + 1, late.Work(false)));
+	CHECK(set.Pending() == 0);
+}
+
+// Stopping with builds in every state waits for the running one, hands back the resources of the
+// finished ones that nobody took, runs none of the queued ones and may be done twice. The baseline
+// does not stop, and then every queued build runs, so the drop is the stop's doing.
+void TestWarmStopWithPendingBuilds() {
+	constexpr uint32_t DONE = 1, RUNNING = 2, QUEUED = 3;
+	{
+		WarmProbe done, running, queued;
+		Warm      set(1, {});
+		CHECK(set.Start(DONE, done.Work(false)));
+		CHECK(set.Start(RUNNING, running.Work(false)));
+		CHECK(set.Start(QUEUED, queued.Work(false)));
+		WaitFor([&] { return queued.builds.load() == 1; });
+		CHECK(done.builds == 1 && running.builds == 1);
+	}
+	WarmProbe done, running, queued;
+	Warm      set(1, {});
+	CHECK(set.Start(DONE, done.Work(false)));
+	// The finished build is not taken before the stop, so only the stop can reach it.
+	WaitFor([&] { return done.builds.load() == 1; });
+	CHECK(set.Start(RUNNING, running.Work(true)));
+	WaitFor([&] { return running.started.load(); });
+	CHECK(set.Start(QUEUED, queued.Work(false)));
+	CHECK(done.token.use_count() == 2);
+
+	Warm::Stopped stopped;
+	std::thread   stopper([&] { stopped = set.Stop(); });
+	WaitFor([&] { return set.Stopping(); });
+	// The running build holds the stop until it is released.
+	CHECK(set.Pending() == 3);
+	running.release = true;
+	stopper.join();
+	CHECK(stopped.waited_for == 1);
+	CHECK(stopped.unadopted.size() == 2);
+	CHECK(queued.builds == 0);
+	CHECK(queued.token.use_count() == 1);
+	CHECK(set.Pending() == 0);
+	CHECK(set.Stop().unadopted.empty());
+}
+
+// A set that is destroyed after it stopped has nothing left to wait for, and a stop with nothing
+// pending returns nothing.
+void TestWarmStopWithNothingPending() {
+	Warm set(2, {});
+	const auto stopped = set.Stop();
+	CHECK(stopped.unadopted.empty() && stopped.waited_for == 0);
+}
+
+// IsDone is true only for a build that has finished and is still pending. It is false while the
+// build is queued, while it runs, after it was taken and for a key nobody started, and true again
+// once the held build is released and drained, so neither an always-true nor an always-false
+// answer can pass.
+void TestWarmIsDone() {
+	constexpr uint32_t QUEUED = 1, RUNNING = 2, UNKNOWN = 99;
+	Blocker   blocker;
+	WarmProbe queued;
+	WarmProbe running;
+	Warm      set(1, {});
+	const auto holding = HoldWorker(set, blocker);
+	CHECK(set.Start(QUEUED, queued.Work(false)));
+	CHECK(!set.IsDone(QUEUED));
+	CHECK(!set.IsDone(UNKNOWN));
+	blocker.release = true;
+	DrainQueue(set.Queue());
+	CHECK(set.IsDone(QUEUED));
+
+	CHECK(set.Start(RUNNING, running.Work(true)));
+	WaitFor([&] { return running.started.load(); });
+	CHECK(!set.IsDone(RUNNING));
+	CHECK(set.IsDone(QUEUED));
+	running.release = true;
+	DrainQueue(set.Queue());
+	CHECK(set.IsDone(RUNNING));
+
+	CHECK(set.Take(QUEUED).has_value());
+	CHECK(!set.IsDone(QUEUED));
+	CHECK(set.IsDone(RUNNING));
+}
+
+// The warm-up starts four workers on a big machine, half the hardware threads on a small one and
+// never fewer than one. It does not follow the async queue's cap, which a later change may move.
+void TestWarmUpWorkerCount() {
+	static_assert(WarmUpWorkerCount(0) == 1);
+	static_assert(WarmUpWorkerCount(1) == 1);
+	static_assert(WarmUpWorkerCount(2) == 1);
+	static_assert(WarmUpWorkerCount(7) == 3);
+	static_assert(WarmUpWorkerCount(8) == 4);
+	static_assert(WarmUpWorkerCount(64) == 4);
+	CHECK(WarmUpWorkerCount(std::thread::hardware_concurrency()) >= 1);
+}
 } // namespace
 
 int main() {
@@ -433,5 +671,12 @@ int main() {
 	TestQueuedJobsRunWithoutStop();
 	TestWorkerCount();
 	TestDestructorStops();
+	TestWarmLookupAdoptsRunningBuild();
+	TestWarmLookupClaimsQueuedBuild();
+	TestWarmStartRefusals();
+	TestWarmStopWithPendingBuilds();
+	TestWarmStopWithNothingPending();
+	TestWarmIsDone();
+	TestWarmUpWorkerCount();
 	std::puts("Pipeline build queue tests passed");
 }

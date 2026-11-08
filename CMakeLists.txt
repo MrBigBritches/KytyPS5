@@ -715,6 +715,8 @@ if(BUILD_TESTING)
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --async-pipelines)
 	add_test(NAME emulator_async_pipelines_depth_only_cli
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --async-pipelines-depth-only)
+	add_test(NAME emulator_background_warm_up_cli
+	         COMMAND $<TARGET_FILE:kyty_emulator> --help --background-warm-up)
 	add_test(NAME emulator_skip_redundant_unmap_drains_cli
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --skip-redundant-unmap-drains)
 	add_test(NAME emulator_keep_gpu_cache_on_reuse_cli

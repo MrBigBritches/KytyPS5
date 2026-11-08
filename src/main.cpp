@@ -83,6 +83,9 @@ static void PrintUsage() {
 	::printf("  --async-pipelines-depth-only         Like --async-pipelines, but only draws with no color\n"
 	         "                                       target go without a pipeline (experimental). Wins\n"
 	         "                                       over --async-pipelines when both are given.\n");
+	::printf("  --background-warm-up                 Build the shader store's compute pipelines on low\n"
+	         "                                       priority workers while the game runs, instead of\n"
+	         "                                       making boot wait for them (experimental).\n");
 	::printf("  --gpu-submit-cadence                 Submit GPU work periodically while a long command\n"
 	         "                                       stream records, so the GPU starts sooner.\n");
 	::printf("  --native-float-minmax                Use the host GPU's float min/max on non-AMD GPUs.\n"
@@ -236,6 +239,7 @@ static constexpr Flag FLAGS[] = {
     {"--cold-pipelines", &ConfigOptions::cold_pipelines_enabled},
     {"--async-pipelines", &ConfigOptions::async_pipelines_enabled},
     {"--async-pipelines-depth-only", &ConfigOptions::async_pipelines_depth_only_enabled},
+    {"--background-warm-up", &ConfigOptions::background_warm_up_enabled},
     {"--gpu-submit-cadence", &ConfigOptions::gpu_submit_cadence_enabled},
     {"--native-float-minmax", &ConfigOptions::native_float_min_max_enabled},
     {"--command-buffer-dump", &ConfigOptions::command_buffer_dump_enabled},

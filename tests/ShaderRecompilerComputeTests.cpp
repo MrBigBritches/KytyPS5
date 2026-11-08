@@ -955,6 +955,44 @@ struct PipelineCacheTestAccess {
     return cache.m_build_queue != nullptr && cache.m_build_queue->Stopping();
   }
 
+  // Gives the cache a warm queue with one worker, as WarmUp does under --background-warm-up.
+  static void EnableWarmCompute(PipelineCache &cache) {
+    cache.m_warm_compute = std::make_unique<WarmBuildSet<uint64_t, PipelineCache::Pipeline>>(
+        1, PipelineBuildQueueOptions{.low_priority = true});
+  }
+
+  // Queues the warm-up build of a compute module, as WarmUp does.
+  static void StartWarmCompute(PipelineCache &cache, const ShaderModule &module) {
+    cache.StartWarmCompute(module);
+  }
+
+  // Warm builds started and not yet taken.
+  static size_t WarmPending(const PipelineCache &cache) {
+    return cache.m_warm_compute == nullptr ? 0 : cache.m_warm_compute->Pending();
+  }
+
+  // The thread priority a warm worker runs at, in Windows units. Zero elsewhere, where this test
+  // does not look.
+  static int WarmWorkerPriority(PipelineCache &cache) {
+    int priority = 0;
+    const auto job = cache.m_warm_compute->Queue().Post([&priority] {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+      priority = GetThreadPriority(GetCurrentThread());
+#endif
+      (void)priority;
+    });
+    while (job->GetState() != PipelineBuildQueue::State::Done) std::this_thread::yield();
+    return priority;
+  }
+
+  // Waits until every warm build started before has finished. The queue has one worker, so a job
+  // posted behind them runs only after they are done.
+  static void DrainWarmQueue(PipelineCache &cache) {
+    auto &queue = cache.m_warm_compute->Queue();
+    const auto job = queue.Post([] {});
+    while (job->GetState() != PipelineBuildQueue::State::Done) std::this_thread::yield();
+  }
+
   // Builds requested and not yet taken into the cache.
   static size_t PendingBuilds(const PipelineCache &cache) {
     return cache.m_pending_graphics.size();
@@ -984,6 +1022,17 @@ struct PipelineCacheTestAccess {
     for (const auto &job : hold.jobs) {
       while (job->GetState() != PipelineBuildQueue::State::Running) std::this_thread::yield();
     }
+  }
+
+  // Occupies the warm worker until released, or until the warm queue stops, so builds started
+  // meanwhile stay queued.
+  static void HoldWarmQueue(PipelineCache &cache, BuildHold &hold) {
+    auto *queue = &cache.m_warm_compute->Queue();
+    hold.jobs.push_back(queue->Post([&hold, queue] {
+      while (!hold.release.load() && !queue->Stopping()) std::this_thread::yield();
+    }));
+    while (hold.jobs.back()->GetState() != PipelineBuildQueue::State::Running)
+      std::this_thread::yield();
   }
 
   // Waits until every build posted before has finished. One job per worker is queued behind them,
@@ -59886,6 +59935,339 @@ void CheckAsyncStableModules(VulkanHarness &vulkan) {
           "an earlier module moved or changed when the program gained more");
 }
 
+// Counts the compute pipelines the driver is asked to create, notes the thread each was created
+// on, and keeps a ledger of the ones still alive, to see who built a pipeline and whether it was
+// destroyed. It watches every pipeline, so a test that wants only compute ones uses no others.
+struct ComputeCreateHook {
+  static inline std::mutex mutex;
+  static inline std::vector<std::thread::id> created_on;
+  static inline std::set<uint64_t> live;
+  static inline PFN_vkCreateComputePipelines real_create = nullptr;
+  static inline PFN_vkDestroyPipeline real_destroy = nullptr;
+
+  static VkResult VKAPI_CALL Create(VkDevice device, VkPipelineCache cache, uint32_t count,
+                                    const VkComputePipelineCreateInfo *infos,
+                                    const VkAllocationCallbacks *allocator,
+                                    VkPipeline *pipelines) {
+    const auto result = real_create(device, cache, count, infos, allocator, pipelines);
+    std::scoped_lock lock(mutex);
+    created_on.push_back(std::this_thread::get_id());
+    if (result == VK_SUCCESS)
+      for (uint32_t i = 0; i < count; i++) live.insert(reinterpret_cast<uint64_t>(pipelines[i]));
+    return result;
+  }
+
+  static void VKAPI_CALL Destroy(VkDevice device, VkPipeline pipeline,
+                                 const VkAllocationCallbacks *allocator) {
+    {
+      std::scoped_lock lock(mutex);
+      live.erase(reinterpret_cast<uint64_t>(pipeline));
+    }
+    real_destroy(device, pipeline, allocator);
+  }
+
+  static size_t Created() {
+    std::scoped_lock lock(mutex);
+    return created_on.size();
+  }
+
+  static std::thread::id CreatedOn(size_t index) {
+    std::scoped_lock lock(mutex);
+    return created_on.at(index);
+  }
+
+  static size_t Live() {
+    std::scoped_lock lock(mutex);
+    return live.size();
+  }
+
+  ComputeCreateHook() {
+    created_on.clear();
+    live.clear();
+    auto &table = VULKAN_HPP_DEFAULT_DISPATCHER;
+    real_create = table.vkCreateComputePipelines;
+    real_destroy = table.vkDestroyPipeline;
+    table.vkCreateComputePipelines = Create;
+    table.vkDestroyPipeline = Destroy;
+  }
+  ~ComputeCreateHook() {
+    auto &table = VULKAN_HPP_DEFAULT_DISPATCHER;
+    table.vkCreateComputePipelines = real_create;
+    table.vkDestroyPipeline = real_destroy;
+  }
+  ComputeCreateHook(const ComputeCreateHook &) = delete;
+  ComputeCreateHook &operator=(const ComputeCreateHook &) = delete;
+};
+
+// Runs `body` with a pipeline cache and the input of one compute program. With `warm` set the
+// cache has a warm queue, as under --background-warm-up, and without it the cache is the one every
+// run has today, which is the baseline for each warm case.
+template <typename Body>
+void WithWarmComputeCache(VulkanHarness &vulkan, bool warm, Body &&body) {
+  static const std::vector<u32> code = [] {
+    std::vector<u32> shader;
+    AppendVMovU32(&shader, 1, 0x5eu);
+    shader.insert(shader.end(), {EncodeMubuf0(0x1c), EncodeMubuf1(1, 0, 0)});
+    AppendEnd(&shader);
+    return shader;
+  }();
+  ShaderMapUserData(reinterpret_cast<uint64_t>(code.data()),
+                    {.type = Prospero::ShaderBinaryType::kCs,
+                     .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
+  Config::Load({.printf_direction = Config::LogDirection::Silent});
+  PipelineCache cache(vulkan.RuntimeContext(), nullptr);
+  if (warm) PipelineCacheTestAccess::EnableWarmCompute(cache);
+  HW::ComputeShaderInfo regs{};
+  regs.cs_regs.data_addr = reinterpret_cast<uint64_t>(code.data());
+  regs.cs_regs.num_thread_x = 1;
+  regs.cs_regs.num_thread_y = 1;
+  regs.cs_regs.num_thread_z = 1;
+  regs.cs_regs.wave_size = 32;
+  regs.cs_regs.user_sgpr = 4;
+  const ShaderBufferResource buffer{{0x10000u, 4u << 16u, 64,
+      DstSel(4, 5, 6, 7) | (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u)}};
+  std::copy_n(buffer.fields, 4, regs.cs_user_sgpr.value);
+  ShaderComputeInputInfo input{};
+  (void)cache.GetComputeProgram(regs, input);
+  body(cache, input);
+}
+
+// A lookup for a compute pipeline that the warm-up built adopts it and compiles nothing more.
+// Without a warm queue the same lookup compiles on the calling thread, which is the baseline, so a
+// count of one with a worker's thread can only come from the warm build.
+void CheckWarmComputeAdopt(VulkanHarness &vulkan) {
+  constexpr const char *name = "WarmComputeAdopt";
+  const auto caller = std::this_thread::get_id();
+  ComputeCreateHook hook;
+  WithWarmComputeCache(vulkan, false, [&](PipelineCache &cache, const ShaderComputeInputInfo &input) {
+    Require(name, "baseline builds on the caller",
+            cache.GetComputePipeline(input).pipeline != nullptr && ComputeCreateHook::Created() == 1 &&
+                ComputeCreateHook::CreatedOn(0) == caller,
+            "a lookup without a warm queue did not compile once on the calling thread");
+  });
+  WithWarmComputeCache(vulkan, true, [&](PipelineCache &cache, const ShaderComputeInputInfo &input) {
+    const auto before = ComputeCreateHook::Created();
+    Require(name, "driver cache clean", !PipelineCacheTestAccess::DriverCacheDirty(cache),
+            "the driver cache was dirty before any warm build");
+    PipelineCacheTestAccess::StartWarmCompute(cache, *input.stage.module);
+    PipelineCacheTestAccess::DrainWarmQueue(cache);
+    Require(name, "worker built it",
+            ComputeCreateHook::Created() == before + 1 &&
+                ComputeCreateHook::CreatedOn(before) != caller,
+            "the warm build did not compile once on its worker");
+    Require(name, "nothing written to the map",
+            PipelineCacheTestAccess::Pipelines(cache)[1] == 0 &&
+                PipelineCacheTestAccess::WarmPending(cache) == 1,
+            "a worker wrote into the compute pipeline map, or the build was not left pending");
+    Require(name, "worker marks the driver cache", PipelineCacheTestAccess::DriverCacheDirty(cache),
+            "a warm build did not mark the driver cache for the next save");
+    // A finished build is only handed over. It is no compile on the GPU thread, so the counter of
+    // pipelines created there stays where it was.
+    const bool counters_were_enabled = Common::DebugCounters::Enabled();
+    Common::DebugCounters::SetEnabled(true);
+    const auto counted_before =
+        Common::DebugCounters::Get(Common::DebugCounters::Counter::PipelinesCreated);
+    const auto first = cache.GetComputePipeline(input).pipeline;
+    const auto counted_after =
+        Common::DebugCounters::Get(Common::DebugCounters::Counter::PipelinesCreated);
+    Common::DebugCounters::SetEnabled(counters_were_enabled);
+    Require(name, "adoption is not counted as a compile", counted_after == counted_before,
+            "taking a finished warm build was counted as a pipeline created on this thread");
+    Require(name, "adopted, not compiled again",
+            first != nullptr && ComputeCreateHook::Created() == before + 1 &&
+                PipelineCacheTestAccess::Pipelines(cache)[1] == 1 &&
+                PipelineCacheTestAccess::WarmPending(cache) == 0,
+            "the lookup compiled the module again instead of taking the warm build");
+    Require(name, "adopted once", cache.GetComputePipeline(input).pipeline == first &&
+                                      ComputeCreateHook::Created() == before + 1,
+            "a second lookup found another pipeline or compiled again");
+  });
+}
+
+// A warm build that no worker has started is claimed by the lookup and compiled once, on the
+// calling thread. The worker that reaches it later finds it taken.
+void CheckWarmComputeClaim(VulkanHarness &vulkan) {
+  constexpr const char *name = "WarmComputeClaim";
+  const auto caller = std::this_thread::get_id();
+  ComputeCreateHook hook;
+  PipelineCacheTestAccess::BuildHold hold;
+  WithWarmComputeCache(vulkan, true, [&](PipelineCache &cache, const ShaderComputeInputInfo &input) {
+    const auto before = ComputeCreateHook::Created();
+    PipelineCacheTestAccess::HoldWarmQueue(cache, hold);
+    PipelineCacheTestAccess::StartWarmCompute(cache, *input.stage.module);
+    Require(name, "left queued", ComputeCreateHook::Created() == before &&
+                                     PipelineCacheTestAccess::WarmPending(cache) == 1,
+            "the build ran although the only worker was held");
+    // The claim is a compile that stops this thread, so it is counted, which the adoption of a
+    // finished build in WarmComputeAdopt is not.
+    const bool counters_were_enabled = Common::DebugCounters::Enabled();
+    Common::DebugCounters::SetEnabled(true);
+    const auto counted_before =
+        Common::DebugCounters::Get(Common::DebugCounters::Counter::PipelinesCreated);
+    const auto claimed = cache.GetComputePipeline(input).pipeline;
+    const auto counted_after =
+        Common::DebugCounters::Get(Common::DebugCounters::Counter::PipelinesCreated);
+    Common::DebugCounters::SetEnabled(counters_were_enabled);
+    Require(name, "claim is counted", counted_after == counted_before + 1,
+            "a claimed warm build was not counted as a pipeline created on this thread");
+    Require(name, "claimed", claimed != nullptr &&
+                                 ComputeCreateHook::Created() == before + 1 &&
+                                 ComputeCreateHook::CreatedOn(before) == caller,
+            "the lookup did not compile the queued build once on the calling thread");
+    hold.release = true;
+    PipelineCacheTestAccess::DrainWarmQueue(cache);
+    Require(name, "compiled once", ComputeCreateHook::Created() == before + 1,
+            "the worker compiled the build again after the lookup had");
+  });
+}
+
+// Stopping the builds drops the warm builds that never ran, waits for none that is running, and
+// destroys the finished pipelines nobody took. A pipeline that a lookup adopted stays alive until
+// the cache is destroyed, which is the baseline for the last case, and a lookup after the stop
+// builds as it would without a warm queue.
+void CheckWarmComputeShutdown(VulkanHarness &vulkan) {
+  constexpr const char *name = "WarmComputeShutdown";
+  ComputeCreateHook hook;
+  PipelineCacheTestAccess::BuildHold hold;
+  WithWarmComputeCache(vulkan, true, [&](PipelineCache &cache, const ShaderComputeInputInfo &input) {
+    PipelineCacheTestAccess::HoldWarmQueue(cache, hold);
+    PipelineCacheTestAccess::StartWarmCompute(cache, *input.stage.module);
+    cache.StopBuilds();
+    cache.StopBuilds();
+    Require(name, "queued build dropped",
+            ComputeCreateHook::Created() == 0 && PipelineCacheTestAccess::WarmPending(cache) == 0,
+            "a queued warm build ran, or stayed pending, after the stop");
+    Require(name, "lookup after the stop builds here",
+            cache.GetComputePipeline(input).pipeline != nullptr && ComputeCreateHook::Created() == 1,
+            "a lookup after the stop did not compile once");
+  });
+  WithWarmComputeCache(vulkan, true, [&](PipelineCache &cache, const ShaderComputeInputInfo &input) {
+    const auto live_before = ComputeCreateHook::Live();
+    PipelineCacheTestAccess::StartWarmCompute(cache, *input.stage.module);
+    PipelineCacheTestAccess::DrainWarmQueue(cache);
+    Require(name, "finished build alive", ComputeCreateHook::Live() == live_before + 1,
+            "the warm build left no pipeline to destroy, so the next check proves nothing");
+    cache.StopBuilds();
+    Require(name, "unadopted build destroyed", ComputeCreateHook::Live() == live_before,
+            "a finished warm build nobody took was not destroyed by the stop");
+  });
+  WithWarmComputeCache(vulkan, true, [&](PipelineCache &cache, const ShaderComputeInputInfo &input) {
+    const auto live_before = ComputeCreateHook::Live();
+    PipelineCacheTestAccess::StartWarmCompute(cache, *input.stage.module);
+    PipelineCacheTestAccess::DrainWarmQueue(cache);
+    (void)cache.GetComputePipeline(input);
+    cache.StopBuilds();
+    Require(name, "adopted build kept", ComputeCreateHook::Live() == live_before + 1,
+            "the stop destroyed a pipeline the cache had already adopted");
+  });
+  Require(name, "everything destroyed with the cache", ComputeCreateHook::Live() == 0,
+          "a pipeline outlived the cache that owned it");
+}
+
+// What the boot of a store leaves behind, for comparing a warm-up with and without the flag.
+struct WarmBootResult {
+  std::array<size_t, 2> pipelines{};
+  size_t warm_pending = 0;
+  uint32_t boot_pipelines = 0;
+  size_t created_after_boot = 0;
+  int worker_priority = 0;
+  size_t created_after_lookups = 0;
+};
+
+// Writes a shader store holding `program_count` compute modules by compiling them once, then boots
+// a cache from it with the flag as given and looks every program up again.
+WarmBootResult RunWarmBoot(VulkanHarness &vulkan, const std::filesystem::path &store,
+                           const std::vector<std::vector<u32>> &codes, bool background) {
+  Config::Load({.printf_direction = Config::LogDirection::Silent,
+                .first_run_report_enabled = true,
+                .background_warm_up_enabled = background});
+  Common::FirstRunReport::Global().Reset();
+  ComputeCreateHook hook;
+  WarmBootResult result;
+  PipelineCache cache(vulkan.RuntimeContext(), nullptr);
+  cache.WarmUp(store);
+  result.pipelines = PipelineCacheTestAccess::Pipelines(cache);
+  result.warm_pending = PipelineCacheTestAccess::WarmPending(cache);
+  result.boot_pipelines = Common::FirstRunReport::Global().Boot().pipelines;
+  if (background) {
+    result.worker_priority = PipelineCacheTestAccess::WarmWorkerPriority(cache);
+    // One worker pass per pending build is not enough to know they are all done, so the lookups
+    // below are what finish them.
+  }
+  result.created_after_boot = ComputeCreateHook::Created();
+  for (const auto &code : codes) {
+    HW::ComputeShaderInfo regs{};
+    regs.cs_regs.data_addr = reinterpret_cast<uint64_t>(code.data());
+    regs.cs_regs.num_thread_x = 1;
+    regs.cs_regs.num_thread_y = 1;
+    regs.cs_regs.num_thread_z = 1;
+    regs.cs_regs.wave_size = 32;
+    regs.cs_regs.user_sgpr = 4;
+    const ShaderBufferResource buffer{{0x10000u, 4u << 16u, 64,
+        DstSel(4, 5, 6, 7) | (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u)}};
+    std::copy_n(buffer.fields, 4, regs.cs_user_sgpr.value);
+    ShaderComputeInputInfo input{};
+    (void)cache.GetComputeProgram(regs, input);
+    (void)cache.GetComputePipeline(input);
+  }
+  result.created_after_lookups = ComputeCreateHook::Created();
+  cache.StopBuilds();
+  return result;
+}
+
+// With the flag on, WarmUp loads the store and returns without creating a compute pipeline. The
+// pipelines are pending on low priority workers, the compute map is empty, and the boot count is
+// what a flag-off boot of the same store reports, which is the baseline. Lookups then adopt the
+// builds, so the driver compiles each module once in either mode.
+void CheckBackgroundWarmUp(VulkanHarness &vulkan) {
+  constexpr const char *name = "BackgroundWarmUp";
+  constexpr size_t program_count = 3;
+  std::vector<std::vector<u32>> codes;
+  for (size_t index = 0; index < program_count; index++) {
+    std::vector<u32> code;
+    AppendVMovU32(&code, 1, 0x61u + static_cast<u32>(index));
+    code.insert(code.end(), {EncodeMubuf0(0x1c), EncodeMubuf1(1, 0, 0)});
+    AppendEnd(&code);
+    codes.push_back(std::move(code));
+  }
+  for (const auto &code : codes)
+    ShaderMapUserData(reinterpret_cast<uint64_t>(code.data()),
+                      {.type = Prospero::ShaderBinaryType::kCs,
+                       .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
+  const auto dir = std::filesystem::temp_directory_path() /
+                   fmt::format("kyty_background_warm_{}",
+                               std::chrono::steady_clock::now().time_since_epoch().count());
+  const auto store = dir / "TEST00001.shaders";
+  // The first run compiles the programs, which records them in the store.
+  (void)RunWarmBoot(vulkan, store, codes, false);
+
+  const auto blocking = RunWarmBoot(vulkan, store, codes, false);
+  Require(name, "baseline boots every pipeline",
+          blocking.pipelines[1] == program_count && blocking.warm_pending == 0 &&
+              blocking.boot_pipelines == program_count &&
+              blocking.created_after_boot == program_count,
+          "a boot without the flag did not build every compute pipeline before returning");
+  const auto background = RunWarmBoot(vulkan, store, codes, true);
+  Require(name, "boot leaves the map empty",
+          background.pipelines[1] == 0 && background.warm_pending == program_count,
+          "boot with the flag wrote compute pipelines, or did not leave them pending");
+  Require(name, "boot count matches the baseline",
+          background.boot_pipelines == blocking.boot_pipelines,
+          "the boot pipeline count changed when the builds moved to the background");
+  Require(name, "each module compiled once",
+          background.created_after_lookups == program_count &&
+              blocking.created_after_lookups == program_count,
+          "a lookup compiled a module that the warm-up had already built");
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+  Require(name, "workers run below normal", background.worker_priority == THREAD_PRIORITY_BELOW_NORMAL,
+          "the warm workers did not run at low priority");
+#endif
+  Config::Load({.printf_direction = Config::LogDirection::Silent});
+  Common::FirstRunReport::Global().Reset();
+  std::filesystem::remove_all(dir);
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
 // Every --async-pipelines check, in the order they build on each other.
 void CheckAsyncPipelines(VulkanHarness &vulkan) {
   const auto run = [](const char *name, const std::function<void()> &check) {
@@ -59902,6 +60284,10 @@ void CheckAsyncPipelines(VulkanHarness &vulkan) {
   run("AsyncPipelineTeardown", [&] { CheckAsyncPipelineTeardown(vulkan); });
   run("AsyncTeardownOrder", [&] { CheckAsyncTeardownOrder(vulkan); });
   run("AsyncStableModules", [&] { CheckAsyncStableModules(vulkan); });
+  run("WarmComputeAdopt", [&] { CheckWarmComputeAdopt(vulkan); });
+  run("WarmComputeClaim", [&] { CheckWarmComputeClaim(vulkan); });
+  run("WarmComputeShutdown", [&] { CheckWarmComputeShutdown(vulkan); });
+  run("BackgroundWarmUp", [&] { CheckBackgroundWarmUp(vulkan); });
   vulkan.CheckAsyncGate();
   vulkan.CheckAsyncDrawsOff();
   vulkan.CheckAsyncDraws();
