@@ -280,6 +280,10 @@ bool PauseWarmUpForDrawsEnabled() {
 	return g_config->pause_warm_up_for_draws_enabled;
 }
 
+bool DeferredNonPushDrawsEnabled() {
+	return g_config->deferred_non_push_draws_enabled;
+}
+
 bool GpuSubmitCadenceEnabled() {
 	return g_config->gpu_submit_cadence_enabled;
 }

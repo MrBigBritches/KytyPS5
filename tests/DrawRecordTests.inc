@@ -918,6 +918,70 @@
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  // Where the address vertex shader of the non-push stream reads. Each read address makes another
+  // shader, so it differs from the +0x100, +0x200 and +0x300 that other tests read.
+  static constexpr uint64_t NonPushStreamReadOffset = DrawStreamReadOffset + 0x400;
+
+  // The commands of the address vertex draw with no push descriptors allowed, so its descriptors go
+  // in a set. With `hole` the draw is split into a hole and recorded at the flush.
+  std::vector<std::string> RecordNonPushDrawStream(const char *name, bool hole) {
+    AsyncDrawRig rig(*this, false);
+    if (hole) CommandSchedulerTestAccess::AllowThisThread(rig.Scheduler());
+    auto &graphics = rig.context->GetGraphics();
+    const auto device_limit = graphics.max_push_descriptors;
+    graphics.max_push_descriptors = 0;
+    const auto rig_vertex = UseAddressVertex(rig, NonPushStreamReadOffset);
+    rig.PaintSentinels();
+    CommandStream::Recorder::Reset(true);
+    if (hole) {
+      const auto source = PrepareHoleSource(rig);
+      Require(name, "set draw", source.pipeline != nullptr && !source.pipeline->uses_push_descriptors,
+              "the hole's draw does not use a descriptor set, so the test proves nothing");
+      SplitHoleOf(rig, source);
+    } else {
+      Require(name, "blocking draw", rig.Draw(), "a draw with a ready pipeline was refused");
+    }
+    rig.Scheduler().Flush();
+    auto rows = CommandStream::Recorder::rows;
+    CommandStream::Recorder::active = false;
+    rig.shaders.SetEsShaderBase(rig_vertex);
+    graphics.max_push_descriptors = device_limit;
+    return rows;
+  }
+
+  // A hole whose descriptors go in a set records the stream of the same draw met in order, with the
+  // two barriers of a hole added, as HoleRecordedStream shows for pushed descriptors. The set is
+  // bound inside the hole's buffer, between its barriers, and nothing is pushed. A hole that bound
+  // its set in the segment, or not at all, fails.
+  void CheckHoleRecordedStreamNonPush() {
+    constexpr const char *name = "HoleRecordedStreamNonPush";
+    CommandStream::Scope hooks;
+    const auto blocking = RecordNonPushDrawStream(name, false);
+    const auto rows = RecordNonPushDrawStream(name, true);
+    std::vector<std::string> without_barriers;
+    std::vector<size_t> barrier_places;
+    for (size_t index = 0; index < rows.size(); ++index) {
+      if (IsStateBarrier(rows[index])) barrier_places.push_back(index);
+      else without_barriers.push_back(rows[index]);
+    }
+    Require(name, "blocking binds a set",
+            HasRow(blocking, "vkCmdBindDescriptorSets(") && !HasRow(blocking, "vkCmdPushDescriptorSet(") &&
+                std::ranges::none_of(blocking, IsStateBarrier),
+            "the blocking draw did not bind a descriptor set, so the hole cannot be compared");
+    Require(name, "two barriers", barrier_places.size() == 2,
+            "the hole's buffer did not start and end with one memory barrier");
+    Require(name, "same stream", RenderExecutorTestAccess::RowMatches(name, without_barriers, blocking),
+            "the hole recorded other commands than the same draw met in order");
+    const auto bind = static_cast<size_t>(
+        std::ranges::find_if(rows, [](const auto &row) { return row.rfind("vkCmdBindDescriptorSets(", 0) == 0; }) -
+        rows.begin());
+    Require(name, "set bound in the hole",
+            barrier_places.size() == 2 && barrier_places[0] < bind && bind < barrier_places[1] &&
+                !HasRow(rows, "vkCmdPushDescriptorSet("),
+            "the hole's descriptor set was not bound between the hole's barriers");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   // A hole never clears. A draw that clears is told apart from one that does not by the check the
   // hole's rendering makes, which stops the process on a clear, so the test calls the check itself.
   // The hole of a clearing draw, with the clear stripped as the eager pass would, loads.
@@ -960,6 +1024,7 @@
     CheckHoleSyncPoints();
     CheckHoleEarlyAdoption();
     CheckHoleRecordedStream();
+    CheckHoleRecordedStreamNonPush();
   }
 
   void CheckDrawRecord() {

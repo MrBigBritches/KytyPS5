@@ -721,6 +721,8 @@ if(BUILD_TESTING)
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --deferred-pipeline-draws)
 	add_test(NAME emulator_pause_warm_up_for_draws_cli
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --pause-warm-up-for-draws)
+	add_test(NAME emulator_deferred_non_push_draws_cli
+	         COMMAND $<TARGET_FILE:kyty_emulator> --help --deferred-non-push-draws)
 	add_test(NAME emulator_skip_redundant_unmap_drains_cli
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --skip-redundant-unmap-drains)
 	add_test(NAME emulator_keep_gpu_cache_on_reuse_cli

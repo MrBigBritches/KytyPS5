@@ -120,6 +120,9 @@ struct ConfigOptions {
 	// resolve's compiles do not compete with the warm-up for cores. Needs --background-warm-up and
 	// --deferred-pipeline-draws, and does nothing without both.
 	bool                   pause_warm_up_for_draws_enabled = false;
+	// Lets a draw whose descriptors go in a descriptor set, not pushed, be deferred too. Its set is
+	// allocated and written when the hole is recorded. Needs --deferred-pipeline-draws.
+	bool                   deferred_non_push_draws_enabled = false;
 	// Lets the GPU start on a long command stream instead of idling until the end-of-slice submit.
 	bool                   gpu_submit_cadence_enabled  = false;
 	// Opts in to the host GPU's float min/max on non-AMD GPUs. It is faster, but the sign of a zero
@@ -227,6 +230,9 @@ bool BackgroundWarmUpEnabled();
 bool DeferredPipelineDrawsEnabled();
 /// True when --pause-warm-up-for-draws holds the warm-up queue while deferred draws resolve.
 bool PauseWarmUpForDrawsEnabled();
+/// True when --deferred-non-push-draws lets draws with a descriptor set be deferred. It does nothing
+/// without --deferred-pipeline-draws.
+bool DeferredNonPushDrawsEnabled();
 bool GpuSubmitCadenceEnabled();
 /// Returns whether non-AMD GPUs may use the host's float min/max instead of the exact emulation.
 bool NativeFloatMinMaxEnabled();

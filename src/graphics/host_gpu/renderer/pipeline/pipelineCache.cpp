@@ -1286,9 +1286,10 @@ const char* PipelineCache::DeferBlocker(const Stages&             stages,
 	if (heap) {
 		return "image_heap";
 	}
-	// A descriptor set is allocated and written in the buffer the draw is met in, so only pushed
-	// descriptors can move into the hole's buffer. The layout code predicts which this draw gets.
-	if (!PredictPushDescriptors(m_graphics, stages)) {
+	// A hole writes its descriptors when it is recorded, so a set would be allocated and written
+	// during the resolve. That is opt in, and without it only pushed descriptors are deferred. The
+	// layout code predicts which this draw gets, since its layout does not exist before the build.
+	if (!Config::DeferredNonPushDrawsEnabled() && !PredictPushDescriptors(m_graphics, stages)) {
 		return "non_push";
 	}
 	return policy != nullptr ? policy->DeferBlocker() : "unsupported";

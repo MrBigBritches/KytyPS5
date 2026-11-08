@@ -802,6 +802,142 @@
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  // The address vertex shader for the non-push test reads here, at an address no other test's
+  // shader reads, so it is a pipeline of its own.
+  static constexpr uint64_t NonPushReadOffset = DrawStreamReadOffset + 0x300;
+
+  struct NonPushRun {
+    std::vector<u32> color;
+    size_t holes = 0;
+    bool predicted_push = true;
+    bool built_push = true;
+    IneligibleCounts ineligible;
+  };
+
+  // One draw of the address vertex shader with no push descriptors allowed, so its page table and
+  // fault buffer go in a descriptor set. `deferred` turns on --deferred-pipeline-draws and holds
+  // the build, and `non_push` turns on --deferred-non-push-draws. With both the draw becomes a hole
+  // whose set is written at the resolve.
+  NonPushRun RunNonPushDraw(const char *name, bool deferred, bool non_push) {
+    NonPushRun run;
+    PipelineCacheTestAccess::BuildHold hold;
+    AsyncDrawRig rig(*this, false, false, false, false, deferred, non_push);
+    auto &scheduler = rig.Scheduler();
+    CommandSchedulerTestAccess::AllowThisThread(scheduler);
+    auto &graphics = rig.context->GetGraphics();
+    const auto device_limit = graphics.max_push_descriptors;
+    graphics.max_push_descriptors = 0;
+    rig.PaintSentinels();
+    if (deferred) PipelineCacheTestAccess::HoldBuildQueue(rig.Pipelines(), hold);
+    const auto rig_vertex = UseAddressVertex(rig, NonPushReadOffset);
+    Common::FirstRunReport::Global().Reset();
+    Require(name, "draw", DrawStreamAuto(rig, 3, 1), "the draw reported failure");
+    rig.shaders.SetEsShaderBase(rig_vertex);
+    run.holes = scheduler.PendingHoleCount();
+    run.ineligible = DeferredIneligible();
+    std::optional<GraphicsPipelineKey> key;
+    if (run.holes == 1) key = CommandSchedulerTestAccess::HeldHoleKey(scheduler, 1);
+    if (key) run.predicted_push = PipelineCacheTestAccess::PredictedPush(rig.Pipelines(), *key);
+    hold.release = true;
+    scheduler.Finish();
+    if (key) run.built_push = PipelineCacheTestAccess::BuiltPush(rig.Pipelines(), *key);
+    run.color = rig.ReadColor();
+    graphics.max_push_descriptors = device_limit;
+    return run;
+  }
+
+  // With --deferred-non-push-draws a draw whose descriptors go in a set is deferred. Without it the
+  // same draw blocks, which the non-push case of DeferredEligibility pins with this rig and limit.
+  // The deferred draw must be a set draw, predicted and built, so a draw with no descriptors, which
+  // is pushed even at a limit of 0, cannot pass. Its picture must match the blocking run, which
+  // covers the target. The address read returns 0 in this rig, so the picture does not show the
+  // set's contents. HoleRecordedStreamNonPush pins the bind and DrawRecordDescriptorSet the writes.
+  void CheckDeferredNonPush() {
+    constexpr const char *name = "DeferredNonPush";
+    const auto baseline = RunNonPushDraw(name, false, false);
+    const auto deferred = RunNonPushDraw(name, true, true);
+    // The new flag needs --deferred-pipeline-draws, so on its own the draw blocks as the baseline.
+    const auto alone = RunNonPushDraw(name, false, true);
+    Require(name, "baseline picture", baseline.holes == 0 && AllDrawn(baseline.color),
+            "the blocking draw did not cover the target");
+    Require(name, "flag alone blocks", alone.holes == 0 && alone.color == baseline.color,
+            "--deferred-non-push-draws deferred a draw without --deferred-pipeline-draws");
+    Require(name, "deferred with a set",
+            deferred.holes == 1 && deferred.ineligible.empty() && !deferred.predicted_push &&
+                !deferred.built_push,
+            "the draw with a descriptor set was not deferred, or was not a set draw");
+    Require(name, "same picture", deferred.color == baseline.color,
+            "the deferred draw with a descriptor set left another picture than the blocking draw");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // Takes sets of `filler` until the heap moves to another pool, then until that pool holds as many
+  // sets as it may, so the next Commit of another layout retires it. Vulkan lets a driver hand out
+  // more sets than a pool's limit, and on such a driver no pool turns over, so this returns false.
+  static bool FillDescriptorPool(DescriptorHeap &heap, vk::DescriptorSetLayout filler) {
+    const auto start = DescriptorHeapTestAccess::CurrentPool(heap);
+    for (uint32_t taken = 0; DescriptorHeapTestAccess::CurrentPool(heap) == start; ++taken) {
+      if (taken > DescriptorHeap::POOL_SETS) return false;
+      (void)heap.Commit(filler);
+    }
+    for (uint32_t index = 1; index < DescriptorHeap::POOL_SETS; ++index) (void)heap.Commit(filler);
+    return true;
+  }
+
+  // A hole's set may come from a pool retired during the resolve. The pool is stamped with the tick
+  // it retired at and reset only once that tick is done, so the stamp must be the tick of the submit
+  // that holds the hole. The heap's pool is filled first, so the hole's set is what retires it. A
+  // resolve that ran after the submit took its tick would stamp the next one, and the pool could be
+  // reset while the hole's set is still in use. A pool that did not change shows the hole took no
+  // set, which would prove nothing.
+  void CheckDeferredNonPushPoolRetire() {
+    constexpr const char *name = "DeferredNonPushPool";
+    PipelineCacheTestAccess::BuildHold hold;
+    AsyncDrawRig rig(*this, false, false, false, false, true, true);
+    auto &scheduler = rig.Scheduler();
+    CommandSchedulerTestAccess::AllowThisThread(scheduler);
+    auto &graphics = rig.context->GetGraphics();
+    const auto device_limit = graphics.max_push_descriptors;
+    graphics.max_push_descriptors = 0;
+    rig.PaintSentinels();
+    PipelineCacheTestAccess::HoldBuildQueue(rig.Pipelines(), hold);
+    const auto rig_vertex = UseAddressVertex(rig, NonPushReadOffset);
+    Require(name, "draw", DrawStreamAuto(rig, 3, 1) && scheduler.PendingHoleCount() == 1,
+            "the draw with a descriptor set was not deferred");
+    rig.shaders.SetEsShaderBase(rig_vertex);
+    vk::DescriptorSetLayoutBinding binding{};
+    binding.descriptorType = vk::DescriptorType::eStorageBuffer;
+    binding.descriptorCount = 1;
+    binding.stageFlags = vk::ShaderStageFlagBits::eVertex;
+    vk::DescriptorSetLayoutCreateInfo layout_info{};
+    layout_info.bindingCount = 1;
+    layout_info.pBindings = &binding;
+    vk::DescriptorSetLayout filler;
+    Require(name, "filler layout", graphics.device.createDescriptorSetLayout(&layout_info, nullptr, &filler) ==
+                                       vk::Result::eSuccess, "the filler layout could not be made");
+    auto &heap = rig.context->GetDescriptorHeap();
+    if (!FillDescriptorPool(heap, filler)) {
+      hold.release = true;
+      scheduler.Finish();
+      graphics.device.destroyDescriptorSetLayout(filler, nullptr);
+      graphics.max_push_descriptors = device_limit;
+      std::printf("[gpu]     %-32s skipped: the driver allocates past a pool's set limit\n", name);
+      return;
+    }
+    const auto full_pool = DescriptorHeapTestAccess::CurrentPool(heap);
+    const auto submit_tick = scheduler.CurrentTick();
+    hold.release = true;
+    scheduler.Flush();
+    Require(name, "retired at the submit's tick",
+            DescriptorHeapTestAccess::CurrentPool(heap) != full_pool &&
+                DescriptorHeapTestAccess::LastRetiredTick(heap) == submit_tick,
+            "the pool the hole's set retired was not stamped with the tick of the submit holding it");
+    scheduler.Finish();
+    graphics.device.destroyDescriptorSetLayout(filler, nullptr);
+    graphics.max_push_descriptors = device_limit;
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   // Runs one scenario and counts the hazards the validation layer reports for it. A hazard fails
   // the test, and the number of messages is printed.
   void RunUnderValidation(const char *scenario, const std::function<void()> &check) {
@@ -835,6 +971,7 @@
     RunUnderValidation("DeferredStreamWrap", [&] { CheckDeferredStreamWrap(); });
     RunUnderValidation("DeferredRegisters", [&] { CheckDeferredRegistersAfterHole(); });
     RunUnderValidation("DeferredQueryAfterHole", [&] { CheckDeferredQueryOpenedAfterHole(); });
+    RunUnderValidation("DeferredNonPush", [&] { CheckDeferredNonPush(); });
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
@@ -1424,6 +1561,8 @@
     CheckDeferredWorkerCount();
     CheckDeferredNotesWork();
     CheckDeferredNeedsGpuThread();
+    CheckDeferredNonPush();
+    CheckDeferredNonPushPoolRetire();
     CheckDeferredHoleCap();
     CheckDeferredShutdownResolve();
     CheckDeferredStreamWrap();

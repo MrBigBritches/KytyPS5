@@ -8,7 +8,6 @@
 namespace Libs::Graphics {
 namespace {
 
-constexpr uint32_t   DescriptorHeapCount = 1024;
 constexpr std::array DescriptorPoolSizes = {
     vk::DescriptorPoolSize {vk::DescriptorType::eStorageBuffer, 8192},
     vk::DescriptorPoolSize {vk::DescriptorType::eSampledImage, 8192},
@@ -82,7 +81,7 @@ bool DescriptorHeap::Allocate(vk::DescriptorSetLayout layout, Batch& batch) {
 
 void DescriptorHeap::CreateDescriptorPool() {
 	vk::DescriptorPoolCreateInfo create {};
-	create.maxSets       = DescriptorHeapCount;
+	create.maxSets       = POOL_SETS;
 	create.poolSizeCount = static_cast<uint32_t>(DescriptorPoolSizes.size());
 	create.pPoolSizes    = DescriptorPoolSizes.data();
 	EXIT_IF(m_graphics.device.createDescriptorPool(&create, nullptr, &m_current_pool) !=

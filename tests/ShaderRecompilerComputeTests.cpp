@@ -1093,6 +1093,16 @@ struct RenderExecutorTestAccess {
   }
 };
 
+struct DescriptorHeapTestAccess {
+  // The pool sets come from now. It changes each time a full pool is retired.
+  static vk::DescriptorPool CurrentPool(const DescriptorHeap &heap) { return heap.m_current_pool; }
+  // The tick the last pool to fill was stamped with. There must be one.
+  static uint64_t LastRetiredTick(const DescriptorHeap &heap) {
+    EXIT_IF(heap.m_pending_pools.empty());
+    return heap.m_pending_pools.back().second;
+  }
+};
+
 struct PipelineCacheTestAccess {
   // Replaces each graphics pipeline whose stage ids name compiled modules with one created
   // from only its key and those modules. The GPU must be idle. Returns how many it replaced.
@@ -19196,15 +19206,17 @@ public:
     // Makes the rig. `async` turns on background builds under the default skip rule, and
     // `depth_only` turns on the second mode instead. `use_htile` gives the depth target HTILE.
     // `deferred` turns on --deferred-pipeline-draws, with or without `async`.
+    // `deferred_non_push` turns on --deferred-non-push-draws, which does nothing without `deferred`.
     AsyncDrawRig(VulkanHarness &owner, bool async, bool use_htile = false, bool occlusion = false,
-                 bool depth_only = false, bool deferred = false)
+                 bool depth_only = false, bool deferred = false, bool deferred_non_push = false)
         : harness(owner), htile(use_htile) {
       Config::Load({.printf_direction = Config::LogDirection::Silent,
                     .occlusion_queries_enabled = occlusion,
                     .first_run_report_enabled = true,
                     .async_pipelines_enabled = async,
                     .async_pipelines_depth_only_enabled = depth_only,
-                    .deferred_pipeline_draws_enabled = deferred});
+                    .deferred_pipeline_draws_enabled = deferred,
+                    .deferred_non_push_draws_enabled = deferred_non_push});
       Common::FirstRunReport::Global().Reset();
       harness.EnsureRuntimeContext();
       harness.SetOcclusionQueries(occlusion);

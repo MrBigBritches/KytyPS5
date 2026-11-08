@@ -465,7 +465,8 @@ private:
 	// the miss until the pipeline was there.
 	static void NoteIneligibleWait(const MissedDraw& missed, const Stages& stages);
 	// The reason a missing pipeline's draw cannot become a hole, or null when it can. The draw's own
-	// state comes from the policy, and the shaders add the image heap and the descriptor kind.
+	// state comes from the policy, and the shaders add the image heap and, unless
+	// --deferred-non-push-draws is on, the descriptor kind.
 	[[nodiscard]] const char* DeferBlocker(const Stages&             stages,
 	                                       const PipelineSkipPolicy* policy) const;
 	// What a draw that missed its pipeline does. `may_skip` is set when the S2 rules allow a skip, and

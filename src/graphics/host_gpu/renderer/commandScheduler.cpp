@@ -460,6 +460,9 @@ CommandScheduler::AcquireHolePipelines(Common::FirstRunReport::DeferredResolve& 
 }
 
 void CommandScheduler::RecordHoles(std::span<const PipelineCache::Pipeline> built) {
+	// A hole that writes a descriptor set takes it from the heap here, which is safe only inside the
+	// resolve of a submit whose tick the heap's pools are stamped with.
+	EXIT_IF(!m_in_submit || !m_in_resolve);
 	auto&  executor = m_context.GetRenderExecutor();
 	size_t next     = 0;
 	for (auto& held: m_held) {
@@ -567,6 +570,9 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	EXIT_IF(m_command.IsInvalid());
 	const ReentryGuard guard(m_in_submit);
 
+	// A hole's descriptor set may come from a pool retired during the resolve, stamped with the tick
+	// read then. That pool is reset only after that tick ends, so the tick must be this submit's.
+	const uint64_t resolve_tick = m_master.CurrentTick();
 	ResolveHoles();
 	const bool last_used = m_command.m_used;
 	m_command.End();
@@ -589,6 +595,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	{
 		Common::LockGuard lock(graphics.queue_mutex);
 		tick = m_master.NextTick();
+		EXIT_IF(tick != resolve_tick);
 		submit.AddSignal(m_master.Handle(), tick);
 
 		vk::TimelineSemaphoreSubmitInfo timeline_info {};
