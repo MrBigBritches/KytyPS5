@@ -912,162 +912,216 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 	}
 }
 
-void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
-                                    vk::PipelineBindPoint              pipeline_bind_point,
-                                    const PipelineCache::Pipeline&     pipeline,
-                                    std::span<PreparedBindings* const> prepared_bindings) {
-	KYTY_PROFILER_FUNCTION();
-	auto                           vk_buffer              = buffer.Handle();
-	size_t                         image_descriptor_count = 0;
-	ShaderRecompiler::IR::PushData push_data;
-	bool                           has_push_data = false;
-	for (const auto* prepared: prepared_bindings) {
-		const auto& program = prepared->runtime->module->info;
+namespace {
+
+/// Records the GDS dependency a stage needs before its shaders run. It ends dynamic rendering on
+/// the scheduler's current buffer, so it belongs to the eager transit half.
+void RecordGdsBarrier(CommandBuffer& buffer, const PreparedBindings& prepared,
+                      const ShaderModule& module) {
+	buffer.EndRendering();
+	const auto barrier       = MakeGdsDependency(prepared.gds.buffer);
+	const auto shader_stages = ShaderPipelineStages(NativeShaderStage(module.info.stage));
+	buffer.Handle().pipelineBarrier(
+	    vk::PipelineStageFlagBits::eHost | vk::PipelineStageFlagBits::eTransfer |
+	        vk::PipelineStageFlagBits::eAllGraphics | vk::PipelineStageFlagBits::eComputeShader,
+	    shader_stages, vk::DependencyFlags {}, 0, nullptr, 1, &barrier, 0, nullptr);
+}
+
+/// Moves one bound image into the layout its binding needs and stores that layout in the binding
+/// for the descriptor write.
+void TransitBindingImage(RenderContext& context, TextureBinding& binding,
+                         vk::CommandBuffer vk_buffer) {
+	auto&                       image = context.GetTextureCache().GetImage(binding.image_id);
+	const auto&                 view  = binding.desc.view_info;
+	const ImageSubresourceRange range {view.base_level, view.level_count, view.base_layer,
+	                                   view.layer_count};
+	const bool                  storage = binding.desc.type == TextureCache::BindingType::Storage;
+	if (image.binding.is_target) {
+		const auto layout = image.binding.attachment_layout;
+		EXIT_IF(layout == vk::ImageLayout::eUndefined);
+		if (image.info.IsDepth()) {
+			const auto host_view =
+			    std::ranges::find(image.views, binding.image_view, &CachedImageView::view);
+			EXIT_IF(storage || host_view == image.views.end());
+			const auto aspect = host_view->info.aspect;
+			if (aspect & ~DepthReadableAspects(layout)) {
+				EXIT("sampling a writable depth/stencil attachment aspect\n");
+			}
+		}
+		image.Transit(layout,
+		              image.binding.attachment_access | vk::AccessFlagBits2::eShaderRead |
+		                  (image.binding.shader_write ? vk::AccessFlagBits2::eShaderWrite
+		                                              : vk::AccessFlags2 {}),
+		              {}, vk_buffer);
+	} else if (image.binding.force_general && !image.info.IsDepth()) {
+		const vk::AccessFlags2 storage_access =
+		    image.binding.shader_write ? vk::AccessFlagBits2::eShaderWrite : vk::AccessFlags2 {};
+		image.Transit(vk::ImageLayout::eGeneral, vk::AccessFlagBits2::eShaderRead | storage_access,
+		              {}, vk_buffer);
+	} else if (storage) {
+		image.Transit(vk::ImageLayout::eGeneral,
+		              vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite, range,
+		              vk_buffer);
+	} else {
+		image.Transit(image.ReadLayout(), vk::AccessFlagBits2::eShaderRead, range, vk_buffer);
+	}
+	binding.layout = image.backing.state.layout;
+}
+
+/// Counts the image and sampler descriptors of all stages so the scratch array is sized once.
+/// Also checks that the pipeline pushes every stage.
+size_t CountImageDescriptors(const PipelineCache::Pipeline&       pipeline,
+                             std::span<const ShaderModule* const> modules) {
+	size_t count = 0;
+	for (const auto* module: modules) {
+		const auto& program = module->info;
 		for (auto mask = program.bindings.descriptor_mask; mask != 0; mask &= mask - 1) {
 			const auto index = std::countr_zero(mask);
-			const auto count = program.bindings.descriptor_counts[index];
 			if (index >= ShaderRecompiler::IR::FirstImageBinding &&
 			    index <= static_cast<size_t>(BindingKind::Samplers)) {
-				image_descriptor_count += count;
+				count += program.bindings.descriptor_counts[index];
 			}
 		}
 		EXIT_IF(!(pipeline.push_stages & NativeShaderStage(program.stage)));
 	}
-	if (pipeline.uses_image_heap) {
-		m_context.GetImageHeap().Commit(buffer, pipeline_bind_point, pipeline.pipeline_layout);
+	return count;
+}
+
+/// Points a buffer-backed write at the view its binding kind names. Sampler writes append their
+/// infos to the image scratch and advance the cursor.
+void FillBufferWrite(RenderContext& context, BindingKind kind, const PreparedBindings& descriptors,
+                     vk::WriteDescriptorSet&                  write,
+                     std::array<vk::DescriptorBufferInfo, 2>& address_buffers,
+                     std::vector<vk::DescriptorImageInfo>& image_infos, size_t& image_cursor) {
+	switch (kind) {
+		case BindingKind::Buffers: write.pBufferInfo = descriptors.buffers.data(); break;
+		case BindingKind::BdaPagetable:
+		case BindingKind::FaultBuffer: {
+			auto&       cache      = context.GetBufferCache();
+			const auto* bda_buffer = kind == BindingKind::BdaPagetable
+			                             ? cache.GetBdaPageTableBuffer()
+			                             : cache.GetFaultBuffer();
+			auto&       view       = address_buffers[kind == BindingKind::FaultBuffer];
+			view                   = {bda_buffer->Handle(), 0, bda_buffer->Size()};
+			write.pBufferInfo      = &view;
+			break;
+		}
+		case BindingKind::FlattenedSrt:
+		case BindingKind::ShaderData:
+		case BindingKind::SharedMemory:
+		case BindingKind::Gds: {
+			const vk::DescriptorBufferInfo* view = &descriptors.gds;
+			if (kind == BindingKind::FlattenedSrt) {
+				view = &descriptors.flattened_srt;
+			} else if (kind == BindingKind::ShaderData) {
+				view = &descriptors.shader_data_buffer;
+			} else if (kind == BindingKind::SharedMemory) {
+				view = &descriptors.shared_memory;
+			}
+			EXIT_IF(view->buffer == nullptr);
+			write.pBufferInfo = view;
+			break;
+		}
+		case BindingKind::Samplers:
+			for (const auto sampler: descriptors.samplers) {
+				image_infos[image_cursor++] = {sampler, nullptr, vk::ImageLayout::eUndefined};
+			}
+			break;
+		case BindingKind::Count: EXIT("invalid descriptor binding kind");
 	}
-	m_descriptor_images.resize(image_descriptor_count);
+}
+
+/// Appends one stage's descriptor writes. Image bindings only reserve their slots here, because
+/// FillImageInfos fills them once the stage's slot starts are known.
+void AppendStageWrites(RenderContext& context, const ShaderModule& module,
+                       const PreparedBindings&                  descriptors,
+                       std::array<vk::DescriptorBufferInfo, 2>& address_buffers,
+                       std::vector<vk::DescriptorImageInfo>&    image_infos,
+                       std::vector<vk::WriteDescriptorSet>& writes, size_t& image_cursor,
+                       std::array<size_t, ShaderRecompiler::IR::ImageBindingCount>& image_starts) {
+	const auto& program = module.info;
+	for (auto mask = program.bindings.descriptor_mask; mask != 0; mask &= mask - 1) {
+		const auto             index = std::countr_zero(mask);
+		const auto             kind  = static_cast<BindingKind>(index);
+		vk::WriteDescriptorSet write {};
+		write.dstBinding       = ShaderRecompiler::IR::NativeBinding(program.stage, kind);
+		write.descriptorType   = NativeDescriptorType(kind);
+		write.descriptorCount  = program.bindings.descriptor_counts[index];
+		const auto image_start = image_cursor;
+		if (ShaderRecompiler::IR::ImageBindingResourceClass(kind) !=
+		    ShaderRecompiler::IR::ImageResourceClass::None) {
+			image_starts[ShaderRecompiler::IR::ImageBindingIndex(kind)] = image_start;
+			image_cursor += write.descriptorCount;
+		} else {
+			FillBufferWrite(context, kind, descriptors, write, address_buffers, image_infos,
+			                image_cursor);
+		}
+		if (image_cursor != image_start) {
+			write.pImageInfo = image_infos.data() + image_start;
+		}
+		writes.push_back(write);
+	}
+}
+
+/// Fills the reserved image slots of one stage from its prepared textures.
+void FillImageInfos(const ShaderModule& module, const PreparedBindings& descriptors,
+                    const std::array<size_t, ShaderRecompiler::IR::ImageBindingCount>& image_starts,
+                    std::vector<vk::DescriptorImageInfo>& image_infos) {
+	const auto& program = module.info;
+	for (uint32_t i = 0; i < program.info.images.size(); ++i) {
+		const auto& resource = program.info.images[i];
+		const auto& texture  = descriptors.images[i];
+		if (resource.heap) continue;
+		const auto kind = *ShaderRecompiler::IR::DescriptorBindingForImage(resource);
+		const auto start =
+		    image_starts[ShaderRecompiler::IR::ImageBindingIndex(kind)] + resource.descriptor_index;
+		for (uint32_t mip = 0; mip < resource.mip_count; ++mip) {
+			image_infos[start + mip] = MakeImageInfo(texture, mip);
+		}
+	}
+}
+
+} // namespace
+
+void RenderExecutor::TransitBindingImages(CommandBuffer&                     buffer,
+                                          std::span<PreparedBindings* const> prepared_bindings) {
+	KYTY_PROFILER_FUNCTION();
+	auto vk_buffer = buffer.Handle();
+	for (auto* prepared: prepared_bindings) {
+		const auto& module = *prepared->runtime->module;
+		if (prepared->gds.buffer != nullptr) {
+			RecordGdsBarrier(buffer, *prepared, module);
+		}
+		for (uint32_t i = 0; i < module.info.info.images.size(); i++) {
+			if (!prepared->images[i].image_id) continue;
+			TransitBindingImage(m_context, prepared->images[i], vk_buffer);
+		}
+	}
+}
+
+void RenderExecutor::WriteBindingDescriptors(vk::CommandBuffer                  vk_buffer,
+                                             vk::PipelineBindPoint              pipeline_bind_point,
+                                             const PipelineCache::Pipeline&     pipeline,
+                                             std::span<PreparedBindings* const> prepared_bindings,
+                                             std::span<const ShaderModule* const> modules) {
+	KYTY_PROFILER_FUNCTION();
+	EXIT_IF(prepared_bindings.size() != modules.size());
+	ShaderRecompiler::IR::PushData push_data;
+	bool                           has_push_data = false;
+	m_descriptor_images.resize(CountImageDescriptors(pipeline, modules));
 	m_descriptor_writes.clear();
-	size_t image_cursor = 0;
+	size_t                                  image_cursor = 0;
 	std::array<vk::DescriptorBufferInfo, 2> address_buffers;
 
-	for (auto* prepared: prepared_bindings) {
-		const auto& program     = prepared->runtime->module->info;
-		auto&       descriptors = *prepared;
-		if (descriptors.gds.buffer != nullptr) {
-			buffer.EndRendering();
-			const auto barrier       = MakeGdsDependency(descriptors.gds.buffer);
-			const auto shader_stages = ShaderPipelineStages(NativeShaderStage(program.stage));
-			vk_buffer.pipelineBarrier(
-			    vk::PipelineStageFlagBits::eHost | vk::PipelineStageFlagBits::eTransfer |
-			        vk::PipelineStageFlagBits::eAllGraphics |
-			        vk::PipelineStageFlagBits::eComputeShader,
-			    shader_stages, vk::DependencyFlags {}, 0, nullptr, 1, &barrier, 0, nullptr);
-		}
-
-		for (uint32_t i = 0; i < program.info.images.size(); i++) {
-			auto& binding = descriptors.images[i];
-			if (!binding.image_id) continue;
-			auto& image = m_context.GetTextureCache().GetImage(binding.image_id);
-			const auto&                 view = binding.desc.view_info;
-			const ImageSubresourceRange range {view.base_level, view.level_count, view.base_layer,
-			                                   view.layer_count};
-			const bool storage = binding.desc.type == TextureCache::BindingType::Storage;
-			if (image.binding.is_target) {
-				const auto layout = image.binding.attachment_layout;
-				EXIT_IF(layout == vk::ImageLayout::eUndefined);
-				if (image.info.IsDepth()) {
-					const auto host_view =
-					    std::ranges::find(image.views, binding.image_view, &CachedImageView::view);
-					EXIT_IF(storage || host_view == image.views.end());
-					const auto aspect = host_view->info.aspect;
-					if (aspect & ~DepthReadableAspects(layout)) {
-						EXIT("sampling a writable depth/stencil attachment aspect\n");
-					}
-				}
-				image.Transit(layout,
-				              image.binding.attachment_access | vk::AccessFlagBits2::eShaderRead |
-				                  (image.binding.shader_write ? vk::AccessFlagBits2::eShaderWrite
-				                                              : vk::AccessFlags2 {}),
-				              {}, vk_buffer);
-			} else if (image.binding.force_general && !image.info.IsDepth()) {
-				const vk::AccessFlags2 storage_access = image.binding.shader_write
-				                                            ? vk::AccessFlagBits2::eShaderWrite
-				                                            : vk::AccessFlags2 {};
-				image.Transit(vk::ImageLayout::eGeneral,
-				              vk::AccessFlagBits2::eShaderRead | storage_access, {}, vk_buffer);
-			} else if (storage) {
-				image.Transit(vk::ImageLayout::eGeneral,
-				              vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
-				              range, vk_buffer);
-			} else {
-				image.Transit(image.ReadLayout(), vk::AccessFlagBits2::eShaderRead, range, vk_buffer);
-			}
-			binding.layout = image.backing.state.layout;
-		}
-
+	for (size_t stage = 0; stage < prepared_bindings.size(); ++stage) {
+		const auto& program     = modules[stage]->info;
+		const auto& descriptors = *prepared_bindings[stage];
 		std::array<size_t, ShaderRecompiler::IR::ImageBindingCount> image_starts {};
-		for (auto mask = program.bindings.descriptor_mask; mask != 0; mask &= mask - 1) {
-			const auto index = std::countr_zero(mask);
-			const auto kind = static_cast<BindingKind>(index);
-			vk::WriteDescriptorSet write {};
-			write.dstBinding = ShaderRecompiler::IR::NativeBinding(program.stage, kind);
-			write.descriptorType = NativeDescriptorType(kind);
-			write.descriptorCount = program.bindings.descriptor_counts[index];
-			const auto image_start = image_cursor;
-			if (ShaderRecompiler::IR::ImageBindingResourceClass(kind) !=
-			    ShaderRecompiler::IR::ImageResourceClass::None) {
-				image_starts[ShaderRecompiler::IR::ImageBindingIndex(kind)] = image_start;
-				image_cursor += write.descriptorCount;
-			} else {
-				switch (kind) {
-					case BindingKind::Buffers:
-						write.pBufferInfo = descriptors.buffers.data();
-						break;
-					case BindingKind::BdaPagetable:
-					case BindingKind::FaultBuffer: {
-						auto& cache = m_context.GetBufferCache();
-						const auto* bda_buffer = kind == BindingKind::BdaPagetable
-						                             ? cache.GetBdaPageTableBuffer()
-						                             : cache.GetFaultBuffer();
-						auto& view = address_buffers[kind == BindingKind::FaultBuffer];
-						view = {bda_buffer->Handle(), 0, bda_buffer->Size()};
-						write.pBufferInfo = &view;
-						break;
-					}
-					case BindingKind::FlattenedSrt:
-					case BindingKind::ShaderData:
-					case BindingKind::SharedMemory:
-					case BindingKind::Gds: {
-						const vk::DescriptorBufferInfo* view = &descriptors.gds;
-						if (kind == BindingKind::FlattenedSrt) {
-							view = &descriptors.flattened_srt;
-						} else if (kind == BindingKind::ShaderData) {
-							view = &descriptors.shader_data_buffer;
-						} else if (kind == BindingKind::SharedMemory) {
-							view = &descriptors.shared_memory;
-						}
-						EXIT_IF(view->buffer == nullptr);
-						write.pBufferInfo = view;
-						break;
-					}
-					case BindingKind::Samplers:
-						for (const auto sampler: descriptors.samplers) {
-							m_descriptor_images[image_cursor++] = {sampler, nullptr, vk::ImageLayout::eUndefined};
-						}
-						break;
-					case BindingKind::Count: EXIT("invalid descriptor binding kind");
-				}
-			}
-			if (image_cursor != image_start) {
-				write.pImageInfo = m_descriptor_images.data() + image_start;
-			}
-			m_descriptor_writes.push_back(write);
-		}
-		for (uint32_t i = 0; i < program.info.images.size(); ++i) {
-			const auto& resource = program.info.images[i];
-			const auto& texture = descriptors.images[i];
-			if (resource.heap) continue;
-			const auto kind = *ShaderRecompiler::IR::DescriptorBindingForImage(resource);
-			const auto start = image_starts[ShaderRecompiler::IR::ImageBindingIndex(kind)] +
-			                   resource.descriptor_index;
-			for (uint32_t mip = 0; mip < resource.mip_count; ++mip) {
-				m_descriptor_images[start + mip] = MakeImageInfo(texture, mip);
-			}
-		}
-
+		AppendStageWrites(m_context, *modules[stage], descriptors, address_buffers,
+		                  m_descriptor_images, m_descriptor_writes, image_cursor, image_starts);
+		FillImageInfos(*modules[stage], descriptors, image_starts, m_descriptor_images);
 		if (program.bindings.UsesPushData()) {
-			std::ranges::copy(prepared->shader_data,
+			std::ranges::copy(descriptors.shader_data,
 			                  push_data.dwords.begin() + program.bindings.push_data_start_dword);
 			has_push_data = true;
 		}
@@ -1077,24 +1131,41 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		vk_buffer.pushConstants(pipeline.pipeline_layout, pipeline.push_stages, 0,
 		                        sizeof(push_data), push_data.dwords.data());
 	}
-
-	if (!m_descriptor_writes.empty()) {
-		if (pipeline.uses_push_descriptors) {
-			vk_buffer.pushDescriptorSetKHR(pipeline_bind_point, pipeline.pipeline_layout, 0,
-			                               static_cast<uint32_t>(m_descriptor_writes.size()),
-			                               m_descriptor_writes.data());
-		} else {
-			const auto set = m_context.GetDescriptorHeap().Commit(pipeline.descriptor_set_layout);
-			for (auto& write: m_descriptor_writes) {
-				write.dstSet = set;
-			}
-			m_context.GetGraphics().device.updateDescriptorSets(
-			    static_cast<uint32_t>(m_descriptor_writes.size()), m_descriptor_writes.data(), 0,
-			    nullptr);
-			vk_buffer.bindDescriptorSets(pipeline_bind_point, pipeline.pipeline_layout, 0, 1, &set,
-			                             0, nullptr);
-		}
+	if (m_descriptor_writes.empty()) return;
+	if (pipeline.uses_push_descriptors) {
+		vk_buffer.pushDescriptorSetKHR(pipeline_bind_point, pipeline.pipeline_layout, 0,
+		                               static_cast<uint32_t>(m_descriptor_writes.size()),
+		                               m_descriptor_writes.data());
+		return;
 	}
+	const auto set = m_context.GetDescriptorHeap().Commit(pipeline.descriptor_set_layout);
+	for (auto& write: m_descriptor_writes) {
+		write.dstSet = set;
+	}
+	m_context.GetGraphics().device.updateDescriptorSets(
+	    static_cast<uint32_t>(m_descriptor_writes.size()), m_descriptor_writes.data(), 0, nullptr);
+	vk_buffer.bindDescriptorSets(pipeline_bind_point, pipeline.pipeline_layout, 0, 1, &set, 0,
+	                             nullptr);
+}
+
+void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
+                                    vk::PipelineBindPoint              pipeline_bind_point,
+                                    const PipelineCache::Pipeline&     pipeline,
+                                    std::span<PreparedBindings* const> prepared_bindings) {
+	KYTY_PROFILER_FUNCTION();
+	EXIT_IF(prepared_bindings.size() > MaxBindingStages);
+	// The runtime pointers are only valid while the draw is being recorded, so the modules are
+	// taken here and the descriptor half never reads a runtime.
+	std::array<const ShaderModule*, MaxBindingStages> modules {};
+	for (size_t stage = 0; stage < prepared_bindings.size(); ++stage) {
+		modules[stage] = prepared_bindings[stage]->runtime->module;
+	}
+	if (pipeline.uses_image_heap) {
+		m_context.GetImageHeap().Commit(buffer, pipeline_bind_point, pipeline.pipeline_layout);
+	}
+	TransitBindingImages(buffer, prepared_bindings);
+	WriteBindingDescriptors(buffer.Handle(), pipeline_bind_point, pipeline, prepared_bindings,
+	                        std::span {modules.data(), prepared_bindings.size()});
 }
 
 } // namespace Libs::Graphics

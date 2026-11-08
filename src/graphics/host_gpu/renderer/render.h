@@ -154,6 +154,17 @@ public:
 	void CommitBindings(CommandBuffer& buffer, vk::PipelineBindPoint pipeline_bind_point,
 	                    const PipelineCache::Pipeline&     pipeline,
 	                    std::span<PreparedBindings* const> bindings);
+	/// Moves the images the stages sample or store into their layouts and records the GDS barriers.
+	/// This is the eager half of CommitBindings. It changes CPU-tracked layouts, so it runs in draw
+	/// order.
+	void TransitBindingImages(CommandBuffer& buffer, std::span<PreparedBindings* const> bindings);
+	/// Writes push constants and descriptors for stages whose images were already transited.
+	/// This is the half that may run later. It reads only the given modules, never a stage runtime.
+	void WriteBindingDescriptors(vk::CommandBuffer vk_buffer,
+	                             vk::PipelineBindPoint pipeline_bind_point,
+	                             const PipelineCache::Pipeline& pipeline,
+	                             std::span<PreparedBindings* const> bindings,
+	                             std::span<const ShaderModule* const> modules);
 	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
 	                                            const ShaderRecompiler::IR::DescriptorValue& value);
 

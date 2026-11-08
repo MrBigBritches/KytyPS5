@@ -18,6 +18,9 @@ namespace Libs::Graphics {
 
 struct ShaderStageRuntime;
 
+// A graphics draw binds up to three vertex-side stages and a pixel stage. Compute binds one.
+inline constexpr size_t MaxBindingStages = 4;
+
 struct TextureBinding {
 	ImageId                    image_id;
 	vk::ImageView              image_view = nullptr;

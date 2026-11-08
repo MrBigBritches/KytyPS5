@@ -1286,9 +1286,9 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		    index_source.address,
 		    static_cast<uint64_t>(draw.index_count) * index_source.guest_element_size);
 	}
-	auto&                            bindings = m_graphics_bindings;
-	std::array<PreparedBindings*, 4> descriptor_stages {};
-	uint32_t                         stage_count = 0;
+	auto&                                           bindings = m_graphics_bindings;
+	std::array<PreparedBindings*, MaxBindingStages> descriptor_stages {};
+	uint32_t                                        stage_count = 0;
 	for (uint32_t i = 0; i < vertex_stages.size(); i++) {
 		PrepareBindings(state.vertex_info[i].stage, bindings.vertex[i]);
 		descriptor_stages[stage_count++] = &bindings.vertex[i];

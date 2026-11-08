@@ -699,6 +699,125 @@ struct RenderExecutorTestAccess {
     return executor.DrawAuto(command, args);
   }
 
+  // Runs the eager transit half of CommitBindings on its own.
+  static void TransitBindingImages(RenderExecutor &executor,
+                                   CommandBuffer &command,
+                                   std::span<PreparedBindings *const> stages) {
+    executor.TransitBindingImages(command, stages);
+  }
+
+  // Runs the descriptor half of CommitBindings on its own, with modules and no runtimes.
+  static void WriteBindingDescriptors(
+      RenderExecutor &executor, CommandBuffer &command,
+      vk::PipelineBindPoint bind_point, const PipelineCache::Pipeline &pipeline,
+      std::span<PreparedBindings *const> stages,
+      std::span<const ShaderModule *const> modules) {
+    executor.WriteBindingDescriptors(command.Handle(), bind_point, pipeline,
+                                     stages, modules);
+  }
+
+  // Names the stage, image and mip whose prepared view is the handle, so exchanging the views
+  // of two stages changes the label. Null is "null" and a handle nothing owns is "unowned".
+  static std::string ViewOwner(std::span<PreparedBindings *const> stages,
+                               vk::ImageView view) {
+    if (!view) return "null";
+    for (size_t stage = 0; stage < stages.size(); ++stage) {
+      const auto &images = stages[stage]->images;
+      for (size_t image = 0; image < images.size(); ++image) {
+        const auto &mips = images[image].mip_views;
+        size_t mip = 0;
+        for (; mip < mips.size() && mips[mip] != view; ++mip) {
+        }
+        if (mip < mips.size() || images[image].image_view == view) {
+          return "s" + std::to_string(stage) + ".i" + std::to_string(image) +
+                 ".m" + std::to_string(mip < mips.size() ? mip : 0);
+        }
+      }
+    }
+    return "unowned";
+  }
+
+  // Names the stage and sampler slot of a prepared sampler handle.
+  static std::string SamplerOwner(std::span<PreparedBindings *const> stages,
+                                  vk::Sampler sampler) {
+    if (!sampler) return "null";
+    for (size_t stage = 0; stage < stages.size(); ++stage) {
+      const auto &samplers = stages[stage]->samplers;
+      const auto found = std::ranges::find(samplers, sampler);
+      if (found != samplers.end()) {
+        return "s" + std::to_string(stage) + ".k" +
+               std::to_string(found - samplers.begin());
+      }
+    }
+    return "unowned";
+  }
+
+  // Names which prepared buffer view a write points at and lists the offset and range of each
+  // entry. A view that no stage owns (the address buffers) is not read.
+  static std::string BufferOwner(std::span<PreparedBindings *const> stages,
+                                 const vk::WriteDescriptorSet &write) {
+    const auto *info = write.pBufferInfo;
+    if (info == nullptr) return "-";
+    const auto describe = [&](const char *what, size_t stage) {
+      std::string text = "s" + std::to_string(stage) + "." + what;
+      for (uint32_t i = 0; i < write.descriptorCount; ++i) {
+        text += info[i].range == VK_WHOLE_SIZE
+                    ? " +" + std::to_string(info[i].offset) + "/whole"
+                    : " +" + std::to_string(info[i].offset) + "/" +
+                          std::to_string(info[i].range);
+        text += info[i].buffer ? "" : "/nobuffer";
+      }
+      return text;
+    };
+    for (size_t stage = 0; stage < stages.size(); ++stage) {
+      const auto &prepared = *stages[stage];
+      if (info == prepared.buffers.data()) return describe("buffers", stage);
+      if (info == &prepared.gds) return describe("gds", stage);
+      if (info == &prepared.flattened_srt) return describe("srt", stage);
+      if (info == &prepared.shader_data_buffer) return describe("shader_data", stage);
+      if (info == &prepared.shared_memory) return describe("shared_memory", stage);
+    }
+    return "address";
+  }
+
+  // Flattens the descriptor scratch of the last write into readable lines. Handles are labelled
+  // by their owner in the prepared bindings, image pointers by their slot, and the set only by
+  // whether the write targets one.
+  static std::vector<std::string> DescriptorScratch(
+      const RenderExecutor &executor, std::span<PreparedBindings *const> stages) {
+    std::vector<std::string> lines;
+    const auto &infos = executor.m_descriptor_images;
+    for (size_t slot = 0; slot < infos.size(); ++slot) {
+      lines.push_back("image[" + std::to_string(slot) + "] view=" +
+                      ViewOwner(stages, infos[slot].imageView) + " sampler=" +
+                      SamplerOwner(stages, infos[slot].sampler) + " layout=" +
+                      vk::to_string(infos[slot].imageLayout));
+    }
+    for (const auto &write : executor.m_descriptor_writes) {
+      lines.push_back(
+          "write bind=" + std::to_string(write.dstBinding) + " " +
+          vk::to_string(write.descriptorType) + " n=" +
+          std::to_string(write.descriptorCount) + " images=" +
+          (write.pImageInfo == nullptr
+               ? std::string("-")
+               : std::to_string(write.pImageInfo - infos.data())) +
+          " buffers=" + BufferOwner(stages, write) +
+          " set=" + (write.dstSet ? "yes" : "no"));
+    }
+    return lines;
+  }
+
+  // True when the rows match. A mismatch prints both so the difference can be read.
+  static bool RowMatches(const char *label, const std::vector<std::string> &actual,
+                         const std::vector<std::string> &expected) {
+    if (actual == expected) return true;
+    std::fprintf(stderr, "row %s differs\n--- expected\n", label);
+    for (const auto &line : expected) std::fprintf(stderr, "%s\n", line.c_str());
+    std::fputs("--- actual\n", stderr);
+    for (const auto &line : actual) std::fprintf(stderr, "%s\n", line.c_str());
+    return false;
+  }
+
   static bool TryConsumeComputeFill(RenderExecutor &executor,
       const ShaderComputeInputInfo &input, CommandBuffer &command,
       uint32_t x, uint32_t y, uint32_t z, uint32_t mode) {
@@ -741,7 +860,8 @@ struct RenderExecutorTestAccess {
 
   static PipelineCache::Pipeline
   CreateDescriptorPipeline(RenderExecutor &executor,
-                           std::span<PreparedBindings *const> stages) {
+                           std::span<PreparedBindings *const> stages,
+                           bool push_descriptors = true) {
     std::vector<vk::DescriptorSetLayoutBinding> layout_bindings;
     bool compute = false;
     for (const auto *prepared : stages) {
@@ -762,8 +882,10 @@ struct RenderExecutorTestAccess {
     }
     vk::DescriptorSetLayoutCreateInfo descriptor_info{};
     descriptor_info.sType = vk::StructureType::eDescriptorSetLayoutCreateInfo;
-    descriptor_info.flags =
-        vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR;
+    if (push_descriptors) {
+      descriptor_info.flags =
+          vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR;
+    }
     descriptor_info.bindingCount =
         static_cast<uint32_t>(layout_bindings.size());
     descriptor_info.pBindings = layout_bindings.data();
@@ -788,7 +910,7 @@ struct RenderExecutorTestAccess {
     EXIT_IF(device.createPipelineLayout(&pipeline_info, nullptr,
                                         &pipeline.pipeline_layout) !=
             vk::Result::eSuccess);
-    pipeline.uses_push_descriptors = true;
+    pipeline.uses_push_descriptors = push_descriptors;
     return pipeline;
   }
 
@@ -3289,6 +3411,116 @@ public:
     scheduler.Finish();
     RenderExecutorTestAccess::DestroyDescriptorPipelines(
         context.GetRenderExecutor(), std::span {&pipeline, 1u});
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
+  // Commits two stages that carry samplers, buffer arrays, GDS, SRT, shader data and shared
+  // memory bindings, through both the push descriptor and the descriptor set path. The rows were
+  // captured from CommitBindings as it was before it was split, with samplers and buffer views
+  // labelled by their owner in the prepared bindings.
+  void CheckGraphicsDescriptorKinds() {
+    constexpr const char *name = "GraphicsDescriptorKinds";
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    auto &executor = context.GetRenderExecutor();
+    using Kind = ShaderRecompiler::IR::DescriptorBindingKind;
+    const auto enable = [](ShaderModule &module, Kind kind, uint32_t count) {
+      auto &bindings = module.info.bindings;
+      bindings.descriptor_counts[static_cast<size_t>(kind)] = count;
+      bindings.descriptor_mask |= uint64_t{1} << static_cast<size_t>(kind);
+    };
+    constexpr uint32_t vertex_push_dword = 2;
+    ShaderModule vertex_module;
+    vertex_module.info.stage = ShaderType::Vertex;
+    vertex_module.info.bindings.push_data_start_dword = vertex_push_dword;
+    enable(vertex_module, Kind::Buffers, 2);
+    enable(vertex_module, Kind::Samplers, 2);
+    enable(vertex_module, Kind::Gds, 1);
+    enable(vertex_module, Kind::FlattenedSrt, 1);
+    enable(vertex_module, Kind::ShaderData, 1);
+    ShaderModule pixel_module;
+    pixel_module.info.stage = ShaderType::Pixel;
+    pixel_module.info.bindings.push_data_start_dword = 0;
+    enable(pixel_module, Kind::Samplers, 1);
+    enable(pixel_module, Kind::ShaderData, 1);
+    enable(pixel_module, Kind::SharedMemory, 1);
+    const ShaderStageRuntime vertex_runtime{&vertex_module, nullptr};
+    const ShaderStageRuntime pixel_runtime{&pixel_module, nullptr};
+
+    std::array<vk::Sampler, 3> samplers{};
+    const vk::SamplerCreateInfo sampler_info{};
+    for (auto &sampler : samplers) {
+      EXIT_IF(m_device.createSampler(&sampler_info, nullptr, &sampler) !=
+              vk::Result::eSuccess);
+    }
+    // Distinct offsets and ranges on one real buffer tell the views apart in the rows. Offsets are
+    // multiples of 256 so they meet any device's storage buffer offset alignment.
+    const auto buffer = context.GetBufferCache().GetGdsBuffer()->Handle();
+    PreparedBindings vertex;
+    vertex.runtime = &vertex_runtime;
+    vertex.samplers = {samplers[0], samplers[1]};
+    vertex.buffers = {{buffer, 0x100, 0x10}, {buffer, 0x200, 0x20}};
+    vertex.gds = {buffer, 0x300, 0x20};
+    vertex.flattened_srt = {buffer, 0x400, 0x20};
+    vertex.shader_data_buffer = {buffer, 0x500, 0x40};
+    vertex.shader_data = {0x11111111u, 0x22222222u};
+    PreparedBindings pixel;
+    pixel.runtime = &pixel_runtime;
+    pixel.samplers = {samplers[2]};
+    pixel.shader_data_buffer = {buffer, 0x600, 0x40};
+    pixel.shared_memory = {buffer, 0x700, 0x8};
+    pixel.shader_data = {0x33333333u, 0x44444444u};
+    std::array<PreparedBindings *, 2> stages{&vertex, &pixel};
+
+    const std::vector<std::string> push_row = {
+        "image[0] view=null sampler=s0.k0 layout=Undefined",
+        "image[1] view=null sampler=s0.k1 layout=Undefined",
+        "image[2] view=null sampler=s1.k0 layout=Undefined",
+        "write bind=0 StorageBuffer n=2 images=- buffers=s0.buffers +256/16 +512/32 set=no",
+        "write bind=51 Sampler n=2 images=0 buffers=- set=no",
+        "write bind=52 StorageBuffer n=1 images=- buffers=s0.gds +768/32 set=no",
+        "write bind=55 StorageBuffer n=1 images=- buffers=s0.srt +1024/32 set=no",
+        "write bind=56 StorageBuffer n=1 images=- buffers=s0.shader_data +1280/64 set=no",
+        "write bind=109 Sampler n=1 images=2 buffers=- set=no",
+        "write bind=114 StorageBuffer n=1 images=- buffers=s1.shader_data +1536/64 set=no",
+        "write bind=115 StorageBuffer n=1 images=- buffers=s1.shared_memory +1792/8 set=no",
+      };
+    const std::vector<std::string> set_row = {
+        "image[0] view=null sampler=s0.k0 layout=Undefined",
+        "image[1] view=null sampler=s0.k1 layout=Undefined",
+        "image[2] view=null sampler=s1.k0 layout=Undefined",
+        "write bind=0 StorageBuffer n=2 images=- buffers=s0.buffers +256/16 +512/32 set=yes",
+        "write bind=51 Sampler n=2 images=0 buffers=- set=yes",
+        "write bind=52 StorageBuffer n=1 images=- buffers=s0.gds +768/32 set=yes",
+        "write bind=55 StorageBuffer n=1 images=- buffers=s0.srt +1024/32 set=yes",
+        "write bind=56 StorageBuffer n=1 images=- buffers=s0.shader_data +1280/64 set=yes",
+        "write bind=109 Sampler n=1 images=2 buffers=- set=yes",
+        "write bind=114 StorageBuffer n=1 images=- buffers=s1.shader_data +1536/64 set=yes",
+        "write bind=115 StorageBuffer n=1 images=- buffers=s1.shared_memory +1792/8 set=yes",
+      };
+    for (const bool push : {true, false}) {
+      const auto pipeline =
+          RenderExecutorTestAccess::CreateDescriptorPipeline(executor, stages, push);
+      RenderExecutorTestAccess::CommitBindings(executor, scheduler.Current(),
+                                               pipeline, vertex, pixel);
+      Require(name, push ? "push descriptor row" : "descriptor set row",
+              RenderExecutorTestAccess::RowMatches(
+                  push ? "push" : "set",
+                  RenderExecutorTestAccess::DescriptorScratch(executor, stages),
+                  push ? push_row : set_row),
+              "the commit wrote different descriptors than before the split");
+      scheduler.Finish();
+      RenderExecutorTestAccess::DestroyDescriptorPipelines(executor,
+                                                           std::span{&pipeline, 1u});
+    }
+    for (const auto sampler : samplers) {
+      m_device.destroySampler(sampler, nullptr);
+    }
     std::printf("[host]    %-32s ok\n", name);
   }
 
@@ -25533,9 +25765,56 @@ public:
                   texture_cache.GetImage(storage_id).IsGpuModified(),
               "the production graphics binding path did not complete vertex "
               "storage acquisition before pixel sampling");
+      // The descriptor scratch of the last write, then for each bound image the layout recorded in
+      // its binding and the CPU-tracked layout and access of its backing, as readable lines.
+      const auto capture_scenario = [&](std::span<PreparedBindings *const> stages) {
+        auto lines = RenderExecutorTestAccess::DescriptorScratch(executor, stages);
+        for (size_t stage = 0; stage < stages.size(); ++stage) {
+          const auto &images = stages[stage]->images;
+          for (size_t image = 0; image < images.size(); ++image) {
+            const auto &binding = images[image];
+            auto line = "binding s" + std::to_string(stage) + ".i" +
+                        std::to_string(image) + " layout=" + vk::to_string(binding.layout);
+            if (binding.image_id) {
+              const auto &state = texture_cache.GetImage(binding.image_id).backing.state;
+              line += " backing=" + vk::to_string(state.layout) +
+                      " access=" + vk::to_string(state.access_mask);
+            }
+            lines.push_back(line);
+          }
+        }
+        return lines;
+      };
+      // Rows captured by running these scenarios through CommitBindings as it was at a8d870ac,
+      // before the split. They pin the image and sampler descriptors, buffer views, and the
+      // CPU-tracked image state. Push constant bytes are written straight to the command buffer
+      // and are not pinned.
+      const std::vector<std::string> storage_then_sampled_row = {
+        "image[0] view=s0.i0.m0 sampler=null layout=General",
+        "image[1] view=s1.i0.m0 sampler=null layout=General",
+        "write bind=37 StorageImage n=1 images=0 buffers=- set=no",
+        "write bind=68 SampledImage n=1 images=1 buffers=- set=no",
+        "binding s0.i0 layout=General backing=General access={ ShaderRead | ShaderWrite }",
+        "binding s1.i0 layout=General backing=General access={ ShaderRead | ShaderWrite }",
+      };
+      const std::vector<std::string> sampled_then_storage_row = {
+        "image[0] view=s0.i0.m0 sampler=null layout=General",
+        "image[1] view=s1.i0.m0 sampler=null layout=General",
+        "write bind=10 SampledImage n=1 images=0 buffers=- set=no",
+        "write bind=95 StorageImage n=1 images=1 buffers=- set=no",
+        "binding s0.i0 layout=General backing=General access={ ShaderRead | ShaderWrite }",
+        "binding s1.i0 layout=General backing=General access={ ShaderRead | ShaderWrite }",
+      };
       descriptor_pipelines.push_back(RenderExecutorTestAccess::CommitBindings(
           executor, scheduler.Current(), graphics_bindings.vertex[0],
           graphics_bindings.pixel));
+      std::array<PreparedBindings *, 2> first_stages{&graphics_bindings.vertex[0],
+                                                     &graphics_bindings.pixel};
+      Require(name, "storage then sampled commit matches the pre-split row",
+              RenderExecutorTestAccess::RowMatches(
+                  "storage_then_sampled", capture_scenario(first_stages),
+                  storage_then_sampled_row),
+              "the commit recorded different descriptors or image state than before the split");
       Require(name, "early writable alias retention",
               texture_cache.GetImage(storage_id).backing.state.access_mask ==
                   (vk::AccessFlagBits2::eShaderRead |
@@ -25595,6 +25874,58 @@ public:
                    vk::AccessFlagBits2::eShaderWrite),
           "sampled/storage aliases did not retain the promoted general "
           "layout and writable access in both generated descriptors");
+
+      // The combined commit above must match the row captured before the split. The split halves
+      // then run in order on the same bindings with the recorded layouts set to a stale value,
+      // so the transit half must record them again.
+      std::array<PreparedBindings *, 2> split_stages{
+          &writable_alias_bindings.vertex[0], &writable_alias_bindings.pixel};
+      Require(name, "sampled then storage commit matches the pre-split row",
+              RenderExecutorTestAccess::RowMatches(
+                  "sampled_then_storage", capture_scenario(split_stages),
+                  sampled_then_storage_row),
+              "the commit recorded different descriptors or image state than before the split");
+      const std::array<const ShaderModule *, 2> split_modules{
+          split_stages[0]->runtime->module, split_stages[1]->runtime->module};
+      const auto &split_pipeline = descriptor_pipelines.back();
+      // A valid layout that differs from the general one the transit half records.
+      const auto clear_layouts = [&] {
+        for (auto *stage : split_stages) {
+          for (auto &image : stage->images) {
+            image.layout = vk::ImageLayout::eShaderReadOnlyOptimal;
+          }
+        }
+      };
+      // The descriptor half must work from the modules alone, so the runtimes are removed
+      // around it. Reading one then crashes instead of passing by luck.
+      const auto write_without_runtimes = [&] {
+        std::array<const ShaderStageRuntime *, 2> saved_runtimes{
+            split_stages[0]->runtime, split_stages[1]->runtime};
+        split_stages[0]->runtime = nullptr;
+        split_stages[1]->runtime = nullptr;
+        RenderExecutorTestAccess::WriteBindingDescriptors(
+            executor, scheduler.Current(), vk::PipelineBindPoint::eGraphics,
+            split_pipeline, split_stages, split_modules);
+        split_stages[0]->runtime = saved_runtimes[0];
+        split_stages[1]->runtime = saved_runtimes[1];
+      };
+      clear_layouts();
+      write_without_runtimes();
+      const auto descriptors_first_row = capture_scenario(split_stages);
+      clear_layouts();
+      RenderExecutorTestAccess::TransitBindingImages(executor, scheduler.Current(),
+                                                     split_stages);
+      write_without_runtimes();
+      Require(name, "split halves match the pre-split row",
+              RenderExecutorTestAccess::RowMatches(
+                  "split_halves", capture_scenario(split_stages),
+                  sampled_then_storage_row),
+              "transit then descriptor halves wrote different descriptors or image state "
+              "than the combined commit did before the split");
+      Require(name, "split order is observable",
+              descriptors_first_row != sampled_then_storage_row,
+              "writing descriptors before the transit half did not change them, so the "
+              "comparison cannot see the order");
       RenderExecutorTestAccess::ResetBindings(executor);
 
       const std::array<uint32_t, 3> split_mip_data{0x01020304u, 0x05060708u,
@@ -68818,6 +69149,7 @@ int main(int argc, char **argv) {
   vulkan.CheckCubeFaceStorageExpansion();
   if (rasterization) {
     vulkan.CheckGraphicsPushConstantBank();
+    vulkan.CheckGraphicsDescriptorKinds();
     vulkan.CheckRenderExecutorColorDiscovery();
     vulkan.CheckRenderExecutorColor1DArrayDiscovery();
     vulkan.CheckColorResolvePlacedTarget();
