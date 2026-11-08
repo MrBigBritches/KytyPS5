@@ -421,6 +421,43 @@ void TestScopesRespectTheFlag() {
 constexpr int64_t kMs = 1000000; // Nanoseconds per millisecond.
 constexpr double kMaxPlausibleMs = 60.0 * 1000.0; // No test here runs for a minute.
 
+// An empty report writes no waits of draws that could not be deferred, which is the baseline, so
+// each figure below can only come from AddDeferredIneligibleWait. Each row keeps its own reason,
+// stages and wait, the flip is the one running when it was added whatever the caller passed, and
+// the totals sum the waits per reason. Two reasons with different sums show a wait was not added to
+// the wrong reason or counted once per row. Reset forgets both.
+void TestIneligibleWaits() {
+  Report report;
+  const auto empty = nlohmann::json::parse(report.ToJson({}, 0, 1.0, 0.0))["deferred_draws"];
+  Check(empty["ineligible_waits"].empty() && empty["ineligible_waited_ms"].empty(),
+        "an empty report had waits of draws that could not be deferred");
+  report.AddDeferredIneligibleWait({.reason = "non_push", .vs = 0x11, .ps = 0x22, .waited_ms = 686.5, .flip = 99});
+  report.OnFlip(3);
+  report.AddDeferredIneligibleWait(
+      {.reason = "indirect", .vs = 0x33, .ps = 0, .waited_ms = 40.25, .gpu_thread = false});
+  report.AddDeferredIneligibleWait({.reason = "non_push", .vs = 0x44, .ps = 0x55, .waited_ms = 1081.0});
+  const auto section = nlohmann::json::parse(report.ToJson({}, 0, 1.0, 0.0))["deferred_draws"];
+  const auto &rows   = section["ineligible_waits"];
+  Check(rows.size() == 3, "waits of draws that could not be deferred were lost or added");
+  Check(rows[0]["reason"] == "non_push" && rows[0]["flip"] == 0 && rows[0]["vs"] == "0000000000000011" &&
+            rows[0]["ps"] == "0000000000000022" && rows[0]["waited_ms"] == 686.5 &&
+            rows[0]["gpu_thread"] == true,
+        "the first wait row lacks its fields, or kept the caller's flip");
+  Check(rows[1]["reason"] == "indirect" && rows[1]["flip"] == 3 && rows[1]["vs"] == "0000000000000033" &&
+            rows[1]["ps"] == "0000000000000000" && rows[1]["waited_ms"] == 40.25 &&
+            rows[1]["gpu_thread"] == false,
+        "the second wait row lacks its fields");
+  Check(rows[2]["reason"] == "non_push" && rows[2]["vs"] == "0000000000000044" && rows[2]["waited_ms"] == 1081.0,
+        "the third wait row lacks its fields");
+  Check(section["ineligible_waited_ms"].size() == 2 && section["ineligible_waited_ms"]["non_push"] == 1767.5 &&
+            section["ineligible_waited_ms"]["indirect"] == 40.25,
+        "the waits were not summed per reason");
+  report.Reset();
+  const auto cleared = report.Summarize();
+  Check(cleared.deferred_ineligible_waits.empty() && cleared.deferred_ineligible_waited_ms.empty(),
+        "Reset kept the waits of draws that could not be deferred");
+}
+
 // An empty report writes no warm-up take rows, which is the baseline, so each row below can only
 // come from AddWarmTake. Each row keeps its own id, how and stopped time, the flip is the one
 // running when it was added, whatever the caller passed, at_ms counts from the epoch, and a row
@@ -809,6 +846,7 @@ int main() {
   TestJsonContents();
   TestDeferredDrawsSection();
   TestWarmTakeRows();
+  TestIneligibleWaits();
   TestScopesRespectTheFlag();
   TestCompileRowsKeepSubmission();
   TestResumeKeepsStampAndCountsOnce();

@@ -444,20 +444,36 @@ private:
 	// Creates the pipeline on this thread and stores it, as every miss does without background builds.
 	Pipeline& CreateGraphicsPipelineHere(Pipeline& slot, const GraphicsPipelineKey& key,
 	                                     const Stages& stages);
-	// The background-build side of AcquireGraphicsPipeline.
+	// What AcquireBuiltPipeline tells its caller about a draw that missed its pipeline. The caller
+	// sets timed when the report is on, and start is then read just before the draw's fate is chosen,
+	// so the drain of other keys' builds is left out of its wait. blocker is the reason the draw could
+	// not be deferred, or null.
+	struct MissedDraw {
+		bool                                  timed   = false;
+		const char*                           blocker = nullptr;
+		std::chrono::steady_clock::time_point start {};
+	};
+	// The background-build side of AcquireGraphicsPipeline. `missed` is filled in for a draw that
+	// missed its pipeline and left alone otherwise.
 	[[nodiscard]] Pipeline* AcquireBuiltPipeline(const GraphicsPipelineKey& key,
 	                                             const Stages&              stages,
 	                                             const DrawRenderState&     state,
 	                                             const PipelineSkipPolicy*  policy,
-	                                             DeferredDraw*              deferred);
+	                                             DeferredDraw*              deferred,
+	                                             MissedDraw&                missed);
+	// Reports a draw that could not be deferred and then waited for its pipeline, with the time from
+	// the miss until the pipeline was there.
+	static void NoteIneligibleWait(const MissedDraw& missed, const Stages& stages);
 	// The reason a missing pipeline's draw cannot become a hole, or null when it can. The draw's own
 	// state comes from the policy, and the shaders add the image heap and the descriptor kind.
 	[[nodiscard]] const char* DeferBlocker(const Stages&             stages,
 	                                       const PipelineSkipPolicy* policy) const;
 	// What a draw that missed its pipeline does. `may_skip` is set when the S2 rules allow a skip, and
-	// the reason the draw cannot be deferred, if any, is counted whatever the fate turns out to be.
+	// the reason the draw cannot be deferred, if any, is counted whatever the fate turns out to be and
+	// returned in `blocker`, which is null otherwise.
 	[[nodiscard]] DrawFate ChooseMissedDrawFate(const Stages& stages, const PipelineSkipPolicy* policy,
-	                                            const DeferredDraw* deferred, bool& may_skip);
+	                                            const DeferredDraw* deferred, bool& may_skip,
+	                                            const char*& blocker);
 	// Notes that the S2 rules would have skipped a draw that was deferred, to report how long it
 	// waited once its build is done.
 	void NoteDeferredWouldSkip(const std::shared_ptr<GraphicsBuild>& build);

@@ -280,6 +280,19 @@ void Report::AddDeferredIneligible(std::string_view reason) {
 	}
 }
 
+void Report::AddDeferredIneligibleWait(const IneligibleWait& wait) {
+	std::lock_guard lock(m_mutex);
+	m_deferred_ineligible_waits.push_back(wait);
+	m_deferred_ineligible_waits.back().flip = m_flip;
+	const auto found = std::ranges::find(m_deferred_ineligible_waited_ms, wait.reason,
+	                                     &std::pair<std::string, double>::first);
+	if (found == m_deferred_ineligible_waited_ms.end()) {
+		m_deferred_ineligible_waited_ms.emplace_back(wait.reason, wait.waited_ms);
+	} else {
+		found->second += wait.waited_ms;
+	}
+}
+
 void Report::AddDeferredWouldSkip(double waited_ms) {
 	std::lock_guard lock(m_mutex);
 	m_deferred_would_skip_draws++;
@@ -352,6 +365,8 @@ void Report::Reset() {
 	m_deferred_resolves_per_flip.clear();
 	m_deferred_resolves_this_flip   = 0;
 	m_deferred_ineligible.clear();
+	m_deferred_ineligible_waits.clear();
+	m_deferred_ineligible_waited_ms.clear();
 	m_deferred_would_skip_draws     = 0;
 	m_deferred_would_skip_waited_ms = 0.0;
 	m_deferred_warm_inline          = 0;
@@ -404,6 +419,28 @@ size_t PauseBucket(double ms) {
 
 } // namespace
 
+void Report::CopyDeferredLocked(Summary& summary) const {
+	summary.deferred_resolves          = m_deferred_resolves;
+	summary.deferred_resolves_per_flip = m_deferred_resolves_per_flip;
+	// The flip still running has not been pushed by OnFlip, so its resolves are added last.
+	if (m_deferred_resolves_this_flip != 0) {
+		summary.deferred_resolves_per_flip.push_back(m_deferred_resolves_this_flip);
+	}
+	summary.deferred_ineligible                      = m_deferred_ineligible;
+	summary.deferred_ineligible_waits                = m_deferred_ineligible_waits;
+	summary.deferred_ineligible_waited_ms            = m_deferred_ineligible_waited_ms;
+	summary.deferred_would_skip_draws                = m_deferred_would_skip_draws;
+	summary.deferred_would_skip_waited_ms            = m_deferred_would_skip_waited_ms;
+	summary.deferred_warm_inline                     = m_deferred_warm_inline;
+	summary.deferred_warm_inline_over_hold_threshold = m_deferred_warm_inline_over;
+	summary.warm_inline_total                        = m_warm_inline_total;
+	summary.warm_inline_total_ms                     = m_warm_inline_total_ms;
+	summary.warm_inline_total_over_hold_threshold    = m_warm_inline_total_over;
+	summary.warm_waited_count                        = m_warm_waited_count;
+	summary.warm_waited_ms                           = m_warm_waited_ms;
+	summary.warm_waited_over_hold_threshold          = m_warm_waited_over;
+}
+
 Summary Report::Summarize() const {
 	std::lock_guard lock(m_mutex);
 	Summary         summary;
@@ -419,23 +456,7 @@ Summary Report::Summarize() const {
 	summary.skips_by_target     = m_skips_by_target;
 	summary.sampled_after_skip_by_target = m_sampled_after_skip;
 	summary.refusals                     = m_refusals;
-	summary.deferred_resolves            = m_deferred_resolves;
-	summary.deferred_resolves_per_flip   = m_deferred_resolves_per_flip;
-	// The flip still running has not been pushed by OnFlip, so its resolves are added last.
-	if (m_deferred_resolves_this_flip != 0) {
-		summary.deferred_resolves_per_flip.push_back(m_deferred_resolves_this_flip);
-	}
-	summary.deferred_ineligible          = m_deferred_ineligible;
-	summary.deferred_would_skip_draws    = m_deferred_would_skip_draws;
-	summary.deferred_would_skip_waited_ms = m_deferred_would_skip_waited_ms;
-	summary.deferred_warm_inline          = m_deferred_warm_inline;
-	summary.deferred_warm_inline_over_hold_threshold = m_deferred_warm_inline_over;
-	summary.warm_inline_total                        = m_warm_inline_total;
-	summary.warm_inline_total_ms                     = m_warm_inline_total_ms;
-	summary.warm_inline_total_over_hold_threshold    = m_warm_inline_total_over;
-	summary.warm_waited_count                        = m_warm_waited_count;
-	summary.warm_waited_ms                           = m_warm_waited_ms;
-	summary.warm_waited_over_hold_threshold          = m_warm_waited_over;
+	CopyDeferredLocked(summary);
 
 	summary.worst_translate = m_translates;
 	std::ranges::stable_sort(summary.worst_translate,
@@ -551,6 +572,29 @@ nlohmann::json SkipsToJson(const Summary& summary) {
 	        {"refused", refused}};
 }
 
+// Writes one row per draw that could not be deferred and waited for its pipeline.
+nlohmann::json IneligibleWaitsToJson(const std::vector<IneligibleWait>& waits) {
+	nlohmann::json rows = nlohmann::json::array();
+	for (const auto& wait: waits) {
+		rows.push_back({{"reason", wait.reason},
+		                {"flip", wait.flip},
+		                {"vs", Hex(wait.vs)},
+		                {"ps", Hex(wait.ps)},
+		                {"waited_ms", Round3(wait.waited_ms)},
+		                {"gpu_thread", wait.gpu_thread}});
+	}
+	return rows;
+}
+
+// Writes the waits of the draws that could not be deferred, summed per reason.
+nlohmann::json IneligibleWaitedMsToJson(const std::vector<std::pair<std::string, double>>& totals) {
+	nlohmann::json waited = nlohmann::json::object();
+	for (const auto& [reason, ms]: totals) {
+		waited[reason] = Round3(ms);
+	}
+	return waited;
+}
+
 // Writes the deferred-draw figures, which are empty or zero unless --deferred-pipeline-draws ran.
 nlohmann::json DeferredToJson(const Summary& summary) {
 	nlohmann::json resolves = nlohmann::json::array();
@@ -580,6 +624,8 @@ nlohmann::json DeferredToJson(const Summary& summary) {
 	return {{"resolves", resolves},
 	        {"resolves_per_flip", summary.deferred_resolves_per_flip},
 	        {"ineligible", ineligible},
+	        {"ineligible_waited_ms", IneligibleWaitedMsToJson(summary.deferred_ineligible_waited_ms)},
+	        {"ineligible_waits", IneligibleWaitsToJson(summary.deferred_ineligible_waits)},
 	        {"s2_would_skip",
 	         {{"draws", summary.deferred_would_skip_draws},
 	          {"waited_ms", Round3(summary.deferred_would_skip_waited_ms)}}},

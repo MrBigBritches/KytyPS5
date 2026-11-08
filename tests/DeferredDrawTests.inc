@@ -389,6 +389,29 @@
 
   using IneligibleCounts = std::vector<std::pair<std::string, uint32_t>>;
 
+  // A draw that blocked compiled its own pipeline, so the report's one wait names that compile's
+  // stages and lasted at least as long. A row with no time, the wrong stages or another reason
+  // fails, and so does a total that is not the row's own wait.
+  void CheckOneIneligibleWait(const char *name, const std::string &reason) {
+    const auto  summary  = Common::FirstRunReport::Global().Summarize();
+    const auto  compiles = Common::FirstRunReport::Global().Compiles();
+    const auto &waits    = summary.deferred_ineligible_waits;
+    const bool  matched =
+        waits.size() == 1 && std::ranges::any_of(compiles, [&](const auto &compile) {
+          return compile.kind == Common::FirstRunReport::Kind::Graphics && compile.id == waits[0].vs &&
+                 compile.id_ps == waits[0].ps && compile.create_ms > 0.0 &&
+                 compile.create_ms <= waits[0].waited_ms;
+        });
+    // The rig draws off the GPU thread, so the row must say so. A row that always claims the GPU
+    // thread fails.
+    Require(name, "ineligible wait",
+            matched && waits[0].reason == reason && waits[0].gpu_thread == GuestGpu::IsGpuThread() &&
+                !waits[0].gpu_thread && summary.deferred_ineligible_waited_ms.size() == 1 &&
+                summary.deferred_ineligible_waited_ms[0].first == reason &&
+                summary.deferred_ineligible_waited_ms[0].second == waits[0].waited_ms,
+            "the blocked draw's wait was not reported under its reason with its stages and time");
+  }
+
   // A draw that cannot be recorded later blocks as before, and is counted under its reason. Each
   // case has a baseline that differs only in the behaviour under test, and defers.
   void CheckDeferredEligibility() {
@@ -443,6 +466,10 @@
       if (push) {
         Require(name, "push defers", scheduler.PendingHoleCount() == 1 && DeferredIneligible().empty(),
                 "a draw that pushes its descriptors was not deferred");
+        // The baseline for the wait below. A deferred draw waited for nothing.
+        Require(name, "push has no wait",
+                Common::FirstRunReport::Global().Summarize().deferred_ineligible_waits.empty(),
+                "a deferred draw was reported as waiting for its pipeline");
         const auto key = CommandSchedulerTestAccess::HeldHoleKey(scheduler, 1);
         Require(name, "predicted push", PipelineCacheTestAccess::PredictedPush(pipelines, key),
                 "the layout code did not predict push descriptors for the deferred draw");
@@ -456,6 +483,7 @@
                 scheduler.PendingHoleCount() == 0 && DeferredIneligible() == IneligibleCounts{{"non_push", 1}} &&
                     counts[1] == 1 && AllDrawn(rig.ReadColor()),
                 "a draw with a descriptor set was deferred, or not counted under its reason");
+        CheckOneIneligibleWait(name, "non_push");
         hold.release = true;
         scheduler.Finish();
       }
@@ -491,11 +519,14 @@
     }
     // A draw that cannot be deferred is counted under its reason even when an S2 skip then takes it.
     // The same draw is skipped with both flags on, and with an open query it cannot be deferred.
+    // The skipped draw waited for nothing, so it has no wait, where the non-push draw above that
+    // blocked through the same path has one.
     const auto skipped = RunFlagScene(name, true, true, true);
     Require(name, "skip fallback is counted",
             skipped.holes == 0 && skipped.skipped && skipped.summary.skips[0] == 1 &&
-                skipped.summary.deferred_ineligible == IneligibleCounts{{"open_query", 1}},
-            "a draw skipped because it could not be deferred was not counted as ineligible");
+                skipped.summary.deferred_ineligible == IneligibleCounts{{"open_query", 1}} &&
+                skipped.summary.deferred_ineligible_waits.empty(),
+            "a draw skipped because it could not be deferred was not counted as ineligible, or has a wait");
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
@@ -752,11 +783,18 @@
       if (allowed) {
         Require(name, "defers", scheduler.PendingHoleCount() == 1 && DeferredIneligible().empty(),
                 "the draw on an allowed thread was not deferred");
+        // The baseline for the wait below. A deferred draw waited for nothing.
+        Require(name, "deferred has no wait",
+                Common::FirstRunReport::Global().Summarize().deferred_ineligible_waits.empty(),
+                "a deferred draw was reported as waiting for its pipeline");
       } else {
         Require(name, "blocks",
                 scheduler.PendingHoleCount() == 0 && AllDrawn(rig.ReadColor()) &&
                     DeferredIneligible() == IneligibleCounts{{"thread", 1}},
                 "a draw on another thread was deferred, or not counted under its reason");
+        // A reason from the draw's own policy, where non_push in DeferredEligibility comes from the
+        // shaders, so both ways a reason reaches the wait are covered.
+        CheckOneIneligibleWait(name, "thread");
       }
       hold.release = true;
       scheduler.Finish();

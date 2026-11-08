@@ -157,6 +157,22 @@ struct DeferredResolve {
 	double      window_held_ms    = 0.0;
 };
 
+/// One draw that --deferred-pipeline-draws could not defer and that then waited for its pipeline,
+/// either compiling it or waiting for a worker. A draw that an S2 skip took instead waited for
+/// nothing and has no row. vs and ps are the stage ids, as in a compile row. waited_ms runs from the
+/// miss to the pipeline's return, so it also holds the store and driver cache checkpoint that
+/// follow a compile, and the input dump when dumps are on. gpu_thread is false for a draw met off
+/// the GPU thread, whose wait stopped no guest rendering. flip is stamped by the report when the
+/// row is added.
+struct IneligibleWait {
+	std::string reason;
+	uint64_t    vs         = 0;
+	uint64_t    ps         = 0;
+	double      waited_ms  = 0.0;
+	bool        gpu_thread = true;
+	int64_t     flip       = 0;
+};
+
 /// How a dispatch got a module the background warm-up had queued, the first time it used it.
 enum class WarmTakeHow : uint8_t {
 	// A worker had already built it.
@@ -242,6 +258,11 @@ struct Summary {
 	// Draws that --deferred-pipeline-draws could not defer, counted per reason. A draw that an S2 skip
 	// then took is counted too, since the count says it was ineligible and not what became of it.
 	std::vector<std::pair<std::string, uint32_t>>            deferred_ineligible;
+	// The draws above that waited for their pipeline, one row each in the order they happened, and
+	// their waits summed per reason. They show which reasons the draws that waited came from. A draw
+	// that S2 also refused is in skips.refused too, so the two must not be added together.
+	std::vector<IneligibleWait>                              deferred_ineligible_waits;
+	std::vector<std::pair<std::string, double>>              deferred_ineligible_waited_ms;
 	// Deferred draws that the S2 skip rules would have allowed to go without a pipeline. waited_ms
 	// is the time from the draw's hole creation until its build is ready, counted once per draw, so
 	// it compares with skips.refused.*.blocked_ms.
@@ -305,6 +326,9 @@ public:
 	void AddDeferredResolve(const DeferredResolve& resolve);
 	/// Records a draw that --deferred-pipeline-draws could not defer, against the reason.
 	void AddDeferredIneligible(std::string_view reason);
+	/// Records a draw that could not be deferred and waited for its pipeline, and adds the wait to
+	/// its reason's total. The flip field is ignored and replaced by the current flip.
+	void AddDeferredIneligibleWait(const IneligibleWait& wait);
 	/// Records a deferred draw that S2 would have skipped, and how long it waited for its pipeline.
 	void AddDeferredWouldSkip(double waited_ms);
 	/// Records a warm-up compute build that ran inline while the warm-up queue was held, and whether
@@ -345,6 +369,8 @@ private:
 	void FlushPendingPauseLocked(int64_t current_flip);
 	// Adds GPU-thread blocking to the pause of the current flip. Caller holds the lock.
 	void AddBlockedLocked(Kind kind, double ms);
+	// Copies the deferred-draw and warm-up figures into a summary. Caller holds the lock.
+	void CopyDeferredLocked(Summary& summary) const;
 	// Pauses including the one still being merged. Caller holds the lock.
 	[[nodiscard]] std::vector<Pause> AllPausesLocked() const;
 
@@ -376,6 +402,8 @@ private:
 	std::vector<uint32_t>                         m_deferred_resolves_per_flip;
 	uint32_t                                      m_deferred_resolves_this_flip = 0;
 	std::vector<std::pair<std::string, uint32_t>> m_deferred_ineligible;
+	std::vector<IneligibleWait>                   m_deferred_ineligible_waits;
+	std::vector<std::pair<std::string, double>>   m_deferred_ineligible_waited_ms;
 	uint32_t                                      m_deferred_would_skip_draws = 0;
 	double                                        m_deferred_would_skip_waited_ms = 0.0;
 	uint32_t                                      m_deferred_warm_inline = 0;
@@ -501,6 +529,13 @@ inline void AddWarmTake(const WarmTake& take) {
 inline void AddDeferredIneligible(std::string_view reason) {
 	if (Enabled()) {
 		Global().AddDeferredIneligible(reason);
+	}
+}
+
+/// Records a draw that could not be deferred and waited for its pipeline.
+inline void AddDeferredIneligibleWait(const IneligibleWait& wait) {
+	if (Enabled()) {
+		Global().AddDeferredIneligibleWait(wait);
 	}
 }
 
