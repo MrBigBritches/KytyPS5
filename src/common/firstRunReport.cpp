@@ -140,6 +140,16 @@ BootInfo Report::Boot() const {
 	return m_boot;
 }
 
+void Report::SetPipelineLibrary(const PipelineLibraryInfo& info) {
+	std::lock_guard lock(m_mutex);
+	m_pipeline_library = info;
+}
+
+PipelineLibraryInfo Report::PipelineLibrary() const {
+	std::lock_guard lock(m_mutex);
+	return m_pipeline_library;
+}
+
 void Report::AddBlockedLocked(Kind kind, double ms) {
 	m_blocked_ms[static_cast<size_t>(kind)] += ms;
 	FlushPendingPauseLocked(m_flip);
@@ -348,6 +358,7 @@ void Report::Reset() {
 	m_submissions_per_flip.clear();
 	m_stamp_failures    = 0;
 	m_boot              = {};
+	m_pipeline_library  = {};
 	m_blocked_ms        = {};
 	m_translate_ms      = 0.0;
 	m_translate_gpu_graphics_ms = 0.0;
@@ -676,6 +687,7 @@ std::string Report::ToJson(const Metadata& metadata, uint64_t audio_holds, doubl
 	const auto summary  = Summarize();
 	const auto compiles = Compiles();
 	const auto boot     = Boot();
+	const auto library  = PipelineLibrary();
 	int64_t    epoch_ns = NO_TIME_NS;
 	{
 		std::lock_guard lock(m_mutex);
@@ -702,6 +714,7 @@ std::string Report::ToJson(const Metadata& metadata, uint64_t audio_holds, doubl
 	    {"cold_stamp_failures", summary.stamp_failures},
 	    {"partial", metadata.partial},
 	    {"boot", BootToJson(boot)},
+	    {"graphics_pipeline_library", {{"active", library.active}, {"inactive_reason", library.inactive_reason}}},
 	    {"play", PlayToJson(summary)},
 	    {"pauses", PausesToJson(summary)},
 	    {"compiles", compile_rows},

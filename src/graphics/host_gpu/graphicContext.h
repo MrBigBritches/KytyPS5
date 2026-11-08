@@ -31,6 +31,9 @@ struct GraphicContext {
 	bool                               compute_subgroup_size_control_enabled = false;
 	bool                               shader_image_int64_atomics_enabled    = false;
 	bool                               attachment_feedback_loop_enabled      = false;
+	// Graphics pipelines may be built from GPL libraries and fast linked. Only with
+	// --graphics-pipeline-library and a device that meets every requirement.
+	bool                               graphics_pipeline_library_enabled     = false;
 	bool                               provoking_vertex_last_enabled         = false;
 	bool                               maintenance8_enabled                  = false;
 	bool                               robust_buffer_access_enabled          = false;

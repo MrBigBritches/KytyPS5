@@ -576,6 +576,9 @@ add_executable(pipeline_build_queue_tests EXCLUDE_FROM_ALL
 target_link_libraries(pipeline_build_queue_tests common fmt::fmt)
 target_include_directories(pipeline_build_queue_tests PRIVATE ${inc_headers})
 
+add_executable(pipeline_library_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/PipelineLibraryTests.cpp")
+target_include_directories(pipeline_library_tests PRIVATE ${inc_headers})
+
 add_executable(ces_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/CesTests.cpp")
 target_link_libraries(ces_tests common fmt::fmt SDL3::SDL3-static)
 target_include_directories(ces_tests PRIVATE ${inc_headers})
@@ -723,6 +726,8 @@ if(BUILD_TESTING)
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --pause-warm-up-for-draws)
 	add_test(NAME emulator_deferred_non_push_draws_cli
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --deferred-non-push-draws)
+	add_test(NAME emulator_graphics_pipeline_library_cli
+	         COMMAND $<TARGET_FILE:kyty_emulator> --help --graphics-pipeline-library)
 	add_test(NAME emulator_skip_redundant_unmap_drains_cli
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --skip-redundant-unmap-drains)
 	add_test(NAME emulator_keep_gpu_cache_on_reuse_cli
@@ -782,6 +787,7 @@ if(BUILD_TESTING)
 	add_test(NAME pipeline_build_queue COMMAND $<TARGET_FILE:pipeline_build_queue_tests>)
 	# A lost wakeup or a job run twice shows up as a hang, so fail fast.
 	set_tests_properties(pipeline_build_queue PROPERTIES TIMEOUT 60)
+	add_test(NAME pipeline_library COMMAND $<TARGET_FILE:pipeline_library_tests>)
 	add_test(NAME ces COMMAND $<TARGET_FILE:ces_tests>)
 	add_test(NAME save_data_dialog COMMAND $<TARGET_FILE:save_data_dialog_tests>)
 	add_test(NAME http_uri_parse COMMAND $<TARGET_FILE:http_uri_parse_tests>)
@@ -922,6 +928,7 @@ if(BUILD_TESTING)
 		jpeg_enc_tests
 		occlusion_queries_tests
 		pipeline_build_queue_tests
+		pipeline_library_tests
 		ces_tests
 		save_data_dialog_tests
 		http_uri_parse_tests

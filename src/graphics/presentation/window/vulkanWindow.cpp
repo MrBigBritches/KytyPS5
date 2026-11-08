@@ -2,11 +2,13 @@
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
+#include "common/firstRunReport.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineLibrary.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -377,6 +379,49 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 	out_queue_family = best_queue_family;
 }
 
+// Queries what --graphics-pipeline-library needs. The query is its own, so the device's shared
+// feature and property chains stay as they were, and with the flag off nothing is asked.
+static PipelineLibrarySupport QueryPipelineLibrarySupport(
+    vk::PhysicalDevice physical_device, const std::vector<vk::ExtensionProperties>& available) {
+	PipelineLibrarySupport support {.flag = Config::GraphicsPipelineLibraryEnabled()};
+	if (!support.flag) {
+		return support;
+	}
+	support.extensions = HasExtension(available, VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME) &&
+	                     HasExtension(available, VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
+	if (!support.extensions) {
+		return support;
+	}
+	vk::StructureChain<vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT>
+	    features;
+	physical_device.getFeatures2(&features.get<vk::PhysicalDeviceFeatures2>());
+	support.feature =
+	    features.get<vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT>().graphicsPipelineLibrary == VK_TRUE;
+	vk::StructureChain<vk::PhysicalDeviceProperties2, vk::PhysicalDeviceGraphicsPipelineLibraryPropertiesEXT>
+	    properties;
+	physical_device.getProperties2(&properties.get<vk::PhysicalDeviceProperties2>());
+	const auto& library = properties.get<vk::PhysicalDeviceGraphicsPipelineLibraryPropertiesEXT>();
+	support.fast_linking              = library.graphicsPipelineLibraryFastLinking == VK_TRUE;
+	support.independent_interpolation = library.graphicsPipelineLibraryIndependentInterpolationDecoration == VK_TRUE;
+	return support;
+}
+
+// Decides whether pipelines may be built from libraries, and if so adds the two extensions. Only a
+// device meeting every requirement gets them, so any other takes the path it always took. The
+// answer is logged and goes to the first-run report, so a run can tell asked for from in use.
+static bool EnablePipelineLibrary(vk::PhysicalDevice                          physical_device,
+                                  const std::vector<vk::ExtensionProperties>& available,
+                                  std::vector<const char*>&                   device_extensions) {
+	const char* blocker = GraphicsPipelineLibraryBlocker(QueryPipelineLibrarySupport(physical_device, available));
+	if (blocker == nullptr) {
+		device_extensions.push_back(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
+		device_extensions.push_back(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
+	}
+	LOGF("Vulkan graphics pipeline library: %s\n", blocker == nullptr ? "on" : blocker);
+	Common::FirstRunReport::SetPipelineLibrary(blocker == nullptr, blocker == nullptr ? "" : blocker);
+	return blocker == nullptr;
+}
+
 static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
                                      std::vector<const char*> device_extensions) {
 	const auto physical_device = graphics.physical_device;
@@ -447,6 +492,8 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	if (!add(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME)) {
 		supported.unlink<vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR>();
 	}
+	graphics.graphics_pipeline_library_enabled =
+	    EnablePipelineLibrary(physical_device, available_extensions, device_extensions);
 	Vr::OpenXrAppendExtensions(device_extensions, available_extensions, true);
 	physical_device.getFeatures2(&supported2);
 	const bool barycentric_supported = barycentric.fragmentShaderBarycentric == VK_TRUE;
@@ -618,7 +665,11 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	    // The renderer only uses the Vulkan 1.3 core dynamic states, but RADV (Mesa 26.3) creates
 	    // its PS epilog cache only when this EXT feature is enabled and crashes in vkCmdDraw when
 	    // a depth- or stencil-writing fragment shader needs an epilog.
-	    vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT {.extendedDynamicState = VK_TRUE}};
+	    vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT {.extendedDynamicState = VK_TRUE},
+	    vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT {.graphicsPipelineLibrary = VK_TRUE}};
+	if (!graphics.graphics_pipeline_library_enabled) {
+		create.unlink<vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT>();
+	}
 	if (!workgroup_layout.workgroupMemoryExplicitLayout) {
 		create.unlink<vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR>();
 	}

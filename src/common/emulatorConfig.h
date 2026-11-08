@@ -123,6 +123,9 @@ struct ConfigOptions {
 	// Lets a draw whose descriptors go in a descriptor set, not pushed, be deferred too. Its set is
 	// allocated and written when the hole is recorded. Needs --deferred-pipeline-draws.
 	bool                   deferred_non_push_draws_enabled = false;
+	// Asks for graphics pipelines built from separately compiled stage libraries, so a stage shared
+	// by several pipelines compiles once. It does nothing on a device that misses any requirement.
+	bool                   graphics_pipeline_library_enabled = false;
 	// Lets the GPU start on a long command stream instead of idling until the end-of-slice submit.
 	bool                   gpu_submit_cadence_enabled  = false;
 	// Opts in to the host GPU's float min/max on non-AMD GPUs. It is faster, but the sign of a zero
@@ -233,6 +236,9 @@ bool PauseWarmUpForDrawsEnabled();
 /// True when --deferred-non-push-draws lets draws with a descriptor set be deferred. It does nothing
 /// without --deferred-pipeline-draws.
 bool DeferredNonPushDrawsEnabled();
+/// True when --graphics-pipeline-library asks for pipelines built from stage libraries. The device
+/// decides whether that happens.
+bool GraphicsPipelineLibraryEnabled();
 bool GpuSubmitCadenceEnabled();
 /// Returns whether non-AMD GPUs may use the host's float min/max instead of the exact emulation.
 bool NativeFloatMinMaxEnabled();

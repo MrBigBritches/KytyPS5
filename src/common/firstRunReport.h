@@ -212,6 +212,14 @@ struct BootInfo {
 	uint32_t pipelines  = 0;
 };
 
+/// Whether graphics pipelines may be built from libraries on this device. --graphics-pipeline-library
+/// in the flags only says it was asked for. inactive_reason names the first requirement the device
+/// missed, and is empty when active or when the device was never asked.
+struct PipelineLibraryInfo {
+	bool        active = false;
+	std::string inactive_reason;
+};
+
 /// Identity of the run, written at the top of the file.
 struct Metadata {
 	std::string                                title_id;
@@ -297,6 +305,10 @@ public:
 	void OnFlip(int64_t flip);
 	/// Stores what the boot warm-up did.
 	void SetBoot(const BootInfo& boot);
+	/// Stores whether the device builds pipelines from libraries.
+	void SetPipelineLibrary(const PipelineLibraryInfo& info);
+	/// What SetPipelineLibrary stored.
+	[[nodiscard]] PipelineLibraryInfo PipelineLibrary() const;
 	/// Records a miss-path translation. Only GPU-thread time during play counts as blocked.
 	void AddTranslate(Kind kind, std::string_view stage, uint64_t hash, double ms, Thread thread);
 	/// Records a driver compile. Only GPU-thread time during play counts as blocked. start_ns is
@@ -385,6 +397,7 @@ private:
 	std::vector<uint32_t>        m_submissions_per_flip;
 	uint32_t                     m_stamp_failures = 0;
 	BootInfo                     m_boot;
+	PipelineLibraryInfo          m_pipeline_library;
 	std::array<double, 2>        m_blocked_ms {};
 	double                       m_translate_ms = 0.0;
 	double                       m_translate_gpu_graphics_ms = 0.0;
@@ -475,6 +488,13 @@ inline void SetPhase(Phase phase) {
 inline void SetBoot(const BootInfo& boot) {
 	if (Enabled()) {
 		Global().SetBoot(boot);
+	}
+}
+
+/// Stores whether the device builds pipelines from libraries, and if not, why not.
+inline void SetPipelineLibrary(bool active, std::string_view inactive_reason) {
+	if (Enabled()) {
+		Global().SetPipelineLibrary({.active = active, .inactive_reason = std::string(inactive_reason)});
 	}
 }
 

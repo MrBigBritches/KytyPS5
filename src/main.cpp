@@ -94,6 +94,8 @@ static void PrintUsage() {
 	         "                                       --deferred-pipeline-draws (experimental).\n");
 	::printf("  --deferred-non-push-draws            Also defer draws whose descriptors are not pushed.\n"
 	         "                                       Needs --deferred-pipeline-draws (experimental).\n");
+	::printf("  --graphics-pipeline-library          Enable graphics pipeline libraries on GPUs that link\n"
+	         "                                       them fast, to share stage compiles (experimental).\n");
 	::printf("  --gpu-submit-cadence                 Submit GPU work periodically while a long command\n"
 	         "                                       stream records, so the GPU starts sooner.\n");
 	::printf("  --native-float-minmax                Use the host GPU's float min/max on non-AMD GPUs.\n"
@@ -251,6 +253,7 @@ static constexpr Flag FLAGS[] = {
     {"--deferred-pipeline-draws", &ConfigOptions::deferred_pipeline_draws_enabled},
     {"--pause-warm-up-for-draws", &ConfigOptions::pause_warm_up_for_draws_enabled},
     {"--deferred-non-push-draws", &ConfigOptions::deferred_non_push_draws_enabled},
+    {"--graphics-pipeline-library", &ConfigOptions::graphics_pipeline_library_enabled},
     {"--gpu-submit-cadence", &ConfigOptions::gpu_submit_cadence_enabled},
     {"--native-float-minmax", &ConfigOptions::native_float_min_max_enabled},
     {"--command-buffer-dump", &ConfigOptions::command_buffer_dump_enabled},

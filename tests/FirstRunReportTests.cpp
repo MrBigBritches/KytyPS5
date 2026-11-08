@@ -421,6 +421,26 @@ void TestScopesRespectTheFlag() {
 constexpr int64_t kMs = 1000000; // Nanoseconds per millisecond.
 constexpr double kMaxPlausibleMs = 60.0 * 1000.0; // No test here runs for a minute.
 
+// A report whose device was never asked says pipeline libraries are not active, with no reason,
+// which is the baseline. An inactive device's reason and an active device are each written as
+// stored, so a report cannot claim libraries a device refused. Reset forgets the answer.
+void TestPipelineLibraryState() {
+  Report report;
+  const auto empty = nlohmann::json::parse(report.ToJson({}, 0, 1.0, 0.0))["graphics_pipeline_library"];
+  Check(empty["active"] == false && empty["inactive_reason"] == "",
+        "a report whose device was never asked claimed pipeline libraries");
+  report.SetPipelineLibrary({.active = false, .inactive_reason = "fast linking is missing"});
+  const auto refused = nlohmann::json::parse(report.ToJson({}, 0, 1.0, 0.0))["graphics_pipeline_library"];
+  Check(refused["active"] == false && refused["inactive_reason"] == "fast linking is missing",
+        "the reason a device refused pipeline libraries was not written");
+  report.SetPipelineLibrary({.active = true});
+  const auto active = nlohmann::json::parse(report.ToJson({}, 0, 1.0, 0.0))["graphics_pipeline_library"];
+  Check(active["active"] == true && active["inactive_reason"] == "",
+        "an active device was not written as active");
+  report.Reset();
+  Check(!report.PipelineLibrary().active, "Reset kept the pipeline library state");
+}
+
 // An empty report writes no waits of draws that could not be deferred, which is the baseline, so
 // each figure below can only come from AddDeferredIneligibleWait. Each row keeps its own reason,
 // stages and wait, the flip is the one running when it was added whatever the caller passed, and
@@ -847,6 +867,7 @@ int main() {
   TestDeferredDrawsSection();
   TestWarmTakeRows();
   TestIneligibleWaits();
+  TestPipelineLibraryState();
   TestScopesRespectTheFlag();
   TestCompileRowsKeepSubmission();
   TestResumeKeepsStampAndCountsOnce();
