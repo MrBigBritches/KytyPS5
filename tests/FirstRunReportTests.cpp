@@ -138,7 +138,7 @@ void TestReadyRows() {
   Check(rows.size() == 1 && rows[0].id == 0x11 && rows[0].id_ps == 0x22 &&
             Near(rows[0].ready_ms, 42.5) && rows[0].skipped_draws == 3,
         "the ready row lost a field");
-  const auto json = report.ToJson({}, 0, 1.0);
+  const auto json = report.ToJson({}, 0, 1.0, 0.0);
   for (const char *needle : {"\"ready\"", "\"ready_ms\": 42.5", "\"skipped_draws\": 3",
                              "\"vs\": \"0000000000000011\""}) {
     Check(json.find(needle) != std::string::npos, needle);
@@ -163,7 +163,7 @@ void TestSampledAfterSkip() {
             summary.sampled_after_skip_by_target[0].second == 5 &&
             summary.sampled_after_skip_by_target[1].second == 1,
         "sampled skips were not summed per target class");
-  const auto json = report.ToJson({}, 0, 1.0);
+  const auto json = report.ToJson({}, 0, 1.0, 0.0);
   Check(json.find("\"sampled_after_skip_by_target_class\"") != std::string::npos &&
             json.find("\"depth\": 5") != std::string::npos,
         "the file lacks the sampled skip counts");
@@ -184,7 +184,7 @@ void TestRefusalsAndBlockedTotals() {
             summary.refusals[0].draws == 2 && Near(summary.refusals[0].blocked_ms, 15.0) &&
             summary.refusals[1].draws == 1 && Near(summary.refusals[1].blocked_ms, 1.5),
         "refusals were not summed per rule");
-  const auto json = report.ToJson({}, 0, 1.0);
+  const auto json = report.ToJson({}, 0, 1.0, 0.0);
   for (const char *needle : {"\"refused\"", "\"too_few_draws\"", "\"draws\": 2",
                              "\"blocked_ms\": 15.0"}) {
     Check(json.find(needle) != std::string::npos, needle);
@@ -281,13 +281,13 @@ void TestJsonContents() {
       .title_id = "PPSA00000", .build = "test-build", .flags = {{"--a", true}, {"--b", false}},
       .cold = true, .partial = true};
   report.AddStampFailure();
-  const auto json = report.ToJson(metadata, 7, 12.5);
+  const auto json = report.ToJson(metadata, 7, 12.5, 2500.5);
   for (const char *needle :
        {"\"title_id\": \"PPSA00000\"", "\"build\": \"test-build\"", "\"--a\": true",
         "\"--b\": false", "\"cold\": true", "\"warm_up_ms\": 1234.5", "\"blocked_ms\"",
         "\"worst_translate\"", "\"pause_histogram\"", "\"longest_pause_ms\": 321.0",
         "\"vs\": \"00000000000000ab\"", "\"ps\": \"00000000000000cd\"",
-        "\"id\": \"00000000000000ef\"", "\"thread\": \"worker\"", "\"audio_holds\": 7",
+        "\"id\": \"00000000000000ef\"", "\"thread\": \"worker\"", "\"audio_holds\": 7", "\"audio_held_ms\": 2500.5",
         "\"run_seconds\": 12.5", "\"flips\": 1,", "\"partial\": true",
         "\"cold_stamp_failures\": 1"}) {
     if (json.find(needle) == std::string::npos) {
@@ -302,11 +302,17 @@ void TestJsonContents() {
 // with their own numbers, so only the recording can have put them there, and Reset forgets them.
 void TestDeferredDrawsSection() {
   Report report;
-  const auto empty = nlohmann::json::parse(report.ToJson({}, 0, 1.0))["deferred_draws"];
+  const auto empty = nlohmann::json::parse(report.ToJson({}, 0, 1.0, 0.0))["deferred_draws"];
   Check(empty["resolves"].empty() && empty["resolves_per_flip"].empty() &&
             empty["ineligible"].empty() && empty["s2_would_skip"]["draws"] == 0 &&
             empty["s2_would_skip"]["waited_ms"] == 0.0,
         "an empty report had deferred-draw figures");
+  Check(empty["warm_inline"]["during_pause"] == 0 && empty["warm_inline"]["over_hold_threshold"] == 0 &&
+            empty["warm_inline"]["total"] == 0 && empty["warm_inline"]["total_ms"] == 0.0 &&
+            empty["warm_inline"]["total_over_hold_threshold"] == 0 &&
+            empty["warm_waited"]["count"] == 0 && empty["warm_waited"]["ms"] == 0.0 &&
+            empty["warm_waited"]["over_hold_threshold"] == 0,
+        "an empty report had warm-up builds");
 
   // The first resolve runs in submission 9 of flip 0, so it carries both.
   Common::FirstRunReport::SubmissionStamp stamp;
@@ -314,7 +320,9 @@ void TestDeferredDrawsSection() {
   report.BeginSubmission(stamp, true);
   report.AddDeferredResolve({.trigger = "fault", .holes = 3, .distinct_keys = 2,
                              .resolve_wait_ms = 12.5, .record_ms = 3.5, .pre_resolve_ms = 7.5,
-                             .save_ms = 0.5, .hold_count_change = 4});
+                             .save_ms = 0.5, .hold_count_change = 4,
+                             .window_hold_count_change = 6, .held_ms = 2.5,
+                             .window_held_ms = 40.5});
   report.EndSubmission();
   report.AddDeferredResolve({.trigger = "submit", .holes = 1});
   report.OnFlip(1);
@@ -326,6 +334,14 @@ void TestDeferredDrawsSection() {
   report.AddDeferredIneligible("image_heap");
   report.AddDeferredWouldSkip(4.0);
   report.AddDeferredWouldSkip(2.5);
+  report.AddDeferredWarmInline(false);
+  report.AddDeferredWarmInline(true);
+  report.AddDeferredWarmInline(true);
+  report.AddWarmCompute(false, 10.0, false);
+  report.AddWarmCompute(false, 300.0, true);
+  report.AddWarmCompute(true, 5.5, false);
+  report.AddWarmCompute(true, 260.0, true);
+  report.AddWarmCompute(true, 255.0, true);
 
   const auto summary = report.Summarize();
   Check(summary.deferred_resolves.size() == 3 && summary.deferred_resolves[0].holes == 3,
@@ -338,12 +354,13 @@ void TestDeferredDrawsSection() {
   Check(summary.deferred_would_skip_draws == 2 && Near(summary.deferred_would_skip_waited_ms, 6.5),
         "would-skip draws were not summed");
 
-  const auto section = nlohmann::json::parse(report.ToJson({}, 0, 1.0))["deferred_draws"];
+  const auto section = nlohmann::json::parse(report.ToJson({}, 0, 1.0, 0.0))["deferred_draws"];
   const auto &rows   = section["resolves"];
   Check(rows.size() == 3 && rows[0]["holes"] == 3 && rows[0]["distinct_keys"] == 2 &&
             rows[0]["resolve_wait_ms"] == 12.5 && rows[0]["record_ms"] == 3.5 &&
             rows[0]["pre_resolve_ms"] == 7.5 && rows[0]["save_ms"] == 0.5 &&
-            rows[0]["hold_count_change"] == 4,
+            rows[0]["hold_count_change"] == 4 && rows[0]["window_hold_count_change"] == 6 &&
+            rows[0]["held_ms"] == 2.5 && rows[0]["window_held_ms"] == 40.5,
         "a resolve row lacks its figures");
   Check(rows[0]["flip"] == 0 && rows[1]["flip"] == 0 && rows[2]["flip"] == 2,
         "resolve rows lack the flip they ran in");
@@ -358,6 +375,19 @@ void TestDeferredDrawsSection() {
         "ineligible reasons were not written");
   Check(section["s2_would_skip"]["draws"] == 2 && section["s2_would_skip"]["waited_ms"] == 6.5,
         "would-skip figures were not written");
+  Check(summary.deferred_warm_inline == 3 && summary.deferred_warm_inline_over_hold_threshold == 2 &&
+            section["warm_inline"]["during_pause"] == 3 &&
+            section["warm_inline"]["over_hold_threshold"] == 2,
+        "inline warm-up builds were not counted, or not split by the hold threshold");
+  Check(summary.warm_inline_total == 2 && Near(summary.warm_inline_total_ms, 310.0) &&
+            summary.warm_inline_total_over_hold_threshold == 1 && summary.warm_waited_count == 3 &&
+            Near(summary.warm_waited_ms, 520.5) && summary.warm_waited_over_hold_threshold == 2,
+        "warm-up builds taken by a dispatch were not summed");
+  Check(section["warm_inline"]["total"] == 2 && section["warm_inline"]["total_ms"] == 310.0 &&
+            section["warm_inline"]["total_over_hold_threshold"] == 1 &&
+            section["warm_waited"]["count"] == 3 && section["warm_waited"]["ms"] == 520.5 &&
+            section["warm_waited"]["over_hold_threshold"] == 2,
+        "warm-up builds taken by a dispatch were not written");
 
   report.Reset();
   const auto cleared = report.Summarize();
@@ -429,7 +459,7 @@ void TestCompileRowsKeepSubmission() {
     Check(rows[index].submission == NO_SUBMISSION && rows[index].start_ns == NO_TIME_NS,
           "a worker, boot, untimed or between-submission row took a submission");
   }
-  const auto json = report.ToJson({}, 0, 1.0);
+  const auto json = report.ToJson({}, 0, 1.0, 0.0);
   for (const char *needle : {"\"submission\": 7", "\"queue\": 1", "\"visible_ms\": 250.0",
                              "\"picked_ms\": 150.0", "\"start_ms\": 1000.0"}) {
     Check(json.find(needle) != std::string::npos, needle);
@@ -500,7 +530,7 @@ void TestSubmissionCountsInJson() {
   report.OnFlip(2);
   report.BeginSubmission({.id = 3}, false); // A resume is not counted.
   report.OnFlip(3);
-  const auto json = Compact(report.ToJson({}, 0, 1.0));
+  const auto json = Compact(report.ToJson({}, 0, 1.0, 0.0));
   Check(json.find("\"submissions\":{\"per_flip\":[0,2,0],\"total\":2}") != std::string::npos,
         "the file lacks the submission counts");
   report.Reset();

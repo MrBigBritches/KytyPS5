@@ -155,17 +155,55 @@ void PipelineBuildQueue::WorkerLoop(std::stop_token stop) {
 		LowerCurrentThreadPriority();
 	}
 	std::unique_lock lock(m_mutex);
-	// Once stop is requested the wait returns false only when the queue is empty, and Stop empties
-	// it first.
-	while (m_ready.wait(lock, stop, [this] { return !m_jobs.empty(); })) {
-		const auto job = std::move(m_jobs.front());
-		m_jobs.pop_front();
-		m_active++;
-		lock.unlock();
-		RunIfQueued(*job);
-		lock.lock();
-		m_active--;
+	while (!stop.stop_requested()) {
+		if (m_jobs.empty()) {
+			// Woken by a post or by the stop.
+			m_ready.wait(lock, stop, [this] { return !m_jobs.empty(); });
+		} else if (PausedLocked()) {
+			// A job waits and the queue is paused. Resume, the deadline and the stop all end the wait, and
+			// so does a pause that moved the deadline, since the wait runs to a copy of the old one.
+			const auto deadline = m_pause_deadline;
+			m_ready.wait_until(lock, stop, deadline, [this, deadline] {
+				return !PausedLocked() || m_pause_deadline != deadline;
+			});
+		} else {
+			const auto job = std::move(m_jobs.front());
+			m_jobs.pop_front();
+			m_active++;
+			lock.unlock();
+			RunIfQueued(*job);
+			lock.lock();
+			m_active--;
+		}
 	}
+}
+
+bool PipelineBuildQueue::PausedLocked() const {
+	return m_paused && Clock::now() < m_pause_deadline;
+}
+
+void PipelineBuildQueue::Pause(Clock::time_point deadline) {
+	{
+		std::scoped_lock lock(m_mutex);
+		deadline         = std::min(deadline, Clock::now() + MAX_PAUSE);
+		m_pause_deadline = PausedLocked() ? std::min(m_pause_deadline, deadline) : deadline;
+		m_paused         = true;
+	}
+	// Workers already waiting on a later deadline must wait on this one.
+	m_ready.notify_all();
+}
+
+void PipelineBuildQueue::Resume() {
+	{
+		std::scoped_lock lock(m_mutex);
+		m_paused = false;
+	}
+	m_ready.notify_all();
+}
+
+bool PipelineBuildQueue::Paused() const {
+	std::scoped_lock lock(m_mutex);
+	return PausedLocked();
 }
 
 uint32_t PipelineBuildQueue::Stop() {

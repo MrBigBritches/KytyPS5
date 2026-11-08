@@ -37,6 +37,7 @@ State& GetState() {
 std::atomic<bool>     g_enabled {false};
 std::atomic<uint32_t> g_active_scopes {0};
 std::atomic<uint64_t> g_hold_count {0};
+std::atomic<uint64_t> g_held_ns {0};
 std::atomic<uint64_t> g_scope_count {0};
 
 // A thread that owns a Scope would wait on its own release, so it never waits.
@@ -104,6 +105,7 @@ Scope::~Scope() {
 		const auto held_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
 		    Clock::now() - *stall_first_hold);
 		g_hold_count.fetch_add(1, std::memory_order_relaxed);
+		g_held_ns.fetch_add(static_cast<uint64_t>(held_ns.count()), std::memory_order_relaxed);
 		DebugCounters::Add(DebugCounters::Counter::AudioHolds);
 		DebugCounters::Add(DebugCounters::Counter::AudioHoldNs,
 		                   static_cast<uint64_t>(held_ns.count()));
@@ -171,6 +173,10 @@ bool IsStalled() {
 
 uint64_t HoldCount() {
 	return g_hold_count.load(std::memory_order_relaxed);
+}
+
+uint64_t HeldNs() {
+	return g_held_ns.load(std::memory_order_relaxed);
 }
 
 uint64_t ScopeCount() {

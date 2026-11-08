@@ -116,6 +116,10 @@ struct ConfigOptions {
 	// Lets a draw that misses its graphics pipeline carry on while the pipeline builds, with the
 	// draw recorded afterwards. Stands alone and enables no draw skips.
 	bool                   deferred_pipeline_draws_enabled = false;
+	// Holds the warm-up queue from the first hole of a submission until its resolve ends, so the
+	// resolve's compiles do not compete with the warm-up for cores. Needs --background-warm-up and
+	// --deferred-pipeline-draws, and does nothing without both.
+	bool                   pause_warm_up_for_draws_enabled = false;
 	// Lets the GPU start on a long command stream instead of idling until the end-of-slice submit.
 	bool                   gpu_submit_cadence_enabled  = false;
 	// Opts in to the host GPU's float min/max on non-AMD GPUs. It is faster, but the sign of a zero
@@ -221,6 +225,8 @@ bool AsyncPipelinesDepthOnly();
 bool BackgroundWarmUpEnabled();
 /// True when --deferred-pipeline-draws lets draws wait for their pipeline out of line.
 bool DeferredPipelineDrawsEnabled();
+/// True when --pause-warm-up-for-draws holds the warm-up queue while deferred draws resolve.
+bool PauseWarmUpForDrawsEnabled();
 bool GpuSubmitCadenceEnabled();
 /// Returns whether non-AMD GPUs may use the host's float min/max instead of the exact emulation.
 bool NativeFloatMinMaxEnabled();

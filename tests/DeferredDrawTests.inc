@@ -1272,6 +1272,107 @@
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  // The warm-up queue is held from the first hole of a submission until its resolve ends, and only
+  // with --background-warm-up, --deferred-pipeline-draws and --pause-warm-up-for-draws together.
+  // The queue the deferred draws build on is never the one held. The other combinations of the
+  // warm-up and pause flags, with the same holes, are the baselines that hold nothing.
+  void CheckDeferredWarmPause() {
+    constexpr const char *name = "DeferredWarmPause";
+    for (int flags = 0; flags < 4; ++flags) {
+      const bool warm_flag = (flags & 1) != 0;
+      const bool pause_flag = (flags & 2) != 0;
+      const bool holds = warm_flag && pause_flag;
+      PipelineCacheTestAccess::BuildHold hold;
+      AsyncDrawRig rig(*this, false, false, false, false, true);
+      Config::Load({.printf_direction = Config::LogDirection::Silent, .first_run_report_enabled = true,
+                    .background_warm_up_enabled = warm_flag, .deferred_pipeline_draws_enabled = true,
+                    .pause_warm_up_for_draws_enabled = pause_flag});
+      auto &scheduler = rig.Scheduler();
+      auto &cache = rig.Pipelines();
+      CommandSchedulerTestAccess::AllowThisThread(scheduler);
+      PipelineCacheTestAccess::EnableWarmCompute(cache);
+      rig.PaintSentinels();
+      PipelineCacheTestAccess::HoldBuildQueue(cache, hold);
+      Require(name, "idle", !PipelineCacheTestAccess::WarmPaused(cache), "the warm queue was held with no hole");
+      Require(name, "first hole", rig.Draw() && scheduler.PendingHoleCount() == 1,
+              "the draw was not deferred");
+      Require(name, "held by the first hole", PipelineCacheTestAccess::WarmPaused(cache) == holds,
+              holds ? "the first hole did not hold the warm queue"
+                    : "the warm queue was held without all three flags");
+      Require(name, "not the draws' queue", !PipelineCacheTestAccess::BuildQueuePaused(cache),
+              "the queue the deferred draws build on was held");
+      rig.SetSecondPipeline(true);
+      Require(name, "second hole", rig.Draw() && scheduler.PendingHoleCount() == 2 &&
+                                       PipelineCacheTestAccess::WarmPaused(cache) == holds,
+              "a second hole changed the hold");
+      hold.release = true;
+      scheduler.Flush();
+      Require(name, "released by the resolve",
+              scheduler.PendingHoleCount() == 0 && !PipelineCacheTestAccess::WarmPaused(cache),
+              "the warm queue stayed held after the resolve");
+    }
+    Config::Load({.printf_direction = Config::LogDirection::Silent});
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // How a submission's window is disturbed by a stall of the GPU thread, for the next test.
+  enum class WindowStall { None, Held, UnderThreshold };
+
+  // The holds of guest audio counted for a resolve cover its whole window from the first hole, in
+  // fields of their own, while the resolve's own fields count the resolve alone. A hold that opens
+  // and closes after the first hole and before the resolve shows in the window, both as a count and
+  // as the milliseconds audio was held, and not in the resolve's fields. A stall under the
+  // threshold holds nothing and adds nothing anywhere. The submission with no stall is the baseline.
+  void CheckDeferredWindowHolds() {
+    constexpr const char *name = "DeferredWindowHolds";
+    namespace Stall = Common::GpuStall;
+    constexpr auto parked_for = std::chrono::milliseconds(40);
+    for (const auto stall : {WindowStall::None, WindowStall::Held, WindowStall::UnderThreshold}) {
+      PipelineCacheTestAccess::BuildHold hold;
+      AsyncDrawRig rig(*this, false, false, false, false, true);
+      // An hour is far above any stall of this test, so the stall of the last case holds nothing.
+      Stall::Configure(true, stall == WindowStall::UnderThreshold ? std::chrono::hours(1)
+                                                                  : std::chrono::milliseconds(0));
+      auto &scheduler = rig.Scheduler();
+      CommandSchedulerTestAccess::AllowThisThread(scheduler);
+      rig.PaintSentinels();
+      PipelineCacheTestAccess::HoldBuildQueue(rig.Pipelines(), hold);
+      Common::FirstRunReport::Global().Reset();
+      Require(name, "hole", rig.Draw() && scheduler.PendingHoleCount() == 1, "the draw was not deferred");
+      if (stall != WindowStall::None) {
+        std::thread audio;
+        {
+          const Stall::Scope scope;
+          audio = std::thread([] { (void)Stall::WaitWhileStalled(); });
+          if (stall == WindowStall::Held) {
+            WaitUntilTrue(name, "parked", [&] { return Stall::WaiterCount() == 1; });
+            // The hold lasts from the parked thread to the end of the scope.
+            std::this_thread::sleep_for(parked_for);
+          } else {
+            audio.join();
+          }
+        }
+        if (audio.joinable()) audio.join();
+      }
+      hold.release = true;
+      scheduler.Flush();
+      const auto rows = Common::FirstRunReport::Global().Summarize().deferred_resolves;
+      Require(name, "one row", rows.size() == 1, "the submission did not resolve once");
+      const bool held = stall == WindowStall::Held;
+      Require(name, "window count", rows[0].window_hold_count_change == (held ? 1u : 0u),
+              "a hold between the first hole and the resolve was not counted in the window");
+      Require(name, "window held time",
+              held ? rows[0].window_held_ms >= parked_for.count() * 0.9 && rows[0].window_held_ms < 5000.0
+                   : rows[0].window_held_ms == 0.0,
+              held ? "the time audio was held in the window was not reported"
+                   : "a window with no hold reported held time");
+      Require(name, "resolve alone", rows[0].hold_count_change == 0 && rows[0].held_ms == 0.0,
+              "a hold from before the resolve was counted as the resolve's own");
+      Stall::Configure(false);
+    }
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckDeferredDraws() {
     CheckDeferredOrderEquivalence();
     CheckDeferredDepthClear();
@@ -1288,4 +1389,6 @@
     CheckDeferredHoleCap();
     CheckDeferredShutdownResolve();
     CheckDeferredStreamWrap();
+    CheckDeferredWarmPause();
+    CheckDeferredWindowHolds();
   }

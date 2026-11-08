@@ -21,6 +21,8 @@ static thread_local CommandScheduler* g_deferred_callback_scheduler = nullptr;
 
 namespace {
 
+constexpr double NS_PER_MS = 1.0e6;
+
 double ElapsedMs(std::chrono::steady_clock::time_point from,
                  std::chrono::steady_clock::time_point to) {
 	return std::chrono::duration<double, std::milli>(to - from).count();
@@ -408,6 +410,10 @@ void CommandScheduler::SplitForHole(std::unique_ptr<DrawHole> hole) {
 	m_held.push_back({m_command_pool.Commit(), true, std::move(hole), false});
 	if (m_pending_holes == 0) {
 		m_first_hole_time = std::chrono::steady_clock::now();
+		m_first_hole_holds = Common::GpuStall::HoldCount();
+		m_first_hole_held_ns = Common::GpuStall::HeldNs();
+		// The resolve waits for compiles, which the warm-up would compete with for cores.
+		m_context.GetPipelineCache().PauseWarmBuilds();
 	}
 	m_pending_holes++;
 	// The cadence is not reset here. A split is not a submit, and the draws on both sides of it
@@ -508,6 +514,7 @@ void CommandScheduler::ResolveHoles() {
 	using Clock             = std::chrono::steady_clock;
 	const auto started      = Clock::now();
 	const auto holds_before = Common::GpuStall::HoldCount();
+	const auto held_before  = Common::GpuStall::HeldNs();
 
 	Common::FirstRunReport::DeferredResolve row;
 	row.trigger        = ResolveTriggerName(m_trigger);
@@ -519,17 +526,25 @@ void CommandScheduler::ResolveHoles() {
 	RecordHoles(built);
 	row.record_ms         = ElapsedMs(record_from, Clock::now());
 	row.hold_count_change = Common::GpuStall::HoldCount() - holds_before;
+	row.held_ms           = static_cast<double>(Common::GpuStall::HeldNs() - held_before) / NS_PER_MS;
 
 	m_pending_holes        = 0;
 	m_hole_flush_requested = false;
+	m_context.GetPipelineCache().ResumeWarmBuilds();
+	// From the first hole to here, so a hold that opened while the draws were still being met counts.
+	row.window_hold_count_change = Common::GpuStall::HoldCount() - m_first_hole_holds;
+	row.window_held_ms =
+	    static_cast<double>(Common::GpuStall::HeldNs() - m_first_hole_held_ns) / NS_PER_MS;
 	m_first_hole_time.reset();
 	Common::FirstRunReport::AddDeferredResolve(row);
 	// Log file only, since a cold burst resolves often and would flood the console.
 	Log::Write(Log::Color::Default, fmt::format(
 	    "Deferred draws resolved ({}): {} holes, {} keys, wait {:.1f} ms, record {:.1f} ms, "
-	    "before resolve {:.1f} ms, save {:.1f} ms\n",
+	    "before resolve {:.1f} ms, save {:.1f} ms, holds {} in the resolve and {} from the first hole, "
+	    "audio held {:.1f} ms in the resolve and {:.1f} ms from the first hole\n",
 	    row.trigger, row.holes, row.distinct_keys, row.resolve_wait_ms, row.record_ms,
-	    row.pre_resolve_ms, row.save_ms));
+	    row.pre_resolve_ms, row.save_ms, row.hold_count_change, row.window_hold_count_change,
+	    row.held_ms, row.window_held_ms));
 }
 
 uint64_t CommandScheduler::GpuLag(uint64_t current_tick, uint64_t known_gpu_tick) noexcept {

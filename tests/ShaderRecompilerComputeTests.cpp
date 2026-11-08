@@ -1183,6 +1183,14 @@ struct PipelineCacheTestAccess {
     cache.m_warm_worker_count_override = count;
   }
 
+  // Whether the warm queue, or the queue the deferred draws build on, is held back by a pause.
+  static bool WarmPaused(const PipelineCache &cache) {
+    return cache.m_warm_compute != nullptr && cache.m_warm_compute->Paused();
+  }
+  static bool BuildQueuePaused(const PipelineCache &cache) {
+    return cache.m_build_queue != nullptr && cache.m_build_queue->Paused();
+  }
+
   // Warm builds started and not yet taken.
   static size_t WarmPending(const PipelineCache &cache) {
     return cache.m_warm_compute == nullptr ? 0 : cache.m_warm_compute->Pending();
@@ -60685,6 +60693,13 @@ void CheckAsyncStableModules(VulkanHarness &vulkan) {
 struct ComputeCreateHook {
   static inline std::mutex mutex;
   static inline std::vector<std::thread::id> created_on;
+  static inline std::atomic<int> delay_ms{0};
+  // How many creations have begun, so a test can tell that a worker is inside one.
+  static inline std::atomic<int> entered{0};
+  // While block is set a creation waits until release is set, which a test does after a pause of
+  // its own, so how long a build lasts does not depend on the sleep of a thread.
+  static inline std::atomic<bool> block{false};
+  static inline std::atomic<bool> release{false};
   // The shader module of each pipeline, in the order the driver was asked to create them.
   static inline std::vector<uint64_t> created_modules;
   static inline std::set<uint64_t> live;
@@ -60695,6 +60710,13 @@ struct ComputeCreateHook {
                                     const VkComputePipelineCreateInfo *infos,
                                     const VkAllocationCallbacks *allocator,
                                     VkPipeline *pipelines) {
+    // A test sets a delay to make a build last as long as it needs.
+    entered++;
+    if (block.load()) {
+      const auto limit = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+      while (!release.load() && std::chrono::steady_clock::now() < limit) std::this_thread::yield();
+    }
+    if (const auto delay = delay_ms.load()) std::this_thread::sleep_for(std::chrono::milliseconds(delay));
     const auto result = real_create(device, cache, count, infos, allocator, pipelines);
     std::scoped_lock lock(mutex);
     created_on.push_back(std::this_thread::get_id());
@@ -60872,6 +60894,140 @@ void CheckWarmComputeClaim(VulkanHarness &vulkan) {
     Require(name, "compiled once", ComputeCreateHook::Created() == before + 1,
             "the worker compiled the build again after the lookup had");
   });
+}
+
+// While the warm queue is held for the holes of a submission, a dispatch whose build no worker has
+// started compiles it on the calling thread, and the cache counts that, and the report counts it
+// again by whether it ran as long as a hold of guest audio. The same lookup after the worker built
+// it counts nothing, which is the baseline. Resuming lets a worker take the next build. The hold
+// needs --background-warm-up, --deferred-pipeline-draws and --pause-warm-up-for-draws together, so
+// each of the seven other combinations is a baseline that holds nothing, and stopping a held queue
+// returns at once.
+void CheckWarmComputePause(VulkanHarness &vulkan) {
+  constexpr const char *name = "WarmComputePause";
+  const auto caller = std::this_thread::get_id();
+  const auto set_flags = [](bool warm, bool deferred, bool pause) {
+    Config::Load({.printf_direction = Config::LogDirection::Silent,
+                  .first_run_report_enabled = true,
+                  .background_warm_up_enabled = warm,
+                  .deferred_pipeline_draws_enabled = deferred,
+                  .pause_warm_up_for_draws_enabled = pause});
+    Common::FirstRunReport::Global().Reset();
+  };
+  ComputeCreateHook hook;
+  WithWarmComputeCache(vulkan, true, [&](PipelineCache &cache, const ShaderComputeInputInfo &input) {
+    set_flags(true, true, true);
+    const auto before = ComputeCreateHook::Created();
+    PipelineCacheTestAccess::StartWarmCompute(cache, *input.stage.module);
+    PipelineCacheTestAccess::DrainWarmQueue(cache);
+    (void)cache.GetComputePipeline(input);
+    Require(name, "baseline", ComputeCreateHook::Created() == before + 1 &&
+                                  ComputeCreateHook::CreatedOn(before) != caller &&
+                                  cache.WarmInlineDuringPause() == 0 &&
+                                  Common::FirstRunReport::Global().Summarize().deferred_warm_inline == 0,
+            "an unpaused warm build was not built by a worker, or was counted as inline");
+  });
+  // A build that ran inline while the queue was held is counted, and counted again when it lasted
+  // as long as a hold of guest audio. A short build is the baseline for the long one.
+  for (const int delay : {0, 300}) {
+    WithWarmComputeCache(vulkan, true, [&](PipelineCache &cache, const ShaderComputeInputInfo &input) {
+      set_flags(true, true, true);
+      const auto before = ComputeCreateHook::Created();
+      cache.PauseWarmBuilds();
+      Require(name, "held", PipelineCacheTestAccess::WarmPaused(cache), "the warm queue was not held");
+      PipelineCacheTestAccess::StartWarmCompute(cache, *input.stage.module);
+      ComputeCreateHook::delay_ms = delay;
+      (void)cache.GetComputePipeline(input);
+      ComputeCreateHook::delay_ms = 0;
+      const auto summary = Common::FirstRunReport::Global().Summarize();
+      Require(name, "inline during the pause",
+              ComputeCreateHook::Created() == before + 1 && ComputeCreateHook::CreatedOn(before) == caller &&
+                  cache.WarmInlineDuringPause() == 1 && summary.deferred_warm_inline == 1,
+              "a dispatch waiting on a held warm build did not compile it itself and count it");
+      Require(name, "over the hold threshold",
+              summary.deferred_warm_inline_over_hold_threshold == (delay > 0 ? 1u : 0u),
+              "a build was not split by whether it ran as long as an audio hold");
+    });
+  }
+  // Every build a dispatch takes before it finishes is counted for the report, held or not. The build
+  // that a worker held back by the test and the dispatch ran itself counts in the totals and not in
+  // the counts for the pause. One a worker was running counts as waited for. A build the worker
+  // finished first counts as neither, which the baseline above shows.
+  for (const int delay : {0, 300}) {
+    WithWarmComputeCache(vulkan, true, [&](PipelineCache &cache, const ShaderComputeInputInfo &input) {
+      set_flags(true, true, true);
+      PipelineCacheTestAccess::BuildHold worker_hold;
+      PipelineCacheTestAccess::HoldWarmQueue(cache, worker_hold);
+      PipelineCacheTestAccess::StartWarmCompute(cache, *input.stage.module);
+      ComputeCreateHook::delay_ms = delay;
+      (void)cache.GetComputePipeline(input);
+      ComputeCreateHook::delay_ms = 0;
+      worker_hold.release = true;
+      const auto summary = Common::FirstRunReport::Global().Summarize();
+      Require(name, "unpaused inline is in the total",
+              summary.warm_inline_total == 1 && summary.warm_waited_count == 0 &&
+                  summary.deferred_warm_inline == 0 && cache.WarmInlineDuringPause() == 0 &&
+                  summary.warm_inline_total_over_hold_threshold == (delay > 0 ? 1u : 0u) &&
+                  (delay == 0 || summary.warm_inline_total_ms >= 250.0),
+              "a build the dispatch ran itself without a pause was not counted in the totals only");
+    });
+  }
+  WithWarmComputeCache(vulkan, true, [&](PipelineCache &cache, const ShaderComputeInputInfo &input) {
+    set_flags(true, true, true);
+    ComputeCreateHook::release = false;
+    ComputeCreateHook::block = true;
+    const int entered_before = ComputeCreateHook::entered.load();
+    PipelineCacheTestAccess::StartWarmCompute(cache, *input.stage.module);
+    WaitUntilTrue(name, "worker building", [&] { return ComputeCreateHook::entered.load() > entered_before; });
+    // The worker is inside the build and stays there until this thread lets it go about a second
+    // from now, which is well past the hold threshold and leaves the wait about 750 ms of slack.
+    std::thread releaser([] {
+      std::this_thread::sleep_for(std::chrono::seconds(1));
+      ComputeCreateHook::release = true;
+    });
+    (void)cache.GetComputePipeline(input);
+    releaser.join();
+    ComputeCreateHook::block = false;
+    const auto summary = Common::FirstRunReport::Global().Summarize();
+    Require(name, "waited is counted",
+            summary.warm_waited_count == 1 && summary.warm_inline_total == 0 &&
+                summary.warm_waited_over_hold_threshold == 1 && summary.warm_waited_ms >= 250.0,
+            "a build a worker was running was not counted as waited for, or not by its length");
+  });
+  WithWarmComputeCache(vulkan, true, [&](PipelineCache &cache, const ShaderComputeInputInfo &input) {
+    set_flags(true, true, true);
+    const auto before = ComputeCreateHook::Created();
+    cache.PauseWarmBuilds();
+    PipelineCacheTestAccess::StartWarmCompute(cache, *input.stage.module);
+    cache.ResumeWarmBuilds();
+    Require(name, "released", !PipelineCacheTestAccess::WarmPaused(cache), "the warm queue stayed held");
+    PipelineCacheTestAccess::DrainWarmQueue(cache);
+    (void)cache.GetComputePipeline(input);
+    Require(name, "worker builds after the resume",
+            ComputeCreateHook::Created() == before + 1 && ComputeCreateHook::CreatedOn(before) != caller &&
+                cache.WarmInlineDuringPause() == 0,
+            "a resumed warm queue did not build on a worker");
+  });
+  for (int flags = 0; flags < 7; ++flags) {
+    WithWarmComputeCache(vulkan, true, [&](PipelineCache &cache, const ShaderComputeInputInfo &) {
+      set_flags((flags & 1) != 0, (flags & 2) != 0, (flags & 4) != 0);
+      cache.PauseWarmBuilds();
+      Require(name, "fewer than three flags do not hold", !PipelineCacheTestAccess::WarmPaused(cache),
+              "the warm queue was held without all three flags");
+    });
+  }
+  WithWarmComputeCache(vulkan, true, [&](PipelineCache &cache, const ShaderComputeInputInfo &input) {
+    set_flags(true, true, true);
+    const auto before = ComputeCreateHook::Created();
+    cache.PauseWarmBuilds();
+    PipelineCacheTestAccess::StartWarmCompute(cache, *input.stage.module);
+    cache.StopBuilds();
+    Require(name, "stop ends the hold", !PipelineCacheTestAccess::WarmPaused(cache) &&
+                                            ComputeCreateHook::Created() == before,
+            "stopping a held warm queue did not return, or ran the queued build");
+  });
+  Config::Load({.printf_direction = Config::LogDirection::Silent});
+  Common::FirstRunReport::Global().Reset();
 }
 
 // Stopping the builds drops the warm builds that never ran, waits for none that is running, and
@@ -61126,6 +61282,7 @@ void CheckAsyncPipelines(VulkanHarness &vulkan) {
   run("WarmComputeAdopt", [&] { CheckWarmComputeAdopt(vulkan); });
   run("WarmComputeClaim", [&] { CheckWarmComputeClaim(vulkan); });
   run("WarmComputeShutdown", [&] { CheckWarmComputeShutdown(vulkan); });
+  run("WarmComputePause", [&] { CheckWarmComputePause(vulkan); });
   run("BackgroundWarmUp", [&] { CheckBackgroundWarmUp(vulkan); });
   run("WarmUpRecordOrder", [&] { CheckWarmUpRecordOrder(vulkan); });
   vulkan.CheckAsyncGate();
@@ -68228,6 +68385,16 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--deferred-draws-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckDeferredDraws();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--warm-pause-only") == 0) {
+    VulkanHarness vulkan;
+    CheckWarmComputePause(vulkan);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--deferred-warm-pause-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckDeferredWarmPause();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--deferred-cap-only") == 0) {

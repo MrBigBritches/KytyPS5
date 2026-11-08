@@ -176,6 +176,13 @@ private:
 	std::jthread m_thread;
 };
 
+// The longest the warm-up queue is held while deferred draws wait for their pipelines. A resolve
+// waits for the parallel builds of one submission, and the measured wait of the worst frame was
+// 3.8 to 7.5 s (4 to 6 workers, 1.0 to 1.34 times contention, design section 7). Ten seconds is
+// above that, so a normal resolve ends the pause first with Resume, while a resolve that never
+// comes cannot starve the warm-up for longer than this.
+inline constexpr std::chrono::seconds WARM_UP_PAUSE_LIMIT {10};
+
 // What a draw that has no pipeline yet does while the pipeline builds. A skipped draw leaves out its
 // commands, a deferred draw becomes a hole in the command stream that is recorded once the pipeline
 // is built, and a blocked draw waits for the pipeline on the GPU thread.
@@ -293,6 +300,19 @@ public:
 	// taken. Later requests build on the calling thread. The owner calls it while the objects the
 	// builds read, such as the image heap's layout, still exist. Calling it again does nothing.
 	void StopBuilds();
+	// Holds the warm-up queue from new builds, from the first hole of a submission until its resolve
+	// ends, so the compiles the resolve waits for do not compete with it for cores. Only with
+	// --background-warm-up, --deferred-pipeline-draws and --pause-warm-up-for-draws, and never the queue of the deferred draws
+	// themselves. Asking again while held keeps the first deadline, so repeats cannot extend it, and
+	// the warm-up limit ends a pause whose resolve never comes. Running warm builds finish, and a
+	// compute dispatch that needs a queued one still runs it on the GPU thread.
+	void PauseWarmBuilds();
+	// Lets the warm-up queue take builds again. Does nothing when it is not held.
+	void ResumeWarmBuilds();
+	// How many warm-up compute builds the GPU thread ran itself while the queue was held. It is an
+	// upper bound on what the pause cost, since a worker busy with something else might not have
+	// reached the build either.
+	[[nodiscard]] uint32_t WarmInlineDuringPause() const noexcept { return m_warm_inline_during_pause; }
 
 private:
 	friend struct PipelineCacheTestAccess;
@@ -396,6 +416,10 @@ private:
 	// pipelines the warm-up builds, by module id, until a lookup adopts them. Only the GPU thread
 	// takes from it, and a worker writes only into the build's own storage.
 	std::unique_ptr<WarmBuildSet<uint64_t, Pipeline>>                            m_warm_compute;
+	// Whether PauseWarmBuilds holds the warm queue, and how many builds ran on the GPU thread meanwhile.
+	// Only the GPU thread touches them.
+	bool                                                                         m_warm_paused = false;
+	uint32_t                                                                     m_warm_inline_during_pause = 0;
 	// Module ids in the order their records appear in the shader store, one entry per record. Filled
 	// while WarmUp loads the store and emptied once the warm-up has queued its builds.
 	std::vector<uint64_t>                                                        m_module_record_order;
@@ -469,6 +493,10 @@ private:
 	// build inside the stall and the timing that the GPU thread owes for that.
 	[[nodiscard]] std::optional<WarmBuildSet<uint64_t, Pipeline>::Taken>
 	TakeUnfinishedWarmCompute(uint64_t id);
+	// Counts and logs a warm-up compute build that stopped the GPU thread for `stopped_ms`, and says
+	// whether the queue was held when it did. Builds already done when taken stop nothing and are not
+	// counted.
+	void NoteWarmComputeStop(PipelineBuildQueue::Acquired how, double stopped_ms, bool queue_held);
 	// Stops the warm queue and destroys the pipelines it built that nobody took.
 	void StopWarmBuilds();
 

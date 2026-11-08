@@ -1559,28 +1559,76 @@ PipelineCache::TakeUnfinishedWarmCompute(uint64_t id) {
 	Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::Count,
 	                                         Common::DebugCounters::Counter::PipelineCreateNs,
 	                                         Common::DebugCounters::Peak::PipelineCreateNs);
-	const auto start = std::chrono::steady_clock::now();
-	auto       taken = m_warm_compute->Take(id);
+	const auto start  = std::chrono::steady_clock::now();
+	const bool paused = m_warm_compute->Paused();
+	auto       taken  = m_warm_compute->Take(id);
 	EXIT_IF(!taken);
-	if (taken->how == PipelineBuildQueue::Acquired::RanInline) {
-		Common::DebugCounters::Add(Common::DebugCounters::Counter::PipelinesCreated);
-	} else if (taken->how == PipelineBuildQueue::Acquired::Waited) {
-		const auto waited_ms = std::chrono::duration<double, std::milli>(
-		                           std::chrono::steady_clock::now() - start)
-		                           .count();
-		Common::FirstRunReport::AddWait(Common::FirstRunReport::Kind::Compute, waited_ms);
+	const auto stopped_ms = std::chrono::duration<double, std::milli>(
+	                            std::chrono::steady_clock::now() - start)
+	                            .count();
+	NoteWarmComputeStop(taken->how, stopped_ms, paused);
+	return taken;
+}
+
+void PipelineCache::NoteWarmComputeStop(PipelineBuildQueue::Acquired how, double stopped_ms,
+                                        bool queue_held) {
+	if (how == PipelineBuildQueue::Acquired::AlreadyDone) {
+		return;
+	}
+	// A stop as long as the audio hold threshold holds guest audio, if audio was waiting, so those
+	// are counted apart. Every build taken here is counted, held or not, so the arms of a run have
+	// figures to compare.
+	const bool over = stopped_ms >= std::chrono::duration<double, std::milli>(
+	                                    Common::GpuStall::GPU_STALL_AUDIO_HOLD_THRESHOLD)
+	                                    .count();
+	const bool waited = how == PipelineBuildQueue::Acquired::Waited;
+	Common::FirstRunReport::AddWarmCompute(waited, stopped_ms, over);
+	if (waited) {
+		Common::FirstRunReport::AddWait(Common::FirstRunReport::Kind::Compute, stopped_ms);
 		// Lets a hold of guest audio be matched to the wait, and shows what a worker at low
 		// priority costs the GPU thread.
 		PipelineCacheLog("Pipeline build: waited {:.1f} ms for a running warm-up compute build",
-		                 waited_ms);
+		                 stopped_ms);
+		return;
 	}
-	return taken;
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::PipelinesCreated);
+	if (queue_held) {
+		// No worker had started this build while the queue was held, so the GPU thread ran it. The
+		// pause may not be the only reason, which is why this is an upper bound.
+		m_warm_inline_during_pause++;
+		Common::FirstRunReport::AddDeferredWarmInline(over);
+		PipelineCacheLog("Pipeline build: a warm-up compute build ran inline while the queue was held, "
+		                 "{:.1f} ms{} ({} so far)",
+		                 stopped_ms, over ? ", over the audio hold threshold" : "",
+		                 m_warm_inline_during_pause);
+	}
+}
+
+void PipelineCache::PauseWarmBuilds() {
+	if (m_warm_compute == nullptr || m_warm_paused || !Config::BackgroundWarmUpEnabled() ||
+	    !Config::DeferredPipelineDrawsEnabled() || !Config::PauseWarmUpForDrawsEnabled()) {
+		return;
+	}
+	m_warm_paused = true;
+	m_warm_compute->Pause(PipelineBuildQueue::Clock::now() + WARM_UP_PAUSE_LIMIT);
+}
+
+void PipelineCache::ResumeWarmBuilds() {
+	if (!m_warm_paused) {
+		return;
+	}
+	m_warm_paused = false;
+	if (m_warm_compute != nullptr) {
+		m_warm_compute->Resume();
+	}
 }
 
 void PipelineCache::StopWarmBuilds() {
 	if (m_warm_compute == nullptr) {
 		return;
 	}
+	// Stopping ends a pause, since the workers wake for the stop.
+	m_warm_paused = false;
 	auto stopped = m_warm_compute->Stop();
 	if (stopped.waited_for != 0) {
 		PipelineCacheLog("Pipeline build: waiting for {} running warm-up compiles", stopped.waited_for);

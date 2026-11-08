@@ -5,6 +5,7 @@
 #include "common/uniqueFunction.h"
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -103,6 +104,25 @@ public:
 	/// what the call had to wait for. Calling it again does nothing and returns 0.
 	uint32_t Stop();
 
+	/// The clock a pause deadline is read from.
+	using Clock = std::chrono::steady_clock;
+
+	/// The furthest ahead a pause may reach. A deadline past it is cut back, so the clock arithmetic
+	/// cannot overflow when a caller passes the end of time.
+	static constexpr std::chrono::hours MAX_PAUSE {1};
+
+	/// Makes the workers take no new job until Resume, or until `deadline` passes, whichever comes
+	/// first. Jobs that are running finish, and a job someone Acquires still runs on that caller. A
+	/// pause that is already in force keeps the earlier of the two deadlines, so asking again cannot
+	/// hold the queue longer.
+	void Pause(Clock::time_point deadline);
+
+	/// Ends a pause at once and wakes every worker. Does nothing when the queue is not paused.
+	void Resume();
+
+	/// True while a pause is in force: asked for and neither resumed nor past its deadline.
+	[[nodiscard]] bool Paused() const;
+
 	/// True once Stop has begun.
 	[[nodiscard]] bool Stopping() const noexcept {
 		return m_stopping.load(std::memory_order_acquire);
@@ -114,12 +134,17 @@ private:
 	static bool RunIfQueued(Job& job);
 	/// Runs the work of a job this thread has just moved to Running, then marks it Done.
 	static void RunClaimed(Job& job);
+	/// Whether a pause is in force. The caller holds m_mutex.
+	[[nodiscard]] bool PausedLocked() const;
 
-	std::mutex                  m_mutex;
+	mutable std::mutex          m_mutex;
 	std::condition_variable_any m_ready;
 	std::deque<JobPtr>          m_jobs;
 	// Jobs a worker has taken from the queue and not finished. Guarded by m_mutex.
 	uint32_t                    m_active = 0;
+	// A pause asked for and not resumed. It is in force only until m_pause_deadline. Guarded by m_mutex.
+	bool                        m_paused = false;
+	Clock::time_point           m_pause_deadline;
 	std::atomic<bool>           m_stopping {false};
 	// Set in the init list and only read by the workers, so it needs no lock.
 	const bool                  m_low_priority;

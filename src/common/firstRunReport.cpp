@@ -286,6 +286,27 @@ void Report::AddDeferredWouldSkip(double waited_ms) {
 	m_deferred_would_skip_waited_ms += waited_ms;
 }
 
+void Report::AddDeferredWarmInline(bool over_hold_threshold) {
+	std::lock_guard lock(m_mutex);
+	m_deferred_warm_inline++;
+	if (over_hold_threshold) {
+		m_deferred_warm_inline_over++;
+	}
+}
+
+void Report::AddWarmCompute(bool waited, double ms, bool over_hold_threshold) {
+	std::lock_guard lock(m_mutex);
+	if (waited) {
+		m_warm_waited_count++;
+		m_warm_waited_ms += ms;
+		m_warm_waited_over += over_hold_threshold ? 1u : 0u;
+	} else {
+		m_warm_inline_total++;
+		m_warm_inline_total_ms += ms;
+		m_warm_inline_total_over += over_hold_threshold ? 1u : 0u;
+	}
+}
+
 double Report::BlockedMs(Kind kind) const {
 	std::lock_guard lock(m_mutex);
 	return m_blocked_ms[static_cast<size_t>(kind)];
@@ -327,6 +348,14 @@ void Report::Reset() {
 	m_deferred_ineligible.clear();
 	m_deferred_would_skip_draws     = 0;
 	m_deferred_would_skip_waited_ms = 0.0;
+	m_deferred_warm_inline          = 0;
+	m_deferred_warm_inline_over     = 0;
+	m_warm_inline_total             = 0;
+	m_warm_inline_total_ms          = 0.0;
+	m_warm_inline_total_over        = 0;
+	m_warm_waited_count             = 0;
+	m_warm_waited_ms                = 0.0;
+	m_warm_waited_over              = 0;
 }
 
 std::vector<Pause> Report::AllPausesLocked() const {
@@ -387,6 +416,14 @@ Summary Report::Summarize() const {
 	summary.deferred_ineligible          = m_deferred_ineligible;
 	summary.deferred_would_skip_draws    = m_deferred_would_skip_draws;
 	summary.deferred_would_skip_waited_ms = m_deferred_would_skip_waited_ms;
+	summary.deferred_warm_inline          = m_deferred_warm_inline;
+	summary.deferred_warm_inline_over_hold_threshold = m_deferred_warm_inline_over;
+	summary.warm_inline_total                        = m_warm_inline_total;
+	summary.warm_inline_total_ms                     = m_warm_inline_total_ms;
+	summary.warm_inline_total_over_hold_threshold    = m_warm_inline_total_over;
+	summary.warm_waited_count                        = m_warm_waited_count;
+	summary.warm_waited_ms                           = m_warm_waited_ms;
+	summary.warm_waited_over_hold_threshold          = m_warm_waited_over;
 
 	summary.worst_translate = m_translates;
 	std::ranges::stable_sort(summary.worst_translate,
@@ -514,7 +551,10 @@ nlohmann::json DeferredToJson(const Summary& summary) {
 		                      {"record_ms", Round3(resolve.record_ms)},
 		                      {"pre_resolve_ms", Round3(resolve.pre_resolve_ms)},
 		                      {"save_ms", Round3(resolve.save_ms)},
-		                      {"hold_count_change", resolve.hold_count_change}};
+		                      {"hold_count_change", resolve.hold_count_change},
+		                      {"window_hold_count_change", resolve.window_hold_count_change},
+		                      {"held_ms", Round3(resolve.held_ms)},
+		                      {"window_held_ms", Round3(resolve.window_held_ms)}};
 		// Left out when unset, as in a compile row.
 		if (resolve.submission != NO_SUBMISSION) {
 			row["submission"] = resolve.submission;
@@ -530,7 +570,17 @@ nlohmann::json DeferredToJson(const Summary& summary) {
 	        {"ineligible", ineligible},
 	        {"s2_would_skip",
 	         {{"draws", summary.deferred_would_skip_draws},
-	          {"waited_ms", Round3(summary.deferred_would_skip_waited_ms)}}}};
+	          {"waited_ms", Round3(summary.deferred_would_skip_waited_ms)}}},
+	        {"warm_inline",
+	         {{"during_pause", summary.deferred_warm_inline},
+	          {"over_hold_threshold", summary.deferred_warm_inline_over_hold_threshold},
+	          {"total", summary.warm_inline_total},
+	          {"total_ms", Round3(summary.warm_inline_total_ms)},
+	          {"total_over_hold_threshold", summary.warm_inline_total_over_hold_threshold}}},
+	        {"warm_waited",
+	         {{"count", summary.warm_waited_count},
+	          {"ms", Round3(summary.warm_waited_ms)},
+	          {"over_hold_threshold", summary.warm_waited_over_hold_threshold}}}};
 }
 
 nlohmann::json BootToJson(const BootInfo& boot) {
@@ -542,8 +592,8 @@ nlohmann::json BootToJson(const BootInfo& boot) {
 
 } // namespace
 
-std::string Report::ToJson(const Metadata& metadata, uint64_t audio_holds,
-                           double run_seconds) const {
+std::string Report::ToJson(const Metadata& metadata, uint64_t audio_holds, double run_seconds,
+                           double audio_held_ms) const {
 	const auto summary  = Summarize();
 	const auto compiles = Compiles();
 	const auto boot     = Boot();
@@ -580,6 +630,7 @@ std::string Report::ToJson(const Metadata& metadata, uint64_t audio_holds,
 	    {"skips", SkipsToJson(summary)},
 	    {"deferred_draws", DeferredToJson(summary)},
 	    {"audio_holds", audio_holds},
+	    {"audio_held_ms", Round3(audio_held_ms)},
 	    {"flips", summary.flips},
 	    {"submissions",
 	     {{"total", summary.submissions}, {"per_flip", summary.submissions_per_flip}}},
@@ -675,7 +726,8 @@ void WriteReportUnguarded() {
 		                  .count();
 	}
 	metadata.partial = g_partial.load(std::memory_order_relaxed);
-	const auto text = Global().ToJson(metadata, GpuStall::HoldCount(), run_seconds);
+	const auto text = Global().ToJson(metadata, GpuStall::HoldCount(), run_seconds,
+	                                  static_cast<double>(GpuStall::HeldNs()) / NS_PER_MS);
 	const auto path = ReportPath(metadata.title_id, std::chrono::system_clock::now());
 	File::CreateDirectories(path.parent_path());
 	if (WriteWhole(path, text)) {

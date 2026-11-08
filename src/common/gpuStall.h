@@ -70,6 +70,13 @@ bool WaitWhileStalled();
 /// counter it always counts, so a run report can read it.
 [[nodiscard]] uint64_t HoldCount();
 
+/// Nanoseconds that guest audio was held in total since the process began, counted when each stall
+/// ends, from the first thread it held to the end of the stall. Unlike the performance panel's
+/// counter it always counts. A stall shorter than the threshold holds nothing and adds nothing, and
+/// a stall still in progress is not in the total yet, so read it before and after to get a window.
+/// A stall is counted in the window where it ends, so a window nested inside an outer scope reads 0.
+[[nodiscard]] uint64_t HeldNs();
+
 /// Scopes created since the process began, so a test can tell one scope from several. Unlike
 /// HoldCount it does not depend on a thread being held while each scope lasts.
 [[nodiscard]] uint64_t ScopeCount();

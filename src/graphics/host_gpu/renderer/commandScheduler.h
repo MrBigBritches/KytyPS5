@@ -237,6 +237,10 @@ private:
 	std::vector<vk::CommandBuffer> m_submit_buffers;
 	DescriptorScratch              m_hole_scratch;
 	size_t                         m_pending_holes = 0;
+	// GpuStall::HoldCount() when the first pending hole was split off, for the holds of the whole window.
+	uint64_t                       m_first_hole_holds = 0;
+	// GpuStall::HeldNs() at the same moment, for the audio held time of the window.
+	uint64_t                       m_first_hole_held_ns = 0;
 	bool                           m_in_submit     = false;
 	bool                           m_in_resolve    = false;
 	std::thread::id                m_extra_hole_thread;

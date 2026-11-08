@@ -132,9 +132,15 @@ struct Refusal {
 /// One resolve of the draws deferred by --deferred-pipeline-draws. All times are in ms.
 /// pre_resolve_ms runs from the first hole to the start of the resolve, resolve_wait_ms is the wait
 /// for the builds, record_ms the recording of the holes and save_ms the driver cache save inside the
-/// resolve. hold_count_change is how many holds of guest audio the resolve added. flip and
+/// resolve. hold_count_change is how many holds of guest audio the resolve added, and
+/// window_hold_count_change how many were added from its first hole until the resolve ended, so
+/// the time before the resolve counts too. held_ms and window_held_ms are the same two windows
+/// measured in milliseconds that guest audio was held, which resolve_wait_ms is not. A stall is
+/// counted in the window where it ends, so a resolve nested inside an outer scope shows 0 for
+/// itself and the outer stall shows when that ends. flip and
 /// submission are stamped by the report when the resolve is added, as for CompileEntry, and trigger
-/// names what forced the resolve (submit, fault, stream_wrap, cap or shutdown).
+/// names what forced the resolve (submit, fault, stream_wrap, cap, shutdown, readback, label,
+/// flip, unmap or slice_end).
 struct DeferredResolve {
 	int64_t     flip              = 0;
 	uint64_t    submission        = NO_SUBMISSION;
@@ -146,6 +152,9 @@ struct DeferredResolve {
 	double      pre_resolve_ms    = 0.0;
 	double      save_ms           = 0.0;
 	uint64_t    hold_count_change = 0;
+	uint64_t    window_hold_count_change = 0;
+	double      held_ms           = 0.0;
+	double      window_held_ms    = 0.0;
 };
 
 /// The GPU thread's blocking within one guest flip, merged into a single pause.
@@ -214,6 +223,23 @@ struct Summary {
 	// it compares with skips.refused.*.blocked_ms.
 	uint32_t                                                 deferred_would_skip_draws = 0;
 	double                                                   deferred_would_skip_waited_ms = 0.0;
+	// Warm-up compute builds the GPU thread ran itself while --pause-warm-up-for-draws held the
+	// queue. That is an upper bound on what the pause cost, since a worker that was busy might not
+	// have reached the build either. The second figure counts those that ran as long as a hold of
+	// guest audio takes to start.
+	// These two are the JSON keys warm_inline.during_pause and warm_inline.over_hold_threshold. Every
+	// over_hold_threshold figure means long enough to hold audio, if audio was waiting.
+	uint32_t                                                 deferred_warm_inline = 0;
+	uint32_t                                                 deferred_warm_inline_over_hold_threshold = 0;
+	// Every warm-up compute build a dispatch took before it finished, held or not, so the arms of
+	// a run can be compared. They are the JSON keys warm_inline.total, total_ms and
+	// total_over_hold_threshold, and warm_waited.count, ms and over_hold_threshold.
+	uint32_t                                                 warm_inline_total = 0;
+	double                                                   warm_inline_total_ms = 0.0;
+	uint32_t                                                 warm_inline_total_over_hold_threshold = 0;
+	uint32_t                                                 warm_waited_count = 0;
+	double                                                   warm_waited_ms = 0.0;
+	uint32_t                                                 warm_waited_over_hold_threshold = 0;
 };
 
 /// The raw records of one run. Thread safe, and it never reads a clock, so tests drive it with
@@ -257,6 +283,13 @@ public:
 	void AddDeferredIneligible(std::string_view reason);
 	/// Records a deferred draw that S2 would have skipped, and how long it waited for its pipeline.
 	void AddDeferredWouldSkip(double waited_ms);
+	/// Records a warm-up compute build that ran inline while the warm-up queue was held, and whether
+	/// it ran long enough to hold guest audio.
+	void AddDeferredWarmInline(bool over_hold_threshold);
+	/// Records a warm-up compute build a dispatch took before it finished: one it ran itself, or one
+	/// it waited for on a worker. `ms` is how long the dispatch was stopped, and the last argument
+	/// whether that was long enough to hold guest audio.
+	void AddWarmCompute(bool waited, double ms, bool over_hold_threshold);
 	/// The GPU-thread time blocked so far in play for the kind.
 	[[nodiscard]] double BlockedMs(Kind kind) const;
 	/// Records a module that --cold-pipelines could not stamp, so it compiled unstamped.
@@ -268,9 +301,10 @@ public:
 
 	/// Works out the totals, histogram and top lists from what was recorded so far.
 	[[nodiscard]] Summary Summarize() const;
-	/// Renders the whole report as JSON text.
+	/// Renders the whole report as JSON text. `audio_held_ms` is the whole run's guest audio held
+	/// time, which also catches holds that land outside every deferred-draw window.
 	[[nodiscard]] std::string ToJson(const Metadata& metadata, uint64_t audio_holds,
-	                                 double run_seconds) const;
+	                                 double run_seconds, double audio_held_ms) const;
 	/// Copy of the compile rows, for tests.
 	[[nodiscard]] std::vector<CompileEntry> Compiles() const;
 	/// Copy of the ready rows, for tests.
@@ -315,6 +349,14 @@ private:
 	std::vector<std::pair<std::string, uint32_t>> m_deferred_ineligible;
 	uint32_t                                      m_deferred_would_skip_draws = 0;
 	double                                        m_deferred_would_skip_waited_ms = 0.0;
+	uint32_t                                      m_deferred_warm_inline = 0;
+	uint32_t                                      m_deferred_warm_inline_over = 0;
+	uint32_t                                      m_warm_inline_total = 0;
+	double                                        m_warm_inline_total_ms = 0.0;
+	uint32_t                                      m_warm_inline_total_over = 0;
+	uint32_t                                      m_warm_waited_count = 0;
+	double                                        m_warm_waited_ms = 0.0;
+	uint32_t                                      m_warm_waited_over = 0;
 };
 
 /// The report of this process.
@@ -401,6 +443,20 @@ inline void AddRefusal(std::string_view reason, double blocked_ms) {
 inline void AddDeferredResolve(const DeferredResolve& resolve) {
 	if (Enabled()) {
 		Global().AddDeferredResolve(resolve);
+	}
+}
+
+/// Records a warm-up compute build that ran inline while the warm-up queue was held.
+inline void AddDeferredWarmInline(bool over_hold_threshold) {
+	if (Enabled()) {
+		Global().AddDeferredWarmInline(over_hold_threshold);
+	}
+}
+
+/// Records a warm-up compute build a dispatch ran itself or waited for.
+inline void AddWarmCompute(bool waited, double ms, bool over_hold_threshold) {
+	if (Enabled()) {
+		Global().AddWarmCompute(waited, ms, over_hold_threshold);
 	}
 }
 

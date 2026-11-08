@@ -276,6 +276,10 @@ bool DeferredPipelineDrawsEnabled() {
 	return g_config->deferred_pipeline_draws_enabled;
 }
 
+bool PauseWarmUpForDrawsEnabled() {
+	return g_config->pause_warm_up_for_draws_enabled;
+}
+
 bool GpuSubmitCadenceEnabled() {
 	return g_config->gpu_submit_cadence_enabled;
 }

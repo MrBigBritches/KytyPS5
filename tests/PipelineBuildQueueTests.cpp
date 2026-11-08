@@ -669,6 +669,217 @@ void TestWarmUpWorkerCount() {
 }
 } // namespace
 
+// How long a test watches a paused job to see that it stays queued. No signal says that a worker
+// did not start something, so this is the one place a short fixed wait is the only way to look.
+constexpr auto QUIET_WINDOW = 100ms;
+
+// True when the job is still queued after the quiet window.
+bool StaysQueued(const PipelineBuildQueue::Job& job) {
+	const auto end = std::chrono::steady_clock::now() + QUIET_WINDOW;
+	while (std::chrono::steady_clock::now() < end) {
+		if (job.GetState() != PipelineBuildQueue::State::Queued) {
+			return false;
+		}
+		std::this_thread::yield();
+	}
+	return true;
+}
+
+constexpr auto FAR_FUTURE = 1h;
+
+// Makes sure the workers are awake and idle, so a job posted next is taken at once unless a pause
+// stops it. Without this the first job could be slow only because the thread had not started.
+void WarmWorker(PipelineBuildQueue& queue) {
+	DrainQueue(queue);
+}
+
+// Test 12. A paused queue still gives a job to whoever acquires it, and the caller runs it inline.
+// The same job on an unpaused queue is run by the worker, which is the baseline: the pause is the
+// only difference between them.
+void TestPausedQueueRunsAcquiredJobInline() {
+	{
+		PipelineBuildQueue queue(1);
+		WarmWorker(queue);
+		Counted counted;
+		auto    job = queue.Post(counted.Work());
+		WaitFor([&] { return job->GetState() == PipelineBuildQueue::State::Done; });
+		CHECK(queue.Acquire(*job) == PipelineBuildQueue::Acquired::AlreadyDone);
+		CHECK(counted.ran_on != std::this_thread::get_id());
+	}
+	PipelineBuildQueue queue(1);
+	WarmWorker(queue);
+	queue.Pause(std::chrono::steady_clock::now() + FAR_FUTURE);
+	CHECK(queue.Paused());
+	Counted counted;
+	auto    job = queue.Post(counted.Work());
+	CHECK(StaysQueued(*job));
+	CHECK(queue.Acquire(*job) == PipelineBuildQueue::Acquired::RanInline);
+	CHECK(counted.runs == 1 && counted.ran_on == std::this_thread::get_id());
+}
+
+// A job that notes when and where it ran, for the tests of a deadline. They read the time the job
+// ran at, which a window of watching could not tell from a job that was never started.
+struct Timed {
+	std::atomic<bool>                      ran {false};
+	std::chrono::steady_clock::time_point ran_at;
+	std::thread::id                        ran_on;
+
+	Common::UniqueFunction<void> Work() {
+		return [this] {
+			ran_at = std::chrono::steady_clock::now();
+			ran_on = std::this_thread::get_id();
+			ran    = true;
+		};
+	}
+};
+
+// A paused queue starts no job before its deadline, and starts it once the deadline has passed, with
+// no Resume. The job says when it ran, so the test needs no window of watching. The unpaused run in
+// the inline test above is the baseline for starting at once.
+void TestPausedQueueWaitsForDeadline() {
+	PipelineBuildQueue queue(1);
+	WarmWorker(queue);
+	constexpr auto PAUSE = 300ms;
+	const auto     start = std::chrono::steady_clock::now();
+	queue.Pause(start + PAUSE);
+	Timed timed;
+	auto  job = queue.Post(timed.Work());
+	WaitFor([&] { return job->GetState() == PipelineBuildQueue::State::Done; });
+	CHECK(timed.ran_at >= start + PAUSE);
+	CHECK(timed.ran_on != std::this_thread::get_id());
+	CHECK(!queue.Paused());
+}
+
+// Resume ends a pause at once and wakes workers that are waiting on the far deadline. The jobs run
+// on workers long before the deadline, and without the Resume they stay queued.
+void TestResumeWakesWorkers() {
+	PipelineBuildQueue queue(2);
+	WarmWorker(queue);
+	queue.Pause(std::chrono::steady_clock::now() + FAR_FUTURE);
+	Counted first;
+	Counted second;
+	auto    first_job  = queue.Post(first.Work());
+	auto    second_job = queue.Post(second.Work());
+	CHECK(StaysQueued(*first_job) && StaysQueued(*second_job));
+	queue.Resume();
+	CHECK(!queue.Paused());
+	WaitFor([&] {
+		return first_job->GetState() == PipelineBuildQueue::State::Done &&
+		       second_job->GetState() == PipelineBuildQueue::State::Done;
+	});
+	CHECK(first.ran_on != std::this_thread::get_id() && second.ran_on != std::this_thread::get_id());
+}
+
+// A job that is running when the pause starts finishes, and the job queued behind it waits for the
+// resume. Without the pause the second job would start as soon as the first ends.
+void TestPausedQueueLetsRunningJobFinish() {
+	PipelineBuildQueue queue(1);
+	Blocker            blocker;
+	auto               running = queue.Post(blocker.Work());
+	WaitFor([&] { return blocker.started.load(); });
+	Counted counted;
+	auto    waiting = queue.Post(counted.Work());
+	queue.Pause(std::chrono::steady_clock::now() + FAR_FUTURE);
+	blocker.release = true;
+	WaitFor([&] { return running->GetState() == PipelineBuildQueue::State::Done; });
+	CHECK(blocker.finished.load());
+	CHECK(StaysQueued(*waiting));
+	queue.Resume();
+	WaitFor([&] { return waiting->GetState() == PipelineBuildQueue::State::Done; });
+	CHECK(counted.runs == 1);
+}
+
+// Pausing again while paused keeps the earlier deadline, so repeated pauses cannot hold the queue
+// for longer than the first one asked. In either order the job runs after the short deadline and
+// well before the far one. Asking for the short deadline second reaches workers that are already
+// waiting on the far one, which the first order does not.
+void TestRepeatedPauseKeepsEarlierDeadline() {
+	for (const bool long_first: {false, true}) {
+		PipelineBuildQueue queue(1);
+		WarmWorker(queue);
+		const auto start = std::chrono::steady_clock::now();
+		Timed      timed;
+		PipelineBuildQueue::JobPtr job;
+		if (long_first) {
+			queue.Pause(start + FAR_FUTURE);
+			// The worker has a job and is waiting on the far deadline when the short one arrives.
+			job = queue.Post(timed.Work());
+			CHECK(StaysQueued(*job));
+			queue.Pause(start + 300ms);
+		} else {
+			queue.Pause(start + 300ms);
+			queue.Pause(start + FAR_FUTURE);
+			job = queue.Post(timed.Work());
+		}
+		WaitFor([&] { return job->GetState() == PipelineBuildQueue::State::Done; });
+		CHECK(timed.ran_at >= start + 300ms);
+		CHECK(timed.ran_at < start + 5s);
+		CHECK(timed.ran_on != std::this_thread::get_id());
+	}
+}
+
+// A deadline at the end of time is cut back to the longest pause, so the clock arithmetic cannot
+// overflow, and the queue is still held and still resumes.
+void TestPauseClampsFarDeadline() {
+	PipelineBuildQueue queue(1);
+	WarmWorker(queue);
+	queue.Pause(std::chrono::steady_clock::time_point::max());
+	CHECK(queue.Paused());
+	Timed timed;
+	auto  job = queue.Post(timed.Work());
+	CHECK(StaysQueued(*job));
+	queue.Resume();
+	WaitFor([&] { return job->GetState() == PipelineBuildQueue::State::Done; });
+	CHECK(timed.ran_on != std::this_thread::get_id());
+}
+
+// Stopping a paused queue neither hangs nor runs what was queued, and the destructor does the same.
+void TestStopPausedQueue() {
+	Counted                    counted;
+	PipelineBuildQueue::JobPtr job;
+	{
+		PipelineBuildQueue queue(2);
+		WarmWorker(queue);
+		queue.Pause(std::chrono::steady_clock::now() + FAR_FUTURE);
+		job = queue.Post(counted.Work());
+		CHECK(StaysQueued(*job));
+		CHECK(queue.Stop() == 0);
+	}
+	CHECK(job->GetState() == PipelineBuildQueue::State::Queued && counted.runs == 0);
+	{
+		PipelineBuildQueue queue(1);
+		queue.Pause(std::chrono::steady_clock::now() + FAR_FUTURE);
+		(void)queue.Post(counted.Work());
+	}
+	CHECK(counted.runs == 0);
+}
+
+// A warm set that is paused hands a build that no worker started to the caller who takes it, and a
+// resumed set runs the next one on a worker. The first take, from an unpaused set, is the baseline.
+void TestPausedWarmSetTakesInline() {
+	Warm      set(1, {});
+	WarmProbe probe;
+	CHECK(set.Start(1, probe.Work(false)));
+	WaitFor([&] { return set.IsDone(1); });
+	auto taken = set.Take(1);
+	CHECK(taken && taken->how == PipelineBuildQueue::Acquired::AlreadyDone);
+	CHECK(taken->result.ran_on != std::this_thread::get_id());
+
+	set.Pause(std::chrono::steady_clock::now() + FAR_FUTURE);
+	CHECK(set.Paused());
+	CHECK(set.Start(2, probe.Work(false)));
+	auto inline_taken = set.Take(2);
+	CHECK(inline_taken && inline_taken->how == PipelineBuildQueue::Acquired::RanInline);
+	CHECK(inline_taken->result.ran_on == std::this_thread::get_id());
+	set.Resume();
+	CHECK(!set.Paused());
+	CHECK(set.Start(3, probe.Work(false)));
+	WaitFor([&] { return set.IsDone(3); });
+	auto resumed = set.Take(3);
+	CHECK(resumed && resumed->result.ran_on != std::this_thread::get_id());
+	(void)set.Stop();
+}
+
 int main() {
 #ifdef KYTY_TEST_HAS_PRIORITY
 	TestLowPriorityWorkers();
@@ -690,5 +901,13 @@ int main() {
 	TestWarmStopWithNothingPending();
 	TestWarmIsDone();
 	TestWarmUpWorkerCount();
+	TestPausedQueueRunsAcquiredJobInline();
+	TestPausedQueueWaitsForDeadline();
+	TestResumeWakesWorkers();
+	TestPausedQueueLetsRunningJobFinish();
+	TestRepeatedPauseKeepsEarlierDeadline();
+	TestStopPausedQueue();
+	TestPauseClampsFarDeadline();
+	TestPausedWarmSetTakesInline();
 	std::puts("Pipeline build queue tests passed");
 }

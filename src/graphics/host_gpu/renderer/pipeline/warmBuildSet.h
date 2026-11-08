@@ -117,6 +117,14 @@ public:
 		return stopped;
 	}
 
+	/// Holds the workers from new builds until Resume or the deadline. A build that someone takes
+	/// still runs on the taker, and a running one finishes.
+	void Pause(PipelineBuildQueue::Clock::time_point deadline) { m_queue.Pause(deadline); }
+	/// Lets the workers take builds again.
+	void Resume() { m_queue.Resume(); }
+	/// True while a pause is in force.
+	[[nodiscard]] bool Paused() const { return m_queue.Paused(); }
+
 	/// True once the set has begun to stop.
 	[[nodiscard]] bool Stopping() const noexcept { return m_queue.Stopping(); }
 
