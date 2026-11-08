@@ -56,6 +56,7 @@ $ArmTable = [ordered]@{
     "deferred"       = @{ Flags = @("--deferred-pipeline-draws");                                                          Ready = $true }
     "deferred-warm-up" = @{ Flags = @("--deferred-pipeline-draws", "--background-warm-up");                               Ready = $true }
     "deferred-pause" = @{ Flags = @("--deferred-pipeline-draws", "--background-warm-up", "--pause-warm-up-for-draws");   Ready = $true }
+    "deferred-non-push" = @{ Flags = @("--deferred-pipeline-draws", "--background-warm-up", "--pause-warm-up-for-draws", "--deferred-non-push-draws"); Ready = $true }
     "gpl"            = @{ Flags = @("--graphics-pipeline-library");                                                        Ready = $false }
     "lookahead"      = @{ Flags = @("--shader-lookahead");                                                                 Ready = $false }
 }
