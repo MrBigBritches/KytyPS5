@@ -304,7 +304,12 @@ bool StreamBuffer::WaitPendingOperations(const std::vector<Watch>& watches,
 		if (!Scheduler().IsFree(watch.tick) && !allow_wait) {
 			return false;
 		}
-		Scheduler().Wait(watch.tick);
+		{
+			// A wait on the current tick submits, and the report should say the ring wrapped.
+			const CommandScheduler::TriggerScope trigger(
+			    Scheduler(), CommandScheduler::ResolveTrigger::StreamWrap);
+			Scheduler().Wait(watch.tick);
+		}
 		if (Usage() == MemoryUsage::Download) {
 			Scheduler().WaitPriorityOperations(watch.tick);
 		}

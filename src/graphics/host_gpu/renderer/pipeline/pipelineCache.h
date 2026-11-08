@@ -227,11 +227,23 @@ public:
 	                                                const DrawRenderState& state,
 	                                                const PipelineSkipPolicy* policy);
 	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info);
-	// Returns a copy of the pipeline a deferred draw waits for, waiting for its background build or
-	// running it here. The build may already have been taken into the cache, by a drain of the
-	// published builds or by a blocking draw of the same key, and then it is not taken again. The key
-	// must be built or pending. GPU thread only, and it touches nothing but this cache.
-	[[nodiscard]] Pipeline AcquireDeferredPipeline(const GraphicsPipelineKey& key);
+	// What one resolve of deferred draws spent in the cache. wait_ms is the wall time of the whole
+	// wait, including a build this thread ran itself. save_ms is the driver cache save after it.
+	struct DeferredAcquireStats {
+		uint32_t distinct_keys = 0;
+		double   wait_ms       = 0.0;
+		double   save_ms       = 0.0;
+	};
+	// Returns a copy of the pipeline for each key, in the same order, waiting for the background
+	// builds in the order the keys are given. The builds were requested when their draws were met, so
+	// the workers run them side by side and the loop only waits. A key may repeat, and a build that an
+	// earlier drain or a blocking draw of the same key already took is not taken again. With
+	// hold_audio the whole wait is one GpuStall scope, so guest audio holds once for the resolve and
+	// never per key. The driver cache is saved once afterwards, outside the scope. Every key must be
+	// built or pending. GPU thread only, and it touches nothing but this cache.
+	[[nodiscard]] std::vector<Pipeline>
+	AcquireDeferredPipelines(std::span<const GraphicsPipelineKey> keys, bool hold_audio,
+	                         DeferredAcquireStats& stats);
 	// True while graphics pipelines are built in the background.
 	[[nodiscard]] bool BuildsInBackground() const noexcept { return m_build_queue != nullptr; }
 	// Drops queued builds, waits for running ones and destroys finished pipelines nobody has
@@ -366,9 +378,15 @@ private:
 	void RequestBuild(const GraphicsPipelineKey& key, const Stages& stages);
 	// Runs on a worker, or on the GPU thread when it claims the job.
 	void RunBuild(const std::shared_ptr<GraphicsBuild>& build);
-	// Waits for, or runs, a queued build and takes its pipeline.
+	// Waits for, or runs, a queued build and takes its pipeline. With resolve_waited_ms set the caller
+	// owns the stall scope, the timing and the driver cache save, as a resolve of deferred draws does,
+	// and a wait for a running build is added to it instead of being recorded here.
 	Pipeline& FinishBuild(const std::shared_ptr<GraphicsBuild>& build,
-	                      const PipelineBuildQueue::JobPtr&      job);
+	                      const PipelineBuildQueue::JobPtr&      job,
+	                      double*                                resolve_waited_ms = nullptr);
+	// The pipeline of one key of a resolve. See AcquireDeferredPipelines.
+	[[nodiscard]] Pipeline AcquireDeferredPipeline(const GraphicsPipelineKey& key,
+	                                               double&                    waited_ms);
 	// Moves a finished build's pipeline into m_graphics_pipelines. GPU thread only.
 	Pipeline& AdoptBuild(std::shared_ptr<GraphicsBuild> build);
 	// Takes every finished build the workers have published.

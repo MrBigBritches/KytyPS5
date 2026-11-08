@@ -15,6 +15,7 @@
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window.h"
+#include "graphics/presentation/window/vulkanValidation.h"
 #include "graphics/presentation/window/windowInternal.h"
 #include "kernel/memory.h"
 #include "libs/controller.h"
@@ -23,11 +24,13 @@
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <fmt/format.h>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 #include <vulkan/vk_platform.h>
@@ -729,6 +732,25 @@ static void VulkanGetExtensions(VulkanExtensions& r) {
 	}
 }
 
+namespace {
+
+// What tests read through VulkanValidation. The callback may run on any thread that calls Vulkan.
+std::atomic<uint64_t>    g_validation_messages {0};
+std::atomic<bool>        g_validation_count_only {false};
+std::mutex               g_validation_kept_mutex;
+std::vector<std::string> g_validation_kept;
+
+// Counts a validation warning or error, and keeps its text while there is room.
+void NoteValidationMessage(const char* text) {
+	g_validation_messages.fetch_add(1, std::memory_order_relaxed);
+	std::lock_guard lock(g_validation_kept_mutex);
+	if (g_validation_kept.size() < VulkanValidation::MAX_KEPT_MESSAGES) {
+		g_validation_kept.emplace_back(text);
+	}
+}
+
+} // namespace
+
 static VKAPI_ATTR vk::Bool32 VKAPI_CALL VulkanDebugMessengerCallback(
     vk::DebugUtilsMessageSeverityFlagBitsEXT      message_severity,
     vk::DebugUtilsMessageTypeFlagsEXT             message_types,
@@ -775,7 +797,14 @@ static VKAPI_ATTR vk::Bool32 VKAPI_CALL VulkanDebugMessengerCallback(
 		default: severity_str = "?";
 	}
 
-	if (error) {
+	const bool validation =
+	    static_cast<bool>(message_types & vk::DebugUtilsMessageTypeFlagBitsEXT::eValidation);
+	if (validation && !debug_printf && !skip) {
+		NoteValidationMessage(callback_data->pMessage);
+	}
+
+	// A test that reads the count turns the exit off, so it can report what the layer said.
+	if (error && !g_validation_count_only.load(std::memory_order_relaxed)) {
 		EXIT("[Vulkan][%s][%u]: %s\n", severity_str, static_cast<uint32_t>(message_types),
 		     callback_data->pMessage);
 	}
@@ -794,6 +823,33 @@ static VKAPI_ATTR vk::Bool32 VKAPI_CALL VulkanDebugMessengerCallback(
 
 	return VK_FALSE;
 }
+
+namespace VulkanValidation {
+
+uint64_t MessageCount() {
+	return g_validation_messages.load(std::memory_order_relaxed);
+}
+
+std::vector<std::string> Messages() {
+	std::lock_guard lock(g_validation_kept_mutex);
+	return g_validation_kept;
+}
+
+void ResetMessages() {
+	std::lock_guard lock(g_validation_kept_mutex);
+	g_validation_messages.store(0, std::memory_order_relaxed);
+	g_validation_kept.clear();
+}
+
+void SetCountOnly(bool count_only) {
+	g_validation_count_only.store(count_only, std::memory_order_relaxed);
+}
+
+vk::PFN_DebugUtilsMessengerCallbackEXT Callback() {
+	return VulkanDebugMessengerCallback;
+}
+
+} // namespace VulkanValidation
 
 static void VulkanCheckInstanceVersion() {
 	uint32_t version = VK_API_VERSION_1_0;

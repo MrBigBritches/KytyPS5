@@ -40,6 +40,7 @@
 #include <ranges>
 #include <span>
 #include <spirv-tools/libspirv.hpp>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 #include <xxhash.h>
@@ -1274,18 +1275,64 @@ PipelineCache::Pipeline* PipelineCache::AcquireBuiltPipeline(const GraphicsPipel
 	return &FinishBuild(pending->second.build, pending->second.job);
 }
 
-PipelineCache::Pipeline PipelineCache::AcquireDeferredPipeline(const GraphicsPipelineKey& key) {
-	if (m_has_published.load(std::memory_order_relaxed)) {
-		DrainPublishedBuilds();
-	}
+PipelineCache::Pipeline PipelineCache::AcquireDeferredPipeline(const GraphicsPipelineKey& key,
+                                                               double&                    waited_ms) {
+	// No drain here. Taking published builds checkpoints the driver cache, which must not run under
+	// the audio hold. AcquireDeferredPipelines drains before its scope, and a build published since
+	// is taken below, when its key is acquired.
 	// Adopting a build twice is fatal, so a key that is already built is only looked up. A drain
-	// above or a blocking draw of the same key may have taken the build while the hole waited.
+	// or a blocking draw of the same key may have taken the build while the hole waited.
 	if (const auto found = m_graphics_pipelines.find(key); found != m_graphics_pipelines.end()) {
 		return found->second;
 	}
 	const auto pending = m_pending_graphics.find(key);
 	EXIT_IF(pending == m_pending_graphics.end());
-	return FinishBuild(pending->second.build, pending->second.job);
+	return FinishBuild(pending->second.build, pending->second.job, &waited_ms);
+}
+
+std::vector<PipelineCache::Pipeline>
+PipelineCache::AcquireDeferredPipelines(std::span<const GraphicsPipelineKey> keys, bool hold_audio,
+                                        DeferredAcquireStats& stats) {
+	using Clock = std::chrono::steady_clock;
+	std::vector<Pipeline> built;
+	built.reserve(keys.size());
+	std::unordered_set<GraphicsPipelineKey, GraphicsPipelineKeyHash> distinct;
+	double                                                          waited_ms = 0.0;
+	// Taking the builds that are already published may save the driver cache, so it happens before
+	// the scope and counts toward save_ms rather than the audio hold.
+	const auto drain_start = Clock::now();
+	if (m_has_published.load(std::memory_order_relaxed)) {
+		DrainPublishedBuilds();
+	}
+	const auto start = Clock::now();
+	{
+		// One scope for the whole wait, so guest audio holds once however many keys there are.
+		// Recording the holes and saving the driver cache are outside it.
+		std::optional<Common::GpuStall::Scope> stall;
+		if (hold_audio) {
+			stall.emplace();
+		}
+		// A resolve is one pause of the GPU thread, so it is one sample of its longest hitch.
+		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::Count,
+		                                         Common::DebugCounters::Counter::PipelineCreateNs,
+		                                         Common::DebugCounters::Peak::PipelineCreateNs);
+		for (const auto& key: keys) {
+			distinct.insert(key);
+			built.push_back(AcquireDeferredPipeline(key, waited_ms));
+		}
+	}
+	const auto waited = Clock::now();
+	stats.distinct_keys = static_cast<uint32_t>(distinct.size());
+	stats.wait_ms       = std::chrono::duration<double, std::milli>(waited - start).count();
+	// Only the time spent waiting for a running worker is added to the blocked time, since builds run
+	// here record themselves as compiles.
+	if (waited_ms > 0.0) {
+		Common::FirstRunReport::AddWait(Common::FirstRunReport::Kind::Graphics, waited_ms);
+	}
+	CheckpointDriverCache();
+	stats.save_ms = std::chrono::duration<double, std::milli>(Clock::now() - waited).count() +
+	                std::chrono::duration<double, std::milli>(start - drain_start).count();
+	return built;
 }
 
 void PipelineCache::RequestBuild(const GraphicsPipelineKey& key, const Stages& stages) {
@@ -1313,10 +1360,34 @@ void PipelineCache::RunBuild(const std::shared_ptr<GraphicsBuild>& build) {
 	m_has_published.store(true, std::memory_order_relaxed);
 }
 
+namespace {
+
+// Makes sure a build job is done. Returns how long this thread waited for a worker that was running
+// it, or nothing when the job was already done or this thread ran it, which counts as a compile.
+std::optional<double> AcquireBuildJob(PipelineBuildQueue& queue, PipelineBuildQueue::Job& job) {
+	const auto start = std::chrono::steady_clock::now();
+	const auto how   = queue.Acquire(job);
+	if (how == PipelineBuildQueue::Acquired::RanInline) {
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::PipelinesCreated);
+	} else if (how == PipelineBuildQueue::Acquired::Waited) {
+		return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+	}
+	return std::nullopt;
+}
+
+} // namespace
+
 PipelineCache::Pipeline& PipelineCache::FinishBuild(const std::shared_ptr<GraphicsBuild>& build,
-                                                    const PipelineBuildQueue::JobPtr&      job) {
+                                                    const PipelineBuildQueue::JobPtr&      job,
+                                                    double* resolve_waited_ms) {
 	// Keeps the build alive across the adoption below, which erases it from the pending map.
 	const auto keep_alive = build;
+	if (resolve_waited_ms != nullptr) {
+		// The resolve holds the stall scope and does the timing and the save for all its keys.
+		*resolve_waited_ms += AcquireBuildJob(*m_build_queue, *job).value_or(0.0);
+		EXIT_IF(!keep_alive->completed.load(std::memory_order_acquire));
+		return AdoptBuild(keep_alive);
+	}
 	{
 		// Both ways of getting the pipeline stop the GPU thread, so guest audio may wait for them.
 		std::optional<Common::GpuStall::Scope> stall;
@@ -1328,17 +1399,10 @@ PipelineCache::Pipeline& PipelineCache::FinishBuild(const std::shared_ptr<Graphi
 		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::Count,
 		                                         Common::DebugCounters::Counter::PipelineCreateNs,
 		                                         Common::DebugCounters::Peak::PipelineCreateNs);
-		const auto start = std::chrono::steady_clock::now();
-		const auto how   = m_build_queue->Acquire(*job);
-		if (how == PipelineBuildQueue::Acquired::RanInline) {
-			Common::DebugCounters::Add(Common::DebugCounters::Counter::PipelinesCreated);
-		} else if (how == PipelineBuildQueue::Acquired::Waited) {
-			const auto waited_ms = std::chrono::duration<double, std::milli>(
-			                           std::chrono::steady_clock::now() - start)
-			                           .count();
-			Common::FirstRunReport::AddWait(Common::FirstRunReport::Kind::Graphics, waited_ms);
+		if (const auto waited_ms = AcquireBuildJob(*m_build_queue, *job)) {
+			Common::FirstRunReport::AddWait(Common::FirstRunReport::Kind::Graphics, *waited_ms);
 			PipelineCacheLog("Pipeline build: waited {:.1f} ms for a running background compile",
-			                 waited_ms);
+			                 *waited_ms);
 		}
 	}
 	EXIT_IF(!keep_alive->completed.load(std::memory_order_acquire));

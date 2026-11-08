@@ -70,6 +70,10 @@ bool WaitWhileStalled();
 /// counter it always counts, so a run report can read it.
 [[nodiscard]] uint64_t HoldCount();
 
+/// Scopes created since the process began, so a test can tell one scope from several. Unlike
+/// HoldCount it does not depend on a thread being held while each scope lasts.
+[[nodiscard]] uint64_t ScopeCount();
+
 /// Number of threads waiting in WaitWhileStalled, so tests can tell when a waiter is parked.
 [[nodiscard]] uint32_t WaiterCount();
 

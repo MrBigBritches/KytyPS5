@@ -2,17 +2,22 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_COMMANDSCHEDULER_H_
 
 #include "common/common.h"
+#include "common/firstRunReport.h"
 #include "common/uniqueFunction.h"
 #include "graphics/host_gpu/renderer/drawRecord.h"
 #include "graphics/host_gpu/renderer/dynamicState.h"
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/submitCadence.h"
 
+#include <chrono>
 #include <condition_variable>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <queue>
+#include <span>
 #include <thread>
 #include <vector>
 
@@ -52,6 +57,37 @@ public:
 	/// buffer by the next Submit, which then sends the segments and holes in order. GPU thread or
 	/// shutdown only, and never from inside Submit.
 	void SplitForHole(std::unique_ptr<DrawHole> hole);
+	/// What forced a resolve of deferred draws, for the first-run report. Submit is the default, for
+	/// every caller that does not say more.
+	enum class ResolveTrigger : uint8_t {
+		Submit,
+		Fault,
+		StreamWrap,
+		Cap,
+		Shutdown,
+		Readback,
+		Label,
+		Flip,
+		Unmap,
+		SliceEnd
+	};
+	/// The name the report gives a trigger.
+	[[nodiscard]] static const char* ResolveTriggerName(ResolveTrigger trigger) noexcept;
+	/// Names the trigger of any resolve that happens while it lives. Put one around a Wait or Flush
+	/// whose caller knows why it submits.
+	class TriggerScope {
+	public:
+		TriggerScope(CommandScheduler& scheduler, ResolveTrigger trigger)
+		    : m_scheduler(scheduler), m_previous(scheduler.m_trigger) {
+			scheduler.m_trigger = trigger;
+		}
+		~TriggerScope() { m_scheduler.m_trigger = m_previous; }
+		KYTY_CLASS_NO_COPY(TriggerScope);
+
+	private:
+		CommandScheduler& m_scheduler;
+		ResolveTrigger    m_previous;
+	};
 	/// Holes split off and not yet recorded. Every Flush, Finish and Wait leaves none.
 	[[nodiscard]] size_t PendingHoleCount() const noexcept { return m_pending_holes; }
 	/// Tells the submit cadence that a draw or dispatch went into the current command buffer.
@@ -128,9 +164,16 @@ private:
 	/// Takes a pool buffer, begins it as the current one and marks the dynamic state as unset in
 	/// it. It leaves the submit cadence alone.
 	void BeginBuffer();
-	/// Builds every pending hole's buffer, waiting for the pipelines it needs. It touches only the
-	/// scheduler and the pipeline cache, because callers reach Submit from inside the caches.
+	/// Builds every pending hole's buffer, waiting for the pipelines it needs, and adds a row to the
+	/// first-run report. It touches only the scheduler and the pipeline cache, because callers reach
+	/// Submit from inside the caches.
 	void ResolveHoles();
+	/// Waits for the pipelines of every unrecorded hole, in hole order, filling the wait columns of
+	/// the report row. This is the only part of a resolve that holds guest audio.
+	[[nodiscard]] std::vector<PipelineCache::Pipeline>
+	AcquireHolePipelines(Common::FirstRunReport::DeferredResolve& row);
+	/// Records every unrecorded hole into its buffer against the pipeline at the same place in `built`.
+	void RecordHoles(std::span<const PipelineCache::Pipeline> built);
 	/// Whether the calling thread may split or resolve. That is the GPU thread, any thread once
 	/// shutdown began, and a thread a test named.
 	[[nodiscard]] bool OnHoleThread() const;
@@ -175,6 +218,11 @@ private:
 	bool                           m_in_submit     = false;
 	bool                           m_in_resolve    = false;
 	std::thread::id                m_extra_hole_thread;
+	// Set by tests so a resolve on their thread holds guest audio as the GPU thread's would.
+	bool                           m_hold_audio_extra_thread = false;
+	// When the first pending hole was split in, for the report's time before the resolve.
+	std::optional<std::chrono::steady_clock::time_point> m_first_hole_time;
+	ResolveTrigger                 m_trigger = ResolveTrigger::Submit;
 };
 
 } // namespace Libs::Graphics

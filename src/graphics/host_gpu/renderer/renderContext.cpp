@@ -102,6 +102,8 @@ bool RenderContext::ResolveReadbackFault(PageFaultAccess access, uint64_t fault_
 			// pending operations alone, because they can free resources that the code which faulted
 			// is still preparing to use.
 			const auto tick = m_command_scheduler.CurrentTick();
+			const CommandScheduler::TriggerScope trigger(m_command_scheduler,
+			                                             CommandScheduler::ResolveTrigger::Fault);
 			m_command_scheduler.Wait(tick);
 			m_command_scheduler.WaitPriorityOperations(tick);
 			return true;
@@ -242,6 +244,8 @@ void RenderContext::RunMemoryOperation(const char* name, uint64_t vaddr, uint64_
 void RenderContext::DrainBeforeUnmap(uint64_t vaddr, uint64_t size) {
 	if (NeedsUnmapDrain(vaddr, size)) {
 		const auto tick = m_command_scheduler.CurrentTick();
+		const CommandScheduler::TriggerScope trigger(m_command_scheduler,
+		                                             CommandScheduler::ResolveTrigger::Unmap);
 		m_command_scheduler.Finish();
 		m_command_scheduler.WaitPriorityOperations(tick);
 	}

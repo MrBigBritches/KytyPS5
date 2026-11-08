@@ -6,6 +6,7 @@
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/firstRunReport.h"
+#include "common/gpuStall.h"
 #include "common/hostException.h"
 #include "common/logging/log.h"
 #include "common/subsystems.h"
@@ -51,6 +52,7 @@
 #include <fstream>
 #include <iterator>
 #include "graphics/presentation/videoOut.h"
+#include "graphics/presentation/window/vulkanValidation.h"
 #include "graphics/presentation/window/windowInternal.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
@@ -326,6 +328,11 @@ struct CommandSchedulerTestAccess {
   }
 
   static bool CadenceDue(const CommandScheduler &scheduler) { return scheduler.m_cadence.Due(); }
+
+  // Makes a resolve on the calling thread hold guest audio, as one on the GPU thread does.
+  static void HoldAudioFromThisThread(CommandScheduler &scheduler) {
+    scheduler.m_hold_audio_extra_thread = true;
+  }
 };
 
 struct CommandBufferTestAccess {
@@ -1225,6 +1232,35 @@ struct PipelineCacheTestAccess {
   static void FinishPending(PipelineCache &cache, const GraphicsPipelineKey &key) {
     const auto pending = cache.m_pending_graphics.find(key);
     (void)cache.FinishBuild(pending->second.build, pending->second.job);
+  }
+
+  // A key no draw made, told apart from the others by its number alone.
+  static GraphicsPipelineKey FakeKey(uint64_t number) {
+    GraphicsPipelineKey key{};
+    key.stage_ids[0] = number;
+    return key;
+  }
+
+  // Replaces the build queue with one of `workers` threads. Nothing may be queued on the old one.
+  static void ReplaceBuildQueue(PipelineCache &cache, uint32_t workers) {
+    cache.m_build_queue = std::make_unique<PipelineBuildQueue>(workers);
+  }
+
+  // Adds a pending build of `key` whose compile is `work`, as RequestBuild adds a real one. The
+  // pipeline it produces has no Vulkan objects.
+  static void PostFakeBuild(PipelineCache &cache, const GraphicsPipelineKey &key,
+                            std::function<void()> work) {
+    auto build = std::make_shared<PipelineCache::GraphicsBuild>(key, PipelineCache::Stages{});
+    auto job = cache.m_build_queue->Post([build, work = std::move(work)] {
+      work();
+      build->completed.store(true, std::memory_order_release);
+    });
+    cache.m_pending_graphics.emplace(key, PipelineCache::PendingBuild{build, job});
+  }
+
+  // Drops the empty pipeline a fake build left in the cache.
+  static void ForgetFakePipeline(PipelineCache &cache, const GraphicsPipelineKey &key) {
+    cache.m_graphics_pipelines.erase(key);
   }
 
   // Builds requested and not yet taken into the cache.
@@ -3104,8 +3140,16 @@ using GateScript = std::vector<std::optional<GateFrame>>;
 
 class VulkanHarness {
 public:
-  VulkanHarness() { Init(); }
+  // With `sync_validation` the instance runs the Khronos validation layer with synchronization
+  // validation, if the layer is installed. SyncValidationActive says whether it does.
+  explicit VulkanHarness(bool sync_validation = false) { Init(sync_validation); }
   ~VulkanHarness() { Destroy(); }
+  // Whether the validation layer with synchronization validation is on for this device.
+  [[nodiscard]] bool SyncValidationActive() const { return m_sync_validation_active; }
+  // Why it is not, for the line a skipped test prints.
+  [[nodiscard]] const std::string &SyncValidationReason() const {
+    return m_sync_validation_reason;
+  }
   // Host float min/max is used on AMD GPUs, as in Kyty.
   [[nodiscard]] bool SupportsNativeFloatMinMax() const {
     vk::PhysicalDeviceProperties properties;
@@ -32490,6 +32534,7 @@ public:
 
 #include "PssrGpuTests.inc"
 #include "DrawRecordTests.inc"
+#include "DeferredResolveTests.inc"
 
 private:
   bool m_rasterization_supported = true;
@@ -32587,7 +32632,55 @@ private:
     m_renderer = std::make_unique<RenderContext>(m_runtime_context);
   }
 
-  void Init() {
+  // Adds the validation layer, its extensions and the synchronization feature to an instance that
+  // is about to be created, when they exist. Returns whether it did, and says why not otherwise.
+  bool AddSyncValidation(std::vector<const char *> *extensions,
+                         std::vector<const char *> *layers) {
+    constexpr const char *layer = "VK_LAYER_KHRONOS_validation";
+    const auto available_layers = vk::enumerateInstanceLayerProperties();
+    const bool has_layer = std::ranges::any_of(available_layers.value, [&](const auto &found) {
+      return std::strcmp(found.layerName.data(), layer) == 0;
+    });
+    if (!has_layer) {
+      m_sync_validation_reason = "the Khronos validation layer is not installed";
+      return false;
+    }
+    const auto layer_extensions = vk::enumerateInstanceExtensionProperties(std::string(layer));
+    const auto has_extension = [&](const char *name) {
+      return std::ranges::any_of(layer_extensions.value, [&](const auto &found) {
+        return std::strcmp(found.extensionName.data(), name) == 0;
+      });
+    };
+    const auto instance_extensions = vk::enumerateInstanceExtensionProperties();
+    const bool has_debug_utils = std::ranges::any_of(instance_extensions.value, [](const auto &found) {
+      return std::strcmp(found.extensionName.data(), VK_EXT_DEBUG_UTILS_EXTENSION_NAME) == 0;
+    });
+    if (!has_debug_utils || !has_extension(VK_EXT_VALIDATION_FEATURES_EXTENSION_NAME)) {
+      m_sync_validation_reason = "the validation layer lacks debug utils or validation features";
+      return false;
+    }
+    extensions->push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+    extensions->push_back(VK_EXT_VALIDATION_FEATURES_EXTENSION_NAME);
+    layers->push_back(layer);
+    return true;
+  }
+
+  // Registers the production debug callback, so the count of messages the layer reports can be read,
+  // and makes errors count instead of ending the test process.
+  void StartCountingValidation() {
+    vk::DebugUtilsMessengerCreateInfoEXT messenger_info{};
+    messenger_info.messageSeverity = vk::DebugUtilsMessageSeverityFlagBitsEXT::eWarning |
+                                     vk::DebugUtilsMessageSeverityFlagBitsEXT::eError;
+    messenger_info.messageType = vk::DebugUtilsMessageTypeFlagBitsEXT::eValidation;
+    messenger_info.pfnUserCallback = Libs::Graphics::VulkanValidation::Callback();
+    RequireVk("VulkanHarness", "validation",
+              m_instance.createDebugUtilsMessengerEXT(&messenger_info, nullptr, &m_messenger),
+              "vkCreateDebugUtilsMessengerEXT");
+    Libs::Graphics::VulkanValidation::SetCountOnly(true);
+    Libs::Graphics::VulkanValidation::ResetMessages();
+  }
+
+  void Init(bool sync_validation) {
     static vk::detail::DynamicLoader loader;
     const auto get_instance_proc_addr =
         loader.getProcAddress<PFN_vkGetInstanceProcAddr>(
@@ -32604,10 +32697,32 @@ private:
     vk::InstanceCreateInfo instance_info{};
     instance_info.sType = vk::StructureType::eInstanceCreateInfo;
     instance_info.pApplicationInfo = &app;
+    std::vector<const char *> instance_extensions;
+    std::vector<const char *> instance_layers;
+    // Synchronization validation is the one feature a hazard between recorded commands needs.
+    const std::array<vk::ValidationFeatureEnableEXT, 1> validation_enables{
+        vk::ValidationFeatureEnableEXT::eSynchronizationValidation};
+    vk::ValidationFeaturesEXT validation_features{};
+    validation_features.enabledValidationFeatureCount =
+        static_cast<u32>(validation_enables.size());
+    validation_features.pEnabledValidationFeatures = validation_enables.data();
+    if (!sync_validation) {
+      m_sync_validation_reason = "synchronization validation was not asked for";
+    } else if (AddSyncValidation(&instance_extensions, &instance_layers)) {
+      m_sync_validation_active = true;
+      instance_info.pNext = &validation_features;
+      instance_info.enabledExtensionCount = static_cast<u32>(instance_extensions.size());
+      instance_info.ppEnabledExtensionNames = instance_extensions.data();
+      instance_info.enabledLayerCount = static_cast<u32>(instance_layers.size());
+      instance_info.ppEnabledLayerNames = instance_layers.data();
+    }
     RequireVk("VulkanHarness", "dispatch",
               vk::createInstance(&instance_info, nullptr, &m_instance),
               "vkCreateInstance");
     VULKAN_HPP_DEFAULT_DISPATCHER.init(m_instance);
+    if (m_sync_validation_active) {
+      StartCountingValidation();
+    }
 
     u32 physical_count = 0;
     RequireVk("VulkanHarness", "dispatch",
@@ -32949,6 +33064,10 @@ private:
       }
       m_device.destroy(nullptr);
     }
+    if (m_messenger != nullptr) {
+      m_instance.destroyDebugUtilsMessengerEXT(m_messenger, nullptr);
+      Libs::Graphics::VulkanValidation::SetCountOnly(false);
+    }
     if (m_instance != nullptr) {
       m_instance.destroy(nullptr);
     }
@@ -33234,6 +33353,9 @@ private:
   }
 
   vk::Instance m_instance = nullptr;
+  vk::DebugUtilsMessengerEXT m_messenger = nullptr;
+  bool m_sync_validation_active = false;
+  std::string m_sync_validation_reason;
   vk::PhysicalDevice m_physical_device = nullptr;
   vk::Device m_device = nullptr;
   vk::Queue m_queue = nullptr;
@@ -67916,6 +68038,11 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--draw-record-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckDrawRecord();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--sync-validation-only") == 0) {
+    VulkanHarness vulkan(true);
+    vulkan.CheckHoleSyncValidation();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--async-pipelines-only") == 0) {

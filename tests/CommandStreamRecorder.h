@@ -4,6 +4,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <cstdint>
+#include <functional>
 #include <initializer_list>
 #include <map>
 #include <string>
@@ -20,6 +21,9 @@ struct Recorder {
   static inline std::vector<std::string> rows;
   static inline std::map<uint64_t, std::string> labels;
   static inline std::map<std::string, uint32_t> counts;
+  // Called as each row is recorded, so a test can look at the state of the process while a command
+  // is recorded. Empty unless a test sets it, and the test clears it again.
+  static inline std::function<void()> probe;
 
   // Forgets the rows and every handle seen so far, and starts or stops recording.
   static void Reset(bool on) {
@@ -92,7 +96,9 @@ inline std::string Join(const char *name, std::initializer_list<std::string> par
 }
 
 inline void Add(std::string row) {
-  if (Recorder::active) Recorder::rows.push_back(std::move(row));
+  if (!Recorder::active) return;
+  Recorder::rows.push_back(std::move(row));
+  if (Recorder::probe) Recorder::probe();
 }
 
 // Wraps one entry of the default dispatcher whose arguments are all plain values or handles.

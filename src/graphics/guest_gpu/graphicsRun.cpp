@@ -509,6 +509,8 @@ bool GuestGpu::Process(Submission& submission) {
 			complete =
 			    cp.Process(submission.execution, submission.commands) == Pm4ProcessResult::Complete;
 			if (submission.execution.MadeProgress()) {
+				const CommandScheduler::TriggerScope trigger(
+				    m_renderer.GetCommandScheduler(), CommandScheduler::ResolveTrigger::SliceEnd);
 				cp.BufferFlush();
 			}
 			break;
@@ -979,6 +981,8 @@ void CommandProcessor::SubmitReadbacksBeforeLabel(uint32_t data_sel) {
 	// A GDS read runs Finish() next, which submits them anyway.
 	constexpr uint32_t DataSelGds = 5;
 	if (QueueReadbacksBeforeLabel() && data_sel != DataSelGds) {
+		const CommandScheduler::TriggerScope trigger(GetScheduler(),
+		                                             CommandScheduler::ResolveTrigger::Label);
 		GetScheduler().Flush();
 	}
 }
@@ -1084,6 +1088,8 @@ void CommandProcessor::Flip(int handle, int index, int flip_mode, int64_t flip_a
 	auto  request = Sync::PrepareVideoOutFlip(command, handle, index, flip_mode, flip_arg);
 	GetScheduler().DeferPriorityOperation(
 	    [&renderer = m_renderer, request] { renderer.GetVideoOut().CompleteFlip(request); });
+	const CommandScheduler::TriggerScope trigger(GetScheduler(),
+	                                             CommandScheduler::ResolveTrigger::Flip);
 	GetScheduler().Flush();
 }
 
@@ -1092,6 +1098,8 @@ void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
 	m_renderer.GetVideoOut().PrepareFlip(request_id, command);
 	GetScheduler().DeferPriorityOperation(
 	    [this, request_id] { m_renderer.GetVideoOut().CompleteFlip(request_id); });
+	const CommandScheduler::TriggerScope trigger(GetScheduler(),
+	                                             CommandScheduler::ResolveTrigger::Flip);
 	GetScheduler().Flush();
 }
 

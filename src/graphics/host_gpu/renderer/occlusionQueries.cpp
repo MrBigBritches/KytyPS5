@@ -54,6 +54,8 @@ void OcclusionQueries::Dump(uint64_t address) {
 
 void OcclusionQueries::PublishDumps() {
 	if (const auto last = m_dumps.back().queries; last != m_read) {
+		const CommandScheduler::TriggerScope trigger(m_scheduler,
+		                                             CommandScheduler::ResolveTrigger::Readback);
 		m_scheduler.Wait(m_dumps.back().tick);
 		// The unread queries wrap around the pool at most once.
 		for (uint64_t read = m_read; read < last;) {

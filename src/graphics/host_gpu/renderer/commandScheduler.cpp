@@ -2,12 +2,17 @@
 
 #include "common/assert.h"
 #include "common/debugCounters.h"
+#include "common/firstRunReport.h"
+#include "common/gpuStall.h"
+#include "common/logging/log.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 
 #include <algorithm>
+#include <chrono>
+#include <fmt/format.h>
 #include <optional>
 
 namespace Libs::Graphics {
@@ -15,6 +20,11 @@ namespace Libs::Graphics {
 static thread_local CommandScheduler* g_deferred_callback_scheduler = nullptr;
 
 namespace {
+
+double ElapsedMs(std::chrono::steady_clock::time_point from,
+                 std::chrono::steady_clock::time_point to) {
+	return std::chrono::duration<double, std::milli>(to - from).count();
+}
 
 // Orders the attachment writes of the buffer before it against the attachment reads and writes of
 // the buffer after it. Draws on one attachment in separate render passes get no other barrier,
@@ -171,6 +181,7 @@ void CommandScheduler::Shutdown() {
 		m_operation_state = OperationState::Draining;
 	}
 	if (!m_command.IsInvalid()) {
+		const TriggerScope trigger(*this, ResolveTrigger::Shutdown);
 		Submit();
 	}
 	m_master.Wait(CurrentTick() - 1);
@@ -395,34 +406,56 @@ void CommandScheduler::SplitForHole(std::unique_ptr<DrawHole> hole) {
 	m_command.End();
 	m_held.push_back({m_command.m_buffer, segment_used, nullptr, false});
 	m_held.push_back({m_command_pool.Commit(), true, std::move(hole), false});
+	if (m_pending_holes == 0) {
+		m_first_hole_time = std::chrono::steady_clock::now();
+	}
 	m_pending_holes++;
 	// The cadence is not reset here. A split is not a submit, and the draws on both sides of it
 	// belong to the same tick.
 	BeginBuffer();
 }
 
-void CommandScheduler::ResolveHoles() {
-	if (m_pending_holes == 0) {
-		return;
+const char* CommandScheduler::ResolveTriggerName(ResolveTrigger trigger) noexcept {
+	switch (trigger) {
+		case ResolveTrigger::Submit: return "submit";
+		case ResolveTrigger::Fault: return "fault";
+		case ResolveTrigger::StreamWrap: return "stream_wrap";
+		case ResolveTrigger::Cap: return "cap";
+		case ResolveTrigger::Shutdown: return "shutdown";
+		case ResolveTrigger::Readback: return "readback";
+		case ResolveTrigger::Label: return "label";
+		case ResolveTrigger::Flip: return "flip";
+		case ResolveTrigger::Unmap: return "unmap";
+		case ResolveTrigger::SliceEnd: return "slice_end";
 	}
-	EXIT_IF(!OnHoleThread());
-	const ReentryGuard guard(m_in_resolve);
-	auto&              pipelines = m_context.GetPipelineCache();
-	auto&              executor  = m_context.GetRenderExecutor();
+	return "submit";
+}
 
-	// Step 5 puts one GpuStall scope around this loop and waits for the builds in parallel. The
-	// loop must stay free of recording, so the scope covers only the wait.
-	std::vector<PipelineCache::Pipeline> built;
-	built.reserve(m_pending_holes);
+std::vector<PipelineCache::Pipeline>
+CommandScheduler::AcquireHolePipelines(Common::FirstRunReport::DeferredResolve& row) {
+	std::vector<GraphicsPipelineKey> keys;
+	keys.reserve(m_pending_holes);
 	for (const auto& held: m_held) {
 		if (held.hole != nullptr && !held.recorded) {
-			built.push_back(pipelines.AcquireDeferredPipeline(held.hole->Key()));
-			// The image heap's set is bound in the segment's buffer, which the hole's buffer lacks.
-			EXIT_IF(built.back().uses_image_heap);
+			keys.push_back(held.hole->Key());
 		}
 	}
+	// A resolve from the shutdown path or another thread must never hold guest audio, since only the
+	// GPU thread's waits stop the frames that audio is paced against.
+	PipelineCache::DeferredAcquireStats stats;
+	auto built = m_context.GetPipelineCache().AcquireDeferredPipelines(
+	    keys, GuestGpu::IsGpuThread() || m_hold_audio_extra_thread, stats);
+	row.distinct_keys   = stats.distinct_keys;
+	row.resolve_wait_ms = stats.wait_ms;
+	row.save_ms         = stats.save_ms;
+	// The image heap's set is bound in the segment's buffer, which the hole's buffer lacks.
+	EXIT_IF(std::ranges::any_of(built, [](const auto& pipeline) { return pipeline.uses_image_heap; }));
+	return built;
+}
 
-	size_t next = 0;
+void CommandScheduler::RecordHoles(std::span<const PipelineCache::Pipeline> built) {
+	auto&  executor = m_context.GetRenderExecutor();
+	size_t next     = 0;
 	for (auto& held: m_held) {
 		if (held.hole == nullptr || held.recorded) {
 			continue;
@@ -438,7 +471,38 @@ void CommandScheduler::ResolveHoles() {
 		EXIT_NOT_IMPLEMENTED(held.buffer.end() != vk::Result::eSuccess);
 		held.recorded = true;
 	}
+}
+
+void CommandScheduler::ResolveHoles() {
+	if (m_pending_holes == 0) {
+		return;
+	}
+	EXIT_IF(!OnHoleThread() || !m_first_hole_time.has_value());
+	const ReentryGuard guard(m_in_resolve);
+	using Clock             = std::chrono::steady_clock;
+	const auto started      = Clock::now();
+	const auto holds_before = Common::GpuStall::HoldCount();
+
+	Common::FirstRunReport::DeferredResolve row;
+	row.trigger        = ResolveTriggerName(m_trigger);
+	row.holes          = static_cast<uint32_t>(m_pending_holes);
+	row.pre_resolve_ms = ElapsedMs(*m_first_hole_time, started);
+	// The wait is the only part under the audio hold. Recording below runs after the hold ends.
+	const auto built       = AcquireHolePipelines(row);
+	const auto record_from = Clock::now();
+	RecordHoles(built);
+	row.record_ms         = ElapsedMs(record_from, Clock::now());
+	row.hold_count_change = Common::GpuStall::HoldCount() - holds_before;
+
 	m_pending_holes = 0;
+	m_first_hole_time.reset();
+	Common::FirstRunReport::AddDeferredResolve(row);
+	// Log file only, since a cold burst resolves often and would flood the console.
+	Log::Write(Log::Color::Default, fmt::format(
+	    "Deferred draws resolved ({}): {} holes, {} keys, wait {:.1f} ms, record {:.1f} ms, "
+	    "before resolve {:.1f} ms, save {:.1f} ms\n",
+	    row.trigger, row.holes, row.distinct_keys, row.resolve_wait_ms, row.record_ms,
+	    row.pre_resolve_ms, row.save_ms));
 }
 
 uint64_t CommandScheduler::GpuLag(uint64_t current_tick, uint64_t known_gpu_tick) noexcept {
