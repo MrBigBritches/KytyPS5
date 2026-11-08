@@ -533,16 +533,22 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	                          push_data_cursor));
 }
 
-// Opens the driver cache and, with --async-pipelines on, starts the build workers.
+// Opens the driver cache and, with --async-pipelines or --deferred-pipeline-draws on, starts the
+// build workers.
 PipelineCache::PipelineCache(GraphicContext&                         graphics,
                              ShaderRecompiler::IR::ImageHeapSource* image_heap)
     : m_graphics(graphics), m_image_heap(image_heap),
       m_next_driver_cache_save(std::chrono::steady_clock::now() + DriverCacheSaveInterval) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
-	// Read once. With the flag off no thread exists and every miss builds on the calling thread.
-	if (Config::AsyncPipelinesEnabled()) {
-		m_build_queue = std::make_unique<PipelineBuildQueue>(PipelineBuildWorkerCount());
+	// Read once. With both flags off no thread exists and every miss builds on the calling thread.
+	// Deferred draws wait for their builds together, so they get more workers. With both flags on
+	// the skips share that larger pool.
+	if (Config::AsyncPipelinesEnabled() || Config::DeferredPipelineDrawsEnabled()) {
+		const uint32_t worker_cap = Config::DeferredPipelineDrawsEnabled()
+		                                ? DEFERRED_PIPELINE_BUILD_WORKERS
+		                                : PIPELINE_BUILD_WORKERS;
+		m_build_queue = std::make_unique<PipelineBuildQueue>(PipelineBuildWorkerCount(worker_cap));
 	}
 }
 
@@ -1213,7 +1219,8 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 
 PipelineCache::Pipeline* PipelineCache::AcquireGraphicsPipeline(const CommandBuffer&   command,
                                                                 const DrawRenderState& state,
-                                                                const PipelineSkipPolicy* policy) {
+                                                                const PipelineSkipPolicy* policy,
+                                                                DeferredDraw* deferred) {
 	KYTY_PROFILER_BLOCK("PipelineCache::CreatePipeline(Gfx)", profiler::colors::DeepOrangeA200);
 	const auto stages = DrawStages(state);
 	const auto key    = MakeGraphicsPipelineKey(command, state, stages);
@@ -1221,8 +1228,12 @@ PipelineCache::Pipeline* PipelineCache::AcquireGraphicsPipeline(const CommandBuf
 		// The change in the report's blocked graphics time across the call is what a refused draw
 		// waited, whether it compiled here or waited for a worker.
 		const double blocked_before = Common::FirstRunReport::BlockedMs(Common::FirstRunReport::Kind::Graphics);
-		auto* pipeline = AcquireBuiltPipeline(key, stages, state, policy);
-		if (policy != nullptr && policy->Refusal() != nullptr) {
+		auto* pipeline = AcquireBuiltPipeline(key, stages, state, policy, deferred);
+		// Refusals are the S2 rules' own, so they are only kept when skips are on, and a deferred
+		// draw waited for nothing.
+		const bool deferred_now = deferred != nullptr && deferred->active;
+		if (Config::AsyncPipelinesEnabled() && !deferred_now && policy != nullptr &&
+		    policy->Refusal() != nullptr) {
 			Common::FirstRunReport::AddRefusal(
 			    policy->Refusal(),
 			    Common::FirstRunReport::BlockedMs(Common::FirstRunReport::Kind::Graphics) - blocked_before);
@@ -1243,10 +1254,60 @@ PipelineCache::GraphicsBuild::GraphicsBuild(const GraphicsPipelineKey& request_k
                                             const Stages&              request_stages)
     : key(request_key), stages(request_stages), requested(std::chrono::steady_clock::now()) {}
 
+const char* PipelineCache::DeferBlocker(const Stages&             stages,
+                                        const PipelineSkipPolicy* policy) const {
+	// A shared heap set is bound in the buffer a draw is met in, which the hole's buffer lacks.
+	const bool heap = std::ranges::any_of(stages, [](const ShaderModule* stage) {
+		return stage != nullptr && stage->info.info.uses_image_heap;
+	});
+	if (heap) {
+		return "image_heap";
+	}
+	// A descriptor set is allocated and written in the buffer the draw is met in, so only pushed
+	// descriptors can move into the hole's buffer. The layout code predicts which this draw gets.
+	if (!PredictPushDescriptors(m_graphics, stages)) {
+		return "non_push";
+	}
+	return policy != nullptr ? policy->DeferBlocker() : "unsupported";
+}
+
+void PipelineCache::NoteDeferredWouldSkip(const std::shared_ptr<GraphicsBuild>& build) {
+	m_would_skip.push_back({build, std::chrono::steady_clock::now()});
+}
+
+void PipelineCache::ReportDeferredWouldSkip() {
+	for (const auto& noted: m_would_skip) {
+		// The build reports its readiness as a time since it was requested, which a draw met after
+		// the request did not wait for. A build done before the draw was deferred waited for nothing.
+		const auto ready_at = noted.build->requested +
+		                      std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+		                          std::chrono::duration<double, std::milli>(noted.build->ready_ms));
+		const double waited_ms =
+		    std::max(0.0, std::chrono::duration<double, std::milli>(ready_at - noted.deferred_at).count());
+		Common::FirstRunReport::AddDeferredWouldSkip(waited_ms);
+	}
+	m_would_skip.clear();
+}
+
+DrawFate PipelineCache::ChooseMissedDrawFate(const Stages& stages, const PipelineSkipPolicy* policy,
+                                             const DeferredDraw* deferred, bool& may_skip) {
+	// The S2 rules are only asked when skips are on. A flag-only run must neither skip nor pay for
+	// their history checks.
+	may_skip = Config::AsyncPipelinesEnabled() && policy != nullptr && policy->MaySkip();
+	const bool  wants_defer = deferred != nullptr && Config::DeferredPipelineDrawsEnabled();
+	const char* blocker     = wants_defer ? DeferBlocker(stages, policy) : nullptr;
+	// The counter says the draw could not be deferred, so a draw that a skip takes instead is in it.
+	if (blocker != nullptr) {
+		Common::FirstRunReport::AddDeferredIneligible(blocker);
+	}
+	return ChooseDrawFate({.defer_allowed = wants_defer && blocker == nullptr, .skip_allowed = may_skip});
+}
+
 PipelineCache::Pipeline* PipelineCache::AcquireBuiltPipeline(const GraphicsPipelineKey& key,
                                                              const Stages&              stages,
                                                              const DrawRenderState&     state,
-                                                             const PipelineSkipPolicy*  policy) {
+                                                             const PipelineSkipPolicy*  policy,
+                                                             DeferredDraw*              deferred) {
 	// The one cost a pipeline that is already built pays for background builds.
 	if (m_has_published.load(std::memory_order_relaxed)) {
 		DrainPublishedBuilds();
@@ -1259,16 +1320,26 @@ PipelineCache::Pipeline* PipelineCache::AcquireBuiltPipeline(const GraphicsPipel
 	    pending->second.build->completed.load(std::memory_order_acquire)) {
 		return &AdoptBuild(pending->second.build);
 	}
-	const bool may_skip = policy != nullptr && policy->MaySkip();
+	bool       may_skip = false;
+	const auto fate     = ChooseMissedDrawFate(stages, policy, deferred, may_skip);
 	if (pending == m_pending_graphics.end()) {
 		DumpPipelineInputs(state);
-		if (!may_skip) {
+		if (fate == DrawFate::Block) {
 			return &CreateGraphicsPipelineHere(m_graphics_pipelines[key], key, stages);
 		}
 		RequestBuild(key, stages);
 		pending = m_pending_graphics.find(key);
 	}
-	if (may_skip) {
+	if (fate == DrawFate::Defer) {
+		deferred->active = true;
+		deferred->key    = key;
+		// A draw that S2 would have dropped is deferred instead, which costs it a wait.
+		if (may_skip) {
+			NoteDeferredWouldSkip(pending->second.build);
+		}
+		return nullptr;
+	}
+	if (fate == DrawFate::Skip) {
 		pending->second.build->skipped_draws++;
 		return nullptr;
 	}
@@ -1329,6 +1400,7 @@ PipelineCache::AcquireDeferredPipelines(std::span<const GraphicsPipelineKey> key
 	if (waited_ms > 0.0) {
 		Common::FirstRunReport::AddWait(Common::FirstRunReport::Kind::Graphics, waited_ms);
 	}
+	ReportDeferredWouldSkip();
 	CheckpointDriverCache();
 	stats.save_ms = std::chrono::duration<double, std::milli>(Clock::now() - waited).count() +
 	                std::chrono::duration<double, std::milli>(start - drain_start).count();

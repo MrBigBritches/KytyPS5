@@ -17,15 +17,19 @@
 namespace Libs::Graphics {
 /// The most threads that build pipelines in the background, a few so that a burst of misses cannot
 /// take every core from the game. A small machine starts fewer.
-/// core from the game.
 inline constexpr uint32_t PIPELINE_BUILD_WORKERS = 4;
 
-/// How many build workers to start on this machine. At most PIPELINE_BUILD_WORKERS, and at most
-/// half the hardware threads, so a small machine keeps room for the guest threads. Never below one.
-uint32_t PipelineBuildWorkerCount();
+/// The most build workers while --deferred-pipeline-draws is on. Its draws wait for their pipelines
+/// together, so a burst of misses finishes sooner with more of them building at once.
+inline constexpr uint32_t DEFERRED_PIPELINE_BUILD_WORKERS = 6;
+
+/// How many build workers to start on this machine. At most `worker_cap`, and at most half the
+/// hardware threads, so a small machine keeps room for the guest threads. Never below one.
+uint32_t PipelineBuildWorkerCount(uint32_t worker_cap = PIPELINE_BUILD_WORKERS);
 
 /// The worker count for a machine with the given number of hardware threads, zero meaning unknown.
-uint32_t PipelineBuildWorkerCountFor(uint32_t hardware_threads);
+uint32_t PipelineBuildWorkerCountFor(uint32_t hardware_threads,
+                                     uint32_t worker_cap = PIPELINE_BUILD_WORKERS);
 
 /// Options for a build queue. The defaults give the queue its original behaviour.
 struct PipelineBuildQueueOptions {

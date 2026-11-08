@@ -302,6 +302,18 @@ void TestWorkerCount() {
 	                       Case{8, 4}, Case{16, 4}, Case{128, 4}}) {
 		CHECK(PipelineBuildWorkerCountFor(test.hardware) == test.workers);
 	}
+	// Deferred pipeline draws raise the cap to six, and the half of the hardware threads still
+	// bounds it.
+	struct CappedCase {
+		uint32_t hardware, cap, workers;
+	};
+	for (const auto test: {CappedCase{8, DEFERRED_PIPELINE_BUILD_WORKERS, 4},
+	                       CappedCase{12, DEFERRED_PIPELINE_BUILD_WORKERS, 6},
+	                       CappedCase{32, DEFERRED_PIPELINE_BUILD_WORKERS, 6},
+	                       CappedCase{32, PIPELINE_BUILD_WORKERS, 4},
+	                       CappedCase{32, 0, 1}}) {
+		CHECK(PipelineBuildWorkerCountFor(test.hardware, test.cap) == test.workers);
+	}
 	const auto here = PipelineBuildWorkerCount();
 	CHECK(here >= 1 && here <= PIPELINE_BUILD_WORKERS);
 }

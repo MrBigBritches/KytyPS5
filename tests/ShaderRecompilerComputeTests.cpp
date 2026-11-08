@@ -322,6 +322,11 @@ struct CommandSchedulerTestAccess {
     return scheduler.m_held[index].has_commands;
   }
 
+  // The key of the pipeline a held hole waits for.
+  static GraphicsPipelineKey HeldHoleKey(const CommandScheduler &scheduler, size_t index) {
+    return scheduler.m_held[index].hole->Key();
+  }
+
   // The buffers the last submit sent, in the order it sent them.
   static std::vector<vk::CommandBuffer> SubmitBuffers(const CommandScheduler &scheduler) {
     return scheduler.m_submit_buffers;
@@ -1129,6 +1134,11 @@ struct PipelineCacheTestAccess {
 
   static bool HasBuildQueue(const PipelineCache &cache) { return cache.m_build_queue != nullptr; }
 
+  // How many threads the build queue started with.
+  static uint32_t BuildWorkers(const PipelineCache &cache) {
+    return cache.m_build_queue->WorkerCount();
+  }
+
   static size_t Programs(const PipelineCache &cache) { return cache.m_program_cache.size(); }
 
   // Marks the driver cache as changed, as a worker does when a background build adds to it.
@@ -1261,6 +1271,43 @@ struct PipelineCacheTestAccess {
   // Drops the empty pipeline a fake build left in the cache.
   static void ForgetFakePipeline(PipelineCache &cache, const GraphicsPipelineKey &key) {
     cache.m_graphics_pipelines.erase(key);
+  }
+
+  // Marks every cached shader module as using the shared image heap, as a shader that samples
+  // through it would be. The next pipeline over one of them is judged and built as a heap user.
+  static void MarkModulesUseImageHeap(PipelineCache &cache) {
+    for (auto &program : cache.m_program_cache | std::views::values) {
+      for (auto &module : program.modules) module.info.info.uses_image_heap = true;
+    }
+  }
+
+  // How many built graphics pipelines push their descriptors, and how many do not.
+  static std::array<size_t, 2> PushPipelineCounts(const PipelineCache &cache) {
+    std::array<size_t, 2> counts{};
+    for (const auto &entry : cache.m_graphics_pipelines) {
+      ++counts[entry.second.uses_push_descriptors ? 0 : 1];
+    }
+    return counts;
+  }
+
+  // The stages a key names, found among the cached modules.
+  static PipelineCache::Stages StagesOf(const PipelineCache &cache, const GraphicsPipelineKey &key) {
+    const auto modules = cache.MapModules();
+    PipelineCache::Stages stages{};
+    for (size_t stage = 0; stage < stages.size(); ++stage) {
+      stages[stage] = modules.at(key.stage_ids[stage]);
+    }
+    return stages;
+  }
+
+  // What the layout code predicts for a key's shaders, before any pipeline exists for it.
+  static bool PredictedPush(const PipelineCache &cache, const GraphicsPipelineKey &key) {
+    return PredictPushDescriptors(cache.m_graphics, StagesOf(cache, key));
+  }
+
+  // Whether the pipeline built for a key pushes its descriptors.
+  static bool BuiltPush(const PipelineCache &cache, const GraphicsPipelineKey &key) {
+    return cache.m_graphics_pipelines.at(key).uses_push_descriptors;
   }
 
   // Builds requested and not yet taken into the cache.
@@ -3146,6 +3193,15 @@ public:
   ~VulkanHarness() { Destroy(); }
   // Whether the validation layer with synchronization validation is on for this device.
   [[nodiscard]] bool SyncValidationActive() const { return m_sync_validation_active; }
+
+  // Tells the next render context whether to make a real occlusion query pool, as the emulator's
+  // device does when the option is on. False if the device cannot reset queries from the host.
+  bool SetOcclusionQueries(bool enabled) {
+    m_runtime_context.occlusion_queries_enabled = enabled && m_occlusion_queries_supported;
+    m_runtime_context.occlusion_query_precise_enabled =
+        m_runtime_context.occlusion_queries_enabled && m_occlusion_query_precise;
+    return m_runtime_context.occlusion_queries_enabled;
+  }
   // Why it is not, for the line a skipped test prints.
   [[nodiscard]] const std::string &SyncValidationReason() const {
     return m_sync_validation_reason;
@@ -19126,16 +19182,19 @@ public:
     bool depth_only_draws = false;
     // Makes the rig. `async` turns on background builds under the default skip rule, and
     // `depth_only` turns on the second mode instead. `use_htile` gives the depth target HTILE.
+    // `deferred` turns on --deferred-pipeline-draws, with or without `async`.
     AsyncDrawRig(VulkanHarness &owner, bool async, bool use_htile = false, bool occlusion = false,
-                 bool depth_only = false)
+                 bool depth_only = false, bool deferred = false)
         : harness(owner), htile(use_htile) {
       Config::Load({.printf_direction = Config::LogDirection::Silent,
                     .occlusion_queries_enabled = occlusion,
                     .first_run_report_enabled = true,
                     .async_pipelines_enabled = async,
-                    .async_pipelines_depth_only_enabled = depth_only});
+                    .async_pipelines_depth_only_enabled = depth_only,
+                    .deferred_pipeline_draws_enabled = deferred});
       Common::FirstRunReport::Global().Reset();
       harness.EnsureRuntimeContext();
+      harness.SetOcclusionQueries(occlusion);
       context.emplace(harness.m_runtime_context);
       MapGuestMemory();
       registers.SetRenderTargetMask(0xf);
@@ -19208,6 +19267,7 @@ public:
       context->UnmapMemory(AsyncBase, AsyncSize);
       Scheduler().Finish();
       context.reset();
+      harness.SetOcclusionQueries(false);
       LibKernel::Memory::KernelMunmap(AsyncBase, AsyncSize);
       LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, AsyncSize);
       Config::Load({.printf_direction = Config::LogDirection::Silent});
@@ -32535,6 +32595,7 @@ public:
 #include "PssrGpuTests.inc"
 #include "DrawRecordTests.inc"
 #include "DeferredResolveTests.inc"
+#include "DeferredDrawTests.inc"
 
 private:
   bool m_rasterization_supported = true;
@@ -32926,6 +32987,9 @@ private:
     auto device_features12 = WindowContext::RequiredVulkan12Features();
     device_features12.shaderSharedInt64Atomics = true;
     device_features12.samplerFilterMinmax = true;
+    // Occlusion queries reset their pool from the host, which a rig can ask for with its own flag.
+    device_features12.hostQueryReset = available_features12.hostQueryReset;
+    m_occlusion_queries_supported = available_features12.hostQueryReset == true;
     vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR workgroup_layout{};
     workgroup_layout.workgroupMemoryExplicitLayout = true;
     device_features12.pNext = &device_features11;
@@ -32995,6 +33059,8 @@ private:
     vk::PhysicalDeviceFeatures device_features{};
     // Matches the emulator device. Only version 1 is enabled, the guarantee shaders rely on.
     device_features.robustBufferAccess = true;
+    device_features.occlusionQueryPrecise = available_features.occlusionQueryPrecise;
+    m_occlusion_query_precise = available_features.occlusionQueryPrecise == true;
     device_features.shaderStorageImageWriteWithoutFormat = true;
     device_features.shaderStorageImageMultisample = available_features.shaderStorageImageMultisample;
     device_features.shaderImageGatherExtended = true;
@@ -33355,6 +33421,9 @@ private:
   vk::Instance m_instance = nullptr;
   vk::DebugUtilsMessengerEXT m_messenger = nullptr;
   bool m_sync_validation_active = false;
+  // Whether the device was made with what the host-reset occlusion query pool needs.
+  bool m_occlusion_queries_supported = false;
+  bool m_occlusion_query_precise = false;
   std::string m_sync_validation_reason;
   vk::PhysicalDevice m_physical_device = nullptr;
   vk::Device m_device = nullptr;
@@ -59838,6 +59907,9 @@ struct RefusingPolicy final : PipelineSkipPolicy {
   mutable bool asked = false;
 };
 
+// Whether the cache rigs below also run with --deferred-pipeline-draws.
+inline bool g_cache_rig_deferred = false;
+
 // Runs `body` on the GPU thread of a fresh render context, with the async flag as given and the
 // first-run report on. The context is destroyed on return, so `body` cannot see teardown.
 template <typename Body>
@@ -59867,7 +59939,8 @@ void WithAsyncCache(VulkanHarness &vulkan, bool async, const std::filesystem::pa
                      .code_size_bytes = static_cast<u32>(pixel.size() * sizeof(u32))});
   Config::Load({.printf_direction = Config::LogDirection::Silent,
                 .first_run_report_enabled = true,
-                .async_pipelines_enabled = async});
+                .async_pipelines_enabled = async,
+                .deferred_pipeline_draws_enabled = g_cache_rig_deferred});
   Common::FirstRunReport::Global().Reset();
   {
     RenderContext context(vulkan.RuntimeContext(), store);
@@ -60045,6 +60118,103 @@ void CheckAsyncPipelinesOff(VulkanHarness &vulkan) {
                 PipelineCacheTestAccess::PendingBuilds(rig.cache) == 0,
             "the pipeline was not built once by the calling thread");
   });
+}
+
+// A policy for the cache to ask. It counts how often the skip rules were consulted, and says what
+// it is told to about the draw's own eligibility.
+struct ProbePolicy final : PipelineSkipPolicy {
+  bool        skip_rules_allow = true;
+  const char *blocker          = nullptr;
+  bool MaySkip() const override {
+    ++skip_rule_asks;
+    return skip_rules_allow;
+  }
+  // Like the gate, it names its rule only once it has been asked and has refused.
+  const char *Refusal() const override {
+    return skip_rule_asks != 0 && !skip_rules_allow ? "probe_rule" : nullptr;
+  }
+  const char *DeferBlocker() const override { return blocker; }
+  mutable uint32_t skip_rule_asks = 0;
+};
+
+// The three answers for a draw that misses its pipeline, asked of the cache directly. A hole is only
+// possible with --deferred-pipeline-draws, the caller's slot and a draw that allows it. The skip
+// rules are only asked with --async-pipelines, and a draw is deferred before it is skipped. A draw
+// that cannot be deferred is counted under its reason whether it is then skipped or blocks.
+void CheckDeferredPolicy(VulkanHarness &vulkan) {
+  constexpr const char *name = "DeferredPolicy";
+  struct Case {
+    const char *label;
+    bool async, deferred, slot, skip_rules_allow;
+    const char *blocker;
+    DrawFate expected;
+    uint32_t skip_rule_asks;
+    const char *counted;
+    // Draws counted as refused a skip. A deferred draw waits for nothing, so it is not one.
+    uint32_t refused;
+  };
+  const Case cases[] = {
+      {"flag alone defers", false, true, true, true, nullptr, DrawFate::Defer, 0, nullptr, 0},
+      {"flag alone blocks what cannot defer", false, true, true, true, "reason", DrawFate::Block, 0,
+       "reason", 0},
+      {"flag alone without a slot blocks", false, true, false, true, nullptr, DrawFate::Block, 0,
+       nullptr, 0},
+      {"both defer before skipping", true, true, true, true, nullptr, DrawFate::Defer, 1, nullptr, 0},
+      {"both defer a draw skips would refuse", true, true, true, false, nullptr, DrawFate::Defer, 1,
+       nullptr, 0},
+      {"both skip what cannot defer", true, true, true, true, "reason", DrawFate::Skip, 1, "reason", 0},
+      {"both block what neither takes", true, true, true, false, "reason", DrawFate::Block, 1,
+       "reason", 1},
+      {"async alone skips", true, false, true, true, nullptr, DrawFate::Skip, 1, nullptr, 0},
+      {"async alone blocks", true, false, true, false, nullptr, DrawFate::Block, 1, nullptr, 1},
+  };
+  for (const auto &test : cases) {
+    g_cache_rig_deferred = test.deferred;
+    WithAsyncCache(vulkan, test.async, {}, [&](const AsyncCacheRig &rig) {
+      Require(name, test.label, PipelineCacheTestAccess::BuildWorkers(rig.cache) >= 1,
+              "the cache has no build queue");
+      const auto state = rig.State(vk::PrimitiveTopology::eTriangleList);
+      ProbePolicy policy;
+      policy.skip_rules_allow = test.skip_rules_allow;
+      policy.blocker          = test.blocker;
+      PipelineCache::DeferredDraw deferred;
+      Common::FirstRunReport::Global().Reset();
+      const auto *pipeline = rig.cache.AcquireGraphicsPipeline(rig.command, state, &policy,
+                                                               test.slot ? &deferred : nullptr);
+      const auto fate = deferred.active ? DrawFate::Defer
+                        : pipeline != nullptr ? DrawFate::Block : DrawFate::Skip;
+      Require(name, test.label, fate == test.expected, "the draw met another fate than expected");
+      Require(name, test.label, policy.skip_rule_asks == test.skip_rule_asks,
+              "the skip rules were asked a different number of times than expected");
+      // A hole or a skip starts the build and leaves it pending, and a block builds on the spot.
+      Require(name, test.label,
+              PipelineCacheTestAccess::PendingBuilds(rig.cache) ==
+                  (test.expected == DrawFate::Block ? 0u : 1u) &&
+                  PipelineCacheTestAccess::Pipelines(rig.cache)[0] ==
+                      (test.expected == DrawFate::Block ? 1u : 0u),
+              "the build was not started in the way the fate calls for");
+      const auto refusals = Common::FirstRunReport::Global().Summarize().refusals;
+      Require(name, test.label,
+              refusals.size() == (test.refused != 0 ? 1u : 0u) &&
+                  (test.refused == 0 || refusals[0].draws == test.refused),
+              "a refusal was counted for a draw that waited for nothing, or was not counted");
+      const auto ineligible = Common::FirstRunReport::Global().Summarize().deferred_ineligible;
+      Require(name, test.label,
+              test.counted == nullptr ? ineligible.empty()
+                                      : ineligible == std::vector<std::pair<std::string, uint32_t>>{
+                                            {test.counted, 1}},
+              "the reason the draw could not be deferred was not counted exactly once");
+    });
+  }
+  g_cache_rig_deferred = false;
+  // Policy B asks for the deferral first. The table below is the whole decision.
+  Require(name, "table",
+          ChooseDrawFate({.defer_allowed = true, .skip_allowed = true}) == DrawFate::Defer &&
+              ChooseDrawFate({.defer_allowed = false, .skip_allowed = true}) == DrawFate::Skip &&
+              ChooseDrawFate({.defer_allowed = true, .skip_allowed = false}) == DrawFate::Defer &&
+              ChooseDrawFate({.defer_allowed = false, .skip_allowed = false}) == DrawFate::Block,
+          "the decision table is not the one the policy documents");
+  std::printf("[gpu]     %-32s ok\n", name);
 }
 
 // A pipeline is built in the background while the draws that want it go without. A worker's
@@ -60935,6 +61105,7 @@ void CheckAsyncPipelines(VulkanHarness &vulkan) {
     std::printf("[gpu]     %-32s ok\n", name);
   };
   run("AsyncPipelinesOff", [&] { CheckAsyncPipelinesOff(vulkan); });
+  run("DeferredPolicy", [&] { CheckDeferredPolicy(vulkan); });
   run("AsyncPipelineBuild", [&] { CheckAsyncPipelineBuild(vulkan); });
   run("AsyncPipelineClaim", [&] { CheckAsyncPipelineClaim(vulkan); });
   run("AsyncPipelineWait", [&] { CheckAsyncPipelineWait(vulkan); });
@@ -68043,6 +68214,28 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--sync-validation-only") == 0) {
     VulkanHarness vulkan(true);
     vulkan.CheckHoleSyncValidation();
+    vulkan.CheckDeferredDrawsUnderValidation();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--deferred-draws-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckDeferredDraws();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--deferred-stencil-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckDeferredStencilClear();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--deferred-htile-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckDeferredHtileClear();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--deferred-draws-sync-only") == 0) {
+    VulkanHarness vulkan(true);
+    vulkan.CheckAttachmentHazardControl();
+    vulkan.CheckDeferredDrawsUnderValidation();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--async-pipelines-only") == 0) {

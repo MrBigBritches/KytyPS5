@@ -176,16 +176,48 @@ private:
 	std::jthread m_thread;
 };
 
+// What a draw that has no pipeline yet does while the pipeline builds. A skipped draw leaves out its
+// commands, a deferred draw becomes a hole in the command stream that is recorded once the pipeline
+// is built, and a blocked draw waits for the pipeline on the GPU thread.
+enum class DrawFate : uint8_t { Skip, Defer, Block };
+
+// What ChooseDrawFate weighs for one draw that missed its pipeline.
+struct DrawFateInputs {
+	// --deferred-pipeline-draws is on, and the draw is allowed to become a hole.
+	bool defer_allowed = false;
+	// --async-pipelines is on, and the S2 rules allow the draw to go without its pipeline.
+	bool skip_allowed = false;
+};
+
+// Decides the fate of a draw. Policy B is the default and defers a draw first, so no geometry is
+// lost, and falls back to an S2 skip only for a draw that cannot be deferred. Policy A asks for the
+// skip first. It is one constant away.
+inline constexpr bool SKIP_BEFORE_DEFER = false;
+[[nodiscard]] constexpr DrawFate ChooseDrawFate(const DrawFateInputs& inputs) noexcept {
+	if (SKIP_BEFORE_DEFER && inputs.skip_allowed) {
+		return DrawFate::Skip;
+	}
+	if (inputs.defer_allowed) {
+		return DrawFate::Defer;
+	}
+	return inputs.skip_allowed ? DrawFate::Skip : DrawFate::Block;
+}
+
 // Asked when a draw's pipeline is still being built in the background, to say whether the draw may
-// go without it.
+// go without it or wait out of line.
 class PipelineSkipPolicy {
 public:
 	virtual ~PipelineSkipPolicy() = default;
-	// Called on the GPU thread, only for a draw that has no pipeline yet.
+	// Called on the GPU thread, only for a draw that has no pipeline yet and only when
+	// --async-pipelines is on, since the S2 rules are what it judges.
 	[[nodiscard]] virtual bool MaySkip() const = 0;
 	// The name of the rule that refused the draw at the last MaySkip, or null if it did not. A
 	// draw that missed its pipeline and was refused is counted under that name.
 	[[nodiscard]] virtual const char* Refusal() const { return nullptr; }
+	// The name of what stops the draw itself from being deferred, or null when nothing does. It
+	// covers the draw's own state, and the pipeline cache adds what its shaders need. A policy that
+	// does not override it never defers.
+	[[nodiscard]] virtual const char* DeferBlocker() const { return "unsupported"; }
 };
 
 // The owning renderer serializes access, including saves while the GPU is running.
@@ -219,13 +251,22 @@ public:
 
 	// Waits for the pipeline if it is not built yet.
 	Pipeline& GetGraphicsPipeline(const CommandBuffer& command, const DrawRenderState& state);
+	// Set by AcquireGraphicsPipeline when the draw is to become a hole. The draw then waits for the
+	// pipeline stored under this key, whose build is already queued or done.
+	struct DeferredDraw {
+		bool                active = false;
+		GraphicsPipelineKey key {};
+	};
 	// Like GetGraphicsPipeline, but returns null instead of waiting when a background build has
-	// not finished and `policy` allows the draw to go without. Without a policy, or when builds
-	// are not in the background, it always returns a pipeline. The first miss that may be skipped
-	// starts the build, and a miss that may not be skipped builds on the calling thread.
+	// not finished and the draw may go without. Without a policy, or when builds are not in the
+	// background, it always returns a pipeline. A miss is judged by ChooseDrawFate. A draw that may be
+	// skipped (only with --async-pipelines) starts the build and returns null. With `deferred` given
+	// and --deferred-pipeline-draws on, an eligible draw starts the build, sets `deferred` and
+	// returns null. Every other miss builds on the calling thread or waits for the running build.
 	[[nodiscard]] Pipeline* AcquireGraphicsPipeline(const CommandBuffer&   command,
 	                                                const DrawRenderState& state,
-	                                                const PipelineSkipPolicy* policy);
+	                                                const PipelineSkipPolicy* policy,
+	                                                DeferredDraw* deferred = nullptr);
 	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info);
 	// What one resolve of deferred draws spent in the cache. wait_ms is the wall time of the whole
 	// wait, including a build this thread ran itself. save_ms is the driver cache save after it.
@@ -244,7 +285,9 @@ public:
 	[[nodiscard]] std::vector<Pipeline>
 	AcquireDeferredPipelines(std::span<const GraphicsPipelineKey> keys, bool hold_audio,
 	                         DeferredAcquireStats& stats);
-	// True while graphics pipelines are built in the background.
+	// True while graphics pipelines are built in the background. That is --async-pipelines or
+	// --deferred-pipeline-draws, and it does not mean that draws are skipped. Skips follow
+	// Config::AsyncPipelinesEnabled() alone.
 	[[nodiscard]] bool BuildsInBackground() const noexcept { return m_build_queue != nullptr; }
 	// Drops queued builds, waits for running ones and destroys finished pipelines nobody has
 	// taken. Later requests build on the calling thread. The owner calls it while the objects the
@@ -331,8 +374,16 @@ private:
 	std::unordered_map<uint64_t, ShaderTessellationInputInfo>                  m_tess_layouts;
 	// Records everything first created; closed without a shader store.
 	ShaderStoreWriter m_store;
-	// Null unless --async-pipelines is on. Only CreatePipelineInternal runs on its workers.
+	// Null unless --async-pipelines or --deferred-pipeline-draws is on. Only CreatePipelineInternal
+	// runs on its workers.
 	std::unique_ptr<PipelineBuildQueue>                                          m_build_queue;
+	// A deferred draw that the S2 rules would have skipped, kept until its resolve reports it. Only
+	// the GPU thread touches it.
+	struct WouldSkip {
+		std::shared_ptr<GraphicsBuild>        build;
+		std::chrono::steady_clock::time_point deferred_at;
+	};
+	std::vector<WouldSkip> m_would_skip;
 	// Builds not yet taken into m_graphics_pipelines. Only the GPU thread touches it, like
 	// m_graphics_pipelines.
 	std::unordered_map<GraphicsPipelineKey, PendingBuild, GraphicsPipelineKeyHash> m_pending_graphics;
@@ -373,7 +424,21 @@ private:
 	[[nodiscard]] Pipeline* AcquireBuiltPipeline(const GraphicsPipelineKey& key,
 	                                             const Stages&              stages,
 	                                             const DrawRenderState&     state,
-	                                             const PipelineSkipPolicy*  policy);
+	                                             const PipelineSkipPolicy*  policy,
+	                                             DeferredDraw*              deferred);
+	// The reason a missing pipeline's draw cannot become a hole, or null when it can. The draw's own
+	// state comes from the policy, and the shaders add the image heap and the descriptor kind.
+	[[nodiscard]] const char* DeferBlocker(const Stages&             stages,
+	                                       const PipelineSkipPolicy* policy) const;
+	// What a draw that missed its pipeline does. `may_skip` is set when the S2 rules allow a skip, and
+	// the reason the draw cannot be deferred, if any, is counted whatever the fate turns out to be.
+	[[nodiscard]] DrawFate ChooseMissedDrawFate(const Stages& stages, const PipelineSkipPolicy* policy,
+	                                            const DeferredDraw* deferred, bool& may_skip);
+	// Notes that the S2 rules would have skipped a draw that was deferred, to report how long it
+	// waited once its build is done.
+	void NoteDeferredWouldSkip(const std::shared_ptr<GraphicsBuild>& build);
+	// Reports the draws noted by NoteDeferredWouldSkip, which a resolve has just waited for.
+	void ReportDeferredWouldSkip();
 	// Queues the build of a key that has none and stores its record.
 	void RequestBuild(const GraphicsPipelineKey& key, const Stages& stages);
 	// Runs on a worker, or on the GPU thread when it claims the job.
@@ -425,6 +490,12 @@ private:
 std::filesystem::path ShaderStorePath();
 // Host capabilities that change the emitted SPIR-V.
 ShaderRecompiler::Spirv::Profile SpirvProfile(const GraphicContext& graphics);
+
+// Whether a pipeline over these stages uses push descriptors, answered from the shaders alone by the
+// code that builds the pipeline layout, so a draw can be judged before its pipeline is built.
+// Stages are indexed like GraphicsPipelineKey::stage_ids.
+[[nodiscard]] bool PredictPushDescriptors(const GraphicContext&                       graphics,
+                                          const std::array<const ShaderModule*, 4>& stages);
 
 // Stages are indexed like GraphicsPipelineKey::stage_ids.
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,

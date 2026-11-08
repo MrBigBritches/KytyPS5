@@ -47,6 +47,10 @@ public:
 		}
 	}
 
+	// Whether a guest query is open. A draw met inside one is counted by it, and a hole could not
+	// count it because the query state it would read is the one at the time it is recorded.
+	[[nodiscard]] bool HasOpenQuery() const { return m_open != 0; }
+
 	// A draw that was skipped, with its pipeline not built yet. If a guest query is open it counts
 	// as one sample, as a draw with no query to count it does, so an occlusion proxy is not culled
 	// for a draw that never ran.

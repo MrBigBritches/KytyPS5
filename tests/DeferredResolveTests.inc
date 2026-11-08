@@ -268,9 +268,7 @@
       side.buffer.fillBuffer(buffer.buffer, 0, 256, 2);
     }
     const auto messages = Validation::Messages();
-    const auto hazards = std::ranges::count_if(messages, [](const auto &message) {
-      return message.find(" hazard ") != std::string::npos;
-    });
+    const auto hazards = static_cast<int64_t>(Validation::HazardCount());
     DestroyBuffer(&buffer);
     Require(name, "hazard seen", hazards > 0,
             "the layer reported no hazard for two unsynchronized writes, so zero proves nothing");
@@ -294,9 +292,7 @@
       Validation::ResetMessages();
       check();
       const auto messages = Validation::Messages();
-      const auto hazards = std::ranges::count_if(messages, [](const auto &message) {
-        return message.find(" hazard ") != std::string::npos;
-      });
+      const auto hazards = static_cast<int64_t>(Validation::HazardCount());
       std::printf("[gpu]     %-32s %s: %llu messages, %lld hazards\n", name, scenario,
                   static_cast<unsigned long long>(Validation::MessageCount()),
                   static_cast<long long>(hazards));
@@ -317,4 +313,5 @@
     CheckResolveRecordsOutsideStall();
     CheckResolveReport();
     CheckHoleSyncValidation();
+    CheckDeferredDrawsUnderValidation();
   }

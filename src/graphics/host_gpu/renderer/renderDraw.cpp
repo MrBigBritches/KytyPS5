@@ -566,17 +566,50 @@ bool DrawMaySkipPipeline(TextureCache& cache, const DrawRenderState& state, bool
 
 namespace {
 
-// Lets a draw go without its pipeline when the gate allows it, and keeps the rule that refused it.
+// The parts of a draw that keep it from becoming a hole and that are known before its pipeline.
+// Mesh draws upload their task parameters and indirect draws read an arguments buffer, and no
+// hole records either yet, so version 1 of deferred draws leaves both to block.
+struct DeferFacts {
+	bool mesh     = false;
+	bool indirect = false;
+};
+
+// Lets a draw go without its pipeline when the gate allows it, keeps the rule that refused it, and
+// says whether the draw could be deferred instead.
 class DrawSkipPolicy final: public PipelineSkipPolicy {
 public:
 	/// Remembers the draw and the mode to judge it in.
-	DrawSkipPolicy(TextureCache& cache, const DrawRenderState& state, bool depth_only)
-	    : m_cache(cache), m_state(state), m_depth_only(depth_only) {}
+	DrawSkipPolicy(RenderContext& context, const DrawRenderState& state, bool depth_only,
+	               const DeferFacts& facts)
+	    : m_context(context), m_cache(context.GetTextureCache()), m_state(state),
+	      m_depth_only(depth_only), m_facts(facts) {}
 
 	/// Whether the remembered draw may go without its pipeline. A refusal is kept for Refusal.
+	/// Without --async-pipelines nothing is skipped, and the history checks are not run.
 	[[nodiscard]] bool MaySkip() const override {
+		if (!Config::AsyncPipelinesEnabled()) {
+			return false;
+		}
 		m_refusal = ExplainSkipRefusal(m_cache, m_state, m_depth_only);
 		return m_refusal == SkipRefusal::None;
+	}
+
+	/// What stops the remembered draw from being recorded later, or null. A guest query that is open
+	/// counts the draw's samples, and a hole would see the query state of the time it is recorded.
+	[[nodiscard]] const char* DeferBlocker() const override {
+		if (m_context.GetOcclusionQueries().HasOpenQuery()) {
+			return "open_query";
+		}
+		if (m_facts.mesh) {
+			return "mesh";
+		}
+		if (m_facts.indirect) {
+			return "indirect";
+		}
+		if (!m_context.GetCommandScheduler().CanSplitHere()) {
+			return "thread";
+		}
+		return m_context.GetCommandScheduler().HoleCapReached() ? "cap" : nullptr;
 	}
 
 	/// The name of the rule that refused the draw at the last question, or null.
@@ -585,27 +618,32 @@ public:
 	}
 
 private:
+	RenderContext&         m_context;
 	TextureCache&          m_cache;
 	const DrawRenderState& m_state;
 	bool                   m_depth_only;
+	DeferFacts             m_facts;
 	mutable SkipRefusal    m_refusal = SkipRefusal::None;
 };
 
 } // namespace
 
 // Gets the draw's pipeline, or null when a background build is not done and the draw may go
-// without it. Without background builds it always waits, exactly as before. The draw's targets are
+// without it or wait out of line, which `deferred` says. Without background builds it always waits,
+// exactly as before. A null `deferred` means the caller cannot make holes. The draw's targets are
 // noted after the answer, and only when the draw will run, so the draw is not evidence for itself
 // and a skipped draw proves nothing. A draw refused a skip is reported by the pipeline cache.
 static PipelineCache::Pipeline* AcquireDrawPipeline(RenderContext& context, CommandBuffer& buffer,
-                                                    const DrawRenderState& state) {
+                                                    const DrawRenderState& state,
+                                                    const DeferFacts&      facts,
+                                                    PipelineCache::DeferredDraw* deferred) {
 	auto& pipelines = context.GetPipelineCache();
 	if (!pipelines.BuildsInBackground()) {
 		return &pipelines.GetGraphicsPipeline(buffer, state);
 	}
-	const DrawSkipPolicy policy {context.GetTextureCache(), state, Config::AsyncPipelinesDepthOnly()};
-	auto*                pipeline = pipelines.AcquireGraphicsPipeline(buffer, state, &policy);
-	if (pipeline != nullptr) {
+	const DrawSkipPolicy policy {context, state, Config::AsyncPipelinesDepthOnly(), facts};
+	auto*                pipeline = pipelines.AcquireGraphicsPipeline(buffer, state, &policy, deferred);
+	if (pipeline != nullptr || (deferred != nullptr && deferred->active)) {
 		NoteDrawTargets(context.GetTextureCache(), state);
 	}
 	return pipeline;
@@ -1371,59 +1409,69 @@ static void CaptureDrawFacts(const DrawCallInfo& draw, const DrawEmitInfo& emit,
 
 // The commands a draw records at the moment it is met. The image transitions change layouts the CPU
 // tracks, so they cannot wait for the pipeline. The vertex buffers go first when the caller wants
-// the commands in their old order.
+// the commands in their old order. A draw with no pipeline yet passes null, and it never uses the
+// image heap, since that is a reason not to defer it.
 void RenderExecutor::RecordEagerDrawCommands(CommandBuffer& buffer, DrawRenderState& state,
                                              const MeshDrawPlan& mesh,
-                                             const PipelineCache::Pipeline& pipeline,
+                                             const PipelineCache::Pipeline* pipeline,
                                              vk::ImageAspectFlags feedback_aspects,
                                              bool bind_vertex_buffers, DrawView& view) {
 	if (bind_vertex_buffers) {
 		CommitVertexBuffers(buffer.Handle(), view.vertex_buffers);
 		view.vertex_buffers_bound = true;
 	}
-	if (pipeline.uses_image_heap) {
+	if (pipeline != nullptr && pipeline->uses_image_heap) {
 		m_context.GetImageHeap().Commit(buffer, vk::PipelineBindPoint::eGraphics,
-		                                pipeline.pipeline_layout);
+		                                pipeline->pipeline_layout);
 	}
 	TransitBindingImages(buffer, view.Bindings());
 	CaptureDrawState(m_context, buffer, state, mesh, feedback_aspects, view);
 	view.address_buffers = CaptureAddressBuffers(view.Modules());
 }
 
+// Registers the original guest indices of an indexed mesh draw for shader reads. Shaders read them
+// only through BDA, and PrepareGraphicsBindings synchronizes registered BDA ranges before any draw
+// commands are committed, so the lookup counts as a use and keeps the buffer resident.
+static void RegisterMeshIndices(RenderContext& context, const DrawCallInfo& draw,
+                                const DrawIndexBufferSource& index_source) {
+	(void)context.GetBufferCache().FindBufferForShaderRead(
+	    index_source.address,
+	    static_cast<uint64_t>(draw.index_count) * index_source.guest_element_size);
+}
+
 // Does everything a draw must do in order when it is met. That covers the resources it reads, its
 // targets and the image layouts it needs, and the state it takes from the registers. What is left
 // for RecordDraw is plain commands. Returns the pipeline to record with, or null when nothing is
-// left to record because the draw was skipped or has no work.
+// left to record because the draw was skipped or has no work. With `deferred` given, a draw may
+// instead wait for its pipeline. Then it returns null with `deferred` set, and the view holds a
+// draw whose vertex buffers are not bound, for the caller to turn into a hole.
 const PipelineCache::Pipeline* RenderExecutor::PrepareDraw(
     CommandBuffer& buffer, const DrawCallInfo& draw, DrawRenderState& state,
     const DrawEmitInfo& emit, const DrawIndexBufferSource& index_source,
-    bool bind_vertex_buffers, DrawView& view) {
+    bool bind_vertex_buffers, DrawView& view, PipelineCache::DeferredDraw* deferred) {
 	const auto mesh =
 	    PlanMeshDraw(buffer.GetUserConfig(), m_context.GetGraphics(), draw, state, emit);
 	if (!mesh) {
 		return nullptr;
 	}
 	if (mesh->active && draw.indexed) {
-		// Register the original guest indices for shader reads; PrepareGraphicsBindings
-		// synchronizes registered BDA ranges before any draw commands are committed. Shaders read
-		// them only through BDA, so the lookup counts as a use and keeps the buffer resident.
-		(void)m_context.GetBufferCache().FindBufferForShaderRead(
-		    index_source.address,
-		    static_cast<uint64_t>(draw.index_count) * index_source.guest_element_size);
+		RegisterMeshIndices(m_context, draw, index_source);
 	}
 	PrepareDrawBindings(state, view);
 	if (!mesh->active) {
 		view.vertex_buffers = AcquireVertexBuffers(buffer, state.vertex_info[0]);
 		view.index_buffer   = PrepareIndexBuffer(buffer, index_source);
 	}
-	const auto           args     = AcquireIndirectArgs(m_context, draw, emit);
-	auto*                pipeline = AcquireDrawPipeline(m_context, buffer, state);
+	const auto args     = AcquireIndirectArgs(m_context, draw, emit);
+	auto*      pipeline = AcquireDrawPipeline(m_context, buffer, state,
+	                                          {mesh->active, args.first != nullptr}, deferred);
+	const bool is_hole  = deferred != nullptr && deferred->active;
 	vk::ImageAspectFlags feedback_aspects;
 	// Runs even for a skipped draw, since it applies the clears the draw consumes and moves the
 	// targets to their attachment layouts.
 	view.rendering = AcquireRenderTargets(buffer, state.color_info, state.color_count,
 	                                      state.depth_info, feedback_aspects, view.Bindings());
-	if (pipeline == nullptr) {
+	if (pipeline == nullptr && !is_hole) {
 		// Returns normally, because the caller treats a false result as a request to replay the
 		// draw on the CPU.
 		SkipDrawWithoutPipeline(m_context, buffer, view.rendering, state);
@@ -1435,9 +1483,9 @@ const PipelineCache::Pipeline* RenderExecutor::PrepareDraw(
 	CaptureDrawFacts(draw, emit, index_source, *mesh, args, view);
 	// Resource preparation above may synchronously finish and restart the scheduler. From this
 	// point onward, every operation targets the current command buffer and cannot touch guest
-	// memory.
-	RecordEagerDrawCommands(buffer, state, *mesh, *pipeline, feedback_aspects,
-	                        bind_vertex_buffers, view);
+	// memory. A hole's own buffer binds the vertex buffers, since the segment's would come first.
+	RecordEagerDrawCommands(buffer, state, *mesh, pipeline, feedback_aspects,
+	                        bind_vertex_buffers && !is_hole, view);
 	return pipeline;
 }
 
@@ -1563,18 +1611,44 @@ void RenderExecutor::RecordBlockingDraw(CommandBuffer& buffer, const DrawView& v
 	RecordDraw(buffer.Handle(), view, pipeline, env);
 }
 
+// Turns a prepared draw whose pipeline is still building into a hole in the command stream. The
+// hole is recorded when the scheduler next submits, between the commands before it and after it.
+// The caller must not use a command buffer it fetched before this call, since the scheduler ends
+// it here and starts another.
+void RenderExecutor::CreateDrawHole(CommandBuffer& buffer, DrawView& view,
+                                    const GraphicsPipelineKey& key) {
+	if (RenderStateClears(view.rendering)) {
+		// The clear was consumed from the registers when the draw was met, so it is applied here, in
+		// the pass before the hole. The hole's own pass loads, as it would after any earlier pass.
+		buffer.BeginRendering(view.rendering);
+		view.rendering.depth_stencil_attachment.depth_clear   = false;
+		view.rendering.depth_stencil_attachment.stencil_clear = false;
+	}
+	auto& scheduler = m_context.GetCommandScheduler();
+	// Counted where the draw is met, since the hole is recorded later and the cadence counts now.
+	scheduler.NoteRecordedWork();
+	scheduler.SplitForHole(std::make_unique<DrawHole>(view, key));
+}
+
 // Records one prepared draw. Resources are prepared and the targets acquired for every draw. With
 // background pipeline builds on, a draw whose pipeline is not ready may then stop short of the
-// commands that bind and draw, and still report a normal draw.
+// commands that bind and draw, and still report a normal draw. With --deferred-pipeline-draws it
+// may instead become a hole that is recorded once the pipeline is built.
 void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallInfo& draw,
                                          DrawRenderState& state, const DrawEmitInfo& emit,
                                          const DrawIndexBufferSource& index_source) {
 	if (CopyDepthToColor(buffer, draw, emit, state)) {
 		return;
 	}
-	DrawView view;
+	DrawView                    view;
+	PipelineCache::DeferredDraw deferred;
 	// The vertex buffers are bound ahead of the image transitions, where this draw always had them.
-	const auto* pipeline = PrepareDraw(buffer, draw, state, emit, index_source, true, view);
+	const auto* pipeline = PrepareDraw(buffer, draw, state, emit, index_source, true, view,
+	                                   Config::DeferredPipelineDrawsEnabled() ? &deferred : nullptr);
+	if (deferred.active) {
+		CreateDrawHole(buffer, view, deferred.key);
+		return;
+	}
 	if (pipeline != nullptr) {
 		RecordBlockingDraw(buffer, view, *pipeline);
 	}

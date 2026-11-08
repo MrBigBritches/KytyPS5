@@ -220,17 +220,24 @@ private:
 	                                              const DrawIndexBufferSource& index_source);
 	/// The eager half of a draw, everything that must happen in order when the draw is met. It
 	/// returns the draw's pipeline, or null when there is nothing to record. With
-	/// `bind_vertex_buffers` the vertex buffers are bound before the image transitions.
+	/// `bind_vertex_buffers` the vertex buffers are bound before the image transitions. With
+	/// `deferred` given, a draw whose pipeline is building may wait for it instead. It then returns
+	/// null with `deferred` set, and leaves the vertex buffers unbound.
 	[[nodiscard]] const PipelineCache::Pipeline*
 	PrepareDraw(CommandBuffer& buffer, const DrawCallInfo& draw, DrawRenderState& state,
 	            const DrawEmitInfo& emit, const DrawIndexBufferSource& index_source,
-	            bool bind_vertex_buffers, DrawView& view);
+	            bool bind_vertex_buffers, DrawView& view,
+	            PipelineCache::DeferredDraw* deferred = nullptr);
+	/// Turns a prepared draw that waits for its pipeline into a hole in the scheduler's command
+	/// stream, after applying any clear it consumed. Nothing fetched from the command buffer
+	/// before the call may be used after it.
+	void CreateDrawHole(CommandBuffer& buffer, DrawView& view, const GraphicsPipelineKey& key);
 	/// Resolves the bindings of every stage the draw runs and lists them in the view.
 	void PrepareDrawBindings(DrawRenderState& state, DrawView& view);
 	/// Records the commands a draw needs at the moment it is met, which are the image transitions
 	/// and, when asked, the vertex buffer bind. It also captures the register state into the view.
 	void RecordEagerDrawCommands(CommandBuffer& buffer, DrawRenderState& state,
-	                             const MeshDrawPlan& mesh, const PipelineCache::Pipeline& pipeline,
+	                             const MeshDrawPlan& mesh, const PipelineCache::Pipeline* pipeline,
 	                             vk::ImageAspectFlags feedback_aspects, bool bind_vertex_buffers,
 	                             DrawView& view);
 	/// Records a prepared draw into the scheduler's current buffer, sharing its rendering with the

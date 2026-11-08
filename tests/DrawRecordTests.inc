@@ -965,6 +965,7 @@
   void CheckDrawRecord() {
     CheckDeferredHoles();
     CheckDeferredResolve();
+    CheckDeferredDraws();
     CheckDrawStream();
     CheckDrawRecordIgnoresRegisters();
     CheckDrawRecordIntoSideBuffer(true);

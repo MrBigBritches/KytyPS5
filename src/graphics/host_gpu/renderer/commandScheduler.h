@@ -88,6 +88,12 @@ public:
 		CommandScheduler& m_scheduler;
 		ResolveTrigger    m_previous;
 	};
+	/// Whether the calling thread may split now. That is the GPU thread, any thread once shutdown
+	/// began, and never from inside a submit or a resolve. A draw on another thread blocks instead.
+	[[nodiscard]] bool CanSplitHere() const { return OnHoleThread() && !m_in_submit && !m_in_resolve; }
+	/// Whether so many holes wait that another draw must block instead. Nothing limits them yet, the
+	/// cap and the flush it asks for come with the pending hole checks.
+	[[nodiscard]] bool HoleCapReached() const noexcept { return false; }
 	/// Holes split off and not yet recorded. Every Flush, Finish and Wait leaves none.
 	[[nodiscard]] size_t PendingHoleCount() const noexcept { return m_pending_holes; }
 	/// Tells the submit cadence that a draw or dispatch went into the current command buffer.

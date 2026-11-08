@@ -831,7 +831,8 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	const auto& snapshot      = *prepared.Runtime().resources;
 	auto&       images        = prepared.images;
 	auto&       texture_cache = m_context.GetTextureCache();
-	const bool  skips_tracked = m_context.GetPipelineCache().BuildsInBackground();
+	// Only skips leave a mark to find. A queue that builds for deferred draws alone skips nothing.
+	const bool  skips_tracked = Config::AsyncPipelinesEnabled();
 	// Acquire each view before a later overlapping descriptor can replace its image.
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
 		if (!images[i].image_id) continue;

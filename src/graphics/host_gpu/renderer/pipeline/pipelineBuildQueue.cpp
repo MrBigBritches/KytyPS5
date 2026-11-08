@@ -82,12 +82,12 @@ bool LowerCurrentThreadPriority() {
 }
 } // namespace
 
-uint32_t PipelineBuildWorkerCountFor(uint32_t hardware_threads) {
-	return std::clamp(std::max(1u, hardware_threads) / 2u, 1u, PIPELINE_BUILD_WORKERS);
+uint32_t PipelineBuildWorkerCountFor(uint32_t hardware_threads, uint32_t worker_cap) {
+	return std::clamp(std::max(1u, hardware_threads) / 2u, 1u, std::max(1u, worker_cap));
 }
 
-uint32_t PipelineBuildWorkerCount() {
-	return PipelineBuildWorkerCountFor(std::thread::hardware_concurrency());
+uint32_t PipelineBuildWorkerCount(uint32_t worker_cap) {
+	return PipelineBuildWorkerCountFor(std::thread::hardware_concurrency(), worker_cap);
 }
 
 PipelineBuildQueue::PipelineBuildQueue(uint32_t worker_count, PipelineBuildQueueOptions options)

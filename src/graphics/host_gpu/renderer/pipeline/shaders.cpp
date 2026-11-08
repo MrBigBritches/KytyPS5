@@ -77,6 +77,33 @@ static void AddLayoutBindings(std::vector<vk::DescriptorSetLayoutBinding>& descr
 	}
 }
 
+// Whether a layout of this many descriptors uses push descriptors. The layout code and the
+// prediction for a pipeline not built yet both ask this.
+static bool UsesPushDescriptors(const GraphicContext& graphics, uint64_t descriptor_count) {
+	return descriptor_count <= graphics.max_push_descriptors;
+}
+
+// The layout bindings that the stages of a graphics pipeline add to its descriptor set.
+static std::vector<vk::DescriptorSetLayoutBinding>
+GatherLayoutBindings(const std::array<const ShaderModule*, 4>& stages) {
+	std::vector<vk::DescriptorSetLayoutBinding> bindings;
+	for (const auto* stage: stages) {
+		if (stage != nullptr) {
+			AddLayoutBindings(bindings, stage->info, NativeShaderStage(stage->info.stage));
+		}
+	}
+	return bindings;
+}
+
+bool PredictPushDescriptors(const GraphicContext&                       graphics,
+                            const std::array<const ShaderModule*, 4>& stages) {
+	uint64_t descriptor_count = 0;
+	for (const auto& binding: GatherLayoutBindings(stages)) {
+		descriptor_count += binding.descriptorCount;
+	}
+	return UsesPushDescriptors(graphics, descriptor_count);
+}
+
 // Creates the descriptor set layout and the pipeline layout that uses it.
 static void CreateLayouts(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                           std::span<const vk::DescriptorSetLayoutBinding> bindings) {
@@ -115,7 +142,7 @@ static void CreateLayouts(GraphicContext& graphics, PipelineCache::Pipeline& pip
 		EXIT("native sampler descriptors exceed device limit: %" PRIu64 "/%u\n",
 		     samplers, limits.maxDescriptorSetSamplers);
 	}
-	pipeline.uses_push_descriptors = descriptor_count <= graphics.max_push_descriptors;
+	pipeline.uses_push_descriptors = UsesPushDescriptors(graphics, descriptor_count);
 
 	vk::DescriptorSetLayoutCreateInfo create {};
 	create.flags        = pipeline.uses_push_descriptors
@@ -291,17 +318,15 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	color_blending.attachmentCount = rendering.color_count;
 	color_blending.pAttachments    = color_blend_attachment;
 
-	std::vector<vk::DescriptorSetLayoutBinding> descriptor_bindings;
+	const auto descriptor_bindings = GatherLayoutBindings(stages);
 	pipeline.push_stages = vk::ShaderStageFlagBits::eFragment;
 	if (task_module) {
 		pipeline.push_stages |= vk::ShaderStageFlagBits::eTaskEXT;
 	}
 	for (const auto* stage: stages) {
 		if (stage != nullptr) {
-			const auto native_stage = NativeShaderStage(stage->info.stage);
-			AddLayoutBindings(descriptor_bindings, stage->info, native_stage);
 			pipeline.uses_image_heap |= stage->info.info.uses_image_heap;
-			pipeline.push_stages |= native_stage;
+			pipeline.push_stages |= NativeShaderStage(stage->info.stage);
 		}
 	}
 	CreateLayouts(graphics, pipeline, descriptor_bindings);

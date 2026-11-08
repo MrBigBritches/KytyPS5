@@ -206,7 +206,8 @@ struct Summary {
 	// submissions_per_flip, the flip still running is appended when it has resolves, so the list can
 	// be one longer than flips. Each resolve's own flip field is exact.
 	std::vector<uint32_t>                                    deferred_resolves_per_flip;
-	// Draws that --deferred-pipeline-draws left to block as before, counted per reason.
+	// Draws that --deferred-pipeline-draws could not defer, counted per reason. A draw that an S2 skip
+	// then took is counted too, since the count says it was ineligible and not what became of it.
 	std::vector<std::pair<std::string, uint32_t>>            deferred_ineligible;
 	// Deferred draws that the S2 skip rules would have allowed to go without a pipeline. waited_ms
 	// is the time from the draw's hole creation until its build is ready, counted once per draw, so

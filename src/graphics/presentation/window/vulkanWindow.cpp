@@ -736,13 +736,19 @@ namespace {
 
 // What tests read through VulkanValidation. The callback may run on any thread that calls Vulkan.
 std::atomic<uint64_t>    g_validation_messages {0};
+std::atomic<uint64_t>    g_validation_hazards {0};
 std::atomic<bool>        g_validation_count_only {false};
 std::mutex               g_validation_kept_mutex;
 std::vector<std::string> g_validation_kept;
 
-// Counts a validation warning or error, and keeps its text while there is room.
-void NoteValidationMessage(const char* text) {
+// Counts a validation warning or error, and keeps its text while there is room. Synchronization
+// hazards are counted by their message id and never by their wording, and every one is counted
+// even after the kept texts are full.
+void NoteValidationMessage(const char* id, const char* text) {
 	g_validation_messages.fetch_add(1, std::memory_order_relaxed);
+	if (id != nullptr && std::strncmp(id, VulkanValidation::HAZARD_ID_PREFIX, std::strlen(VulkanValidation::HAZARD_ID_PREFIX)) == 0) {
+		g_validation_hazards.fetch_add(1, std::memory_order_relaxed);
+	}
 	std::lock_guard lock(g_validation_kept_mutex);
 	if (g_validation_kept.size() < VulkanValidation::MAX_KEPT_MESSAGES) {
 		g_validation_kept.emplace_back(text);
@@ -800,7 +806,7 @@ static VKAPI_ATTR vk::Bool32 VKAPI_CALL VulkanDebugMessengerCallback(
 	const bool validation =
 	    static_cast<bool>(message_types & vk::DebugUtilsMessageTypeFlagBitsEXT::eValidation);
 	if (validation && !debug_printf && !skip) {
-		NoteValidationMessage(callback_data->pMessage);
+		NoteValidationMessage(callback_data->pMessageIdName, callback_data->pMessage);
 	}
 
 	// A test that reads the count turns the exit off, so it can report what the layer said.
@@ -830,6 +836,10 @@ uint64_t MessageCount() {
 	return g_validation_messages.load(std::memory_order_relaxed);
 }
 
+uint64_t HazardCount() {
+	return g_validation_hazards.load(std::memory_order_relaxed);
+}
+
 std::vector<std::string> Messages() {
 	std::lock_guard lock(g_validation_kept_mutex);
 	return g_validation_kept;
@@ -838,6 +848,7 @@ std::vector<std::string> Messages() {
 void ResetMessages() {
 	std::lock_guard lock(g_validation_kept_mutex);
 	g_validation_messages.store(0, std::memory_order_relaxed);
+	g_validation_hazards.store(0, std::memory_order_relaxed);
 	g_validation_kept.clear();
 }
 

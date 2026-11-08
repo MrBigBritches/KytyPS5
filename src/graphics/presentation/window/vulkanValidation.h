@@ -15,8 +15,14 @@ namespace Libs::Graphics::VulkanValidation {
 /// The most message texts kept, so a flood of the same hazard does not use up memory.
 inline constexpr size_t MAX_KEPT_MESSAGES = 32;
 
+/// The start of the message id of every synchronization hazard the layer reports.
+inline constexpr const char* HAZARD_ID_PREFIX = "SYNC-HAZARD";
+
 /// Validation warnings and errors the callback has seen since the last reset.
 [[nodiscard]] uint64_t MessageCount();
+
+/// How many of them were synchronization hazards, told by message id and not by wording.
+[[nodiscard]] uint64_t HazardCount();
 
 /// The first MAX_KEPT_MESSAGES message texts seen since the last reset.
 [[nodiscard]] std::vector<std::string> Messages();
