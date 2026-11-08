@@ -9,6 +9,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/shaderBindings.h"
 
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <type_traits>
@@ -49,6 +50,20 @@ struct PreparedBindings {
 	vk::DescriptorBufferInfo              shader_data_buffer;
 	vk::DescriptorBufferInfo              shared_memory;
 	std::vector<uint32_t>                 shader_data;
+};
+
+// The views of the buffers that let shaders reach guest memory by address. Shaders that use them
+// bind the BDA page table first and the fault buffer second. A draw captures them when it is
+// prepared, so writing its descriptors later never asks the buffer cache.
+struct AddressBufferInfos {
+	std::array<vk::DescriptorBufferInfo, 2> views {};
+};
+
+// The space a descriptor write fills before it records the descriptors. The caller owns it, so a
+// write that runs while another is half done can never share its arrays.
+struct DescriptorScratch {
+	std::vector<vk::DescriptorImageInfo> images;
+	std::vector<vk::WriteDescriptorSet>  writes;
 };
 
 [[nodiscard]] vk::DescriptorType

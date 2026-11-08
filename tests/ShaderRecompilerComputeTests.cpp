@@ -1,5 +1,6 @@
 #define SPV_ENABLE_UTILITY_CODE
 
+#include "CommandStreamRecorder.h"
 #include "common/assert.h"
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
@@ -38,6 +39,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/shader/recompiler/ir/Serialize.h"
 #include "graphics/host_gpu/renderer/debug.h"
+#include "graphics/host_gpu/renderer/drawRecord.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/renderDraw.h"
@@ -699,6 +701,48 @@ struct RenderExecutorTestAccess {
     return executor.DrawAuto(command, args);
   }
 
+  // Does what DrawAuto does up to the end of its eager half, for a plain draw with no indirect
+  // arguments, and returns the pipeline the recording half needs. The draw's state is left behind,
+  // so the caller records the view and then resets the bindings.
+  static const PipelineCache::Pipeline *PrepareAutoDraw(
+      RenderExecutor &executor, CommandBuffer &command, const DrawAutoArgs &args,
+      vk::PrimitiveTopology topology, DrawView &view, bool bind_vertex_buffers = true) {
+    auto &context = executor.m_context;
+    context.GetCommandScheduler().PopPendingOperations();
+    Common::LockGuard lock(context.GetMutex());
+    DrawRenderState state{};
+    state.topology = topology;
+    const DrawCallInfo draw{false, args.vertex_count, args.instance_count};
+    if (!executor.PrepareDrawRenderState(command, draw, state)) return nullptr;
+    const auto [vertex_offset, instance_offset] = ResolveDrawOffsets(
+        command.GetUserConfig().GetIndexOffset(), state.vertex_info[0]);
+    const DrawEmitInfo emit{vertex_offset + static_cast<int32_t>(args.first_vertex),
+                            instance_offset};
+    return executor.PrepareDraw(command, draw, state, emit, {}, bind_vertex_buffers, view);
+  }
+
+  // Draws like DrawAuto, but lets `between` see and change the view after the eager half and
+  // before the draw is recorded into the scheduler's buffer.
+  static void DrawAutoSplit(RenderExecutor &executor, CommandBuffer &command,
+                            const DrawAutoArgs &args, vk::PrimitiveTopology topology,
+                            const std::function<void(DrawView &)> &between) {
+    DrawView view;
+    const auto *pipeline = PrepareAutoDraw(executor, command, args, topology, view);
+    between(view);
+    if (pipeline != nullptr) executor.RecordBlockingDraw(command, view, *pipeline);
+    executor.ResetBindings();
+  }
+
+  static void RecordDraw(RenderExecutor &executor, vk::CommandBuffer command,
+                         const DrawView &view, const PipelineCache::Pipeline &pipeline,
+                         DrawRecordEnv &env) {
+    executor.RecordDraw(command, view, pipeline, env);
+  }
+
+  static const DescriptorScratch &Scratch(const RenderExecutor &executor) {
+    return executor.m_descriptor_scratch;
+  }
+
   // Runs the eager transit half of CommitBindings on its own.
   static void TransitBindingImages(RenderExecutor &executor,
                                    CommandBuffer &command,
@@ -786,14 +830,14 @@ struct RenderExecutorTestAccess {
   static std::vector<std::string> DescriptorScratch(
       const RenderExecutor &executor, std::span<PreparedBindings *const> stages) {
     std::vector<std::string> lines;
-    const auto &infos = executor.m_descriptor_images;
+    const auto &infos = executor.m_descriptor_scratch.images;
     for (size_t slot = 0; slot < infos.size(); ++slot) {
       lines.push_back("image[" + std::to_string(slot) + "] view=" +
                       ViewOwner(stages, infos[slot].imageView) + " sampler=" +
                       SamplerOwner(stages, infos[slot].sampler) + " layout=" +
                       vk::to_string(infos[slot].imageLayout));
     }
-    for (const auto &write : executor.m_descriptor_writes) {
+    for (const auto &write : executor.m_descriptor_scratch.writes) {
       lines.push_back(
           "write bind=" + std::to_string(write.dstBinding) + " " +
           vk::to_string(write.descriptorType) + " n=" +
@@ -32382,6 +32426,7 @@ public:
   }
 
 #include "PssrGpuTests.inc"
+#include "DrawRecordTests.inc"
 
 private:
   bool m_rasterization_supported = true;
@@ -67805,6 +67850,11 @@ int main(int argc, char **argv) {
     CheckDriverCacheSave(vulkan);
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--draw-record-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckDrawRecord();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--async-pipelines-only") == 0) {
     VulkanHarness vulkan;
     CheckAsyncPipelines(vulkan);
@@ -69124,6 +69174,7 @@ int main(int argc, char **argv) {
   CheckShaderStore(vulkan);
   CheckColdPipelines(vulkan);
   CheckAsyncPipelines(vulkan);
+  vulkan.CheckDrawRecord();
   CheckFirstRunWiring(vulkan);
   vulkan.CheckOrderedDispatch();
   vulkan.CheckGpuSubmitCadence();

@@ -988,22 +988,18 @@ size_t CountImageDescriptors(const PipelineCache::Pipeline&       pipeline,
 }
 
 /// Points a buffer-backed write at the view its binding kind names. Sampler writes append their
-/// infos to the image scratch and advance the cursor.
-void FillBufferWrite(RenderContext& context, BindingKind kind, const PreparedBindings& descriptors,
-                     vk::WriteDescriptorSet&                  write,
-                     std::array<vk::DescriptorBufferInfo, 2>& address_buffers,
+/// infos to the image scratch and advance the cursor. It never reaches the buffer cache, because the
+/// address buffers were captured when the draw was prepared.
+void FillBufferWrite(BindingKind kind, const PreparedBindings& descriptors,
+                     vk::WriteDescriptorSet& write, const AddressBufferInfos& address_buffers,
                      std::vector<vk::DescriptorImageInfo>& image_infos, size_t& image_cursor) {
 	switch (kind) {
 		case BindingKind::Buffers: write.pBufferInfo = descriptors.buffers.data(); break;
 		case BindingKind::BdaPagetable:
 		case BindingKind::FaultBuffer: {
-			auto&       cache      = context.GetBufferCache();
-			const auto* bda_buffer = kind == BindingKind::BdaPagetable
-			                             ? cache.GetBdaPageTableBuffer()
-			                             : cache.GetFaultBuffer();
-			auto&       view       = address_buffers[kind == BindingKind::FaultBuffer];
-			view                   = {bda_buffer->Handle(), 0, bda_buffer->Size()};
-			write.pBufferInfo      = &view;
+			const auto& view = address_buffers.views[kind == BindingKind::FaultBuffer];
+			EXIT_IF(view.buffer == nullptr);
+			write.pBufferInfo = &view;
 			break;
 		}
 		case BindingKind::FlattenedSrt:
@@ -1033,9 +1029,8 @@ void FillBufferWrite(RenderContext& context, BindingKind kind, const PreparedBin
 
 /// Appends one stage's descriptor writes. Image bindings only reserve their slots here, because
 /// FillImageInfos fills them once the stage's slot starts are known.
-void AppendStageWrites(RenderContext& context, const ShaderModule& module,
-                       const PreparedBindings&                  descriptors,
-                       std::array<vk::DescriptorBufferInfo, 2>& address_buffers,
+void AppendStageWrites(const ShaderModule& module, const PreparedBindings& descriptors,
+                       const AddressBufferInfos&                address_buffers,
                        std::vector<vk::DescriptorImageInfo>&    image_infos,
                        std::vector<vk::WriteDescriptorSet>& writes, size_t& image_cursor,
                        std::array<size_t, ShaderRecompiler::IR::ImageBindingCount>& image_starts) {
@@ -1053,8 +1048,7 @@ void AppendStageWrites(RenderContext& context, const ShaderModule& module,
 			image_starts[ShaderRecompiler::IR::ImageBindingIndex(kind)] = image_start;
 			image_cursor += write.descriptorCount;
 		} else {
-			FillBufferWrite(context, kind, descriptors, write, address_buffers, image_infos,
-			                image_cursor);
+			FillBufferWrite(kind, descriptors, write, address_buffers, image_infos, image_cursor);
 		}
 		if (image_cursor != image_start) {
 			write.pImageInfo = image_infos.data() + image_start;
@@ -1099,27 +1093,53 @@ void RenderExecutor::TransitBindingImages(CommandBuffer&                     buf
 	}
 }
 
+AddressBufferInfos RenderExecutor::CaptureAddressBuffers(
+    std::span<const ShaderModule* const> modules) {
+	AddressBufferInfos captured;
+	auto&              cache = m_context.GetBufferCache();
+	for (const auto* module: modules) {
+		const auto mask = module->info.bindings.descriptor_mask;
+		for (const auto kind: {BindingKind::BdaPagetable, BindingKind::FaultBuffer}) {
+			if ((mask & (uint64_t {1} << static_cast<uint32_t>(kind))) == 0) continue;
+			const auto* buffer = kind == BindingKind::BdaPagetable ? cache.GetBdaPageTableBuffer()
+			                                                       : cache.GetFaultBuffer();
+			captured.views[kind == BindingKind::FaultBuffer] = {buffer->Handle(), 0, buffer->Size()};
+		}
+	}
+	return captured;
+}
+
 void RenderExecutor::WriteBindingDescriptors(vk::CommandBuffer                  vk_buffer,
                                              vk::PipelineBindPoint              pipeline_bind_point,
                                              const PipelineCache::Pipeline&     pipeline,
                                              std::span<PreparedBindings* const> prepared_bindings,
                                              std::span<const ShaderModule* const> modules) {
+	WriteBindingDescriptors(vk_buffer, pipeline_bind_point, pipeline, prepared_bindings, modules,
+	                        CaptureAddressBuffers(modules), m_descriptor_scratch);
+}
+
+void RenderExecutor::WriteBindingDescriptors(vk::CommandBuffer                  vk_buffer,
+                                             vk::PipelineBindPoint              pipeline_bind_point,
+                                             const PipelineCache::Pipeline&     pipeline,
+                                             std::span<PreparedBindings* const> prepared_bindings,
+                                             std::span<const ShaderModule* const> modules,
+                                             const AddressBufferInfos&          address_buffers,
+                                             DescriptorScratch&                 scratch) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(prepared_bindings.size() != modules.size());
 	ShaderRecompiler::IR::PushData push_data;
 	bool                           has_push_data = false;
-	m_descriptor_images.resize(CountImageDescriptors(pipeline, modules));
-	m_descriptor_writes.clear();
-	size_t                                  image_cursor = 0;
-	std::array<vk::DescriptorBufferInfo, 2> address_buffers;
+	scratch.images.resize(CountImageDescriptors(pipeline, modules));
+	scratch.writes.clear();
+	size_t image_cursor = 0;
 
 	for (size_t stage = 0; stage < prepared_bindings.size(); ++stage) {
 		const auto& program     = modules[stage]->info;
 		const auto& descriptors = *prepared_bindings[stage];
 		std::array<size_t, ShaderRecompiler::IR::ImageBindingCount> image_starts {};
-		AppendStageWrites(m_context, *modules[stage], descriptors, address_buffers,
-		                  m_descriptor_images, m_descriptor_writes, image_cursor, image_starts);
-		FillImageInfos(*modules[stage], descriptors, image_starts, m_descriptor_images);
+		AppendStageWrites(*modules[stage], descriptors, address_buffers, scratch.images,
+		                  scratch.writes, image_cursor, image_starts);
+		FillImageInfos(*modules[stage], descriptors, image_starts, scratch.images);
 		if (program.bindings.UsesPushData()) {
 			std::ranges::copy(descriptors.shader_data,
 			                  push_data.dwords.begin() + program.bindings.push_data_start_dword);
@@ -1131,19 +1151,19 @@ void RenderExecutor::WriteBindingDescriptors(vk::CommandBuffer                  
 		vk_buffer.pushConstants(pipeline.pipeline_layout, pipeline.push_stages, 0,
 		                        sizeof(push_data), push_data.dwords.data());
 	}
-	if (m_descriptor_writes.empty()) return;
+	if (scratch.writes.empty()) return;
 	if (pipeline.uses_push_descriptors) {
 		vk_buffer.pushDescriptorSetKHR(pipeline_bind_point, pipeline.pipeline_layout, 0,
-		                               static_cast<uint32_t>(m_descriptor_writes.size()),
-		                               m_descriptor_writes.data());
+		                               static_cast<uint32_t>(scratch.writes.size()),
+		                               scratch.writes.data());
 		return;
 	}
 	const auto set = m_context.GetDescriptorHeap().Commit(pipeline.descriptor_set_layout);
-	for (auto& write: m_descriptor_writes) {
+	for (auto& write: scratch.writes) {
 		write.dstSet = set;
 	}
 	m_context.GetGraphics().device.updateDescriptorSets(
-	    static_cast<uint32_t>(m_descriptor_writes.size()), m_descriptor_writes.data(), 0, nullptr);
+	    static_cast<uint32_t>(scratch.writes.size()), scratch.writes.data(), 0, nullptr);
 	vk_buffer.bindDescriptorSets(pipeline_bind_point, pipeline.pipeline_layout, 0, 1, &set, 0,
 	                             nullptr);
 }

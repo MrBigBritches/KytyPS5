@@ -18,6 +18,7 @@
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
+#include "graphics/host_gpu/renderer/drawRecord.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -448,14 +449,6 @@ static bool DrawHasValidVertexShader(const HW::Shader& sh_ctx) {
 	return vs.es_regs.data_addr != 0;
 }
 
-struct DrawCallInfo {
-	bool     indexed        = true;
-	uint32_t index_count    = 0;
-	uint32_t instance_count = 0;
-
-	[[nodiscard]] const char* Name() const { return indexed ? "DrawIndex" : "DrawIndexAuto"; }
-};
-
 // Whether an HTILE clear is waiting to be applied to the depth target by the next draw into it.
 static bool HtileClearPending(TextureCache& cache, const RenderDepthInfo& depth) {
 	const auto& metadata = depth.desc.info.metadata;
@@ -785,20 +778,6 @@ bool RenderExecutor::ConsumeMetadataColorOperation(CommandBuffer& buffer) {
 	       mode == static_cast<uint8_t>(CbColorMode::DccDecompress);
 }
 
-// vertex_offset is the first vertex of non-indexed draws.
-struct DrawEmitInfo {
-	int32_t          vertex_offset  = 0;
-	uint32_t         first_instance = 0;
-	DrawIndirectArgs indirect;
-};
-
-struct DrawIndexBufferSource {
-	uint64_t    address            = 0;
-	const void* host_data          = nullptr;
-	uint64_t    size               = 0;
-	uint32_t    guest_element_size = 0;
-};
-
 // The task shader's inputs for an indirect mesh draw: Params in gpu_mesh_indirect.task.
 struct MeshTaskParams {
 	vk::DeviceAddress records        = 0;
@@ -811,12 +790,6 @@ struct MeshTaskParams {
 	uint32_t          max_groups     = 0;
 	uint32_t          max_instances  = 0;
 	uint32_t          max_total      = 0;
-};
-
-struct PreparedIndexBuffer {
-	vk::Buffer     buffer = nullptr;
-	vk::DeviceSize offset = 0;
-	vk::IndexType  type   = vk::IndexType::eUint16;
 };
 
 static uint64_t VertexBufferDescriptorSize(int binding, const ShaderVertexInputInfo& info) {
@@ -849,15 +822,6 @@ struct VertexBufferRange {
 	std::pair<Buffer*, uint64_t> binding;
 
 	[[nodiscard]] uint64_t RequestedSize() const { return requested_end - base_address; }
-};
-
-struct PreparedVertexBuffers {
-	static constexpr uint32_t MaxBuffers = ShaderVertexInputInfo::RES_MAX;
-
-	std::array<vk::Buffer, MaxBuffers>     buffers {};
-	std::array<vk::DeviceSize, MaxBuffers> offsets {};
-	std::array<vk::DeviceSize, MaxBuffers> sizes {};
-	uint32_t                               count = 0;
 };
 
 static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               buffer,
@@ -1138,9 +1102,10 @@ static void LogDrawStateIfNeeded(const CommandBuffer& buffer, const DrawCallInfo
 	                  draw.index_count, index_addr);
 }
 
-static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_buffer,
+// Records the draw calls of a plain draw. The primitive type is the one the draw was met with.
+static void EmitDrawPrimitives(Prospero::PrimitiveType primitive_type, vk::CommandBuffer vk_buffer,
                                const DrawCallInfo& draw, const DrawEmitInfo& emit) {
-	switch (ucfg.GetPrimType()) {
+	switch (primitive_type) {
 		case Prospero::PrimitiveType::kPointList:
 		case Prospero::PrimitiveType::kLineList:
 		case Prospero::PrimitiveType::kLineStrip:
@@ -1172,7 +1137,7 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_
 				}
 			}
 			break;
-		default: EXIT("unknown primitive type: %u\n", static_cast<uint32_t>(ucfg.GetPrimType()));
+		default: EXIT("unknown primitive type: %u\n", static_cast<uint32_t>(primitive_type));
 	}
 }
 
@@ -1230,167 +1195,111 @@ bool RenderExecutor::CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo&
 	return true;
 }
 
-// Records one prepared draw. Resources are prepared and the targets acquired for every draw. With
-// background pipeline builds on, a draw whose pipeline is not ready may then stop short of the
-// commands that bind and draw, and still report a normal draw.
-void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallInfo& draw,
-                                         DrawRenderState& state, const DrawEmitInfo& emit,
-                                         const DrawIndexBufferSource& index_source) {
-	auto&      ucfg                     = buffer.GetUserConfig();
-	const bool primitive_restart_enable = state.primitive_restart_enable;
-	if (CopyDepthToColor(buffer, draw, emit, state)) {
-		return;
+// The mesh facts of a draw that decide how it launches.
+struct MeshDrawPlan {
+	bool     active = false;
+	bool     task   = false;
+	uint32_t groups = 0;
+};
+
+// Stops on a mesh draw the host cannot launch as the guest asked.
+static void CheckMeshDrawSupported(const HW::UserConfig& ucfg, const DrawCallInfo& draw,
+                                   const DrawRenderState& state) {
+	const bool  primitive_restart_enable = state.primitive_restart_enable;
+	const auto& mesh                     = state.vertex_info[0].mesh;
+	EXIT_NOT_IMPLEMENTED(mesh.fast_launch && (draw.indexed || primitive_restart_enable));
+	static std::atomic_bool restart_warned = false;
+	if (primitive_restart_enable && !restart_warned.exchange(true, std::memory_order_relaxed)) {
+		std::printf("Warning: primitive restart is not implemented for mesh shaders; "
+		            "continuing draw (primitive=%u indexed=%u)\n",
+		            static_cast<uint32_t>(ucfg.GetPrimType()), draw.indexed);
 	}
-	const auto  vertex_stages = state.VertexStages();
-	const bool  mesh_active   = state.vertex_info[0].stage.module->info.stage == ShaderType::Mesh;
-	const bool  mesh_task     = state.vertex_info[0].stage.module->mesh_task;
-	const auto& mesh          = state.vertex_info[0].mesh;
-	const auto& limits        = m_context.GetGraphics().mesh_shader_properties;
-	uint32_t    mesh_groups   = 0;
-	if (mesh_active) {
-		EXIT_NOT_IMPLEMENTED(mesh.fast_launch && (draw.indexed || primitive_restart_enable));
-		static std::atomic_bool restart_warned = false;
-		if (primitive_restart_enable && !restart_warned.exchange(true, std::memory_order_relaxed)) {
-			std::printf("Warning: primitive restart is not implemented for mesh shaders; "
-			            "continuing draw (primitive=%u indexed=%u)\n",
-			            static_cast<uint32_t>(ucfg.GetPrimType()), draw.indexed);
-		}
-		if (mesh.primitives_per_group == 0) {
-			EXIT("unsupported mesh draw: primitive=%u indexed=%u restart=%u\n",
-			     static_cast<uint32_t>(ucfg.GetPrimType()), draw.indexed, primitive_restart_enable);
-		}
+	if (mesh.primitives_per_group == 0) {
+		EXIT("unsupported mesh draw: primitive=%u indexed=%u restart=%u\n",
+		     static_cast<uint32_t>(ucfg.GetPrimType()), draw.indexed, primitive_restart_enable);
 	}
-	if (mesh_task) {
+}
+
+// Works out how a draw launches. Nothing comes back when a mesh draw has no primitives or no
+// instances, because there is nothing to record for it.
+static std::optional<MeshDrawPlan> PlanMeshDraw(const HW::UserConfig& ucfg,
+                                                const GraphicContext& graphics,
+                                                const DrawCallInfo& draw,
+                                                const DrawRenderState& state,
+                                                const DrawEmitInfo& emit) {
+	const auto&  stage = state.vertex_info[0].stage;
+	MeshDrawPlan plan {.active = stage.module->info.stage == ShaderType::Mesh,
+	                   .task   = stage.module->mesh_task};
+	const auto& limits = graphics.mesh_shader_properties;
+	if (plan.active) {
+		CheckMeshDrawSupported(ucfg, draw, state);
+	}
+	if (plan.task) {
 		EXIT_NOT_IMPLEMENTED(emit.indirect.count > std::min(limits.maxTaskWorkGroupCount[0],
 		                                                    limits.maxTaskWorkGroupTotalCount));
-	} else if (mesh_active) {
-		const auto primitives = mesh.InputPrimitiveCount(draw.index_count);
-		if (primitives == 0 || draw.instance_count == 0) {
-			return;
-		}
-		mesh_groups = (primitives - 1u) / mesh.primitives_per_group + 1u;
-		if (mesh_groups > limits.maxMeshWorkGroupCount[0] ||
-		    draw.instance_count > limits.maxMeshWorkGroupCount[1] ||
-		    static_cast<uint64_t>(mesh_groups) * draw.instance_count >
-		        limits.maxMeshWorkGroupTotalCount) {
-			EXIT("mesh draw exceeds host workgroup limits: %ux%u\n", mesh_groups,
-			     draw.instance_count);
-		}
+		return plan;
 	}
+	if (!plan.active) {
+		return plan;
+	}
+	const auto& mesh       = state.vertex_info[0].mesh;
+	const auto  primitives = mesh.InputPrimitiveCount(draw.index_count);
+	if (primitives == 0 || draw.instance_count == 0) {
+		return std::nullopt;
+	}
+	plan.groups = (primitives - 1u) / mesh.primitives_per_group + 1u;
+	if (plan.groups > limits.maxMeshWorkGroupCount[0] ||
+	    draw.instance_count > limits.maxMeshWorkGroupCount[1] ||
+	    static_cast<uint64_t>(plan.groups) * draw.instance_count >
+	        limits.maxMeshWorkGroupTotalCount) {
+		EXIT("mesh draw exceeds host workgroup limits: %ux%u\n", plan.groups, draw.instance_count);
+	}
+	return plan;
+}
 
-	if (mesh_active && draw.indexed) {
-		// Register the original guest indices for shader reads; PrepareGraphicsBindings
-		// synchronizes registered BDA ranges before any draw commands are committed. Shaders read
-		// them only through BDA, so the lookup counts as a use and keeps the buffer resident.
-		(void)m_context.GetBufferCache().FindBufferForShaderRead(
-		    index_source.address,
-		    static_cast<uint64_t>(draw.index_count) * index_source.guest_element_size);
+// The buffer the GPU reads a draw's indirect records from, or nothing for a plain draw.
+static std::pair<Buffer*, uint64_t> AcquireIndirectArgs(RenderContext&     context,
+                                                         const DrawCallInfo& draw,
+                                                         const DrawEmitInfo& emit) {
+	if (emit.indirect.address == 0) {
+		return {};
 	}
-	auto&                                           bindings = m_graphics_bindings;
-	std::array<PreparedBindings*, MaxBindingStages> descriptor_stages {};
-	uint32_t                                        stage_count = 0;
-	for (uint32_t i = 0; i < vertex_stages.size(); i++) {
-		PrepareBindings(state.vertex_info[i].stage, bindings.vertex[i]);
-		descriptor_stages[stage_count++] = &bindings.vertex[i];
-	}
-	if (state.ps_active) {
-		PrepareBindings(state.ps_input_info.stage, bindings.pixel);
-		descriptor_stages[stage_count++] = &bindings.pixel;
-	}
-	const auto stages = std::span {descriptor_stages.data(), stage_count};
-	PrepareGraphicsBindings(stages, std::span {state.color_info, state.color_count});
-	PreparedVertexBuffers vertex_bindings;
-	PreparedIndexBuffer   index_binding;
-	if (!mesh_active) {
-		vertex_bindings = AcquireVertexBuffers(buffer, state.vertex_info[0]);
-		index_binding   = PrepareIndexBuffer(buffer, index_source);
-	}
-	std::pair<Buffer*, uint64_t> args_buffer {};
-	if (emit.indirect.address != 0) {
-		const auto size = static_cast<uint64_t>(emit.indirect.count - 1) * emit.indirect.stride +
-		                  (draw.indexed ? sizeof(vk::DrawIndexedIndirectCommand)
-		                                : sizeof(vk::DrawIndirectCommand));
-		args_buffer = m_context.GetBufferCache().ObtainBuffer(emit.indirect.address, size, false);
-		EXIT_IF((args_buffer.second & 3u) != 0);
-	}
-	auto* pipeline_or_null = AcquireDrawPipeline(m_context, buffer, state);
-	vk::ImageAspectFlags feedback_aspects;
-	// Runs even for a skipped draw, since it applies the clears the draw consumes and moves the
-	// targets to their attachment layouts.
-	const auto rendering =
-	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info,
-	                         feedback_aspects, stages);
-	if (pipeline_or_null == nullptr) {
-		// Returns normally, because the caller treats a false result as a request to replay the
-		// draw on the CPU.
-		SkipDrawWithoutPipeline(m_context, buffer, rendering, state);
-		return;
-	}
-	auto& pipeline = *pipeline_or_null;
-	vk::DeviceAddress task_params = 0;
-	if (mesh_task) {
-		const MeshTaskParams params {
-		    .records        = args_buffer.first->BufferDeviceAddress() + args_buffer.second,
-		    .index_address  = index_source.address,
-		    .stride         = emit.indirect.stride,
-		    .index_size     = index_source.guest_element_size,
-		    .index_limit    = draw.index_count,
-		    .primitive_size = mesh.InputPrimitiveSize(),
-		    .group_step     = mesh.primitives_per_group * mesh.InputPrimitiveStep(),
-		    .max_groups     = limits.maxMeshWorkGroupCount[0],
-		    .max_instances  = limits.maxMeshWorkGroupCount[1],
-		    .max_total      = limits.maxMeshWorkGroupTotalCount,
-		};
-		auto& stream = m_context.GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream);
-		task_params  = stream.BufferDeviceAddress() + stream.Copy(&params, sizeof(params), 8);
-	}
+	const auto size = static_cast<uint64_t>(emit.indirect.count - 1) * emit.indirect.stride +
+	                  (draw.indexed ? sizeof(vk::DrawIndexedIndirectCommand)
+	                                : sizeof(vk::DrawIndirectCommand));
+	auto args = context.GetBufferCache().ObtainBuffer(emit.indirect.address, size, false);
+	EXIT_IF((args.second & 3u) != 0);
+	return args;
+}
 
-	// Resource preparation above may synchronously finish and restart the scheduler. From this
-	// point onward, every operation targets the current command buffer and cannot touch guest
-	// memory.
-	auto vk_buffer = buffer.Handle();
-	if (!mesh_active) {
-		CommitVertexBuffers(vk_buffer, vertex_bindings);
-	}
-	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages);
-	if (!mesh_active) {
-		CommitIndexBuffer(vk_buffer, index_binding);
-	}
-	using ShaderRecompiler::IR::PushData;
-	const auto draw_dwords =
-	    PushData::GraphicsDrawDwords(mesh_active, state.ps_input_info.object_primitive_id);
-	if (draw_dwords != 0) {
-		std::array<uint32_t, PushData::MeshDrawDwordCount> draw_data {};
-		if (mesh_task) {
-			draw_data[0] = static_cast<uint32_t>(task_params);
-			draw_data[1] = static_cast<uint32_t>(task_params >> 32u);
-		} else if (mesh_active) {
-			draw_data = {draw.index_count,
-			             static_cast<uint32_t>(emit.vertex_offset),
-			             index_source.guest_element_size,
-			             static_cast<uint32_t>(index_source.address),
-			             static_cast<uint32_t>(index_source.address >> 32u)};
-		} else {
-			draw_data[0] = buffer.GetUserConfig().GetObjectId();
-		}
-		vk_buffer.pushConstants(pipeline.pipeline_layout, pipeline.push_stages, 0,
-		                        draw_dwords * sizeof(uint32_t), draw_data.data());
-	}
-	if (const auto planes = vertex_stages.back().user_clip_planes; planes != 0) {
-		vk_buffer.pushConstants(pipeline.pipeline_layout, pipeline.push_stages,
-		                        PushData::UserClipPlaneDword * sizeof(uint32_t),
-		                        std::bit_width(planes) * 4u * sizeof(uint32_t),
-		                        buffer.GetRegisters().GetUserClipPlanes().data());
-	}
+// Puts the inputs of an indirect mesh draw's task shader in the stream buffer, and returns where.
+static vk::DeviceAddress UploadMeshTaskParams(RenderContext& context, const DrawCallInfo& draw,
+                                              const DrawEmitInfo&                 emit,
+                                              const DrawIndexBufferSource&        index_source,
+                                              const std::pair<Buffer*, uint64_t>& args,
+                                              const ShaderVertexInputInfo&        vertex) {
+	const auto&          limits = context.GetGraphics().mesh_shader_properties;
+	const auto&          mesh   = vertex.mesh;
+	const MeshTaskParams params {
+	    .records        = args.first->BufferDeviceAddress() + args.second,
+	    .index_address  = index_source.address,
+	    .stride         = emit.indirect.stride,
+	    .index_size     = index_source.guest_element_size,
+	    .index_limit    = draw.index_count,
+	    .primitive_size = mesh.InputPrimitiveSize(),
+	    .group_step     = mesh.primitives_per_group * mesh.InputPrimitiveStep(),
+	    .max_groups     = limits.maxMeshWorkGroupCount[0],
+	    .max_instances  = limits.maxMeshWorkGroupCount[1],
+	    .max_total      = limits.maxMeshWorkGroupTotalCount,
+	};
+	auto& stream = context.GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream);
+	return stream.BufferDeviceAddress() + stream.Copy(&params, sizeof(params), 8);
+}
 
-	auto& dynamic_state = m_context.GetCommandScheduler().GetDynamicState();
-	UpdateGraphicsDynamicState(buffer, dynamic_state, vertex_stages.back(), state.depth_info,
-	                           rendering);
-	dynamic_state.SetAttachmentFeedbackLoopAspects(feedback_aspects);
-	dynamic_state.Commit(m_context.GetGraphics(), vk_buffer);
-
+// The stages of a draw that write buffers, which the draw must fence off from the memory's users.
+static vk::PipelineStageFlags DrawShaderWriteStages(const DrawRenderState& state) {
 	vk::PipelineStageFlags shader_write_stages = {};
-	for (const auto& stage: vertex_stages) {
+	for (const auto& stage: state.VertexStages()) {
 		if (HasShaderBufferWrites(stage.stage)) {
 			shader_write_stages |= ShaderPipelineStages(NativeShaderStage(stage.logical_stage));
 		}
@@ -1398,36 +1307,276 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	if (state.ps_active && HasShaderBufferWrites(state.ps_input_info.stage)) {
 		shader_write_stages |= vk::PipelineStageFlagBits::eFragmentShader;
 	}
-	if (shader_write_stages) {
-		// As for dispatches, buffer writes wait for earlier accesses to the memory.
-		buffer.EndRendering();
-		ShaderWriteHazardBarrier(vk_buffer, shader_write_stages);
-	}
-	buffer.BeginRendering(rendering);
-	vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
-	auto&         occlusion_queries = m_context.GetOcclusionQueries();
-	const int32_t occlusion_query   = occlusion_queries.Begin(vk_buffer);
-	if (mesh_task) {
-		vk_buffer.drawMeshTasksEXT(emit.indirect.count, 1, 1);
-	} else if (mesh_active) {
-		vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
-	} else if (args_buffer.first == nullptr) {
-		EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
-	} else if (draw.indexed) {
-		vk_buffer.drawIndexedIndirect(args_buffer.first->Handle(), args_buffer.second,
-		                              emit.indirect.count, emit.indirect.stride);
-	} else {
-		vk_buffer.drawIndirect(args_buffer.first->Handle(), args_buffer.second,
-		                       emit.indirect.count, emit.indirect.stride);
-	}
-	occlusion_queries.End(vk_buffer, occlusion_query);
-	Common::DebugCounters::Add(Common::DebugCounters::Counter::Draws);
-	Common::DebugCounters::Add(Common::DebugCounters::Counter::DrawInstances, draw.instance_count);
-	m_context.GetCommandScheduler().NoteRecordedWork();
+	return shader_write_stages;
+}
 
-	if (shader_write_stages) {
-		buffer.EndRendering();
-		ShaderWriteBarrier(vk_buffer, shader_write_stages);
+// Copies what recording reads from the registers into the view, and updates the dynamic state that
+// the recording commits. Both read the guest state, which belongs to this draw only until the next.
+static void CaptureDrawState(RenderContext& context, CommandBuffer& buffer,
+                             const DrawRenderState& state, const MeshDrawPlan& mesh,
+                             vk::ImageAspectFlags feedback_aspects, DrawView& view) {
+	using ShaderRecompiler::IR::PushData;
+	const auto& ucfg          = buffer.GetUserConfig();
+	const auto  vertex_stages = state.VertexStages();
+	view.primitive_type       = ucfg.GetPrimType();
+	view.object_id            = ucfg.GetObjectId();
+	view.draw_dwords =
+	    PushData::GraphicsDrawDwords(mesh.active, state.ps_input_info.object_primitive_id);
+	view.user_clip_planes = vertex_stages.back().user_clip_planes;
+	if (view.user_clip_planes != 0) {
+		view.user_clip_plane_dwords = buffer.GetRegisters().GetUserClipPlanes();
+	}
+	auto& dynamic_state = context.GetCommandScheduler().GetDynamicState();
+	UpdateGraphicsDynamicState(buffer, dynamic_state, vertex_stages.back(), state.depth_info,
+	                           view.rendering);
+	dynamic_state.SetAttachmentFeedbackLoopAspects(feedback_aspects);
+	view.dynamic_state       = &dynamic_state;
+	view.shader_write_stages = DrawShaderWriteStages(state);
+}
+
+// Resolves the bindings of every stage the draw runs, and lists them in the view.
+void RenderExecutor::PrepareDrawBindings(DrawRenderState& state, DrawView& view) {
+	auto&      bindings      = m_graphics_bindings;
+	const auto vertex_stages = state.VertexStages();
+	for (uint32_t i = 0; i < vertex_stages.size(); i++) {
+		PrepareBindings(state.vertex_info[i].stage, bindings.vertex[i]);
+		view.bindings[view.stage_count++] = &bindings.vertex[i];
+	}
+	if (state.ps_active) {
+		PrepareBindings(state.ps_input_info.stage, bindings.pixel);
+		view.bindings[view.stage_count++] = &bindings.pixel;
+	}
+	PrepareGraphicsBindings(view.Bindings(), std::span {state.color_info, state.color_count});
+	for (uint32_t i = 0; i < view.stage_count; i++) {
+		view.modules[i] = view.bindings[i]->runtime->module;
+	}
+}
+
+// Copies the plain facts of a draw into its view.
+static void CaptureDrawFacts(const DrawCallInfo& draw, const DrawEmitInfo& emit,
+                             const DrawIndexBufferSource& index_source, const MeshDrawPlan& mesh,
+                             const std::pair<Buffer*, uint64_t>& args, DrawView& view) {
+	view.draw               = draw;
+	view.emit               = emit;
+	view.mesh_active        = mesh.active;
+	view.mesh_task          = mesh.task;
+	view.mesh_groups        = mesh.groups;
+	view.index_address      = index_source.address;
+	view.index_element_size = index_source.guest_element_size;
+	if (args.first != nullptr) {
+		view.args_buffer = args.first->Handle();
+		view.args_offset = args.second;
+	}
+}
+
+// The commands a draw records at the moment it is met. The image transitions change layouts the CPU
+// tracks, so they cannot wait for the pipeline. The vertex buffers go first when the caller wants
+// the commands in their old order.
+void RenderExecutor::RecordEagerDrawCommands(CommandBuffer& buffer, DrawRenderState& state,
+                                             const MeshDrawPlan& mesh,
+                                             const PipelineCache::Pipeline& pipeline,
+                                             vk::ImageAspectFlags feedback_aspects,
+                                             bool bind_vertex_buffers, DrawView& view) {
+	if (bind_vertex_buffers) {
+		CommitVertexBuffers(buffer.Handle(), view.vertex_buffers);
+		view.vertex_buffers_bound = true;
+	}
+	if (pipeline.uses_image_heap) {
+		m_context.GetImageHeap().Commit(buffer, vk::PipelineBindPoint::eGraphics,
+		                                pipeline.pipeline_layout);
+	}
+	TransitBindingImages(buffer, view.Bindings());
+	CaptureDrawState(m_context, buffer, state, mesh, feedback_aspects, view);
+	view.address_buffers = CaptureAddressBuffers(view.Modules());
+}
+
+// Does everything a draw must do in order when it is met. That covers the resources it reads, its
+// targets and the image layouts it needs, and the state it takes from the registers. What is left
+// for RecordDraw is plain commands. Returns the pipeline to record with, or null when nothing is
+// left to record because the draw was skipped or has no work.
+const PipelineCache::Pipeline* RenderExecutor::PrepareDraw(
+    CommandBuffer& buffer, const DrawCallInfo& draw, DrawRenderState& state,
+    const DrawEmitInfo& emit, const DrawIndexBufferSource& index_source,
+    bool bind_vertex_buffers, DrawView& view) {
+	const auto mesh =
+	    PlanMeshDraw(buffer.GetUserConfig(), m_context.GetGraphics(), draw, state, emit);
+	if (!mesh) {
+		return nullptr;
+	}
+	if (mesh->active && draw.indexed) {
+		// Register the original guest indices for shader reads; PrepareGraphicsBindings
+		// synchronizes registered BDA ranges before any draw commands are committed. Shaders read
+		// them only through BDA, so the lookup counts as a use and keeps the buffer resident.
+		(void)m_context.GetBufferCache().FindBufferForShaderRead(
+		    index_source.address,
+		    static_cast<uint64_t>(draw.index_count) * index_source.guest_element_size);
+	}
+	PrepareDrawBindings(state, view);
+	if (!mesh->active) {
+		view.vertex_buffers = AcquireVertexBuffers(buffer, state.vertex_info[0]);
+		view.index_buffer   = PrepareIndexBuffer(buffer, index_source);
+	}
+	const auto           args     = AcquireIndirectArgs(m_context, draw, emit);
+	auto*                pipeline = AcquireDrawPipeline(m_context, buffer, state);
+	vk::ImageAspectFlags feedback_aspects;
+	// Runs even for a skipped draw, since it applies the clears the draw consumes and moves the
+	// targets to their attachment layouts.
+	view.rendering = AcquireRenderTargets(buffer, state.color_info, state.color_count,
+	                                      state.depth_info, feedback_aspects, view.Bindings());
+	if (pipeline == nullptr) {
+		// Returns normally, because the caller treats a false result as a request to replay the
+		// draw on the CPU.
+		SkipDrawWithoutPipeline(m_context, buffer, view.rendering, state);
+		return nullptr;
+	}
+	view.task_params        = mesh->task ? UploadMeshTaskParams(m_context, draw, emit, index_source,
+	                                                            args, state.vertex_info[0])
+	                                     : 0;
+	CaptureDrawFacts(draw, emit, index_source, *mesh, args, view);
+	// Resource preparation above may synchronously finish and restart the scheduler. From this
+	// point onward, every operation targets the current command buffer and cannot touch guest
+	// memory.
+	RecordEagerDrawCommands(buffer, state, *mesh, *pipeline, feedback_aspects,
+	                        bind_vertex_buffers, view);
+	return pipeline;
+}
+
+// Records the draw's mesh, object id and clip plane push constants.
+static void RecordDrawPushConstants(vk::CommandBuffer vk_buffer, const DrawView& view,
+                                    const PipelineCache::Pipeline& pipeline) {
+	using ShaderRecompiler::IR::PushData;
+	if (view.draw_dwords != 0) {
+		std::array<uint32_t, PushData::MeshDrawDwordCount> draw_data {};
+		if (view.mesh_task) {
+			draw_data[0] = static_cast<uint32_t>(view.task_params);
+			draw_data[1] = static_cast<uint32_t>(view.task_params >> 32u);
+		} else if (view.mesh_active) {
+			draw_data = {view.draw.index_count,
+			             static_cast<uint32_t>(view.emit.vertex_offset),
+			             view.index_element_size,
+			             static_cast<uint32_t>(view.index_address),
+			             static_cast<uint32_t>(view.index_address >> 32u)};
+		} else {
+			draw_data[0] = view.object_id;
+		}
+		vk_buffer.pushConstants(pipeline.pipeline_layout, pipeline.push_stages, 0,
+		                        view.draw_dwords * sizeof(uint32_t), draw_data.data());
+	}
+	if (view.user_clip_planes != 0) {
+		// Each plane up to the highest enabled one takes four dwords.
+		vk_buffer.pushConstants(pipeline.pipeline_layout, pipeline.push_stages,
+		                        PushData::UserClipPlaneDword * sizeof(uint32_t),
+		                        std::bit_width(view.user_clip_planes) * 4u * sizeof(uint32_t),
+		                        view.user_clip_plane_dwords.data());
+	}
+}
+
+// Records the draw call of a prepared draw.
+static void RecordDrawCall(vk::CommandBuffer vk_buffer, const DrawView& view) {
+	const auto& draw = view.draw;
+	const auto& emit = view.emit;
+	if (view.mesh_task) {
+		vk_buffer.drawMeshTasksEXT(emit.indirect.count, 1, 1);
+	} else if (view.mesh_active) {
+		vk_buffer.drawMeshTasksEXT(view.mesh_groups, draw.instance_count, 1);
+	} else if (view.args_buffer == nullptr) {
+		EmitDrawPrimitives(view.primitive_type, vk_buffer, draw, emit);
+	} else if (draw.indexed) {
+		vk_buffer.drawIndexedIndirect(view.args_buffer, view.args_offset, emit.indirect.count,
+		                              emit.indirect.stride);
+	} else {
+		vk_buffer.drawIndirect(view.args_buffer, view.args_offset, emit.indirect.count,
+		                       emit.indirect.stride);
+	}
+}
+
+void RenderExecutor::RecordDraw(vk::CommandBuffer vk_buffer, const DrawView& view,
+                                const PipelineCache::Pipeline& pipeline, DrawRecordEnv& env) {
+	if (!view.vertex_buffers_bound) {
+		CommitVertexBuffers(vk_buffer, view.vertex_buffers);
+	}
+	WriteBindingDescriptors(vk_buffer, vk::PipelineBindPoint::eGraphics, pipeline, view.Bindings(),
+	                        view.Modules(), view.address_buffers, env.Scratch());
+	CommitIndexBuffer(vk_buffer, view.index_buffer);
+	RecordDrawPushConstants(vk_buffer, view, pipeline);
+	view.dynamic_state->Commit(m_context.GetGraphics(), vk_buffer);
+	env.BeginRendering(vk_buffer, view.rendering);
+	vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
+	const int32_t token = env.BeginDraw(vk_buffer);
+	RecordDrawCall(vk_buffer, view);
+	env.EndDraw(vk_buffer, token, view.draw);
+}
+
+namespace {
+
+// Records a draw as it is met. That means into the scheduler's current command buffer, in a
+// rendering it shares with the draws around it, and with its samples counted for any open guest
+// occlusion query. The barriers that fence off a stage's buffer writes belong here, since they end
+// the rendering that the wrapper tracks.
+class BlockingDrawEnv final: public DrawRecordEnv {
+public:
+	BlockingDrawEnv(RenderContext& context, CommandBuffer& buffer, DescriptorScratch& scratch,
+	                vk::PipelineStageFlags shader_write_stages)
+	    : m_context(context), m_buffer(buffer), m_scratch(scratch),
+	      m_shader_write_stages(shader_write_stages) {}
+
+	DescriptorScratch& Scratch() override { return m_scratch; }
+
+	void BeginRendering(vk::CommandBuffer command, const RenderState& rendering) override {
+		if (m_shader_write_stages) {
+			// As for dispatches, buffer writes wait for earlier accesses to the memory.
+			m_buffer.EndRendering();
+			ShaderWriteHazardBarrier(command, m_shader_write_stages);
+		}
+		m_buffer.BeginRendering(rendering);
+	}
+
+	int32_t BeginDraw(vk::CommandBuffer command) override {
+		return m_context.GetOcclusionQueries().Begin(command);
+	}
+
+	void EndDraw(vk::CommandBuffer command, int32_t token, const DrawCallInfo& draw) override {
+		m_context.GetOcclusionQueries().End(command, token);
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::Draws);
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::DrawInstances,
+		                           draw.instance_count);
+		m_context.GetCommandScheduler().NoteRecordedWork();
+		if (m_shader_write_stages) {
+			m_buffer.EndRendering();
+			ShaderWriteBarrier(command, m_shader_write_stages);
+		}
+	}
+
+private:
+	RenderContext&         m_context;
+	CommandBuffer&         m_buffer;
+	DescriptorScratch&     m_scratch;
+	vk::PipelineStageFlags m_shader_write_stages;
+};
+
+} // namespace
+
+// Records a prepared draw as it is met, through an env that forwards to the command buffer wrapper.
+void RenderExecutor::RecordBlockingDraw(CommandBuffer& buffer, const DrawView& view,
+                                        const PipelineCache::Pipeline& pipeline) {
+	BlockingDrawEnv env(m_context, buffer, m_descriptor_scratch, view.shader_write_stages);
+	RecordDraw(buffer.Handle(), view, pipeline, env);
+}
+
+// Records one prepared draw. Resources are prepared and the targets acquired for every draw. With
+// background pipeline builds on, a draw whose pipeline is not ready may then stop short of the
+// commands that bind and draw, and still report a normal draw.
+void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallInfo& draw,
+                                         DrawRenderState& state, const DrawEmitInfo& emit,
+                                         const DrawIndexBufferSource& index_source) {
+	if (CopyDepthToColor(buffer, draw, emit, state)) {
+		return;
+	}
+	DrawView view;
+	// The vertex buffers are bound ahead of the image transitions, where this draw always had them.
+	const auto* pipeline = PrepareDraw(buffer, draw, state, emit, index_source, true, view);
+	if (pipeline != nullptr) {
+		RecordBlockingDraw(buffer, view, *pipeline);
 	}
 }
 

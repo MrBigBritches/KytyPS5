@@ -6,6 +6,7 @@
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
+#include "graphics/host_gpu/renderer/drawRecord.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -40,12 +41,7 @@ void CommandBuffer::End() const {
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 }
 
-void CommandBuffer::BeginRendering(const RenderState& state) const {
-	if (m_rendering && m_render_state == state) {
-		return;
-	}
-	EndRendering();
-
+void RecordBeginRendering(vk::CommandBuffer command, const RenderState& state) {
 	std::array<vk::RenderingAttachmentInfo, RENDER_COLOR_ATTACHMENTS_MAX> colors {};
 	for (uint32_t i = 0; i < state.num_color_attachments; i++) {
 		const auto& attachment = state.color_attachments[i];
@@ -79,7 +75,19 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	rendering.pColorAttachments    = colors.data();
 	rendering.pDepthAttachment     = depth_stencil.has_depth ? &depth : nullptr;
 	rendering.pStencilAttachment   = depth_stencil.has_stencil ? &stencil : nullptr;
-	Handle().beginRendering(rendering);
+	command.beginRendering(rendering);
+}
+
+void RecordEndRendering(vk::CommandBuffer command) {
+	command.endRendering();
+}
+
+void CommandBuffer::BeginRendering(const RenderState& state) const {
+	if (m_rendering && m_render_state == state) {
+		return;
+	}
+	EndRendering();
+	RecordBeginRendering(Handle(), state);
 	m_render_state = state;
 	// The open pass holds the cleared contents, so a later clear begins a new pass.
 	m_render_state.depth_stencil_attachment.depth_clear   = false;
@@ -91,7 +99,7 @@ void CommandBuffer::EndRendering() const {
 	if (!m_rendering) {
 		return;
 	}
-	Handle().endRendering();
+	RecordEndRendering(Handle());
 	m_rendering = false;
 }
 

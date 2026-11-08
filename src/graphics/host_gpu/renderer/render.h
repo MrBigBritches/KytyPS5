@@ -25,6 +25,9 @@ struct GraphicContext;
 struct DrawCallInfo;
 struct DrawEmitInfo;
 struct DrawIndexBufferSource;
+struct DrawView;
+struct MeshDrawPlan;
+class DrawRecordEnv;
 class RenderContext;
 class CommandScheduler;
 struct RenderExecutorTestAccess;
@@ -165,6 +168,23 @@ public:
 	                             const PipelineCache::Pipeline& pipeline,
 	                             std::span<PreparedBindings* const> bindings,
 	                             std::span<const ShaderModule* const> modules);
+	/// The same, with the address buffers and the scratch the caller provides. This form never
+	/// reaches the buffer cache and never uses the executor's own scratch.
+	void WriteBindingDescriptors(vk::CommandBuffer vk_buffer,
+	                             vk::PipelineBindPoint pipeline_bind_point,
+	                             const PipelineCache::Pipeline& pipeline,
+	                             std::span<PreparedBindings* const> bindings,
+	                             std::span<const ShaderModule* const> modules,
+	                             const AddressBufferInfos& address_buffers,
+	                             DescriptorScratch& scratch);
+	/// The BDA page table and fault buffer views of the stages that bind them.
+	[[nodiscard]] AddressBufferInfos CaptureAddressBuffers(std::span<const ShaderModule* const> modules);
+	/// Records the commands of a prepared draw into `command`. This is the half of a draw that needs
+	/// its pipeline. It reads only the view and the pipeline, never the registers, the caches or an
+	/// image's tracked layout, and it never transits an image. `env` decides how the draw's
+	/// rendering begins and what surrounds its draw call.
+	void RecordDraw(vk::CommandBuffer command, const DrawView& view,
+	                const PipelineCache::Pipeline& pipeline, DrawRecordEnv& env);
 	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
 	                                            const ShaderRecompiler::IR::DescriptorValue& value);
 
@@ -192,6 +212,25 @@ private:
 	void                      ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallInfo& draw,
 	                                              DrawRenderState& state, const DrawEmitInfo& emit,
 	                                              const DrawIndexBufferSource& index_source);
+	/// The eager half of a draw, everything that must happen in order when the draw is met. It
+	/// returns the draw's pipeline, or null when there is nothing to record. With
+	/// `bind_vertex_buffers` the vertex buffers are bound before the image transitions.
+	[[nodiscard]] const PipelineCache::Pipeline*
+	PrepareDraw(CommandBuffer& buffer, const DrawCallInfo& draw, DrawRenderState& state,
+	            const DrawEmitInfo& emit, const DrawIndexBufferSource& index_source,
+	            bool bind_vertex_buffers, DrawView& view);
+	/// Resolves the bindings of every stage the draw runs and lists them in the view.
+	void PrepareDrawBindings(DrawRenderState& state, DrawView& view);
+	/// Records the commands a draw needs at the moment it is met, which are the image transitions
+	/// and, when asked, the vertex buffer bind. It also captures the register state into the view.
+	void RecordEagerDrawCommands(CommandBuffer& buffer, DrawRenderState& state,
+	                             const MeshDrawPlan& mesh, const PipelineCache::Pipeline& pipeline,
+	                             vk::ImageAspectFlags feedback_aspects, bool bind_vertex_buffers,
+	                             DrawView& view);
+	/// Records a prepared draw into the scheduler's current buffer, sharing its rendering with the
+	/// draws around it. This is what a draw met in order uses.
+	void RecordBlockingDraw(CommandBuffer& buffer, const DrawView& view,
+	                        const PipelineCache::Pipeline& pipeline);
 	[[nodiscard]] RenderState AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
 	                                               uint32_t color_count, RenderDepthInfo& depth,
 	                                               vk::ImageAspectFlags& feedback_aspects,
@@ -211,8 +250,7 @@ private:
 	GraphicsBindings                     m_graphics_bindings;
 	PreparedBindings                     m_compute_bindings;
 	std::vector<ImageId>                  m_bound_images;
-	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
-	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
+	DescriptorScratch                     m_descriptor_scratch;
 	vk::DescriptorSetLayout               m_pssr_descriptor_layout = nullptr;
 	vk::PipelineLayout                    m_pssr_pipeline_layout   = nullptr;
 	vk::Pipeline                          m_pssr_pipeline          = nullptr;
