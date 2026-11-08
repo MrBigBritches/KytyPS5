@@ -5,9 +5,27 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <latch>
 #include <memory>
 #include <thread>
 #include <vector>
+
+#include "common/config.h"
+#if defined(__APPLE__)
+#include <pthread/qos.h>
+#define KYTY_TEST_HAS_PRIORITY 1
+#elif KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#define KYTY_TEST_HAS_PRIORITY 1
+#elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+#include <sys/resource.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#define KYTY_TEST_HAS_PRIORITY 1
+#endif
 
 namespace {
 using namespace Libs::Graphics;
@@ -307,9 +325,105 @@ void TestDestructorStops() {
 	CHECK(blocker.finished);
 	CHECK(counted.runs == 0);
 }
+
+#ifdef KYTY_TEST_HAS_PRIORITY
+// The priority of the calling thread in the units of this platform. It is the Windows thread
+// priority, the Linux nice value of the thread or the macOS QoS class.
+int CurrentThreadPriority() {
+#if defined(__APPLE__)
+	return static_cast<int>(qos_class_self());
+#elif KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	return GetThreadPriority(GetCurrentThread());
+#else
+	return getpriority(PRIO_PROCESS, static_cast<id_t>(syscall(SYS_gettid)));
+#endif
+}
+
+// What a lowered worker reports, given what an ordinary thread reports.
+int LoweredPriority(int ordinary) {
+#if defined(__APPLE__)
+	(void)ordinary;
+	return static_cast<int>(QOS_CLASS_UTILITY);
+#elif KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	(void)ordinary;
+	return THREAD_PRIORITY_BELOW_NORMAL;
+#else
+	// These mirror LOW_PRIORITY_NICE and MAX_NICE in pipelineBuildQueue.cpp.
+	constexpr int EXPECTED_NICE_STEP = 5;
+	constexpr int MAX_NICE           = 19;
+	return std::min(ordinary + EXPECTED_NICE_STEP, MAX_NICE);
+#endif
+}
+
+// Returns the priority each worker of the queue reports. Every job waits for all the others, so
+// no worker can take two of them and each worker is seen exactly once.
+std::vector<int> WorkerThreadPriorities(PipelineBuildQueue& queue) {
+	const uint32_t   worker_count = queue.WorkerCount();
+	std::vector<int> priorities(worker_count, -1);
+	std::latch       all_started(worker_count);
+	std::vector<PipelineBuildQueue::JobPtr> jobs;
+	for (uint32_t index = 0; index < worker_count; index++) {
+		jobs.push_back(queue.Post([&, index] {
+			priorities[index] = CurrentThreadPriority();
+			all_started.arrive_and_wait();
+		}));
+	}
+	WaitFor([&] {
+		return std::all_of(jobs.begin(), jobs.end(), [](const auto& job) {
+			return job->GetState() == PipelineBuildQueue::State::Done;
+		});
+	});
+	return priorities;
+}
+
+// The low priority option lowers every worker thread and nothing else. The default queue is the
+// baseline that differs only in the option, since a worker could differ for another reason.
+void TestLowPriorityWorkers() {
+	constexpr uint32_t WORKERS         = 3;
+	const int          caller_priority = CurrentThreadPriority();
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	const auto process_class = GetPriorityClass(GetCurrentProcess());
+#endif
+	int ordinary = 0;
+	{
+		PipelineBuildQueue queue(WORKERS);
+		for (const int priority: WorkerThreadPriorities(queue)) {
+			CHECK(priority == caller_priority);
+			ordinary = priority;
+		}
+	}
+	// A runner already at the lowest priority could not tell a lowered worker from an ordinary one.
+	CHECK(LoweredPriority(ordinary) != ordinary);
+	{
+		PipelineBuildQueue queue(WORKERS, PipelineBuildQueueOptions {.low_priority = true});
+		const auto         priorities = WorkerThreadPriorities(queue);
+		CHECK(priorities.size() == WORKERS);
+		for (const int priority: priorities) {
+			CHECK(priority == LoweredPriority(ordinary));
+		}
+	}
+	CHECK(CurrentThreadPriority() == caller_priority);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	CHECK(GetPriorityClass(GetCurrentProcess()) == process_class);
+#endif
+}
+#endif
+
+// A queue with the option set still runs its jobs.
+void TestLowPriorityQueueRunsJobs() {
+	PipelineBuildQueue queue(1, PipelineBuildQueueOptions {.low_priority = true});
+	Counted            counted;
+	auto               job = queue.Post(counted.Work());
+	WaitFor([&] { return job->GetState() == PipelineBuildQueue::State::Done; });
+	CHECK(counted.runs == 1);
+}
 } // namespace
 
 int main() {
+#ifdef KYTY_TEST_HAS_PRIORITY
+	TestLowPriorityWorkers();
+#endif
+	TestLowPriorityQueueRunsJobs();
 	TestWorkerRunsJob();
 	TestInlineClaimRunsOnce();
 	TestAcquireWaitsForRunningJob();

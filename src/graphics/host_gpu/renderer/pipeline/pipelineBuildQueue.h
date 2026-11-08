@@ -27,6 +27,17 @@ uint32_t PipelineBuildWorkerCount();
 /// The worker count for a machine with the given number of hardware threads, zero meaning unknown.
 uint32_t PipelineBuildWorkerCountFor(uint32_t hardware_threads);
 
+/// Options for a build queue. The defaults give the queue its original behaviour.
+struct PipelineBuildQueueOptions {
+	/// Runs each worker thread below normal priority, so builds yield to the guest and render
+	/// threads. Opt in only, and it never changes the priority of the process. This is below normal
+	/// on Windows, a higher nice value on Linux and the utility QoS class on macOS. A refusal by
+	/// the system is logged once per process and the worker runs on at normal priority. On Linux
+	/// and macOS threads that the driver creates from a worker inherit the lowered setting, and on
+	/// Apple Silicon the utility class may put the workers on efficiency cores.
+	bool low_priority = false;
+};
+
 /// Runs jobs on a few worker threads in the order they were posted. It knows nothing about what a
 /// job does. Each job is run exactly once, by a worker or by whoever needs the result first.
 class PipelineBuildQueue {
@@ -66,8 +77,8 @@ public:
 
 	using JobPtr = std::shared_ptr<Job>;
 
-	/// Starts `worker_count` threads.
-	explicit PipelineBuildQueue(uint32_t worker_count);
+	/// Starts `worker_count` threads, configured by `options`.
+	explicit PipelineBuildQueue(uint32_t worker_count, PipelineBuildQueueOptions options = {});
 	/// Stops the queue first if the owner did not.
 	~PipelineBuildQueue();
 	KYTY_CLASS_NO_COPY(PipelineBuildQueue);
@@ -106,6 +117,8 @@ private:
 	// Jobs a worker has taken from the queue and not finished. Guarded by m_mutex.
 	uint32_t                    m_active = 0;
 	std::atomic<bool>           m_stopping {false};
+	// Set in the init list and only read by the workers, so it needs no lock.
+	const bool                  m_low_priority;
 	// Declared last, so the workers join before the rest is destroyed.
 	std::vector<std::jthread>   m_workers;
 };
