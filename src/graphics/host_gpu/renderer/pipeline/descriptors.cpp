@@ -738,8 +738,8 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 	auto& cache = m_context.GetBufferCache();
 	for (auto* stage: stages) {
 		auto&       prepared = *stage;
-		const auto& program  = prepared.runtime->module->info;
-		const auto& snapshot = *prepared.runtime->resources;
+		const auto& program  = prepared.Runtime().module->info;
+		const auto& snapshot = *prepared.Runtime().resources;
 		const auto& layout   = program.bindings;
 		prepared.buffer_sources.resize(layout.descriptor_counts[static_cast<size_t>(BindingKind::Buffers)]);
 		if (layout.descriptor_counts[static_cast<size_t>(BindingKind::Buffers)] == 0) {
@@ -766,7 +766,7 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 				if (program.info.buffers[resource].written) {
 					// Sentinel write ranges end before tables captured by any bound stage.
 					for (const auto* reader: stages) {
-						for (const auto [read_address, read_size]: reader->runtime->resources->specialization_reads) {
+						for (const auto [read_address, read_size]: reader->Runtime().resources->specialization_reads) {
 							if (read_size == 0) continue;
 							if (read_address > address) {
 								size = std::min(size, read_address - address);
@@ -794,8 +794,8 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 
 void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
-	const auto& program  = prepared.runtime->module->info;
-	const auto& snapshot = *prepared.runtime->resources;
+	const auto& program  = prepared.Runtime().module->info;
+	const auto& snapshot = *prepared.Runtime().resources;
 	const auto& layout   = program.bindings;
 
 	prepared.buffers.resize(layout.descriptor_counts[static_cast<size_t>(BindingKind::Buffers)]);
@@ -827,8 +827,8 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 
 void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
-	const auto& program       = prepared.runtime->module->info;
-	const auto& snapshot      = *prepared.runtime->resources;
+	const auto& program       = prepared.Runtime().module->info;
+	const auto& snapshot      = *prepared.Runtime().resources;
 	auto&       images        = prepared.images;
 	auto&       texture_cache = m_context.GetTextureCache();
 	const bool  skips_tracked = m_context.GetPipelineCache().BuildsInBackground();
@@ -881,8 +881,8 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 	bool uses_image_heap = false;
 	FindBuffers(stages);
 	for (auto* stage: stages) {
-		uses_dma |= stage->runtime->module->info.info.uses_dma;
-		uses_image_heap |= stage->runtime->module->info.info.uses_image_heap;
+		uses_dma |= stage->Runtime().module->info.info.uses_dma;
+		uses_image_heap |= stage->Runtime().module->info.info.uses_image_heap;
 	}
 	if (uses_dma) {
 		m_context.PrepareBda();
@@ -1082,7 +1082,7 @@ void RenderExecutor::TransitBindingImages(CommandBuffer&                     buf
 	KYTY_PROFILER_FUNCTION();
 	auto vk_buffer = buffer.Handle();
 	for (auto* prepared: prepared_bindings) {
-		const auto& module = *prepared->runtime->module;
+		const auto& module = *prepared->Runtime().module;
 		if (prepared->gds.buffer != nullptr) {
 			RecordGdsBarrier(buffer, *prepared, module);
 		}
@@ -1178,7 +1178,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	// taken here and the descriptor half never reads a runtime.
 	std::array<const ShaderModule*, MaxBindingStages> modules {};
 	for (size_t stage = 0; stage < prepared_bindings.size(); ++stage) {
-		modules[stage] = prepared_bindings[stage]->runtime->module;
+		modules[stage] = prepared_bindings[stage]->Runtime().module;
 	}
 	if (pipeline.uses_image_heap) {
 		m_context.GetImageHeap().Commit(buffer, pipeline_bind_point, pipeline.pipeline_layout);

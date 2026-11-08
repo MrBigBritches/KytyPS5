@@ -1274,6 +1274,20 @@ PipelineCache::Pipeline* PipelineCache::AcquireBuiltPipeline(const GraphicsPipel
 	return &FinishBuild(pending->second.build, pending->second.job);
 }
 
+PipelineCache::Pipeline PipelineCache::AcquireDeferredPipeline(const GraphicsPipelineKey& key) {
+	if (m_has_published.load(std::memory_order_relaxed)) {
+		DrainPublishedBuilds();
+	}
+	// Adopting a build twice is fatal, so a key that is already built is only looked up. A drain
+	// above or a blocking draw of the same key may have taken the build while the hole waited.
+	if (const auto found = m_graphics_pipelines.find(key); found != m_graphics_pipelines.end()) {
+		return found->second;
+	}
+	const auto pending = m_pending_graphics.find(key);
+	EXIT_IF(pending == m_pending_graphics.end());
+	return FinishBuild(pending->second.build, pending->second.job);
+}
+
 void PipelineCache::RequestBuild(const GraphicsPipelineKey& key, const Stages& stages) {
 	auto build = std::make_shared<GraphicsBuild>(key, stages);
 	auto job   = m_build_queue->Post([this, build] { RunBuild(build); });

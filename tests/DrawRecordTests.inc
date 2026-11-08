@@ -651,7 +651,319 @@
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  // A draw prepared as the first half of a blocking draw, with what a hole needs from it. The pipeline
+  // is the one the draw built, and its key is the one a hole waits on.
+  struct HoleSource {
+    DrawView view;
+    const PipelineCache::Pipeline *pipeline = nullptr;
+    GraphicsPipelineKey key{};
+  };
+
+  // The vertex buffers are left to the hole's own buffer, as a hole requires.
+  HoleSource PrepareHoleSource(AsyncDrawRig &rig, bool strip_clears = true) {
+    HoleSource source;
+    source.pipeline = RenderExecutorTestAccess::PrepareAutoDraw(
+        rig.context->GetRenderExecutor(), rig.Scheduler().Current(),
+        {.vertex_count = 3, .instance_count = 1}, vk::PrimitiveTopology::eTriangleList,
+        source.view, false);
+    Require("DeferredHoles", "prepared", source.pipeline != nullptr, "the draw was not prepared");
+    const auto key = PipelineCacheTestAccess::KeyOf(rig.Pipelines(), source.pipeline);
+    Require("DeferredHoles", "key", key.has_value(), "the draw's pipeline has no key");
+    source.key = *key;
+    // The eager pass of a real hole consumes the draw's clears, so the hole's view carries none.
+    if (strip_clears) {
+      source.view.rendering.depth_stencil_attachment.depth_clear = false;
+      source.view.rendering.depth_stencil_attachment.stencil_clear = false;
+    }
+    return source;
+  }
+
+  // Splits the scheduler's buffer for a hole of the prepared draw, then drops the executor's
+  // bindings the way a finished draw does. The hole keeps its own copies.
+  void SplitHoleOf(AsyncDrawRig &rig, const HoleSource &source) {
+    rig.Scheduler().SplitForHole(std::make_unique<DrawHole>(source.view, source.key));
+    RenderExecutorTestAccess::ResetBindings(rig.context->GetRenderExecutor());
+  }
+
+  // seg0, hole0, seg1 go out in that order, and the draw after the split sets all its state. The
+  // draw before the hole is blocking, so the state was committed and only an invalidation at the
+  // split makes the draw after it set the viewport again. Without the split nothing is set.
+  void CheckHoleBookkeeping() {
+    constexpr const char *name = "HoleBookkeeping";
+    CommandStream::Scope hooks;
+    const auto third_draw_rows = [&](bool split) {
+      AsyncDrawRig rig(*this, false);
+      auto &scheduler = rig.Scheduler();
+      CommandSchedulerTestAccess::AllowThisThread(scheduler);
+      rig.PaintSentinels();
+      Require(name, "first draw", rig.Draw(), "a draw with a ready pipeline was refused");
+      const auto tick = scheduler.CurrentTick();
+      if (split) {
+        CommandSchedulerTestAccess::SetCadence(
+            scheduler, MakeTestCadence(true, SubmitCadence::Clock::duration::zero()));
+        scheduler.NoteRecordedWork();
+        const auto source = PrepareHoleSource(rig);
+        SplitHoleOf(rig, source);
+        Require(name, "tick and cadence kept",
+                scheduler.CurrentTick() == tick && CommandSchedulerTestAccess::CadenceDue(scheduler),
+                "the split changed the tick or reset the submit cadence");
+        Require(name, "one pending hole",
+                scheduler.PendingHoleCount() == 1 &&
+                    CommandSchedulerTestAccess::HeldCount(scheduler) == 2 &&
+                    !CommandSchedulerTestAccess::HeldIsHole(scheduler, 0) &&
+                    CommandSchedulerTestAccess::HeldIsHole(scheduler, 1),
+                "the split did not leave one segment and one reserved hole");
+      } else {
+        Require(name, "second draw", rig.Draw(), "a draw with a ready pipeline was refused");
+      }
+      CommandStream::Recorder::Reset(true);
+      Require(name, "third draw", rig.Draw(), "a draw with a ready pipeline was refused");
+      auto rows = CommandStream::Recorder::rows;
+      CommandStream::Recorder::active = false;
+      if (split) {
+        const auto first = CommandSchedulerTestAccess::HeldBuffer(scheduler, 0);
+        const auto hole = CommandSchedulerTestAccess::HeldBuffer(scheduler, 1);
+        const auto last = scheduler.Current().Handle();
+        CommandStream::Recorder::Reset(true);
+        scheduler.Flush();
+        const auto resolved = CommandStream::Recorder::rows;
+        CommandStream::Recorder::active = false;
+        const auto sent = CommandSchedulerTestAccess::SubmitBuffers(scheduler);
+        Require(name, "submit order", sent == std::vector<vk::CommandBuffer>{first, hole, last},
+                "the submit did not send the segment, the hole and the next segment in that order");
+        Require(name, "resolved",
+                scheduler.PendingHoleCount() == 0 &&
+                    CommandSchedulerTestAccess::HeldCount(scheduler) == 0 &&
+                    scheduler.CurrentTick() == tick + 1,
+                "the submit left a hole pending or did not take one tick");
+        Require(name, "hole sets all state", HasRow(resolved, "vkCmdSetViewportWithCount("),
+                "the hole did not set the dynamic state, which its buffer starts without");
+      }
+      return rows;
+    };
+    Require(name, "baseline sets no state",
+            !HasRow(third_draw_rows(false), "vkCmdSetViewportWithCount("),
+            "a draw in the same buffer set state that did not change, so the split proves nothing");
+    Require(name, "state invalidated at the split",
+            HasRow(third_draw_rows(true), "vkCmdSetViewportWithCount("),
+            "the draw after the split did not set its state in the new buffer");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // A segment nothing was recorded into is left out of the submit. Two holes in a row leave one
+  // between them, and the last segment is empty too. With no hole the one buffer is still sent.
+  void CheckHoleEmptySegments() {
+    constexpr const char *name = "HoleEmptySegments";
+    CommandStream::Scope hooks;
+    {
+      AsyncDrawRig rig(*this, false);
+      auto &scheduler = rig.Scheduler();
+      CommandSchedulerTestAccess::AllowThisThread(scheduler);
+      rig.PaintSentinels();
+      const auto source = PrepareHoleSource(rig);
+      SplitHoleOf(rig, source);
+      scheduler.SplitForHole(std::make_unique<DrawHole>(source.view, source.key));
+      Require(name, "layout",
+              CommandSchedulerTestAccess::HeldCount(scheduler) == 4 &&
+                  CommandSchedulerTestAccess::HeldHasCommands(scheduler, 0) &&
+                  !CommandSchedulerTestAccess::HeldHasCommands(scheduler, 2),
+              "the segments between the splits were not told apart by what was recorded");
+      const auto first = CommandSchedulerTestAccess::HeldBuffer(scheduler, 0);
+      const auto hole_one = CommandSchedulerTestAccess::HeldBuffer(scheduler, 1);
+      const auto hole_two = CommandSchedulerTestAccess::HeldBuffer(scheduler, 3);
+      scheduler.Flush();
+      Require(name, "empty segments skipped",
+              CommandSchedulerTestAccess::SubmitBuffers(scheduler) ==
+                  std::vector<vk::CommandBuffer>{first, hole_one, hole_two},
+              "the submit sent an empty segment or lost a buffer");
+    }
+    AsyncDrawRig rig(*this, false);
+    rig.PaintSentinels();
+    Require(name, "plain draw", rig.Draw(), "a draw with a ready pipeline was refused");
+    rig.Scheduler().Flush();
+    Require(name, "one buffer without holes",
+            CommandSchedulerTestAccess::SubmitBuffers(rig.Scheduler()).size() == 1,
+            "a submit with no hole did not send exactly its one buffer");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // Flush, Finish and Wait each resolve every hole, so none is pending when they return.
+  void CheckHoleSyncPoints() {
+    constexpr const char *name = "HoleSyncPoints";
+    CommandStream::Scope hooks;
+    for (int sync = 0; sync < 3; ++sync) {
+      AsyncDrawRig rig(*this, false);
+      auto &scheduler = rig.Scheduler();
+      CommandSchedulerTestAccess::AllowThisThread(scheduler);
+      rig.PaintSentinels();
+      SplitHoleOf(rig, PrepareHoleSource(rig));
+      Require(name, "hole pending", scheduler.PendingHoleCount() == 1, "the split left no hole");
+      if (sync == 0) scheduler.Flush();
+      if (sync == 1) scheduler.Finish();
+      if (sync == 2) scheduler.Wait(scheduler.CurrentTick());
+      Require(name, sync == 0 ? "flush" : sync == 1 ? "finish" : "wait",
+              scheduler.PendingHoleCount() == 0 &&
+                  CommandSchedulerTestAccess::HeldCount(scheduler) == 0,
+              "the call returned with a hole not recorded");
+    }
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // A hole's build may be taken into the cache before the hole is resolved, by a drain of the
+  // published builds or by a blocking draw of the same key. Taking it again is fatal, so the
+  // resolve must find it built. The last case has neither, and the resolve takes the build itself.
+  void CheckHoleEarlyAdoption() {
+    constexpr const char *name = "HoleEarlyAdoption";
+    CommandStream::Scope hooks;
+    for (int early = 0; early < 3; ++early) {
+      PipelineCacheTestAccess::BuildHold hold;
+      AsyncDrawRig rig(*this, true);
+      auto &scheduler = rig.Scheduler();
+      auto &cache = rig.Pipelines();
+      CommandSchedulerTestAccess::AllowThisThread(scheduler);
+      rig.PaintSentinels();
+      const auto source = PrepareHoleSource(rig);
+      PipelineCacheTestAccess::HoldBuildQueue(cache, hold);
+      PipelineCacheTestAccess::RetireToBackground(cache, source.key);
+      SplitHoleOf(rig, source);
+      Require(name, "pending",
+              PipelineCacheTestAccess::PendingBuilds(cache) == 1 &&
+                  !PipelineCacheTestAccess::IsBuilt(cache, source.key),
+              "the hole's build was not left pending");
+      if (early == 0) {
+        hold.release = true;
+        WaitUntilTrue(name, "build",
+                      [&] { return PipelineCacheTestAccess::FinishedBuilds(cache) == 1; });
+        WaitUntilTrue(name, "published",
+                      [&] { return PipelineCacheTestAccess::HasPublished(cache); });
+        PipelineCacheTestAccess::DrainPublished(cache);
+      } else if (early == 1) {
+        PipelineCacheTestAccess::FinishPending(cache, source.key);
+      }
+      Require(name, "taken early", PipelineCacheTestAccess::IsBuilt(cache, source.key) == (early != 2),
+              "the build was taken before the resolve when it should not be, or not when it should");
+      scheduler.Flush();
+      Require(name, "resolved",
+              scheduler.PendingHoleCount() == 0 && PipelineCacheTestAccess::PendingBuilds(cache) == 0 &&
+                  PipelineCacheTestAccess::IsBuilt(cache, source.key) &&
+                  CommandSchedulerTestAccess::SubmitBuffers(scheduler).size() == 2,
+              "the resolve did not record the hole against its built pipeline");
+      hold.release = true;
+    }
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  static bool IsStateBarrier(const std::string &row) {
+    return row.rfind("vkCmdPipelineBarrier2( mem{", 0) == 0;
+  }
+
+  // The stream a hole records equals the stream of the same draw met in order, with two additions.
+  // The additions are the memory barriers at the start and the end of the hole's buffer, and the
+  // split itself, which adds no commands. The hole's copy of the bindings has no runtime, so a
+  // recording that read one would have stopped.
+  void CheckHoleRecordedStream() {
+    constexpr const char *name = "HoleRecordedStream";
+    CommandStream::Scope hooks;
+    std::vector<std::string> blocking;
+    {
+      AsyncDrawRig rig(*this, false);
+      rig.PaintSentinels();
+      CommandStream::Recorder::Reset(true);
+      Require(name, "blocking draw", rig.Draw(), "a draw with a ready pipeline was refused");
+      rig.Scheduler().Flush();
+      blocking = CommandStream::Recorder::rows;
+      CommandStream::Recorder::active = false;
+    }
+    AsyncDrawRig rig(*this, false);
+    CommandSchedulerTestAccess::AllowThisThread(rig.Scheduler());
+    rig.PaintSentinels();
+    CommandStream::Recorder::Reset(true);
+    const auto source = PrepareHoleSource(rig);
+    Require(name, "source keeps its runtime", source.view.bindings[0]->runtime != nullptr,
+            "the test draw had no runtime to drop, so the copy proves nothing");
+    SplitHoleOf(rig, source);
+    rig.Scheduler().Flush();
+    const auto rows = CommandStream::Recorder::rows;
+    CommandStream::Recorder::active = false;
+
+    Require(name, "blocking has no barrier", std::ranges::none_of(blocking, IsStateBarrier),
+            "the blocking stream has a memory barrier, so the hole's cannot be told apart");
+    std::vector<std::string> without_barriers;
+    std::vector<size_t> barrier_places;
+    for (size_t index = 0; index < rows.size(); ++index) {
+      if (IsStateBarrier(rows[index])) barrier_places.push_back(index);
+      else without_barriers.push_back(rows[index]);
+    }
+    Require(name, "two barriers", barrier_places.size() == 2,
+            "the hole's buffer did not start and end with one memory barrier");
+    Require(name, "same stream",
+            RenderExecutorTestAccess::RowMatches(name, without_barriers, blocking),
+            "the hole recorded other commands than the same draw met in order");
+    const auto first_state = static_cast<size_t>(
+        std::ranges::find_if(rows,
+                             [](const auto &row) {
+                               return row.find("vkCmdSetViewportWithCount(") != std::string::npos;
+                             }) -
+        rows.begin());
+    Require(name, "barriers at the ends",
+            barrier_places.size() == 2 && barrier_places[0] < first_state &&
+                barrier_places[1] + 1 == rows.size(),
+            "the barriers are not at the start and the end of the hole's buffer");
+    Require(name, "barrier stages",
+            barrier_places.size() == 2 && rows[barrier_places[0]] == rows[barrier_places[1]] &&
+                HasRow({rows[barrier_places[0]]}, "ColorAttachmentOutput") &&
+                HasRow({rows[barrier_places[0]]}, "LateFragmentTests") &&
+                HasRow({rows[barrier_places[0]]}, "DepthStencilAttachmentRead"),
+            "the barrier does not order attachment writes against attachment reads and writes");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // A hole never clears. A draw that clears is told apart from one that does not by the check the
+  // hole's rendering makes, which stops the process on a clear, so the test calls the check itself.
+  // The hole of a clearing draw, with the clear stripped as the eager pass would, loads.
+  void CheckHoleClearsStripped() {
+    constexpr const char *name = "HoleClearsStripped";
+    CommandStream::Scope hooks;
+    AsyncDrawRig rig(*this, false);
+    CommandSchedulerTestAccess::AllowThisThread(rig.Scheduler());
+    rig.PaintSentinels();
+    rig.SetDepthClear(true);
+    auto source = PrepareHoleSource(rig, false);
+    Require(name, "draw clears", RenderStateClears(source.view.rendering),
+            "the clearing draw's view has no clear, so the test proves nothing");
+    source.view.rendering.depth_stencil_attachment.depth_clear = false;
+    Require(name, "check passes a stripped view", !RenderStateClears(source.view.rendering),
+            "a view with no clear failed the check");
+    source.view.rendering.depth_stencil_attachment.depth_clear = true;
+    Require(name, "check sees a depth clear", RenderStateClears(source.view.rendering),
+            "a view that clears the depth passed the check");
+    source.view.rendering.depth_stencil_attachment.depth_clear = false;
+    source.view.rendering.depth_stencil_attachment.stencil_clear = true;
+    Require(name, "check sees a stencil clear", RenderStateClears(source.view.rendering),
+            "a view that clears the stencil passed the check");
+    source.view.rendering.depth_stencil_attachment.stencil_clear = false;
+    SplitHoleOf(rig, source);
+    CommandStream::Recorder::Reset(true);
+    rig.Scheduler().Flush();
+    const auto rows = CommandStream::Recorder::rows;
+    CommandStream::Recorder::active = false;
+    Require(name, "hole loads", HasRow(rows, "depth{") && HasRow(rows, "load=Load") &&
+                !HasRow(rows, "load=Clear"),
+            "the hole's rendering cleared an attachment");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  void CheckDeferredHoles() {
+    CheckHoleClearsStripped();
+    CheckHoleBookkeeping();
+    CheckHoleEmptySegments();
+    CheckHoleSyncPoints();
+    CheckHoleEarlyAdoption();
+    CheckHoleRecordedStream();
+  }
+
   void CheckDrawRecord() {
+    CheckDeferredHoles();
     CheckDrawStream();
     CheckDrawRecordIgnoresRegisters();
     CheckDrawRecordIntoSideBuffer(true);

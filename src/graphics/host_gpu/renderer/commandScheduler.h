@@ -3,12 +3,14 @@
 
 #include "common/common.h"
 #include "common/uniqueFunction.h"
+#include "graphics/host_gpu/renderer/drawRecord.h"
 #include "graphics/host_gpu/renderer/dynamicState.h"
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/submitCadence.h"
 
 #include <condition_variable>
+#include <memory>
 #include <mutex>
 #include <queue>
 #include <thread>
@@ -43,6 +45,15 @@ public:
 	void                      DeferOperation(Common::UniqueFunction<void>&& operation);
 	void                      DeferPriorityOperation(Common::UniqueFunction<void>&& operation);
 	[[nodiscard]] bool        HasPendingPriorityOperations();
+	/// Ends the current command buffer, reserves an empty buffer for `hole` after it and starts a new
+	/// current buffer, all in one call so a split can never be half done. Nothing is submitted, the
+	/// tick does not change and the submit cadence keeps counting. The new buffer starts with none of
+	/// the dynamic state set, so the scheduler's copy is invalidated. The hole is recorded into its
+	/// buffer by the next Submit, which then sends the segments and holes in order. GPU thread or
+	/// shutdown only, and never from inside Submit.
+	void SplitForHole(std::unique_ptr<DrawHole> hole);
+	/// Holes split off and not yet recorded. Every Flush, Finish and Wait leaves none.
+	[[nodiscard]] size_t PendingHoleCount() const noexcept { return m_pending_holes; }
 	/// Tells the submit cadence that a draw or dispatch went into the current command buffer.
 	void NoteRecordedWork() { m_cadence.NoteWork(); }
 	/// Returns whether the submit cadence is on, which makes scheduler ticks much faster than
@@ -105,6 +116,39 @@ private:
 	/// since the known GPU tick can pass the last submitted tick between two reads.
 	[[nodiscard]] static uint64_t GpuLag(uint64_t current_tick, uint64_t known_gpu_tick) noexcept;
 
+	/// One piece of the next submission, in submit order. A segment holds the commands recorded
+	/// between two splits. A hole holds a reserved buffer and the draw to record into it.
+	struct HeldBuffer {
+		vk::CommandBuffer         buffer       = nullptr;
+		bool                      has_commands = false;
+		std::unique_ptr<DrawHole> hole;
+		bool                      recorded = false;
+	};
+
+	/// Takes a pool buffer, begins it as the current one and marks the dynamic state as unset in
+	/// it. It leaves the submit cadence alone.
+	void BeginBuffer();
+	/// Builds every pending hole's buffer, waiting for the pipelines it needs. It touches only the
+	/// scheduler and the pipeline cache, because callers reach Submit from inside the caches.
+	void ResolveHoles();
+	/// Whether the calling thread may split or resolve. That is the GPU thread, any thread once
+	/// shutdown began, and a thread a test named.
+	[[nodiscard]] bool OnHoleThread() const;
+	/// Sets a flag for its lifetime and stops if it was already set, which means Submit or
+	/// ResolveHoles was entered again from inside itself.
+	class ReentryGuard {
+	public:
+		explicit ReentryGuard(bool& flag): m_flag(flag) {
+			EXIT_IF(m_flag);
+			m_flag = true;
+		}
+		~ReentryGuard() { m_flag = false; }
+		KYTY_CLASS_NO_COPY(ReentryGuard);
+
+	private:
+		bool& m_flag;
+	};
+
 	void BeginNext();
 	void PriorityOperationsThread(std::stop_token stop);
 	void QueueOperation(Common::UniqueFunction<void>&& operation, bool priority);
@@ -118,12 +162,19 @@ private:
 	DynamicState                 m_dynamic_state;
 	std::queue<PendingOperation> m_pending_operations;
 	std::queue<PendingOperation> m_priority_operations;
-	std::mutex                   m_operation_mutex;
+	mutable std::mutex           m_operation_mutex;
 	std::condition_variable      m_operation_available;
 	std::jthread                 m_priority_thread;
 	uint64_t                     m_priority_active_tick = 0; // 0 while none runs
 	OperationState               m_operation_state      = OperationState::Open;
 	SubmitCadence                m_cadence;
+	std::vector<HeldBuffer>        m_held;
+	std::vector<vk::CommandBuffer> m_submit_buffers;
+	DescriptorScratch              m_hole_scratch;
+	size_t                         m_pending_holes = 0;
+	bool                           m_in_submit     = false;
+	bool                           m_in_resolve    = false;
+	std::thread::id                m_extra_hole_thread;
 };
 
 } // namespace Libs::Graphics

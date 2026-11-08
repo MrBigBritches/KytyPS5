@@ -227,6 +227,11 @@ public:
 	                                                const DrawRenderState& state,
 	                                                const PipelineSkipPolicy* policy);
 	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info);
+	// Returns a copy of the pipeline a deferred draw waits for, waiting for its background build or
+	// running it here. The build may already have been taken into the cache, by a drain of the
+	// published builds or by a blocking draw of the same key, and then it is not taken again. The key
+	// must be built or pending. GPU thread only, and it touches nothing but this cache.
+	[[nodiscard]] Pipeline AcquireDeferredPipeline(const GraphicsPipelineKey& key);
 	// True while graphics pipelines are built in the background.
 	[[nodiscard]] bool BuildsInBackground() const noexcept { return m_build_queue != nullptr; }
 	// Drops queued builds, waits for running ones and destroys finished pipelines nobody has

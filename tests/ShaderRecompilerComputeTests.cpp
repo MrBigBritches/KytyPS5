@@ -302,6 +302,30 @@ struct CommandSchedulerTestAccess {
   static uint64_t GpuLag(uint64_t current_tick, uint64_t known_gpu_tick) {
     return CommandScheduler::GpuLag(current_tick, known_gpu_tick);
   }
+
+  // Lets the calling thread split and resolve, as the GPU thread may. Tests run the rig on their own.
+  static void AllowThisThread(CommandScheduler &scheduler) {
+    scheduler.m_extra_hole_thread = std::this_thread::get_id();
+  }
+
+  // The ended buffers held for the next submit, segments and holes in order.
+  static size_t HeldCount(const CommandScheduler &scheduler) { return scheduler.m_held.size(); }
+  static vk::CommandBuffer HeldBuffer(const CommandScheduler &scheduler, size_t index) {
+    return scheduler.m_held[index].buffer;
+  }
+  static bool HeldIsHole(const CommandScheduler &scheduler, size_t index) {
+    return scheduler.m_held[index].hole != nullptr;
+  }
+  static bool HeldHasCommands(const CommandScheduler &scheduler, size_t index) {
+    return scheduler.m_held[index].has_commands;
+  }
+
+  // The buffers the last submit sent, in the order it sent them.
+  static std::vector<vk::CommandBuffer> SubmitBuffers(const CommandScheduler &scheduler) {
+    return scheduler.m_submit_buffers;
+  }
+
+  static bool CadenceDue(const CommandScheduler &scheduler) { return scheduler.m_cadence.Due(); }
 };
 
 struct CommandBufferTestAccess {
@@ -1162,6 +1186,45 @@ struct PipelineCacheTestAccess {
     auto &queue = cache.m_warm_compute->Queue();
     const auto job = queue.Post([] {});
     while (job->GetState() != PipelineBuildQueue::State::Done) std::this_thread::yield();
+  }
+
+  // The key the cache stores a pipeline under, found by its address.
+  static std::optional<GraphicsPipelineKey> KeyOf(const PipelineCache &cache,
+                                                  const PipelineCache::Pipeline *pipeline) {
+    for (const auto &[key, stored] : cache.m_graphics_pipelines) {
+      if (&stored == pipeline) return key;
+    }
+    return std::nullopt;
+  }
+
+  static bool IsBuilt(const PipelineCache &cache, const GraphicsPipelineKey &key) {
+    return cache.m_graphics_pipelines.contains(key);
+  }
+
+  // Drops a built pipeline and asks for it to be built in the background instead, as a draw that
+  // missed it would. The pipeline must not be in any recorded command.
+  static void RetireToBackground(PipelineCache &cache, const GraphicsPipelineKey &key) {
+    const auto found = cache.m_graphics_pipelines.find(key);
+    auto &device = cache.m_graphics.device;
+    device.destroyPipeline(found->second.pipeline, nullptr);
+    device.destroyPipelineLayout(found->second.pipeline_layout, nullptr);
+    device.destroyDescriptorSetLayout(found->second.descriptor_set_layout, nullptr);
+    cache.m_graphics_pipelines.erase(found);
+    const auto modules = cache.MapModules();
+    PipelineCache::Stages stages{};
+    for (size_t stage = 0; stage < stages.size(); ++stage) {
+      stages[stage] = modules.at(key.stage_ids[stage]);
+    }
+    cache.RequestBuild(key, stages);
+  }
+
+  // Takes every published build, as any draw that finds a pipeline does first.
+  static void DrainPublished(PipelineCache &cache) { cache.DrainPublishedBuilds(); }
+
+  // Waits for the pending build of a key and takes it, as a blocking draw of the same key does.
+  static void FinishPending(PipelineCache &cache, const GraphicsPipelineKey &key) {
+    const auto pending = cache.m_pending_graphics.find(key);
+    (void)cache.FinishBuild(pending->second.build, pending->second.job);
   }
 
   // Builds requested and not yet taken into the cache.

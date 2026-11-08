@@ -124,6 +124,36 @@ public:
 	virtual void EndDraw(vk::CommandBuffer command, int32_t token, const DrawCallInfo& draw) = 0;
 };
 
+// A draw whose pipeline is not built when it is met. It owns copies of everything RecordDraw reads,
+// so the draw can be recorded later into a command buffer of its own, after the draw's stack frame,
+// the registers and the scheduler's dynamic state have moved on. The bindings lose their runtime
+// pointers, since those point into the stack frame, and the dynamic state has every bit dirty, since
+// the buffer it is recorded into starts with none of it set. The view's pointers refer to the hole's
+// own copies, so a hole never moves.
+class DrawHole {
+public:
+	// The view must come from a draw prepared without early vertex buffer binds, since the commands
+	// of the hole's buffer have to bind them. Its bindings and dynamic state are copied.
+	DrawHole(const DrawView& view, const GraphicsPipelineKey& key);
+	KYTY_CLASS_NO_COPY(DrawHole);
+
+	/// The key of the pipeline the draw waits for.
+	[[nodiscard]] const GraphicsPipelineKey& Key() const noexcept { return m_key; }
+	/// The draw to record, over this hole's own copies.
+	[[nodiscard]] const DrawView& View() const noexcept { return m_view; }
+
+private:
+	GraphicsPipelineKey                              m_key;
+	DrawView                                         m_view;
+	std::array<PreparedBindings, MaxBindingStages>   m_bindings;
+	DynamicState                                     m_dynamic_state;
+};
+
+// Whether beginning this rendering would clear an attachment. Colour attachments always load, so
+// only depth and stencil can. A hole's rendering must not, because the clear is applied once, in
+// the pass the draw's eager half records where the draw was met.
+[[nodiscard]] bool RenderStateClears(const RenderState& state);
+
 // Begins and ends dynamic rendering on a command buffer of the caller's own. Unlike the same calls
 // on CommandBuffer they remember nothing, so each begin opens a pass and each end closes one.
 void RecordBeginRendering(vk::CommandBuffer command, const RenderState& state);

@@ -82,6 +82,27 @@ void RecordEndRendering(vk::CommandBuffer command) {
 	command.endRendering();
 }
 
+bool RenderStateClears(const RenderState& state) {
+	return state.depth_stencil_attachment.depth_clear || state.depth_stencil_attachment.stencil_clear;
+}
+
+DrawHole::DrawHole(const DrawView& view, const GraphicsPipelineKey& key)
+    : m_key(key), m_view(view), m_dynamic_state(*view.dynamic_state) {
+	EXIT_IF(view.vertex_buffers_bound);
+	EXIT_IF(view.stage_count > MaxBindingStages);
+	for (uint32_t stage = 0; stage < view.stage_count; ++stage) {
+		m_bindings[stage]         = *view.bindings[stage];
+		m_bindings[stage].runtime = nullptr;
+		m_view.bindings[stage]    = &m_bindings[stage];
+	}
+	// The copied view must not point at the source's bindings past the stages it uses.
+	for (size_t stage = view.stage_count; stage < MaxBindingStages; ++stage) {
+		m_view.bindings[stage] = nullptr;
+	}
+	m_dynamic_state.Invalidate();
+	m_view.dynamic_state = &m_dynamic_state;
+}
+
 void CommandBuffer::BeginRendering(const RenderState& state) const {
 	if (m_rendering && m_render_state == state) {
 		return;

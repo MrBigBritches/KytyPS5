@@ -39,6 +39,12 @@ struct PreparedBindings {
 
 	// The draw owns the immutable compiled-program/runtime-snapshot association through commit.
 	const ShaderStageRuntime* runtime = nullptr;
+	/// The runtime of the draw that prepared these bindings. A copy kept past that draw, such as a
+	/// deferred draw's, has none, and reading it then is a bug.
+	[[nodiscard]] const ShaderStageRuntime& Runtime() const {
+		EXIT_IF(runtime == nullptr);
+		return *runtime;
+	}
 	// Keep the resolved guest range through cache preparation; only the host buffer ID may
 	// become stale and need resolving again when bindings are rebound.
 	std::vector<BufferSource>             buffer_sources;

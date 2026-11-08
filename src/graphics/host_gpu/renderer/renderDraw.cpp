@@ -1348,7 +1348,7 @@ void RenderExecutor::PrepareDrawBindings(DrawRenderState& state, DrawView& view)
 	}
 	PrepareGraphicsBindings(view.Bindings(), std::span {state.color_info, state.color_count});
 	for (uint32_t i = 0; i < view.stage_count; i++) {
-		view.modules[i] = view.bindings[i]->runtime->module;
+		view.modules[i] = view.bindings[i]->Runtime().module;
 	}
 }
 

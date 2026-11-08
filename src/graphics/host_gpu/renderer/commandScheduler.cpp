@@ -2,7 +2,10 @@
 
 #include "common/assert.h"
 #include "common/debugCounters.h"
+#include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
+#include "graphics/host_gpu/renderer/renderContext.h"
 
 #include <algorithm>
 #include <optional>
@@ -10,6 +13,68 @@
 namespace Libs::Graphics {
 
 static thread_local CommandScheduler* g_deferred_callback_scheduler = nullptr;
+
+namespace {
+
+// Orders the attachment writes of the buffer before it against the attachment reads and writes of
+// the buffer after it. Draws on one attachment in separate render passes get no other barrier,
+// because the layout transitions the CPU tracks add none between two uses of the same layout.
+void RecordHoleBarrier(vk::CommandBuffer command) {
+	constexpr auto attachment_stages = vk::PipelineStageFlagBits2::eColorAttachmentOutput |
+	                                   vk::PipelineStageFlagBits2::eEarlyFragmentTests |
+	                                   vk::PipelineStageFlagBits2::eLateFragmentTests;
+	vk::MemoryBarrier2 barrier {};
+	barrier.srcStageMask  = attachment_stages;
+	barrier.srcAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite |
+	                        vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
+	barrier.dstStageMask  = attachment_stages;
+	barrier.dstAccessMask = vk::AccessFlagBits2::eColorAttachmentRead |
+	                        vk::AccessFlagBits2::eColorAttachmentWrite |
+	                        vk::AccessFlagBits2::eDepthStencilAttachmentRead |
+	                        vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
+	vk::DependencyInfo dependency {};
+	dependency.memoryBarrierCount = 1;
+	dependency.pMemoryBarriers    = &barrier;
+	command.pipelineBarrier2(dependency);
+}
+
+// Records a hole's draw into a buffer of its own. The rendering is a pass of its own that loads the
+// attachments, since any clear was applied where the draw was met and its view says so. Holes never touch the occlusion
+// queries, whose open state is the live one and not the draw's.
+class HoleDrawEnv final: public DrawRecordEnv {
+public:
+	HoleDrawEnv(DescriptorScratch& scratch, vk::PipelineStageFlags shader_write_stages)
+	    : m_scratch(scratch), m_shader_write_stages(shader_write_stages) {}
+
+	DescriptorScratch& Scratch() override { return m_scratch; }
+
+	void BeginRendering(vk::CommandBuffer command, const RenderState& rendering) override {
+		if (m_shader_write_stages) {
+			ShaderWriteHazardBarrier(command, m_shader_write_stages);
+		}
+		// A clear belongs to the pass recorded where the draw was met. Dropping it here would lose it.
+		EXIT_IF(RenderStateClears(rendering));
+		RecordBeginRendering(command, rendering);
+	}
+
+	int32_t BeginDraw(vk::CommandBuffer) override { return -1; }
+
+	void EndDraw(vk::CommandBuffer command, int32_t, const DrawCallInfo& draw) override {
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::Draws);
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::DrawInstances,
+		                           draw.instance_count);
+		RecordEndRendering(command);
+		if (m_shader_write_stages) {
+			ShaderWriteBarrier(command, m_shader_write_stages);
+		}
+	}
+
+private:
+	DescriptorScratch&     m_scratch;
+	vk::PipelineStageFlags m_shader_write_stages;
+};
+
+} // namespace
 
 CommandScheduler::CommandPool::CommandPool(GraphicContext& graphics, MasterSemaphore& master)
     : m_graphics(graphics), m_master(master) {
@@ -296,14 +361,84 @@ CommandBuffer& CommandScheduler::Current() {
 	return m_command;
 }
 
-CommandBuffer& CommandScheduler::BeginCommand() {
-	EXIT_IF(!m_command.IsInvalid());
+void CommandScheduler::BeginBuffer() {
 	m_command.m_buffer = m_command_pool.Commit();
 	m_command.Begin();
+	m_command.m_used = false;
 	m_dynamic_state.Invalidate();
+}
+
+CommandBuffer& CommandScheduler::BeginCommand() {
+	EXIT_IF(!m_command.IsInvalid());
+	EXIT_IF(!m_held.empty());
+	BeginBuffer();
 	// Any submit starts a new command buffer, so the cadence counts again from its first draw.
 	m_cadence.Reset();
 	return m_command;
+}
+
+bool CommandScheduler::OnHoleThread() const {
+	if (GuestGpu::IsGpuThread() || std::this_thread::get_id() == m_extra_hole_thread) {
+		return true;
+	}
+	std::lock_guard lock(m_operation_mutex);
+	return m_operation_state != OperationState::Open;
+}
+
+void CommandScheduler::SplitForHole(std::unique_ptr<DrawHole> hole) {
+	EXIT_IF(hole == nullptr || m_command.IsInvalid());
+	EXIT_IF(m_in_submit || m_in_resolve);
+	EXIT_IF(!OnHoleThread());
+	// End closes an open rendering, which a segment must not leave open. It marks the buffer as used,
+	// so the answer is read first.
+	const bool segment_used = m_command.m_used;
+	m_command.End();
+	m_held.push_back({m_command.m_buffer, segment_used, nullptr, false});
+	m_held.push_back({m_command_pool.Commit(), true, std::move(hole), false});
+	m_pending_holes++;
+	// The cadence is not reset here. A split is not a submit, and the draws on both sides of it
+	// belong to the same tick.
+	BeginBuffer();
+}
+
+void CommandScheduler::ResolveHoles() {
+	if (m_pending_holes == 0) {
+		return;
+	}
+	EXIT_IF(!OnHoleThread());
+	const ReentryGuard guard(m_in_resolve);
+	auto&              pipelines = m_context.GetPipelineCache();
+	auto&              executor  = m_context.GetRenderExecutor();
+
+	// Step 5 puts one GpuStall scope around this loop and waits for the builds in parallel. The
+	// loop must stay free of recording, so the scope covers only the wait.
+	std::vector<PipelineCache::Pipeline> built;
+	built.reserve(m_pending_holes);
+	for (const auto& held: m_held) {
+		if (held.hole != nullptr && !held.recorded) {
+			built.push_back(pipelines.AcquireDeferredPipeline(held.hole->Key()));
+			// The image heap's set is bound in the segment's buffer, which the hole's buffer lacks.
+			EXIT_IF(built.back().uses_image_heap);
+		}
+	}
+
+	size_t next = 0;
+	for (auto& held: m_held) {
+		if (held.hole == nullptr || held.recorded) {
+			continue;
+		}
+		vk::CommandBufferBeginInfo begin {};
+		begin.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
+		EXIT_NOT_IMPLEMENTED(held.buffer.begin(&begin) != vk::Result::eSuccess);
+		RecordHoleBarrier(held.buffer);
+		HoleDrawEnv env(m_hole_scratch, held.hole->View().shader_write_stages);
+		executor.RecordDraw(held.buffer, held.hole->View(), built[next++], env);
+		// Orders the hole's writes before the segment that follows it.
+		RecordHoleBarrier(held.buffer);
+		EXIT_NOT_IMPLEMENTED(held.buffer.end() != vk::Result::eSuccess);
+		held.recorded = true;
+	}
+	m_pending_holes = 0;
 }
 
 uint64_t CommandScheduler::GpuLag(uint64_t current_tick, uint64_t known_gpu_tick) noexcept {
@@ -324,10 +459,23 @@ bool CommandScheduler::TakeDueCadenceSubmit() {
 
 uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	EXIT_IF(m_command.IsInvalid());
+	const ReentryGuard guard(m_in_submit);
 
+	ResolveHoles();
+	const bool last_used = m_command.m_used;
 	m_command.End();
-	const auto buffer   = m_command.m_buffer;
-	auto&      graphics = m_graphics;
+	// Segments and holes go in order. A segment nothing was recorded into is left out, unless it is
+	// the only buffer, which a submit has always sent.
+	m_submit_buffers.clear();
+	for (const auto& held: m_held) {
+		if (held.hole != nullptr || held.has_commands) {
+			m_submit_buffers.push_back(held.buffer);
+		}
+	}
+	if (last_used || m_held.empty()) {
+		m_submit_buffers.push_back(m_command.m_buffer);
+	}
+	auto& graphics = m_graphics;
 	EXIT_IF(graphics.queue == nullptr);
 
 	vk::Result result;
@@ -348,8 +496,8 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		submit_info.waitSemaphoreCount   = submit.num_wait_semaphores;
 		submit_info.pWaitSemaphores      = submit.wait_semaphores.data();
 		submit_info.pWaitDstStageMask    = submit.wait_stages.data();
-		submit_info.commandBufferCount   = 1;
-		submit_info.pCommandBuffers      = &buffer;
+		submit_info.commandBufferCount   = static_cast<uint32_t>(m_submit_buffers.size());
+		submit_info.pCommandBuffers      = m_submit_buffers.data();
 		submit_info.signalSemaphoreCount = submit.num_signal_semaphores;
 		submit_info.pSignalSemaphores    = submit.signal_semaphores.data();
 
@@ -362,6 +510,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	}
 
 	m_command.m_buffer = nullptr;
+	m_held.clear();
 	return tick;
 }
 
