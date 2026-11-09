@@ -35,6 +35,12 @@ struct StoreFrame {
 	uint64_t checksum = 0;
 };
 
+/// The largest compressed record a writer appends and a reader accepts. The largest record of the
+/// biggest game seen is about 5.7 MB raw and zstd makes records smaller, so 16 MiB is about three
+/// times what any real frame needs even if it did not compress at all. A reader waits for a frame
+/// up to this size, so a corrupt size field cannot make it wait for gigabytes.
+constexpr uint32_t MAX_STORE_FRAME_COMPRESSED_BYTES = 16u * 1024u * 1024u;
+
 /// The zstd level of every record. Changing it changes the stored bytes but not their meaning.
 constexpr int STORE_COMPRESSION_LEVEL = 3;
 

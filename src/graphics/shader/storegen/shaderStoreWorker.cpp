@@ -324,6 +324,8 @@ private:
 	bool BuildOne(uint64_t rank, const RankedCandidate& entry, const HostValues& host);
 	bool Drop(uint64_t rank, const PredictedProgram& program, const BuiltCandidate& built,
 	          const Candidate& candidate);
+	bool DropOversizeRecord(uint64_t rank, const PredictedProgram& program,
+	                        const Candidate& candidate);
 	void Summarize(int code);
 
 	const WorkerRequest&          m_request;
@@ -421,6 +423,18 @@ bool Worker::Drop(uint64_t rank, const PredictedProgram& program, const BuiltCan
 	return logged;
 }
 
+// Drops one candidate whose record no reader of the file would accept. Unlike the other drops it
+// does not leave out the rest of the program, since the size belongs to this module alone. Returns
+// false when the log could not be written.
+bool Worker::DropOversizeRecord(uint64_t rank, const PredictedProgram& program,
+                                const Candidate& candidate) {
+	const auto hash = program.scanned->code_hash;
+	m_result.candidates_dropped++;
+	m_result.frame_too_large_drops++;
+	m_result.drops.push_back({hash, rank, DropReason::FrameTooLarge, candidate.push_start, 0});
+	return m_progress.Line(fmt::format("drop {} {:016x} frame_too_large", rank, hash));
+}
+
 // Builds one candidate and appends its record. Returns false when the output or the log could not
 // be written.
 bool Worker::BuildOne(uint64_t rank, const RankedCandidate& entry, const HostValues& host) {
@@ -447,6 +461,9 @@ bool Worker::BuildOne(uint64_t rank, const RankedCandidate& entry, const HostVal
 		return Drop(rank, program, built, candidate);
 	}
 	const auto framed = FrameStoreRecord(built.record);
+	if (framed.size() - sizeof(StoreFrame) > m_hooks.max_frame_compressed_bytes) {
+		return DropOversizeRecord(rank, program, candidate);
+	}
 	if (!m_output.Append(framed)) {
 		return false;
 	}
@@ -478,15 +495,16 @@ void Worker::Summarize(int code) {
 	m_progress.Line(fmt::format(
 	    "summary exit={} scanned={} predicted={} skipped_by_request={} candidates={} written={} "
 	    "record_bytes={} dropped={} failed_earlier={} before_start={} push_start_mismatches={} "
-	    "resource_count_mismatches={} with_calls={} unclassified={} unreadable={} with_problems={} "
+	    "resource_count_mismatches={} frame_too_large_drops={} with_calls={} unclassified={} "
+	    "unreadable={} with_problems={} "
 	    "worst_ms={:.0f} worst_rank={} worst_hash={:016x} predict_ms={:.0f} total_ms={:.0f} "
 	    "order={:016x}",
 	    code, m_result.programs_scanned, m_result.programs_predicted,
 	    m_result.programs_skipped_by_request, m_result.candidates, m_result.records_written,
 	    m_result.record_bytes, m_result.candidates_dropped, m_result.candidates_failed_earlier,
 	    m_result.candidates_before_start, m_result.push_start_mismatches,
-	    m_result.resource_count_mismatches, m_result.programs_with_calls,
-	    m_result.programs_unclassified, m_result.programs_unreadable,
+	    m_result.resource_count_mismatches, m_result.frame_too_large_drops,
+	    m_result.programs_with_calls, m_result.programs_unclassified, m_result.programs_unreadable,
 	    m_result.programs_with_problems, m_result.worst_candidate_ms, m_result.worst_candidate_rank,
 	    m_result.worst_candidate_hash, m_result.predict_ms, m_result.total_ms,
 	    m_result.order_hash));

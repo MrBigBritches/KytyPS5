@@ -1594,6 +1594,57 @@ void TestResourceCountMismatch() {
 	CHECK(logged);
 }
 
+// A record whose compressed size is over the frame cap is dropped alone, with a log line and a
+// count, and the other candidates of its program are still written. The cap is lowered through the
+// hook to one byte under the largest record, so only the largest records trip it. The baseline is
+// the same run with the cap at the largest record, which drops nothing, so a worker that dropped
+// for another reason would show there too.
+void TestOversizeRecordIsDroppedAlone() {
+	TempDirectory directory;
+	const auto    eboot            = BuildEboot(MainPrograms());
+	const auto    baseline_request = MakeRequest(directory, eboot, "baseline");
+	const auto    baseline         = Run(baseline_request);
+	bool          exact            = false;
+	const auto    all = ReadRecords(baseline.file, HeaderBytes(baseline_request), exact);
+	CHECK(baseline.result.records_written == 7 && baseline.result.frame_too_large_drops == 0);
+	size_t largest = 0;
+	for (const auto& stored: all) {
+		largest = std::max(largest, FrameStoreRecord(stored.raw).size() - sizeof(StoreFrame));
+	}
+	WorkerHooks at_cap;
+	at_cap.max_frame_compressed_bytes = static_cast<uint32_t>(largest);
+	const auto same                   = Run(MakeRequest(directory, eboot, "at_cap"), at_cap);
+	CHECK(same.result.records_written == 7 && same.result.frame_too_large_drops == 0);
+
+	WorkerHooks hooks;
+	hooks.max_frame_compressed_bytes = static_cast<uint32_t>(largest - 1);
+	const auto request               = MakeRequest(directory, eboot, "lowered");
+	const auto run                   = Run(request, hooks);
+	size_t     oversize              = 0;
+	for (const auto& stored: all) {
+		oversize += FrameStoreRecord(stored.raw).size() - sizeof(StoreFrame) > largest - 1;
+	}
+	CHECK(oversize >= 1 && oversize < all.size());
+	CHECK(run.result.exit_code == WORKER_EXIT_DONE);
+	CHECK(run.result.frame_too_large_drops == oversize && run.result.drops.size() == oversize);
+	// Only the oversize candidates are gone. A drop of the rest of their program would take more.
+	CHECK(run.result.records_written == all.size() - oversize);
+	CHECK(run.result.candidates_dropped == oversize);
+	CHECK(run.result.push_start_mismatches == 0 && run.result.resource_count_mismatches == 0);
+	const auto records = ReadRecords(run.file, HeaderBytes(request), exact);
+	CHECK(exact && records.size() == all.size() - oversize);
+	for (const auto& drop: run.result.drops) {
+		CHECK(drop.reason == DropReason::FrameTooLarge);
+	}
+	size_t logged = 0;
+	for (const auto& line: run.log) {
+		logged += line.ends_with("frame_too_large");
+	}
+	CHECK(logged == oversize);
+	// Every candidate still gets its start line, since the size is known only after translating.
+	CHECK(StartLines(run.log).size() == all.size());
+}
+
 } // namespace
 
 int main() {
@@ -1618,6 +1669,7 @@ int main() {
 	TestResourceCountMismatch();
 	TestProgramExceedsSpecialization();
 	TestExtraSpecializationBufferIsKept();
+	TestOversizeRecordIsDroppedAlone();
 	if (g_failures != 0) {
 		std::fprintf(stderr, "%d check(s) failed\n", g_failures);
 		return 1;

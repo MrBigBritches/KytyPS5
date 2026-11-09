@@ -1,6 +1,7 @@
 #ifndef GRAPHICS_SHADER_STOREGEN_SHADER_STORE_WORKER_H
 #define GRAPHICS_SHADER_STOREGEN_SHADER_STORE_WORKER_H
 
+#include "graphics/shader/shaderStoreRecord.h"
 #include "graphics/shader/storegen/computePredictor.h"
 #include "graphics/shader/storegen/storeWorkerFormat.h"
 
@@ -45,6 +46,10 @@ enum class DropReason : uint8_t {
 	PushStartMismatch,
 	/// The translated program lists more buffers, images or samplers than the specialization.
 	ResourceCountMismatch,
+	/// The candidate's record is over MAX_STORE_FRAME_COMPRESSED_BYTES, which no reader accepts.
+	/// Only this candidate is dropped, since the size belongs to one module and not to its
+	/// program, so a supervisor leaves this drop's hash out of the failed hashes.
+	FrameTooLarge,
 };
 
 /// One program the worker stopped generating, and the evidence.
@@ -87,9 +92,11 @@ struct WorkerResult {
 	uint64_t records_written    = 0;
 	uint64_t record_bytes       = 0;
 
-	/// Programs dropped by each check.
+	/// Programs dropped by each check. Candidates whose record was over the frame cap are counted
+	/// in frame_too_large_drops, and each is also counted in candidates_dropped.
 	uint32_t                push_start_mismatches     = 0;
 	uint32_t                resource_count_mismatches = 0;
+	uint32_t                frame_too_large_drops     = 0;
 	std::vector<WorkerDrop> drops;
 
 	/// XXH3 of the candidate ids in rank order, and the same value the log's `order` line holds. A
@@ -115,6 +122,8 @@ struct WorkerHooks {
 	/// Called with a program's code hash and its candidates once they are predicted. A test uses it
 	/// to make a prediction wrong on purpose.
 	std::function<void(uint64_t code_hash, std::vector<Candidate>& candidates)> after_prediction;
+	/// The largest compressed record the worker writes. A test lowers it.
+	uint32_t max_frame_compressed_bytes = MAX_STORE_FRAME_COMPRESSED_BYTES;
 };
 
 /// Runs a worker request to the end, in this process.
@@ -135,7 +144,9 @@ struct WorkerHooks {
 /// A candidate whose module has another push data start than predicted is not written, the rest
 /// of its program is dropped, and the drop is counted and logged as `drop <rank> <hash> ...`.
 /// A supervisor that restarts the worker adds the hash of each `drop` line to the request's
-/// failed_hashes, so the restart does not build the program again.
+/// failed_hashes, so the restart does not build the program again. The exception is a
+/// `frame_too_large` drop, which drops one candidate only and leaves the program's others to be
+/// built.
 /// The last line of the log is `summary` with the counts, whenever the log was opened.
 ///
 /// The recompiler can end the process through EXIT, so a caller that must survive that runs this
