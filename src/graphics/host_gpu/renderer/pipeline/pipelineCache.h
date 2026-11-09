@@ -8,6 +8,7 @@
 #include "common/uniqueFunction.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
+#include "graphics/host_gpu/renderer/pipeline/descriptorSetLayoutCache.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineBuildQueue.h"
 #include "graphics/host_gpu/renderer/pipeline/warmBuildSet.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
@@ -257,7 +258,8 @@ public:
 		bool                    uses_image_heap       = false;
 		// The split layout of --graphics-pipeline-library. Set 0 holds the VS bindings, set 1 is the
 		// image heap and set 2 holds the PS bindings. `descriptor_set_layout` is null then, and the
-		// two layouts below are the ones the pipeline owns.
+		// two layouts below belong to the cache's DescriptorSetLayoutCache and are shared, so the
+		// pipeline does not destroy them.
 		bool                    uses_split_sets       = false;
 		vk::DescriptorSetLayout vertex_set_layout     = nullptr;
 		vk::DescriptorSetLayout pixel_set_layout      = nullptr;
@@ -393,6 +395,12 @@ private:
 	};
 
 	GraphicContext&                      m_graphics;
+	// The set layouts of the split pipelines, shared by them and by the libraries that come later.
+	// It is declared before everything that builds or holds a pipeline, so it is destroyed after the
+	// build queue and after the destructor body has destroyed every pipeline layout. The descriptor
+	// heap in RenderContext is destroyed after this cache and keeps handles only as map keys, which
+	// it never looks up again once the cache is gone.
+	DescriptorSetLayoutCache             m_set_layouts;
 	ShaderRecompiler::IR::ImageHeapSource* m_image_heap;
 	std::unordered_map<ProgramKey, Program, ProgramKeyHash> m_program_cache;
 	// Modules compiled per stage.
@@ -590,10 +598,16 @@ inline constexpr uint32_t SPLIT_SET_COUNT  = 3;
                                                 std::span<const vk::DescriptorSetLayoutBinding> pixel);
 
 // Destroys what a pipeline owns, whichever layout it has. Handles that were never made are skipped.
+// The set layouts of a split pipeline are shared and belong to the DescriptorSetLayoutCache.
 void DestroyPipelineObjects(vk::Device device, const PipelineCache::Pipeline& pipeline);
+// How many set layouts DestroyPipelineObjects has destroyed so far, for tests. Layouts of the
+// DescriptorSetLayoutCache never count, since only the cache destroys them.
+[[nodiscard]] uint64_t PipelineSetLayoutDestroyCount();
 
-// Stages are indexed like GraphicsPipelineKey::stage_ids.
-void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+// Stages are indexed like GraphicsPipelineKey::stage_ids. The set layouts of a split pipeline come
+// from `set_layouts`, which must outlive the pipeline.
+void CreatePipelineInternal(GraphicContext& graphics, DescriptorSetLayoutCache& set_layouts,
+                            PipelineCache::Pipeline& pipeline,
                             const GraphicsPipelineKey&                 key,
                             const std::array<const ShaderModule*, 4>& stages,
                             vk::PipelineCache                          driver_cache);

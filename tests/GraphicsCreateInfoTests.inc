@@ -260,6 +260,8 @@
 
     CreateInfoCapture.clear();
     SetGraphicsCreateInfoObserver(&CaptureGraphicsCreateInfo);
+    // These pipelines are not split, so the cache stays empty. It is here because the call takes one.
+    DescriptorSetLayoutCache set_layouts(m_device);
     struct Case {
       GraphicsPipelineKey key;
       bool with_pixel;
@@ -277,7 +279,7 @@
       PipelineCache::Pipeline pipeline;
       const std::array<const ShaderModule *, 4> stages {&vertex, nullptr, nullptr,
                                                         item.with_pixel ? &pixel : nullptr};
-      CreatePipelineInternal(graphics, pipeline, item.key, stages, nullptr);
+      CreatePipelineInternal(graphics, set_layouts, pipeline, item.key, stages, nullptr);
       DestroyPipelineObjects(m_device, pipeline);
     }
     SetGraphicsCreateInfoObserver(nullptr);

@@ -538,7 +538,7 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 // build workers.
 PipelineCache::PipelineCache(GraphicContext&                         graphics,
                              ShaderRecompiler::IR::ImageHeapSource* image_heap)
-    : m_graphics(graphics), m_image_heap(image_heap),
+    : m_graphics(graphics), m_set_layouts(graphics.device), m_image_heap(image_heap),
       m_next_driver_cache_save(std::chrono::steady_clock::now() + DriverCacheSaveInterval) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
@@ -1205,7 +1205,7 @@ PipelineCache::Pipeline& PipelineCache::CreateGraphicsPipelineHere(Pipeline&    
 		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::PipelinesCreated,
 		                                         Common::DebugCounters::Counter::PipelineCreateNs,
 		                                         Common::DebugCounters::Peak::PipelineCreateNs);
-		CreatePipelineInternal(m_graphics, slot, key, stages, m_driver_cache);
+		CreatePipelineInternal(m_graphics, m_set_layouts, slot, key, stages, m_driver_cache);
 	}
 	StorePipeline(key);
 	CheckpointDriverCache();
@@ -1453,7 +1453,8 @@ void PipelineCache::RequestBuild(const GraphicsPipelineKey& key, const Stages& s
 void PipelineCache::RunBuild(const std::shared_ptr<GraphicsBuild>& build) {
 	// On a worker the compile records itself as worker time, and nothing here counts toward the
 	// GPU thread's compile counters.
-	CreatePipelineInternal(m_graphics, build->pipeline, build->key, build->stages, m_driver_cache);
+	CreatePipelineInternal(m_graphics, m_set_layouts, build->pipeline, build->key, build->stages,
+	                       m_driver_cache);
 	build->ready_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
 	                                                            build->requested)
 	                      .count();

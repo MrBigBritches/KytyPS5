@@ -585,6 +585,12 @@ add_executable(pipeline_parts_tests EXCLUDE_FROM_ALL
 target_link_libraries(pipeline_parts_tests common Vulkan::Headers xxhash fmt::fmt)
 target_include_directories(pipeline_parts_tests PRIVATE ${inc_headers})
 
+add_executable(descriptor_set_layout_cache_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/DescriptorSetLayoutCacheTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/descriptorSetLayoutCache.cpp")
+target_link_libraries(descriptor_set_layout_cache_tests common Vulkan::Headers xxhash fmt::fmt)
+target_include_directories(descriptor_set_layout_cache_tests PRIVATE ${inc_headers})
+
 add_executable(ces_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/CesTests.cpp")
 target_link_libraries(ces_tests common fmt::fmt SDL3::SDL3-static)
 target_include_directories(ces_tests PRIVATE ${inc_headers})
@@ -795,6 +801,7 @@ if(BUILD_TESTING)
 	set_tests_properties(pipeline_build_queue PROPERTIES TIMEOUT 60)
 	add_test(NAME pipeline_library COMMAND $<TARGET_FILE:pipeline_library_tests>)
 	add_test(NAME pipeline_parts COMMAND $<TARGET_FILE:pipeline_parts_tests>)
+	add_test(NAME descriptor_set_layout_cache COMMAND $<TARGET_FILE:descriptor_set_layout_cache_tests>)
 	add_test(NAME ces COMMAND $<TARGET_FILE:ces_tests>)
 	add_test(NAME save_data_dialog COMMAND $<TARGET_FILE:save_data_dialog_tests>)
 	add_test(NAME http_uri_parse COMMAND $<TARGET_FILE:http_uri_parse_tests>)
@@ -943,6 +950,7 @@ if(BUILD_TESTING)
 		pipeline_build_queue_tests
 		pipeline_library_tests
 		pipeline_parts_tests
+		descriptor_set_layout_cache_tests
 		ces_tests
 		save_data_dialog_tests
 		http_uri_parse_tests

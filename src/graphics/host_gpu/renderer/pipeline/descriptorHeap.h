@@ -44,6 +44,7 @@ private:
 	MasterSemaphore&                                    m_master_semaphore;
 	vk::DescriptorPool                                  m_current_pool = nullptr;
 	std::deque<std::pair<vk::DescriptorPool, uint64_t>> m_pending_pools;
+	// A layout key must outlive every later Commit. That only matters if layouts are ever evicted.
 	std::unordered_map<vk::DescriptorSetLayout, Batch>  m_sets;
 };
 

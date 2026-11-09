@@ -1103,6 +1103,9 @@ struct DescriptorHeapTestAccess {
     EXIT_IF(heap.m_pending_pools.empty());
     return heap.m_pending_pools.back().second;
   }
+  // How many layout handles the heap holds a batch of sets for. The count falls to zero when a pool
+  // is retired, so a reading is only comparable with another from the same pool.
+  static size_t Batches(const DescriptorHeap &heap) { return heap.m_sets.size(); }
 };
 
 struct PipelineCacheTestAccess {
@@ -1302,6 +1305,25 @@ struct PipelineCacheTestAccess {
     for (auto &program : cache.m_program_cache | std::views::values) {
       for (auto &module : program.modules) module.info.info.uses_image_heap = true;
     }
+  }
+
+  // The shared set layouts of the cache.
+  static DescriptorSetLayoutCache &SetLayouts(PipelineCache &cache) { return cache.m_set_layouts; }
+
+  // The keys of the built graphics pipelines, in no particular order.
+  static std::vector<GraphicsPipelineKey> GraphicsKeys(const PipelineCache &cache) {
+    std::vector<GraphicsPipelineKey> keys;
+    for (const auto &entry : cache.m_graphics_pipelines) keys.push_back(entry.first);
+    return keys;
+  }
+
+  // Destroys a built pipeline's objects the way the cache does and forgets it. The pipeline must
+  // not be in any recorded command.
+  static void DestroyGraphicsPipeline(PipelineCache &cache, const GraphicsPipelineKey &key) {
+    const auto found = cache.m_graphics_pipelines.find(key);
+    EXIT_IF(found == cache.m_graphics_pipelines.end());
+    DestroyPipelineObjects(cache.m_graphics.device, found->second);
+    cache.m_graphics_pipelines.erase(found);
   }
 
   // How many built graphics pipelines push their descriptors, and how many do not.

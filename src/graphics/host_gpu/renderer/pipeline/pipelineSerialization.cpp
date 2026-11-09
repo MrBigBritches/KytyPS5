@@ -373,7 +373,7 @@ bool PipelineCache::CreateGraphicsPipeline(Pipeline& pipeline, const GraphicsPip
 		}
 		stages[i] = found->second;
 	}
-	CreatePipelineInternal(m_graphics, pipeline, key, stages, m_driver_cache);
+	CreatePipelineInternal(m_graphics, m_set_layouts, pipeline, key, stages, m_driver_cache);
 	return true;
 }
 

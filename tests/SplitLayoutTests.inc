@@ -688,6 +688,18 @@
             "the layer reported a synchronization hazard");
   }
 
+  // A pipeline destroyed and then the cache that owns its set layouts must make the layer say
+  // nothing. Unlike the scenarios, this code makes no shader module or draw, so there is no noise
+  // for a baseline to excuse, and a double destroy or a destroy of a layout in use is a message.
+  void CheckCacheOwnedLayoutsUnderValidation() {
+    constexpr const char *name = "SplitLayoutValidation";
+    const auto owned = MeasureValidation([&] { CheckPipelineKeepsSharedLayouts(); });
+    std::printf("[gpu]     %-32s cache-owned layouts: %llu messages\n", name,
+                static_cast<unsigned long long>(owned.count));
+    Require(name, "cache-owned layouts", owned.count == 0,
+            "destroying a pipeline and then its cache made the validation layer report a message");
+  }
+
   // The split layout scenarios under validation, skipped when the layer is not on or the device
   // cannot have the library. The control proves the layer reports a hazard at all.
   void CheckSplitLayoutUnderValidation() {
@@ -709,6 +721,9 @@
     CheckSplitScenarioUnderValidation("deferral", [&](bool split) { CheckSplitDeferralPass(split); });
     CheckSplitScenarioUnderValidation("draws", [&](bool split) { CheckSplitDrawsPass(split); });
     CheckSplitScenarioUnderValidation("heap", [&](bool split) { CheckSplitHeapPass(split); });
+    CheckCacheOwnedLayoutsUnderValidation();
+    CheckSplitScenarioUnderValidation("sharing", [&](bool split) { CheckSharedLayouts(split); });
+    CheckSplitScenarioUnderValidation("teardown", [&](bool split) { CheckSharedLayoutTeardown(split); });
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
@@ -747,6 +762,289 @@
     std::printf("[host]    %-32s ok\n", name);
   }
 
+  // Where the shaders of the sharing checks read. The vertex shader has bindings, and the two pixel
+  // shaders are different programs with the same bindings.
+  static constexpr uint64_t SplitSharedVertexOffset = SplitVertexReadOffset + 0x400;
+  static constexpr uint64_t SplitSharedPixelOffsetA = SplitVertexReadOffset + 0x500;
+  static constexpr uint64_t SplitSharedPixelOffsetB = SplitVertexReadOffset + 0x600;
+  // The layouts of the three pipelines of the sharing check. Two share the vertex shader, and two
+  // share the pixel shader. A cache that shared everything would fail the third, whose vertex shader
+  // has no bindings.
+  static constexpr size_t SplitSharedDistinctLayouts = 3;
+
+  // What a pipeline of the sharing checks says about its set layouts.
+  struct SharedLayoutPipeline {
+    GraphicsPipelineKey key{};
+    bool split = false;
+    vk::DescriptorSetLayout vertex = nullptr;
+    vk::DescriptorSetLayout pixel = nullptr;
+    vk::DescriptorSetLayout single = nullptr;
+  };
+
+  static SharedLayoutPipeline LayoutsOfKey(const PipelineCache &cache, const GraphicsPipelineKey &key) {
+    const auto &pipeline = PipelineCacheTestAccess::PipelineOf(cache, key);
+    return {key, pipeline.uses_split_sets, pipeline.vertex_set_layout, pipeline.pixel_set_layout,
+            pipeline.descriptor_set_layout};
+  }
+
+  // The layouts of the one pipeline that is not in `seen`, which is added to it.
+  static SharedLayoutPipeline NewestLayouts(const PipelineCache &cache,
+                                            std::vector<GraphicsPipelineKey> &seen) {
+    for (const auto &key : PipelineCacheTestAccess::GraphicsKeys(cache)) {
+      if (std::ranges::find(seen, key) == seen.end()) {
+        seen.push_back(key);
+        return LayoutsOfKey(cache, key);
+      }
+    }
+    Require("SplitLayoutSharing", "new pipeline", false, "the draw did not build a pipeline");
+    return {};
+  }
+
+  // Draws once with the given vertex shader and a pixel shader that reads at `pixel_offset`.
+  // `plain_vertex` is the rig's own vertex shader, which has no bindings.
+  SharedLayoutPipeline DrawSharedLayoutPipeline(AsyncDrawRig &rig, uint64_t plain_vertex,
+                                                bool vertex_bindings, uint64_t pixel_offset,
+                                                std::vector<GraphicsPipelineKey> &seen) {
+    if (vertex_bindings) {
+      UseAddressVertex(rig, SplitSharedVertexOffset);
+    } else {
+      rig.shaders.SetEsShaderBase(plain_vertex);
+    }
+    UseAddressPixel(rig, pixel_offset);
+    Require("SplitLayoutSharing", "draw", rig.Draw(), "the draw reported failure");
+    return NewestLayouts(rig.Pipelines(), seen);
+  }
+
+  // What the three draws of the sharing check left behind.
+  struct SharedLayoutRun {
+    SharedLayoutPipeline first, same_vertex, plain_vertex;
+    size_t batches_start = 0, batches_first = 0, batches_second = 0;
+    size_t cached = 0;
+  };
+
+  // Draws three pipelines. The first has a vertex shader with bindings, the second has the same
+  // vertex shader and another pixel shader, and the third has a vertex shader without bindings and
+  // the first one's pixel shader. The heap is read after the first and the second.
+  SharedLayoutRun RunSharedLayoutDraws(bool split, uint32_t push_limit) {
+    SharedLayoutRun run;
+    SplitLayoutScope layout(*this, split);
+    AsyncDrawRig rig(*this, false);
+    auto &graphics = rig.context->GetGraphics();
+    const auto device_limit = graphics.max_push_descriptors;
+    graphics.max_push_descriptors = push_limit;
+    const auto plain = rig.shaders.GetVs().es_regs.data_addr;
+    auto &heap = rig.context->GetDescriptorHeap();
+    rig.PaintSentinels();
+    std::vector<GraphicsPipelineKey> seen;
+    run.batches_start = DescriptorHeapTestAccess::Batches(heap);
+    run.first = DrawSharedLayoutPipeline(rig, plain, true, SplitSharedPixelOffsetA, seen);
+    run.batches_first = DescriptorHeapTestAccess::Batches(heap);
+    run.same_vertex = DrawSharedLayoutPipeline(rig, plain, true, SplitSharedPixelOffsetB, seen);
+    run.batches_second = DescriptorHeapTestAccess::Batches(heap);
+    run.plain_vertex = DrawSharedLayoutPipeline(rig, plain, false, SplitSharedPixelOffsetA, seen);
+    auto &sets = PipelineCacheTestAccess::SetLayouts(rig.Pipelines());
+    run.cached = sets.Size();
+    Require("SplitLayoutSharing", "picture", AllDrawn(rig.ReadColor()),
+            "the draws left another picture");
+    graphics.max_push_descriptors = device_limit;
+    return run;
+  }
+
+  // The layouts of three split pipelines are shared where their stages agree. The pipeline whose
+  // vertex shader has no bindings is the baseline, since a cache that handed out one layout, or a
+  // pipeline that kept its own, would not show the difference between it and the other two.
+  void CheckSharedSplitLayouts(const SharedLayoutRun &run) {
+    constexpr const char *name = "SplitLayoutSharing";
+    Require(name, "split layouts",
+            run.first.split && run.same_vertex.split && run.plain_vertex.split &&
+                run.first.vertex != nullptr && run.first.pixel != nullptr &&
+                run.plain_vertex.vertex != nullptr && run.first.single == nullptr,
+            "the pipelines did not get the split layout");
+    Require(name, "same vertex shader, same set 0 layout",
+            run.first.vertex == run.same_vertex.vertex, "two pipelines with one vertex shader did not share set 0");
+    Require(name, "same bindings, same set 2 layout",
+            run.first.pixel == run.same_vertex.pixel && run.first.pixel == run.plain_vertex.pixel,
+            "pipelines with pixel shaders of the same bindings did not share set 2");
+    Require(name, "other vertex bindings, other set 0 layout",
+            run.first.vertex != run.plain_vertex.vertex,
+            "a vertex shader without bindings got the layout of one with bindings");
+    Require(name, "one create per distinct layout",
+            run.cached == SplitSharedDistinctLayouts,
+            "the cache made a layout more than once");
+  }
+
+  // Without the library mode the pipelines keep the layout of their own, and the cache is not used.
+  // That is the baseline of the sharing check, and the status quo that the off path must keep.
+  void CheckUnsharedSingleLayouts(const SharedLayoutRun &run) {
+    constexpr const char *name = "SplitLayoutSharing";
+    Require(name, "single set layouts",
+            !run.first.split && !run.same_vertex.split && !run.plain_vertex.split &&
+                run.first.single != nullptr && run.same_vertex.single != nullptr &&
+                run.first.vertex == nullptr && run.first.pixel == nullptr,
+            "a pipeline got the split layout with the mode off");
+    Require(name, "each pipeline owns its layout",
+            run.first.single != run.same_vertex.single && run.first.single != run.plain_vertex.single,
+            "two single set pipelines shared a layout");
+    Require(name, "cache unused", run.cached == 0,
+            "the shared layout cache was used with the mode off");
+  }
+
+  // The heap holds a batch per layout handle. Shared layouts give the second pipeline nothing new,
+  // and the baseline of separate single set layouts gives it one more. A pushed set takes no set from
+  // the heap, so this needs a limit that pushes nothing.
+  void CheckSharedLayoutBatches(bool split, const SharedLayoutRun &run) {
+    Require("SplitLayoutSharing", "first pipeline took batches", run.batches_first > run.batches_start,
+            "the first draw took no descriptor set from the heap");
+    if (split) {
+      Require("SplitLayoutSharing", "second pipeline shares the batches",
+              run.batches_second == run.batches_first,
+              "a pipeline with shared layouts took batches of its own");
+    } else {
+      Require("SplitLayoutSharing", "baseline: separate layouts take more batches",
+              run.batches_second > run.batches_first,
+              "single set pipelines did not take a batch each");
+    }
+  }
+
+  // One pass of the sharing check in one layout mode and push limit.
+  void CheckSharedLayoutsPass(bool split, uint32_t push_limit) {
+    const auto run = RunSharedLayoutDraws(split, push_limit);
+    if (split) {
+      CheckSharedSplitLayouts(run);
+    } else {
+      CheckUnsharedSingleLayouts(run);
+    }
+    if (push_limit == SplitNoPushLimit) CheckSharedLayoutBatches(split, run);
+  }
+
+  // Runs the sharing check with the layouts pushed and not.
+  void CheckSharedLayouts(bool split) {
+    for (const uint32_t limit : {SplitPushLimit, SplitNoPushLimit}) CheckSharedLayoutsPass(split, limit);
+  }
+
+  // Builds the pipeline of the pixel shader that reads at `pixel_offset`, with the vertex shader that
+  // has bindings. No draw is recorded, so the pipeline may be destroyed at once.
+  HoleSource PrepareSharedLayoutSource(AsyncDrawRig &rig, uint64_t pixel_offset) {
+    UseAddressVertex(rig, SplitSharedVertexOffset);
+    UseAddressPixel(rig, pixel_offset);
+    return PrepareHoleSource(rig);
+  }
+
+  // A pipeline destroyed before the cache leaves the layouts it shared alive for the pipelines that
+  // still use them and for the one built next. The set layouts a pipeline destroys are counted, and a
+  // split pipeline must destroy none while a single set pipeline destroys its one, which is the
+  // baseline. A layout destroyed with the pipeline anyway is also a dead handle in the second
+  // pipeline and in the layout made from it, which the validation layer reports. The cache
+  // destroys each layout once, when the rig destroys the context after this.
+  void CheckSharedLayoutTeardown(bool split) {
+    constexpr const char *name = "SplitLayoutTeardown";
+    SplitLayoutScope layout(*this, split);
+    AsyncDrawRig rig(*this, false);
+    auto &cache = rig.Pipelines();
+    auto &sets = PipelineCacheTestAccess::SetLayouts(cache);
+    const auto first = LayoutsOfKey(cache, PrepareSharedLayoutSource(rig, SplitSharedPixelOffsetA).key);
+    const auto second_key = PrepareSharedLayoutSource(rig, SplitSharedPixelOffsetB).key;
+    const auto cached = sets.Size();
+    const auto destroys = PipelineSetLayoutDestroyCount();
+    PipelineCacheTestAccess::DestroyGraphicsPipeline(cache, first.key);
+    Require(name, "set layouts destroyed by the pipeline", PipelineSetLayoutDestroyCount() - destroys == (split ? 0u : 1u),
+            "destroying a pipeline destroyed another number of set layouts than the ones it owns");
+    Require(name, "layouts kept", sets.Size() == cached && cached == (split ? 2u : 0u),
+            "destroying a pipeline changed the layouts of the cache");
+    const auto second = LayoutsOfKey(cache, second_key);
+    if (split) {
+      const auto set_layouts = SplitSetLayouts(second.vertex, rig.context->GetGraphics().image_heap_layout,
+                                               second.pixel);
+      vk::PipelineLayoutCreateInfo info{};
+      info.flags = vk::PipelineLayoutCreateFlagBits::eIndependentSetsEXT;
+      info.setLayoutCount = SPLIT_SET_COUNT;
+      info.pSetLayouts = set_layouts.data();
+      vk::PipelineLayout probe = nullptr;
+      auto &device = rig.context->GetGraphics().device;
+      Require(name, "layout from the shared sets", device.createPipelineLayout(&info, nullptr, &probe) == vk::Result::eSuccess,
+              "a pipeline layout could not be made from the shared set layouts");
+      device.destroyPipelineLayout(probe, nullptr);
+    }
+    const auto rebuilt = LayoutsOfKey(cache, PrepareSharedLayoutSource(rig, SplitSharedPixelOffsetA).key);
+    Require(name, "rebuilt pipeline gets the same layouts",
+            !split || (rebuilt.vertex == first.vertex && rebuilt.pixel == first.pixel &&
+                       sets.Size() == cached),
+            "the pipeline built after the first was destroyed did not get the shared layouts back");
+    std::printf("[gpu]     %-32s ok (%s)\n", name, split ? "split" : "single set");
+  }
+
+  // Destroying a split pipeline destroys its pipeline layout and not the set layouts, which belong
+  // to the cache. The device is called directly by DestroyPipelineObjects and by the cache, so a set
+  // layout destroyed by both is a double destroy that only the validation layer can see. This check
+  // is therefore run under the layer by CheckSplitLayoutUnderValidation, which requires no messages.
+  // Without the layer the destroy count and the cache destroying each layout once still show it.
+  void CheckPipelineKeepsSharedLayouts() {
+    constexpr const char *name = "SplitLayoutTeardown";
+    std::vector<vk::DescriptorSetLayout> created, destroyed;
+    {
+      DescriptorSetLayoutCache cache(
+          [&](const vk::DescriptorSetLayoutCreateInfo &info) {
+            vk::DescriptorSetLayout made = nullptr;
+            Require(name, "make layout", m_device.createDescriptorSetLayout(&info, nullptr, &made) == vk::Result::eSuccess,
+                    "a set layout could not be made");
+            created.push_back(made);
+            return made;
+          },
+          [&](vk::DescriptorSetLayout layout) {
+            destroyed.push_back(layout);
+            m_device.destroyDescriptorSetLayout(layout, nullptr);
+          });
+      const std::array bindings{
+          vk::DescriptorSetLayoutBinding{0, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eVertex, nullptr}};
+      PipelineCache::Pipeline pipeline;
+      pipeline.uses_split_sets = true;
+      pipeline.vertex_set_layout = cache.GetOrCreate(bindings, {});
+      pipeline.pixel_set_layout = cache.GetOrCreate({}, {});
+      const std::array set_layouts{pipeline.vertex_set_layout, pipeline.pixel_set_layout};
+      vk::PipelineLayoutCreateInfo info{};
+      info.setLayoutCount = static_cast<uint32_t>(set_layouts.size());
+      info.pSetLayouts = set_layouts.data();
+      Require(name, "make pipeline layout",
+              m_device.createPipelineLayout(&info, nullptr, &pipeline.pipeline_layout) == vk::Result::eSuccess,
+              "a pipeline layout could not be made");
+      // The count is the tripwire that needs no validation layer. The baseline is a single set
+      // pipeline, whose one layout is its own and is destroyed with it.
+      const auto destroys_before = PipelineSetLayoutDestroyCount();
+      DestroyPipelineObjects(m_device, pipeline);
+      Require(name, "split pipeline destroyed no set layout",
+              PipelineSetLayoutDestroyCount() == destroys_before,
+              "destroying a split pipeline destroyed a set layout");
+      PipelineCache::Pipeline single;
+      const vk::DescriptorSetLayoutCreateInfo single_info{};
+      Require(name, "make own layout",
+              m_device.createDescriptorSetLayout(&single_info, nullptr, &single.descriptor_set_layout) ==
+                  vk::Result::eSuccess,
+              "a set layout could not be made");
+      DestroyPipelineObjects(m_device, single);
+      Require(name, "single set pipeline destroyed its layout",
+              PipelineSetLayoutDestroyCount() == destroys_before + 1,
+              "the destroy count did not count the layout of a single set pipeline");
+      Require(name, "cache not asked to destroy early", created.size() == 2 && destroyed.empty(),
+              "the cache destroyed a set layout while it was alive");
+    }
+    Require(name, "cache destroyed each once",
+            destroyed.size() == created.size() &&
+                std::set<vk::DescriptorSetLayout>(destroyed.begin(), destroyed.end()) ==
+                    std::set<vk::DescriptorSetLayout>(created.begin(), created.end()),
+            "the cache did not destroy every layout it made exactly once");
+    std::printf("[gpu]     %-32s ok (cache owns the layouts)\n", name);
+  }
+
+  // All the tests of the shared set layouts, which need a device with the library for the split half.
+  void CheckSplitLayoutSharing() {
+    CheckPipelineKeepsSharedLayouts();
+    for (const bool split : {false, true}) {
+      CheckSharedLayouts(split);
+      CheckSharedLayoutTeardown(split);
+    }
+    std::printf("[gpu]     %-32s ok\n", "SplitLayoutSharing");
+  }
+
   // All the tests of the split layout. The device part is skipped, with the reason, when the device
   // has no graphics pipeline library.
   void CheckSplitLayout() {
@@ -765,6 +1063,7 @@
     CheckSplitLayoutDraws();
     CheckSplitLayoutStore();
     CheckSplitLayoutHeap();
+    CheckSplitLayoutSharing();
     std::printf("[gpu]     %-32s ok\n", name);
   }
 

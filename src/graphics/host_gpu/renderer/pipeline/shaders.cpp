@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <fmt/format.h>
 #include <span>
@@ -161,16 +162,30 @@ vk::ShaderModule CompileSplitPixelModule(const GraphicContext& graphics, ShaderT
 	return CompileSPV(moved, graphics.device);
 }
 
+// Counts the set layouts that DestroyPipelineObjects destroyed. A tripwire for tests, since the
+// layouts of a split pipeline belong to the cache and must never be counted here. Tests read it as
+// a before and after difference, which holds while no other thread destroys pipelines meanwhile.
+static std::atomic<uint64_t> g_pipeline_set_layout_destroys {0};
+
+uint64_t PipelineSetLayoutDestroyCount() {
+	return g_pipeline_set_layout_destroys.load();
+}
+
+// Destroys a set layout that a pipeline owns, and counts it. Every set layout destroy of a pipeline
+// goes through here, so the count shows a pipeline destroying a layout.
+static void DestroyOwnedSetLayout(vk::Device device, vk::DescriptorSetLayout layout) {
+	if (layout != nullptr) {
+		device.destroyDescriptorSetLayout(layout, nullptr);
+		g_pipeline_set_layout_destroys++;
+	}
+}
+
 void DestroyPipelineObjects(vk::Device device, const PipelineCache::Pipeline& pipeline) {
 	device.destroyPipeline(pipeline.pipeline, nullptr);
 	device.destroyPipelineLayout(pipeline.pipeline_layout, nullptr);
-	// A null handle is skipped, so a pipeline of the single-set layout makes the calls it always did.
-	for (const auto layout: {pipeline.descriptor_set_layout, pipeline.vertex_set_layout,
-	                         pipeline.pixel_set_layout}) {
-		if (layout != nullptr) {
-			device.destroyDescriptorSetLayout(layout, nullptr);
-		}
-	}
+	// Only this layout is the pipeline's own. A split pipeline has none, and its vertex and pixel set
+	// layouts are shared, so they are left for the DescriptorSetLayoutCache to destroy once.
+	DestroyOwnedSetLayout(device, pipeline.descriptor_set_layout);
 }
 
 std::string DescriptorLimitError(const vk::PhysicalDeviceLimits&                limits,
@@ -238,6 +253,12 @@ static uint64_t CheckDescriptorLimits(const GraphicContext&                     
 	return descriptor_count;
 }
 
+// The create flags of a split set layout, which are push or none.
+static vk::DescriptorSetLayoutCreateFlags SetLayoutFlags(bool push) {
+	return push ? vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR
+	            : vk::DescriptorSetLayoutCreateFlags {};
+}
+
 // Creates a descriptor set layout, which may have no bindings.
 static vk::DescriptorSetLayout CreateSetLayout(const GraphicContext&                         graphics,
                                                std::span<const vk::DescriptorSetLayoutBinding> bindings,
@@ -282,8 +303,10 @@ static constexpr vk::ShaderStageFlags SPLIT_PUSH_STAGES =
 
 // Creates the split layout. Set 0 holds the VS bindings, set 1 is the image heap exactly as in the
 // single-set layout, and set 2 holds the PS bindings, pushed when the PS alone fits. The sets are
-// independent, so a pipeline library that knows one stage can still be given a layout.
-static void CreateSplitLayouts(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+// independent, so a pipeline library that knows one stage can still be given a layout. The two set
+// layouts, empty ones too, come from the shared cache. The pipeline layout stays the pipeline's own.
+static void CreateSplitLayouts(GraphicContext& graphics, DescriptorSetLayoutCache& shared_layouts,
+                               PipelineCache::Pipeline& pipeline,
                                const std::array<const ShaderModule*, 4>& stages) {
 	const auto plan = PlanSplitSets(graphics, stages);
 	const auto limit_error = SplitLayoutLimitError(graphics.GetPhysicalDeviceProperties().limits,
@@ -294,8 +317,9 @@ static void CreateSplitLayouts(GraphicContext& graphics, PipelineCache::Pipeline
 	pipeline.uses_split_sets       = true;
 	pipeline.pixel_set_is_push     = plan.pixel_push;
 	pipeline.uses_push_descriptors = plan.push_only;
-	pipeline.vertex_set_layout     = CreateSetLayout(graphics, plan.vertex, false);
-	pipeline.pixel_set_layout      = CreateSetLayout(graphics, plan.pixel, plan.pixel_push);
+	pipeline.vertex_set_layout     = shared_layouts.GetOrCreate(plan.vertex, {});
+	pipeline.pixel_set_layout      =
+	    shared_layouts.GetOrCreate(plan.pixel, SetLayoutFlags(plan.pixel_push));
 	pipeline.push_stages           = SPLIT_PUSH_STAGES;
 	const vk::PushConstantRange push_constants {pipeline.push_stages, 0,
 	                                            ShaderRecompiler::IR::NativePushConstantSize};
@@ -509,7 +533,8 @@ void FillDynamicStateParts(DynamicStateParts& out, const GraphicContext& graphic
 // Sets up the push stages, the image heap flag and the layouts of a graphics pipeline. The layout
 // is shared by all four parts, so it is set up apart from them. A pipeline that libraries could
 // build gets the split layout when the library mode is on, and every other one gets the single set.
-static void CreateGraphicsLayouts(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+static void CreateGraphicsLayouts(GraphicContext& graphics, DescriptorSetLayoutCache& set_layouts,
+                                  PipelineCache::Pipeline& pipeline,
                                   const GraphicsPipelineKey&                 key,
                                   const std::array<const ShaderModule*, 4>& stages,
                                   bool                                       has_task_stage) {
@@ -519,7 +544,7 @@ static void CreateGraphicsLayouts(GraphicContext& graphics, PipelineCache::Pipel
 		}
 	}
 	if (UsesSplitLayout(graphics, key, stages)) {
-		CreateSplitLayouts(graphics, pipeline, stages);
+		CreateSplitLayouts(graphics, set_layouts, pipeline, stages);
 		return;
 	}
 	const auto descriptor_bindings = GatherLayoutBindings(stages);
@@ -611,7 +636,8 @@ static HelperModules CreateHelperModules(GraphicContext& graphics, const ShaderM
 	return helpers;
 }
 
-void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+void CreatePipelineInternal(GraphicContext& graphics, DescriptorSetLayoutCache& set_layouts,
+                            PipelineCache::Pipeline& pipeline,
                             const GraphicsPipelineKey&                 key,
                             const std::array<const ShaderModule*, 4>& stages,
                             vk::PipelineCache                          driver_cache) {
@@ -638,7 +664,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	FillFragmentShaderParts(parts.fragment_shader, key, pixel);
 	FillFragmentOutputParts(parts.fragment_output, key);
 	FillDynamicStateParts(parts.dynamic, graphics, key);
-	CreateGraphicsLayouts(graphics, pipeline, key, stages, static_cast<bool>(helpers.task));
+	CreateGraphicsLayouts(graphics, set_layouts, pipeline, key, stages,
+	                      static_cast<bool>(helpers.task));
 
 	if (pipeline.uses_split_sets && pixel != nullptr) {
 		// The PS resources are in set 2 of this layout, which only the patched module says.
