@@ -660,13 +660,14 @@ target_link_libraries(image_page_table_tests common fmt::fmt)
 target_include_directories(image_page_table_tests PRIVATE ${inc_headers})
 
 add_kyty_full_emulator_test(shader_recompiler_compute_tests "${KYTY_TESTS_DIR}/ShaderRecompilerComputeTests.cpp")
-# A light target. It links only the scan, the register decoder and the device-free key code.
+# A light target. It links only the scan, the register decoder and the device-free key and sl00 code.
 add_executable(shader_store_scan_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ShaderStoreScanTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/csRegisters.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/shaderStaticKey.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/storegen/ebootShaderScan.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/storegen/computeStaticKey.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/storegen/sl00Metadata.cpp"
 )
 target_link_libraries(shader_store_scan_tests common fmt::fmt xxhash)
 target_include_directories(shader_store_scan_tests PRIVATE ${inc_headers})
