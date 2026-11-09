@@ -725,6 +725,23 @@ add_executable(shader_store_tailer_tests EXCLUDE_FROM_ALL
 target_link_libraries(shader_store_tailer_tests common fmt::fmt xbyak::xbyak xxhash libzstd_static)
 target_include_directories(shader_store_tailer_tests PRIVATE ${inc_headers})
 
+# The supervisor of a store worker. It starts this test binary as a fake worker, so it links no
+# recompiler and needs no device.
+add_executable(shader_store_supervisor_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ShaderStoreSupervisorTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/storegen/storeSupervisor.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/storegen/storeGenerationGate.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/storegen/frameTailer.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/storegen/progressLog.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/storegen/storeWorkerFormat.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/shaderStoreRecord.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/gpu_format.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
+)
+target_link_libraries(shader_store_supervisor_tests common fmt::fmt xbyak::xbyak xxhash libzstd_static)
+target_include_directories(shader_store_supervisor_tests PRIVATE ${inc_headers})
+
 # The reader of a store worker's progress log. It reads text lines through Common::File and needs no
 # graphics device.
 add_executable(shader_store_progress_log_tests EXCLUDE_FROM_ALL
@@ -953,6 +970,8 @@ if(BUILD_TESTING)
 	add_test(NAME shader_store_record COMMAND $<TARGET_FILE:shader_store_record_tests>)
 	add_test(NAME shader_store_tailer COMMAND $<TARGET_FILE:shader_store_tailer_tests>)
 	add_test(NAME shader_store_progress_log COMMAND $<TARGET_FILE:shader_store_progress_log_tests>)
+	add_test(NAME shader_store_supervisor COMMAND $<TARGET_FILE:shader_store_supervisor_tests>)
+	set_tests_properties(shader_store_supervisor PROPERTIES TIMEOUT 300)
 	add_test(NAME shader_store_worker COMMAND $<TARGET_FILE:shader_store_worker_tests>)
 	add_test(NAME shader_store_dispatch COMMAND $<TARGET_FILE:shader_store_dispatch_tests>)
 	set_tests_properties(shader_store_dispatch PROPERTIES TIMEOUT 300)
@@ -1090,6 +1109,7 @@ if(BUILD_TESTING)
 		shader_store_record_tests
 		shader_store_tailer_tests
 		shader_store_progress_log_tests
+		shader_store_supervisor_tests
 		shader_store_worker_tests
 		shader_store_dispatch_tests
 		virtual_memory_allocation_tests

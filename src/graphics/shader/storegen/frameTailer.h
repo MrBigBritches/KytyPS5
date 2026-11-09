@@ -181,14 +181,16 @@ public:
 	/// since a bad item at the end is held once more before it is final.
 	///
 	/// What the supervisor does with the status:
-	/// - On DamagedFrame, HeaderError or FrameTooLarge while the child lives, it terminates the
-	///   child and restarts it with kept = GoodOffset, or builds a fresh tailer and poller when
-	///   that is 0. On Truncated it does the second, with kept 0. After a restart with kept = 0, as
+	/// - On DamagedFrame or FrameTooLarge while the child lives, it terminates the child, cuts
+	///   the output file, and restarts fresh: kept 0, a new tailer and poller, since a rank cannot
+	///   be derived from a file offset. HeaderError ends generation, since no restart would write
+	///   another header. On Truncated it restarts fresh too. After a restart with kept = 0, as
 	///   after exit code 14, the fresh run delivers records the inbox already holds, so the
 	///   supervisor must deduplicate them by module id.
-	/// - It treats Complete as done only together with the child's exit code 0 or 10.
-	/// - After it cuts the file back, it calls RestartFrom itself, and it does not poll with
-	///   child_exited true between the cut and the respawn.
+	/// - It treats Complete as done only together with the child's exit code 0. Exit code 10 is
+	///   Verify mode's answer, which nothing asks for yet, so it ends generation.
+	/// - After a crash it calls RestartFrom itself, and it does not poll with child_exited true
+	///   between that and the respawn. A fresh restart makes a new tailer and poller instead.
 	/// @param child_exited passed to FrameTailer::Poll. The caller reads whether the child exited
 	///                     before calling this, since bytes written just before the exit must still
 	///                     be read after it is seen.
