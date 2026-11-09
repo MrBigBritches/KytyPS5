@@ -521,6 +521,91 @@ void TestPipelineLibraryCounters() {
         "Reset kept the library counters");
 }
 
+// The rows of pipelines linked from libraries. An empty report has none and a zero summary, which is the
+// baseline. Each row keeps its own figures and the flip it was added in whatever the caller passed,
+// the summary adds them and takes the largest, and only a pipeline whose kinds include both stage
+// libraries counts as having built them in sequence. Reset forgets the rows.
+void TestLibraryPipelineRows() {
+  using Common::FirstRunReport::LibraryKind;
+  using Common::FirstRunReport::LibraryPipelineRow;
+  constexpr uint32_t kPre = 1u << static_cast<uint32_t>(LibraryKind::PreRaster);
+  constexpr uint32_t kFragment = 1u << static_cast<uint32_t>(LibraryKind::Fragment);
+  constexpr uint32_t kVertexInput = 1u << static_cast<uint32_t>(LibraryKind::VertexInput);
+  Report report;
+  const auto empty = nlohmann::json::parse(report.ToJson({}, 0, 1.0, 0.0))["graphics_pipeline_library"]["pipelines"];
+  Check(empty["rows"].empty() && empty["summary"]["all"]["count"] == 0 &&
+            empty["summary"]["all"]["built_both_stage_libraries"] == 0 &&
+            empty["summary"]["gpu"]["total_ms"]["max"] == 0.0,
+        "an empty report claimed library pipelines");
+  report.OnFlip(7);
+  report.AddLibraryPipeline({.vs = 0xa, .ps = 0xb, .flip = 99, .thread = Thread::Gpu, .built_ms = 4.0,
+                             .waited_ms = 1.0, .link_ms = 0.25, .total_ms = 6.0, .built_count = 2,
+                             .built_kinds = kPre | kFragment});
+  report.AddLibraryPipeline({.vs = 0xa, .ps = 0xc, .thread = Thread::Worker, .built_ms = 1.5, .waited_ms = 3.0,
+                             .link_ms = 0.5, .total_ms = 5.5, .built_count = 2,
+                             .built_kinds = kFragment | kVertexInput});
+  report.AddLibraryPipeline({.vs = 0xd, .ps = 0xe, .thread = Thread::Worker, .link_ms = 0.25, .total_ms = 0.5});
+  const auto json = nlohmann::json::parse(report.ToJson({}, 0, 1.0, 0.0))["graphics_pipeline_library"]["pipelines"];
+  const auto &rows = json["rows"];
+  Check(rows.size() == 3 && rows[0]["vs"] == "000000000000000a" && rows[0]["flip"] == 7 && rows[0]["thread"] == "gpu" &&
+            rows[0]["built_ms"] == 4.0 && rows[0]["waited_ms"] == 1.0 && rows[0]["link_ms"] == 0.25 &&
+            rows[0]["total_ms"] == 6.0 && rows[0]["built_count"] == 2,
+        "a library pipeline row did not keep its figures");
+  Check(rows[0]["built_kinds"] == nlohmann::json::array({"pre_raster", "fragment"}) &&
+            rows[1]["built_kinds"] == nlohmann::json::array({"vertex_input", "fragment"}) &&
+            rows[2]["built_kinds"].empty() && rows[1]["thread"] == "worker",
+        "the kinds a row built were not named");
+  const auto &summary = json["summary"]["all"];
+  Check(summary["count"] == 3 && summary["built_ms"]["sum"] == 5.5 && summary["built_ms"]["max"] == 4.0 &&
+            summary["waited_ms"]["sum"] == 4.0 && summary["waited_ms"]["max"] == 3.0 &&
+            summary["link_ms"]["sum"] == 1.0 && summary["total_ms"]["sum"] == 12.0 &&
+            summary["total_ms"]["max"] == 6.0,
+        "the summary did not add and maximise the rows");
+  Check(summary["built_both_stage_libraries"] == 1 && summary["built_any_library"] == 2,
+        "the pipelines that built both stage libraries were not counted apart from those that built one");
+  // The first row is the GPU thread's and the other two are workers', and each side has its own figures.
+  const auto &gpu = json["summary"]["gpu"], &worker = json["summary"]["worker"];
+  Check(gpu["count"] == 1 && gpu["built_ms"]["sum"] == 4.0 && gpu["waited_ms"]["sum"] == 1.0 &&
+            gpu["total_ms"]["sum"] == 6.0 && gpu["built_both_stage_libraries"] == 1,
+        "the GPU thread's summary took in a worker's row, or missed its own");
+  Check(worker["count"] == 2 && worker["built_ms"]["sum"] == 1.5 && worker["waited_ms"]["sum"] == 3.0 &&
+            worker["total_ms"]["sum"] == 6.0 && worker["built_both_stage_libraries"] == 0 &&
+            worker["built_any_library"] == 1,
+        "the workers' summary took in the GPU thread's row, or missed its own");
+  report.Reset();
+  Check(report.LibraryPipelines().empty(), "Reset kept the library pipeline rows");
+}
+
+// The scope adds the libraries a thread makes, the waits and the link to one row, and records it only
+// when committed. An uncommitted scope, which is a pipeline that fell back, leaves no row. Notes from
+// outside any scope go nowhere, and with the report off nothing is recorded at all.
+void TestLibraryPipelineScope() {
+  using Common::FirstRunReport::LibraryKind;
+  using Common::FirstRunReport::LibraryPipelineScope;
+  Common::FirstRunReport::Configure(true, false);
+  auto &report = Common::FirstRunReport::Global();
+  report.Reset();
+  LibraryPipelineScope::NoteBuilt(LibraryKind::Fragment, 9.0);
+  {
+    LibraryPipelineScope scope(1, 2, true);
+    LibraryPipelineScope::NoteBuilt(LibraryKind::PreRaster, 2.0);
+    LibraryPipelineScope::NoteBuilt(LibraryKind::Fragment, 3.0);
+    LibraryPipelineScope::NoteWaited(4.0);
+    LibraryPipelineScope::NoteLink(0.5);
+    scope.Commit();
+  }
+  { LibraryPipelineScope fell_back(3, 4, false); LibraryPipelineScope::NoteBuilt(LibraryKind::Output, 1.0); }
+  const auto rows = report.LibraryPipelines();
+  Check(rows.size() == 1 && rows[0].vs == 1 && rows[0].ps == 2 && rows[0].thread == Thread::Gpu &&
+            rows[0].built_ms == 5.0 && rows[0].built_count == 2 && rows[0].waited_ms == 4.0 &&
+            rows[0].link_ms == 0.5 && rows[0].total_ms >= 0.0,
+        "the scope did not collect one row of what the thread did, or recorded outside its scope");
+  report.Reset();
+  Common::FirstRunReport::Configure(false, false);
+  { LibraryPipelineScope off(5, 6, true); LibraryPipelineScope::NoteBuilt(LibraryKind::PreRaster, 1.0); off.Commit(); }
+  Check(report.LibraryPipelines().empty(), "a scope recorded while the report was off");
+}
+
 // An empty report writes no waits of draws that could not be deferred, which is the baseline, so
 // each figure below can only come from AddDeferredIneligibleWait. Each row keeps its own reason,
 // stages and wait, the flip is the one running when it was added whatever the caller passed, and
@@ -949,6 +1034,8 @@ int main() {
   TestIneligibleWaits();
   TestPipelineLibraryState();
   TestPipelineLibraryCounters();
+  TestLibraryPipelineRows();
+  TestLibraryPipelineScope();
   TestScopesRespectTheFlag();
   TestCompileRowsKeepSubmission();
   TestResumeKeepsStampAndCountsOnce();

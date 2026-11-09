@@ -291,6 +291,55 @@ void TestWaitsForRunningBuildOnly() {
 	std::printf("GraphicsLibraryCacheTests: wait ok\n");
 }
 
+// The pipeline row of a thread that builds a library holds the build as built time, and the row of a thread
+// that waits for it holds the wait as waited time and builds nothing. The build is held for a while, so
+// both figures are well above zero. What else could pass is a row that files the wait as a build, which
+// shows as a built count on the waiter.
+void TestRowsSeparateBuildAndWait() {
+	using Common::FirstRunReport::LibraryKind;
+	using Common::FirstRunReport::LibraryPipelineScope;
+	// The build is held long enough that a waiter which starts a little late on a slow machine still
+	// waits for most of it. The waiter is checked against half of the shorter bound below.
+	constexpr auto   hold     = std::chrono::milliseconds(200);
+	constexpr double at_least = 100.0;
+	constexpr double waiter_share = at_least / 2;
+	Common::FirstRunReport::Configure(true, false);
+	Common::FirstRunReport::Global().Reset();
+	FakeDriver driver;
+	auto       cache = MakeCache(driver);
+	Pipeline   pipeline;
+	FillBaseline(pipeline);
+	const auto        key = MakePreRasterKey(pipeline.key, pipeline.Stages());
+	std::atomic<bool> building {false};
+	std::thread       builder([&] {
+        LibraryPipelineScope scope(1, 1, false);
+        (void)cache.GetOrBuild(key, [&] {
+            building = true;
+            std::this_thread::sleep_for(hold);
+            return driver.Build(LibraryPart::PreRaster);
+        });
+        scope.Commit();
+    });
+	Check(WaitFor(building), "the build never started");
+	std::thread waiter([&] {
+		LibraryPipelineScope scope(2, 2, false);
+		(void)cache.GetOrBuild(key, [&] { return driver.Build(LibraryPart::PreRaster); });
+		scope.Commit();
+	});
+	builder.join();
+	waiter.join();
+	const auto rows = Common::FirstRunReport::Global().LibraryPipelines();
+	Common::FirstRunReport::Configure(false, false);
+	Check(rows.size() == 2, "there was not a row for each thread");
+	const auto& built  = rows[0].vs == 1 ? rows[0] : rows[1];
+	const auto& waited = rows[0].vs == 1 ? rows[1] : rows[0];
+	Check(built.built_count == 1 && built.built_ms >= at_least && built.waited_ms == 0.0,
+	      "the thread that built did not get the time as built time");
+	Check(waited.built_count == 0 && waited.built_ms == 0.0 && waited.waited_ms >= waiter_share,
+	      "the thread that waited got the wait as built time, or no wait");
+	std::printf("GraphicsLibraryCacheTests: rows ok\n");
+}
+
 // A refused library is kept, so the key is not tried again, and the pipeline that needed it is built
 // whole. The baseline is a library that was made, which is built once and counted as built.
 void TestRefusalIsKept() {
@@ -368,6 +417,7 @@ int main() {
 	TestDedup();
 	TestConcurrentBuilds();
 	TestWaitsForRunningBuildOnly();
+	TestRowsSeparateBuildAndWait();
 	TestRefusalIsKept();
 	TestDestroyOnce();
 	TestLinkAndFallbackCounts();

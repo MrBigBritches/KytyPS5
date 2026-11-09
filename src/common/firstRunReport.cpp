@@ -16,6 +16,11 @@
 
 namespace Common::FirstRunReport {
 
+double ElapsedMs(std::chrono::steady_clock::time_point start) {
+	return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
+	    .count();
+}
+
 namespace {
 
 constexpr double   ROUNDING_SCALE       = 1000.0;
@@ -52,11 +57,6 @@ int64_t ToNs(std::chrono::steady_clock::time_point point) {
 
 double Round3(double value) {
 	return std::round(value * ROUNDING_SCALE) / ROUNDING_SCALE;
-}
-
-double ElapsedMs(std::chrono::steady_clock::time_point start) {
-	return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
-	    .count();
 }
 
 std::string Hex(uint64_t value) {
@@ -177,6 +177,17 @@ void Report::AddLibraryLink(double ms) {
 	m_library_stats.links++;
 	m_library_stats.link_ms_total += ms;
 	m_library_stats.link_ms_max = std::max(m_library_stats.link_ms_max, ms);
+}
+
+void Report::AddLibraryPipeline(const LibraryPipelineRow& row) {
+	std::lock_guard lock(m_mutex);
+	m_library_pipelines.push_back(row);
+	m_library_pipelines.back().flip = m_flip;
+}
+
+std::vector<LibraryPipelineRow> Report::LibraryPipelines() const {
+	std::lock_guard lock(m_mutex);
+	return m_library_pipelines;
 }
 
 void Report::AddLibraryFallback(FallbackKind kind) {
@@ -399,6 +410,7 @@ void Report::Reset() {
 	m_boot              = {};
 	m_pipeline_library  = {};
 	m_library_stats     = {};
+	m_library_pipelines.clear();
 	m_blocked_ms        = {};
 	m_translate_ms      = 0.0;
 	m_translate_gpu_graphics_ms = 0.0;
@@ -726,9 +738,70 @@ constexpr std::array<const char*, LIBRARY_KIND_COUNT> LIBRARY_KIND_NAMES {
 constexpr std::array<const char*, FALLBACK_KIND_COUNT> FALLBACK_KIND_NAMES {
     "rect_list", "tess", "mesh", "create_failed"};
 
+// The sum and the largest of one figure of the rows.
+nlohmann::json SumAndMax(const std::vector<LibraryPipelineRow>& rows, double LibraryPipelineRow::*field) {
+	double sum = 0.0, largest = 0.0;
+	for (const auto& row: rows) {
+		sum += row.*field;
+		largest = std::max(largest, row.*field);
+	}
+	return {{"sum", Round3(sum)}, {"max", Round3(largest)}};
+}
+
+// The summary of some library pipeline rows. built_both_stage_libraries counts the pipelines whose thread
+// made the pre-rasterization and the fragment shader library itself, one after the other. A thread that
+// built one stage library and waited for the other shows up as a row with one built kind and a
+// non-zero waited_ms, and is not counted there.
+nlohmann::json LibraryPipelinesSummary(const std::vector<LibraryPipelineRow>& rows) {
+	constexpr uint32_t both_stages = (1u << static_cast<uint32_t>(LibraryKind::PreRaster)) |
+	                                 (1u << static_cast<uint32_t>(LibraryKind::Fragment));
+	uint32_t both = 0, any = 0;
+	for (const auto& row: rows) {
+		both += (row.built_kinds & both_stages) == both_stages ? 1u : 0u;
+		any += row.built_count != 0 ? 1u : 0u;
+	}
+	return {{"count", rows.size()},
+	        {"built_ms", SumAndMax(rows, &LibraryPipelineRow::built_ms)},
+	        {"waited_ms", SumAndMax(rows, &LibraryPipelineRow::waited_ms)},
+	        {"link_ms", SumAndMax(rows, &LibraryPipelineRow::link_ms)},
+	        {"total_ms", SumAndMax(rows, &LibraryPipelineRow::total_ms)},
+	        {"built_any_library", any},
+	        {"built_both_stage_libraries", both}};
+}
+
+// The rows and their summary, under graphics_pipeline_library.pipelines.
+nlohmann::json LibraryPipelinesToJson(const std::vector<LibraryPipelineRow>& rows) {
+	nlohmann::json list = nlohmann::json::array();
+	for (const auto& row: rows) {
+		nlohmann::json kinds = nlohmann::json::array();
+		for (size_t index = 0; index < LIBRARY_KIND_COUNT; index++) {
+			if ((row.built_kinds & (1u << index)) != 0) kinds.push_back(LIBRARY_KIND_NAMES[index]);
+		}
+		list.push_back({{"vs", Hex(row.vs)},
+		                {"ps", Hex(row.ps)},
+		                {"flip", row.flip},
+		                {"thread", row.thread == Thread::Gpu ? "gpu" : "worker"},
+		                {"built_ms", Round3(row.built_ms)},
+		                {"built_count", row.built_count},
+		                {"built_kinds", kinds},
+		                {"waited_ms", Round3(row.waited_ms)},
+		                {"link_ms", Round3(row.link_ms)},
+		                {"total_ms", Round3(row.total_ms)}});
+	}
+	// Only the GPU thread's time blocks play, so its rows are summed apart from the workers'.
+	std::vector<LibraryPipelineRow> gpu, worker;
+	for (const auto& row: rows) (row.thread == Thread::Gpu ? gpu : worker).push_back(row);
+	return {{"summary",
+	         {{"all", LibraryPipelinesSummary(rows)},
+	          {"gpu", LibraryPipelinesSummary(gpu)},
+	          {"worker", LibraryPipelinesSummary(worker)}}},
+	        {"rows", list}};
+}
+
 // The graphics_pipeline_library section, which says whether libraries were on and what they did.
 nlohmann::json PipelineLibraryToJson(const PipelineLibraryInfo&  info,
-                                     const PipelineLibraryStats& stats) {
+                                     const PipelineLibraryStats& stats,
+                                     const std::vector<LibraryPipelineRow>& rows) {
 	nlohmann::json libraries = nlohmann::json::object();
 	for (size_t index = 0; index < LIBRARY_KIND_COUNT; index++) {
 		const auto& kind = stats.libraries[index];
@@ -748,7 +821,8 @@ nlohmann::json PipelineLibraryToJson(const PipelineLibraryInfo&  info,
 	        {"links", {{"count", stats.links},
 	                   {"ms_total", Round3(stats.link_ms_total)},
 	                   {"ms_max", Round3(stats.link_ms_max)}}},
-	        {"fallback_full", fallback}};
+	        {"fallback_full", fallback},
+	        {"pipelines", LibraryPipelinesToJson(rows)}};
 }
 
 } // namespace
@@ -785,7 +859,7 @@ std::string Report::ToJson(const Metadata& metadata, uint64_t audio_holds, doubl
 	    {"cold_stamp_failures", summary.stamp_failures},
 	    {"partial", metadata.partial},
 	    {"boot", BootToJson(boot)},
-	    {"graphics_pipeline_library", PipelineLibraryToJson(library, LibraryStats())},
+	    {"graphics_pipeline_library", PipelineLibraryToJson(library, LibraryStats(), LibraryPipelines())},
 	    {"play", PlayToJson(summary)},
 	    {"pauses", PausesToJson(summary)},
 	    {"compiles", compile_rows},
@@ -955,6 +1029,60 @@ SubmissionScope::SubmissionScope(SubmissionStamp& stamp, bool is_commands)
 SubmissionScope::~SubmissionScope() {
 	if (m_active) {
 		Global().EndSubmission();
+	}
+}
+
+namespace {
+
+// The pipeline being linked on this thread, or null. Its row is the scope's own member.
+thread_local LibraryPipelineScope* t_library_pipeline = nullptr;
+
+} // namespace
+
+LibraryPipelineScope::LibraryPipelineScope(uint64_t vs, uint64_t ps, bool on_gpu_thread)
+    : m_active(Enabled()) {
+	if (!m_active) {
+		return;
+	}
+	m_row.vs     = vs;
+	m_row.ps     = ps;
+	m_row.thread = on_gpu_thread ? Thread::Gpu : Thread::Worker;
+	m_start      = std::chrono::steady_clock::now();
+	m_previous   = t_library_pipeline;
+	t_library_pipeline = this;
+}
+
+LibraryPipelineScope::~LibraryPipelineScope() {
+	if (m_active) {
+		t_library_pipeline = m_previous;
+	}
+}
+
+void LibraryPipelineScope::Commit() {
+	if (m_active) {
+		m_row.total_ms = ElapsedMs(m_start);
+		Global().AddLibraryPipeline(m_row);
+	}
+}
+
+void LibraryPipelineScope::NoteBuilt(LibraryKind kind, double ms) {
+	if (t_library_pipeline != nullptr) {
+		auto& row = t_library_pipeline->m_row;
+		row.built_ms += ms;
+		row.built_count++;
+		row.built_kinds |= 1u << static_cast<uint32_t>(kind);
+	}
+}
+
+void LibraryPipelineScope::NoteWaited(double ms) {
+	if (t_library_pipeline != nullptr) {
+		t_library_pipeline->m_row.waited_ms += ms;
+	}
+}
+
+void LibraryPipelineScope::NoteLink(double ms) {
+	if (t_library_pipeline != nullptr) {
+		t_library_pipeline->m_row.link_ms += ms;
 	}
 }
 

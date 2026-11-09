@@ -126,6 +126,8 @@ private:
 	struct Entry {
 		std::once_flag once;
 		LibraryHandles handles;
+		// Set when the build is over, so a request that finds it set did not wait for anyone.
+		std::atomic<bool> done {false};
 	};
 
 	// One table of entries. Entries are never erased, so a reference to one stays valid while other
@@ -144,17 +146,27 @@ private:
 			std::scoped_lock lock(table.mutex);
 			entry = &table.entries.try_emplace(key).first->second;
 		}
-		bool built_here = false;
+		// Clocks are read only when the report is on, which is the only reader of the times.
+		const bool timed      = Common::FirstRunReport::Enabled();
+		bool       built_here = false;
+		const bool finished   = entry->done.load(std::memory_order_acquire);
+		const bool waits      = timed && !finished;
+		const auto wait_start = waits ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
 		std::call_once(entry->once, [&] {
-			built_here = true;
-			const auto start = std::chrono::steady_clock::now();
+			built_here       = true;
+			const auto start = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
 			entry->handles   = build();
 			NoteBuilt(part, entry->handles.pipeline != nullptr,
-			          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
-			              .count());
+			          timed ? Common::FirstRunReport::ElapsedMs(start) : 0.0);
+			entry->done.store(true, std::memory_order_release);
 		});
 		if (!built_here) {
 			NoteHit(part, entry->handles.pipeline != nullptr);
+			// The call returned when the other thread's build finished, so the time since the start is wait.
+			if (waits) {
+				Common::FirstRunReport::LibraryPipelineScope::NoteWaited(
+				    Common::FirstRunReport::ElapsedMs(wait_start));
+			}
 		}
 		return entry->handles;
 	}

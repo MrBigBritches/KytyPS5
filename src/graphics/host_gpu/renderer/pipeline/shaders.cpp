@@ -696,10 +696,15 @@ static bool TryLinkFromLibraries(GraphicContext& graphics, DescriptorSetLayoutCa
 	if (!ShouldUseLibraries(graphics, libraries, key, stages)) {
 		return false;
 	}
+	// The row covers the layouts too, and is recorded only if the link works.
+	const auto* pixel = stages[PIXEL_STAGE_INDEX];
+	Common::FirstRunReport::LibraryPipelineScope row(stages[VERTEX_STAGE_INDEX]->id,
+	                                                 pixel != nullptr ? pixel->id : 0, GuestGpu::IsGpuThread());
 	// The link needs the full layout, which is the same one a whole pipeline would get.
 	CreateGraphicsLayouts(graphics, set_layouts, pipeline, key, stages, false);
 	layouts_ready = true;
 	if (CreatePipelineFromLibraries(graphics, *libraries, pipeline, key, stages, driver_cache)) {
+		row.Commit();
 		pipeline.from_libraries = true;
 		pipeline.linked_from    = libraries;
 		return true;

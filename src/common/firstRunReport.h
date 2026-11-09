@@ -253,6 +253,27 @@ struct PipelineLibraryStats {
 	std::array<uint32_t, FALLBACK_KIND_COUNT>        fallback_full {};
 };
 
+/// Milliseconds since a time on the steady clock.
+[[nodiscard]] double ElapsedMs(std::chrono::steady_clock::time_point start);
+
+/// One pipeline linked from libraries, with where its time went. built_ms is the time this thread
+/// spent making libraries for this pipeline, built_count of them, and built_kinds has a bit for each
+/// LibraryKind among them. waited_ms is the time spent waiting for libraries other threads were
+/// making, and link_ms the fast link. total_ms is the whole create, layouts included, so it is at
+/// least the sum of the three. A pipeline built whole after a refusal has no row.
+struct LibraryPipelineRow {
+	uint64_t vs           = 0;
+	uint64_t ps           = 0;
+	int64_t  flip         = 0;
+	Thread   thread       = Thread::Worker;
+	double   built_ms     = 0.0;
+	double   waited_ms    = 0.0;
+	double   link_ms      = 0.0;
+	double   total_ms     = 0.0;
+	uint32_t built_count  = 0;
+	uint32_t built_kinds  = 0;
+};
+
 /// Identity of the run, written at the top of the file.
 struct Metadata {
 	std::string                                title_id;
@@ -356,6 +377,10 @@ public:
 	void AddLibraryFallback(FallbackKind kind);
 	/// What the Add calls above recorded.
 	[[nodiscard]] PipelineLibraryStats LibraryStats() const;
+	/// Records one pipeline linked from libraries. The flip field is replaced by the current flip.
+	void AddLibraryPipeline(const LibraryPipelineRow& row);
+	/// Copy of the library pipeline rows, for tests.
+	[[nodiscard]] std::vector<LibraryPipelineRow> LibraryPipelines() const;
 	/// Records a miss-path translation. Only GPU-thread time during play counts as blocked.
 	void AddTranslate(Kind kind, std::string_view stage, uint64_t hash, double ms, Thread thread);
 	/// Records a driver compile. Only GPU-thread time during play counts as blocked. start_ns is
@@ -446,6 +471,7 @@ private:
 	BootInfo                     m_boot;
 	PipelineLibraryInfo          m_pipeline_library;
 	PipelineLibraryStats         m_library_stats;
+	std::vector<LibraryPipelineRow> m_library_pipelines;
 	std::array<double, 2>        m_blocked_ms {};
 	double                       m_translate_ms = 0.0;
 	double                       m_translate_gpu_graphics_ms = 0.0;
@@ -671,12 +697,46 @@ inline void AddLibraryLink(double ms) {
 	}
 }
 
+/// Records one pipeline linked from libraries.
+inline void AddLibraryPipeline(const LibraryPipelineRow& row) {
+	if (Enabled()) {
+		Global().AddLibraryPipeline(row);
+	}
+}
+
 /// Counts a pipeline built whole although libraries were asked for.
 inline void AddLibraryFallback(FallbackKind kind) {
 	if (Enabled()) {
 		Global().AddLibraryFallback(kind);
 	}
 }
+
+/// Times one pipeline built from libraries, on the thread that builds it. While it exists, the
+/// library cache adds to its row the libraries this thread makes, the time it waits for libraries
+/// other threads make, and the link. Commit records the row, so a pipeline that falls back to a
+/// whole build leaves none. With the report off it reads no clock and every call does nothing.
+class LibraryPipelineScope {
+public:
+	LibraryPipelineScope(uint64_t vs, uint64_t ps, bool on_gpu_thread);
+	~LibraryPipelineScope();
+	LibraryPipelineScope(const LibraryPipelineScope&)            = delete;
+	LibraryPipelineScope& operator=(const LibraryPipelineScope&) = delete;
+
+	/// Records the row with the time since construction as total_ms.
+	void Commit();
+	/// Adds a library this thread made for the pipeline it is building, if it is building one.
+	static void NoteBuilt(LibraryKind kind, double ms);
+	/// Adds time spent waiting for a library another thread made.
+	static void NoteWaited(double ms);
+	/// Adds the time of the link.
+	static void NoteLink(double ms);
+
+private:
+	bool                                  m_active;
+	LibraryPipelineRow                    m_row;
+	std::chrono::steady_clock::time_point m_start;
+	LibraryPipelineScope*                 m_previous = nullptr;
+};
 
 /// Times a shader translation from construction to destruction and records it. Declare it where
 /// the cache miss begins. Costs one relaxed load when the report is off.

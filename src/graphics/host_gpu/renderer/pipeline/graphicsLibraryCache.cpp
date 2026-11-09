@@ -64,6 +64,7 @@ void GraphicsLibraryCache::NoteBuilt(LibraryPart part, bool succeeded, double ms
 	if (succeeded) {
 		m_built[index]++;
 		Common::FirstRunReport::AddLibraryBuilt(ReportKind(part), ms);
+		Common::FirstRunReport::LibraryPipelineScope::NoteBuilt(ReportKind(part), ms);
 	} else {
 		m_failed[index]++;
 		Common::FirstRunReport::AddLibraryFailed(ReportKind(part));
@@ -81,6 +82,7 @@ void GraphicsLibraryCache::NoteHit(LibraryPart part, bool usable) {
 }
 
 void GraphicsLibraryCache::NoteLink(double ms) {
+	Common::FirstRunReport::LibraryPipelineScope::NoteLink(ms);
 	m_links++;
 	m_live_links++;
 	g_total_links++;

@@ -1197,6 +1197,43 @@
     std::printf("[gpu]     %-32s ok (create infos)\n", name);
   }
 
+  // The report keeps one row for each pipeline linked from libraries, with what its thread built. A
+  // pipeline whose libraries are all new builds the vertex input, pre-rasterization, fragment shader and
+  // output libraries itself, so its row has four and a build time. A second pipeline that shares all but
+  // the pixel shader builds only that fragment library, and a third that shares everything builds none
+  // and waits for none. What else could give two or more stage libraries is a row that counts the
+  // libraries it was given, which the second and third rows rule out.
+  void CheckLibraryPipelineRows() {
+    constexpr const char *name = "GraphicsLibraryRows";
+    using Common::FirstRunReport::LibraryKind;
+    constexpr uint32_t pre_raster = 1u << static_cast<uint32_t>(LibraryKind::PreRaster);
+    constexpr uint32_t fragment = 1u << static_cast<uint32_t>(LibraryKind::Fragment);
+    LibraryReportScope report;
+    LibraryRig rig(*this);
+    SplitLayoutScope mode(*this, true);
+    const auto key = LibraryBaseKey(LibraryCase{});
+    (void)rig.Build(key, rig.shaders.vertex, &rig.shaders.pixel[0], true);
+    (void)rig.Build(key, rig.shaders.vertex, &rig.shaders.pixel[1], true);
+    (void)rig.Build(key, rig.shaders.vertex, &rig.shaders.pixel[1], true);
+    const auto rows = Common::FirstRunReport::Global().LibraryPipelines();
+    Require(name, "one row each", rows.size() == 3, "there was not one row for each linked pipeline");
+    const auto &first = rows[0], &second = rows[1], &third = rows[2];
+    Require(name, "all new", first.built_count == 4 && (first.built_kinds & (pre_raster | fragment)) == (pre_raster | fragment) &&
+                                 first.built_ms > 0.0 && first.waited_ms == 0.0,
+            "a pipeline with all new libraries did not build its two stage libraries and the rest itself");
+    Require(name, "times", first.link_ms > 0.0 && first.total_ms >= first.built_ms + first.link_ms &&
+                               first.vs == rig.shaders.vertex.id && first.ps == rig.shaders.pixel[0].id &&
+                               first.thread == Common::FirstRunReport::Thread::Worker,
+            "the row did not name its shaders and thread, or its times do not add up");
+    Require(name, "only its own", second.built_count == 1 && second.built_kinds == fragment && second.built_ms > 0.0 &&
+                                      second.waited_ms == 0.0,
+            "a pipeline sharing all but its pixel shader did not build only the fragment library");
+    Require(name, "shared", third.built_count == 0 && third.built_ms == 0.0 && third.built_kinds == 0 &&
+                                third.waited_ms == 0.0 && third.link_ms > 0.0,
+            "a pipeline sharing everything built or waited for a library, or was not linked");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   // All the tests of the libraries. The device part needs rasterization features and the library.
   void CheckGraphicsLibraries() {
     constexpr const char *name = "GraphicsLibraries";
@@ -1208,6 +1245,7 @@
     CheckLibraryDynamicStates();
     CheckLibraryCreateInfoDynamicStates();
     CheckLibraryDedup();
+    CheckLibraryPipelineRows();
     CheckLibraryEquivalence();
     CheckLibraryConcurrency();
     CheckLibraryFallback();

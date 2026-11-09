@@ -190,7 +190,9 @@ bool LinkLibraries(GraphicContext& graphics, vk::PipelineCache driver_cache,
 	vk::GraphicsPipelineCreateInfo info {};
 	info.pNext  = &link;
 	info.layout = pipeline.pipeline_layout;
-	const auto start  = std::chrono::steady_clock::now();
+	// The clock is read only when the report is on, which is the only reader of the time.
+	const bool timed  = Common::FirstRunReport::Enabled();
+	const auto start  = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
 	auto       result = vk::Result::eErrorInitializationFailed;
 	if (!LibraryStepShouldFail(LibraryStep::Link)) {
 		result = graphics.device.createGraphicsPipelines(driver_cache, 1, &info, nullptr, &pipeline.pipeline);
@@ -200,8 +202,7 @@ bool LinkLibraries(GraphicContext& graphics, vk::PipelineCache driver_cache,
 		pipeline.pipeline = nullptr;
 		return false;
 	}
-	cache.NoteLink(
-	    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+	cache.NoteLink(timed ? Common::FirstRunReport::ElapsedMs(start) : 0.0);
 	return true;
 }
 
