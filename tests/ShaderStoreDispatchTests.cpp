@@ -7,6 +7,7 @@
 #include "common/childProcess.h"
 #include "common/common.h"
 #include "common/crashUi.h"
+#include "graphics/shader/storegen/progressLog.h"
 #include "graphics/shader/storegen/shaderStoreWorker.h"
 #include "graphics/shader/storegen/storeWorkerFormat.h"
 #include "graphics/shader/storegen/workerProcess.h"
@@ -208,6 +209,17 @@ int StatusOf(int code) {
 #endif
 }
 
+// Reads a real worker's progress log from its first byte with the reader the supervisor uses. A
+// line the reader does not take is counted, so none may be: this is what notices that the worker's
+// log format and the parser have drifted apart.
+ProgressLogReader ReadRealLog(const WorkerRequest& request) {
+	ProgressLogReader reader(PathFromUtf8(request.progress_path));
+	reader.BeginSpawnAt(0, ProgressClock::now());
+	reader.PollToEnd(ProgressClock::now());
+	CHECK(reader.MalformedLines() == 0);
+	return reader;
+}
+
 // A request that cannot be read is answered with 11, and a missing request file too.
 void TestBadRequest() {
 	TempDirectory directory;
@@ -253,6 +265,11 @@ void TestMinimalRequestFinishes() {
 	                                            ComputeEbootIdentity(TINY_EBOOT_BYTES, {}));
 	CHECK(ReadFile(PathFromUtf8(request.output_path)) == expected);
 	CHECK(ReadText(TextFileOf(request)).starts_with(EARLIER_TEXT));
+	// No program means no predict, start or drop line, and the run still ends with its summary.
+	const auto log = ReadRealLog(request);
+	CHECK(log.KindCount(ProgressKind::Summary) == 1 && log.Summary() &&
+	      log.Summary()->exit_code == 0);
+	CHECK(log.KindCount(ProgressKind::Predict) == 0 && log.KindCount(ProgressKind::Start) == 0);
 }
 
 // What the worker prints lands in the text file, after what an earlier run left, and so does the
@@ -272,6 +289,15 @@ void TestRecompilerExitIsCaptured() {
 	CHECK(text.starts_with(EARLIER_TEXT));
 	CHECK(text.find(EXIT_TEXT_MARK) != std::string::npos);
 	CHECK(text.find(RECOMPILER_LOG_MARK) != std::string::npos);
+	// The program is translated while it is predicted, so the run ends at its predict line, which
+	// is the last line and the one that blames it. It never got to an order, a start or the
+	// summary.
+	const auto crash_log = ReadRealLog(crash);
+	CHECK(crash_log.KindCount(ProgressKind::Predict) >= 1);
+	CHECK(crash_log.LastLine() && crash_log.LastLine()->kind == ProgressKind::Predict);
+	CHECK(crash_log.KindCount(ProgressKind::Order) == 0 && !crash_log.LatestOrder());
+	CHECK(crash_log.KindCount(ProgressKind::Start) == 0 && !crash_log.LastStart());
+	CHECK(crash_log.KindCount(ProgressKind::Summary) == 0 && !crash_log.Summary());
 
 	const fs::path plain_eboot = directory / "plain.eboot";
 	WriteFile(plain_eboot, BuildEboot({ProgramSmall()}));
@@ -284,6 +310,12 @@ void TestRecompilerExitIsCaptured() {
 	// leave none of this in the file. The EXIT text is the crash's alone.
 	CHECK(plain_text.find(RECOMPILER_LOG_MARK) != std::string::npos);
 	CHECK(plain_text.find(EXIT_TEXT_MARK) == std::string::npos);
+	// The same program without the crash gets as far as the summary.
+	const auto plain_log = ReadRealLog(plain);
+	CHECK(plain_log.KindCount(ProgressKind::Predict) >= 1 &&
+	      plain_log.KindCount(ProgressKind::Order) >= 1);
+	CHECK(plain_log.KindCount(ProgressKind::Start) >= 1);
+	CHECK(plain_log.KindCount(ProgressKind::Summary) == 1 && plain_log.Summary());
 }
 
 // A worker whose parent is already gone ends at once, from EnterChildMode, and never runs. The

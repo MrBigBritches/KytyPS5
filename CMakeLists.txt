@@ -725,6 +725,15 @@ add_executable(shader_store_tailer_tests EXCLUDE_FROM_ALL
 target_link_libraries(shader_store_tailer_tests common fmt::fmt xbyak::xbyak xxhash libzstd_static)
 target_include_directories(shader_store_tailer_tests PRIVATE ${inc_headers})
 
+# The reader of a store worker's progress log. It reads text lines through Common::File and needs no
+# graphics device.
+add_executable(shader_store_progress_log_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ShaderStoreProgressLogTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/storegen/progressLog.cpp"
+)
+target_link_libraries(shader_store_progress_log_tests common fmt::fmt)
+target_include_directories(shader_store_progress_log_tests PRIVATE ${inc_headers})
+
 # The store worker translates and compiles real programs, so this links the whole recompiler. It
 # still needs no graphics device and none of the emulator's libraries, so it does not build the
 # emulator's sources as the full emulator tests do.
@@ -764,6 +773,7 @@ endif()
 add_executable(shader_store_dispatch_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ShaderStoreDispatchTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/storegen/storeWorkerFormat.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/storegen/progressLog.cpp"
 )
 add_dependencies(shader_store_dispatch_tests kyty_emulator)
 target_compile_definitions(shader_store_dispatch_tests PRIVATE
@@ -942,6 +952,7 @@ if(BUILD_TESTING)
 	add_test(NAME shader_store_keys COMMAND $<TARGET_FILE:shader_store_keys_tests>)
 	add_test(NAME shader_store_record COMMAND $<TARGET_FILE:shader_store_record_tests>)
 	add_test(NAME shader_store_tailer COMMAND $<TARGET_FILE:shader_store_tailer_tests>)
+	add_test(NAME shader_store_progress_log COMMAND $<TARGET_FILE:shader_store_progress_log_tests>)
 	add_test(NAME shader_store_worker COMMAND $<TARGET_FILE:shader_store_worker_tests>)
 	add_test(NAME shader_store_dispatch COMMAND $<TARGET_FILE:shader_store_dispatch_tests>)
 	set_tests_properties(shader_store_dispatch PROPERTIES TIMEOUT 300)
@@ -1078,6 +1089,7 @@ if(BUILD_TESTING)
 		shader_store_keys_tests
 		shader_store_record_tests
 		shader_store_tailer_tests
+		shader_store_progress_log_tests
 		shader_store_worker_tests
 		shader_store_dispatch_tests
 		virtual_memory_allocation_tests
