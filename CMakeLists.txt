@@ -706,6 +706,39 @@ add_executable(shader_store_record_tests EXCLUDE_FROM_ALL
 target_link_libraries(shader_store_record_tests common fmt::fmt xbyak::xbyak xxhash libzstd_static)
 target_include_directories(shader_store_record_tests PRIVATE ${inc_headers})
 
+# The store worker translates and compiles real programs, so this links the whole recompiler. It
+# still needs no graphics device and none of the emulator's libraries, so it does not build the
+# emulator's sources as the full emulator tests do.
+file(GLOB shader_store_worker_recompiler_src CONFIGURE_DEPENDS
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/*.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/frontend/cfg/*.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/frontend/decode/*.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/frontend/translate/*.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/backend/spirv/*.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/*.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/opcodes/*.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/*.cpp"
+)
+file(GLOB shader_store_worker_storegen_src CONFIGURE_DEPENDS
+	"${KYTY_SOURCE_DIR}/graphics/shader/storegen/*.cpp"
+)
+add_executable(shader_store_worker_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ShaderStoreWorkerTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/csRegisters.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/gpu_format.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/moduleId.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/shaderPixelParameter.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/shaderStaticKey.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/shaderStoreRecord.cpp"
+	${shader_store_worker_storegen_src}
+	${shader_store_worker_recompiler_src}
+)
+target_link_libraries(shader_store_worker_tests common Vulkan::Headers fmt::fmt xxhash xbyak::xbyak spirv-tools-opt spirv-tools libzstd_static)
+target_include_directories(shader_store_worker_tests PRIVATE ${inc_headers})
+if (KYTY_CLANG_CL)
+	set_source_files_properties(${shader_store_worker_recompiler_src} PROPERTIES COMPILE_FLAGS "-Wno-pragma-pack -Wno-deprecated-declarations -D_TIMESPEC_DEFINED")
+endif()
+
 set(gpu_test_generated_dir "${PROJECT_BINARY_DIR}/gpu_test_shaders")
 set(gpu_test_ms_depth_source
 	"${gpu_tiler_shader_dir}/gpu_test_ms_depth.comp")
@@ -875,6 +908,7 @@ if(BUILD_TESTING)
 	add_test(NAME shader_store_predictor COMMAND $<TARGET_FILE:shader_store_predictor_tests>)
 	add_test(NAME shader_store_keys COMMAND $<TARGET_FILE:shader_store_keys_tests>)
 	add_test(NAME shader_store_record COMMAND $<TARGET_FILE:shader_store_record_tests>)
+	add_test(NAME shader_store_worker COMMAND $<TARGET_FILE:shader_store_worker_tests>)
 	add_test(NAME shader_recompiler_submit_cadence
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --submit-cadence-only)
 	add_test(NAME shader_recompiler_submit_cadence_gpu
@@ -1007,6 +1041,7 @@ if(BUILD_TESTING)
 		shader_store_predictor_tests
 		shader_store_keys_tests
 		shader_store_record_tests
+		shader_store_worker_tests
 		virtual_memory_allocation_tests
 		audio_out2_port_tests
 		audio_out_timing_tests
