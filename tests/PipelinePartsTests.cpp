@@ -375,6 +375,76 @@ void TestGplEligible() {
 	Check(GplEligible(depth_only.key, depth_stages), "a depth-only pipeline must be eligible");
 }
 
+// A module made of a header and the given instructions, to feed MoveDescriptorSet. Each
+// instruction is its opcode and operands, and the word count is added here.
+std::vector<uint32_t> MakeModule(const std::vector<std::vector<uint32_t>>& instructions) {
+	constexpr uint32_t magic = 0x07230203u, version = 0x00010500u, id_bound = 100u, length_shift = 16u;
+	std::vector<uint32_t> words {magic, version, 0u, id_bound, 0u};
+	for (const auto& instruction: instructions) {
+		words.push_back((static_cast<uint32_t>(instruction.size()) << length_shift) | instruction[0]);
+		words.insert(words.end(), instruction.begin() + 1, instruction.end());
+	}
+	return words;
+}
+
+// Moving a set rewrites the DescriptorSet decorations with that value, and only those. The module
+// has the decorations of two sets, a binding decoration with a set-like value, a constant whose
+// literal is the decoration number and the set number, and a decoration of another kind. A walk that
+// edited a word because of its value would change the constant or the binding.
+void TestMoveDescriptorSet() {
+	constexpr uint32_t op_decorate = 71, op_constant = 43, set_decoration = 34, binding_decoration = 33;
+	constexpr uint32_t emitted_set = 0, heap_set = 1, pixel_set = 2;
+	const auto module = MakeModule({
+	    {op_decorate, 10, set_decoration, emitted_set},
+	    {op_decorate, 11, binding_decoration, emitted_set},
+	    {op_decorate, 12, set_decoration, heap_set},
+	    {op_decorate, 13, set_decoration, emitted_set},
+	    {op_constant, 1, 14, set_decoration, emitted_set},
+	    {op_decorate, 15, 3u},
+	});
+	const auto moved = MoveDescriptorSet(module, emitted_set, pixel_set);
+	std::size_t changed = 0;
+	Check(moved.size() == module.size(), "the patched module changed size");
+	for (std::size_t word = 0; word < module.size(); ++word) {
+		changed += module[word] != moved[word];
+	}
+	Check(changed == 2, "exactly the two set 0 decorations must change");
+	// The header is 5 words, then the four-word decorations start at 5, 9, 13 and 17, and the
+	// constant at 21. The set value of a decoration is its last word.
+	Check(moved[8] == pixel_set && moved[20] == pixel_set,
+	      "the set 0 decorations must become the pixel set");
+	Check(moved[16] == heap_set, "the set 1 decoration must stay");
+	Check(moved[12] == emitted_set, "a binding decoration with the value of the set must stay");
+	Check(moved[25] == emitted_set, "a constant with the value of the set must stay");
+	// Moving a set that no decoration has changes nothing.
+	Check(MoveDescriptorSet(module, 7, pixel_set) == module, "a set no decoration has changed a word");
+	// A module whose last instruction is a set 0 decoration cut one word short has nothing returned,
+	// so no half walked copy is used. The same module whole is patched, which is its baseline.
+	auto cut = MakeModule({{op_decorate, 10, set_decoration, emitted_set}});
+	Check(TryMoveDescriptorSet(cut, emitted_set, pixel_set).has_value(), "a whole module was refused");
+	cut.pop_back();
+	Check(!TryMoveDescriptorSet(cut, emitted_set, pixel_set).has_value(),
+	      "a cut module was returned, patched or not");
+	auto no_magic = module;
+	no_magic[0] = 0;
+	Check(!TryMoveDescriptorSet(no_magic, emitted_set, pixel_set).has_value(),
+	      "a module without the SPIR-V magic was walked");
+}
+
+// The layouts of the split layout go to the slots the SPIR-V hard-codes. Fake handles tell them
+// apart, so a layout in another slot fails without a device.
+void TestSplitSetLayouts() {
+	const auto handle = [](uintptr_t value) {
+		return vk::DescriptorSetLayout(reinterpret_cast<VkDescriptorSetLayout>(value));
+	};
+	const auto layouts = SplitSetLayouts(handle(0x10), handle(0x20), handle(0x30));
+	Check(layouts.size() == SPLIT_SET_COUNT, "the split layout must have three sets");
+	Check(layouts[SPLIT_VERTEX_SET] == handle(0x10), "the VS set must be at its slot");
+	Check(layouts[ShaderRecompiler::IR::ImageHeapSet] == handle(0x20),
+	      "the image heap layout must be at the heap set the SPIR-V names");
+	Check(layouts[SPLIT_PIXEL_SET] == handle(0x30), "the PS set must be at its slot");
+}
+
 } // namespace
 
 int main() {
@@ -383,6 +453,8 @@ int main() {
 	TestEveryFieldReachesTheRightParts();
 	TestSharing();
 	TestGplEligible();
+	TestMoveDescriptorSet();
+	TestSplitSetLayouts();
 	std::printf("PipelinePartsTests: ok\n");
 	return 0;
 }

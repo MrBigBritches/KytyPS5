@@ -389,6 +389,7 @@ ShaderModule& PipelineCache::CompileModule(Program& program, const ProgramKey& k
 	auto& module = program.modules.emplace_back(ShaderModule {
 	    .id             = id,
 	    .module         = CompileSPV(result.spirv, m_graphics.device),
+	    .gpl_module     = CompileSplitPixelModule(m_graphics, key.stage, result.spirv),
 	    .info           = std::move(info),
 	    .specialization = program.specialization,
 	    .function_code  = {function_code.begin(), function_code.end()},
@@ -559,9 +560,7 @@ PipelineCache::~PipelineCache() {
 	Save();
 	auto destroy = [this](const auto& pipelines) {
 		for (const auto& pipeline: pipelines | std::views::values) {
-			m_graphics.device.destroyPipeline(pipeline.pipeline, nullptr);
-			m_graphics.device.destroyPipelineLayout(pipeline.pipeline_layout, nullptr);
-			m_graphics.device.destroyDescriptorSetLayout(pipeline.descriptor_set_layout, nullptr);
+			DestroyPipelineObjects(m_graphics.device, pipeline);
 		}
 	};
 	destroy(m_graphics_pipelines);
@@ -569,6 +568,7 @@ PipelineCache::~PipelineCache() {
 	for (const auto& program: m_program_cache | std::views::values) {
 		for (const auto& module: program.modules) {
 			m_graphics.device.destroyShaderModule(module.module, nullptr);
+			m_graphics.device.destroyShaderModule(module.gpl_module, nullptr);
 		}
 	}
 	m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
@@ -1277,7 +1277,7 @@ PipelineCache::GraphicsBuild::GraphicsBuild(const GraphicsPipelineKey& request_k
                                             const Stages&              request_stages)
     : key(request_key), stages(request_stages), requested(std::chrono::steady_clock::now()) {}
 
-const char* PipelineCache::DeferBlocker(const Stages&             stages,
+const char* PipelineCache::DeferBlocker(const GraphicsPipelineKey& key, const Stages& stages,
                                         const PipelineSkipPolicy* policy) const {
 	// A shared heap set is bound in the buffer a draw is met in, which the hole's buffer lacks.
 	const bool heap = std::ranges::any_of(stages, [](const ShaderModule* stage) {
@@ -1289,7 +1289,9 @@ const char* PipelineCache::DeferBlocker(const Stages&             stages,
 	// A hole writes its descriptors when it is recorded, so a set would be allocated and written
 	// during the resolve. That is opt in, and without it only pushed descriptors are deferred. The
 	// layout code predicts which this draw gets, since its layout does not exist before the build.
-	if (!Config::DeferredNonPushDrawsEnabled() && !PredictPushDescriptors(m_graphics, stages)) {
+	// With the split layout every draw whose VS has bindings gets a set, so the key is asked too.
+	if (!Config::DeferredNonPushDrawsEnabled() &&
+	    !PredictPushDescriptors(m_graphics, key, stages)) {
 		return "non_push";
 	}
 	return policy != nullptr ? policy->DeferBlocker() : "unsupported";
@@ -1313,14 +1315,15 @@ void PipelineCache::ReportDeferredWouldSkip() {
 	m_would_skip.clear();
 }
 
-DrawFate PipelineCache::ChooseMissedDrawFate(const Stages& stages, const PipelineSkipPolicy* policy,
+DrawFate PipelineCache::ChooseMissedDrawFate(const GraphicsPipelineKey& key, const Stages& stages,
+                                             const PipelineSkipPolicy* policy,
                                              const DeferredDraw* deferred, bool& may_skip,
                                              const char*& blocker) {
 	// The S2 rules are only asked when skips are on. A flag-only run must neither skip nor pay for
 	// their history checks.
 	may_skip = Config::AsyncPipelinesEnabled() && policy != nullptr && policy->MaySkip();
 	const bool wants_defer = deferred != nullptr && Config::DeferredPipelineDrawsEnabled();
-	blocker                = wants_defer ? DeferBlocker(stages, policy) : nullptr;
+	blocker                = wants_defer ? DeferBlocker(key, stages, policy) : nullptr;
 	// The counter says the draw could not be deferred, so a draw that a skip takes instead is in it.
 	if (blocker != nullptr) {
 		Common::FirstRunReport::AddDeferredIneligible(blocker);
@@ -1352,7 +1355,7 @@ PipelineCache::Pipeline* PipelineCache::AcquireBuiltPipeline(const GraphicsPipel
 		missed.start = std::chrono::steady_clock::now();
 	}
 	bool       may_skip = false;
-	const auto fate     = ChooseMissedDrawFate(stages, policy, deferred, may_skip, missed.blocker);
+	const auto fate     = ChooseMissedDrawFate(key, stages, policy, deferred, may_skip, missed.blocker);
 	if (pending == m_pending_graphics.end()) {
 		DumpPipelineInputs(state);
 		if (fate == DrawFate::Block) {
@@ -1695,9 +1698,7 @@ void PipelineCache::StopWarmBuilds() {
 	// that never ran owns none. Each finished one marked the driver cache when it was built, so the
 	// save that follows keeps its work.
 	for (const auto& pipeline: stopped.unadopted) {
-		m_graphics.device.destroyPipeline(pipeline.pipeline, nullptr);
-		m_graphics.device.destroyPipelineLayout(pipeline.pipeline_layout, nullptr);
-		m_graphics.device.destroyDescriptorSetLayout(pipeline.descriptor_set_layout, nullptr);
+		DestroyPipelineObjects(m_graphics.device, pipeline);
 	}
 	m_warm_compute.reset();
 }
@@ -1714,9 +1715,7 @@ void PipelineCache::StopBuilds() {
 	// that never ran owns none.
 	for (const auto& pending: m_pending_graphics | std::views::values) {
 		const auto& pipeline = pending.build->pipeline;
-		m_graphics.device.destroyPipeline(pipeline.pipeline, nullptr);
-		m_graphics.device.destroyPipelineLayout(pipeline.pipeline_layout, nullptr);
-		m_graphics.device.destroyDescriptorSetLayout(pipeline.descriptor_set_layout, nullptr);
+		DestroyPipelineObjects(m_graphics.device, pipeline);
 	}
 	m_pending_graphics.clear();
 	{

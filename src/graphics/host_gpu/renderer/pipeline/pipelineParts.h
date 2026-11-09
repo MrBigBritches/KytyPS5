@@ -12,6 +12,8 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
+#include <span>
 #include <type_traits>
 #include <vector>
 
@@ -148,6 +150,28 @@ struct PartKeyHash {
 // built whole.
 [[nodiscard]] bool GplEligible(const GraphicsPipelineKey&                 key,
                                const std::array<const ShaderModule*, 4>& stages);
+
+// The descriptor set that the SPIR-V emitter gives every resource except the image heap.
+inline constexpr uint32_t EMITTED_DESCRIPTOR_SET = 0;
+
+// Returns a copy of `code` in which every DescriptorSet decoration with the value `from_set` has the
+// value `to_set`. Nothing else changes, so the image heap, which sits in another set, stays where it
+// is, and the copy has as many words as the original. Returns nothing if `code` has no SPIR-V magic
+// number or an instruction runs past its end, since a partly walked module must not be used.
+[[nodiscard]] std::optional<std::vector<uint32_t>>
+TryMoveDescriptorSet(std::span<const uint32_t> code, uint32_t from_set, uint32_t to_set);
+
+// Like TryMoveDescriptorSet, but stops the process on a module that cannot be walked. The split
+// layout moves the PS bindings out of set 0 this way, so the VS and the PS can have sets of their own.
+[[nodiscard]] std::vector<uint32_t> MoveDescriptorSet(std::span<const uint32_t> code,
+                                                      uint32_t from_set, uint32_t to_set);
+
+// The set layouts of a split pipeline layout in set order, with the VS set at SPLIT_VERTEX_SET, the
+// image heap at ImageHeapSet and the PS set at SPLIT_PIXEL_SET. The heap number is hard-coded in the
+// SPIR-V, so a layout in the wrong slot would make shaders read another set.
+[[nodiscard]] std::array<vk::DescriptorSetLayout, SPLIT_SET_COUNT>
+SplitSetLayouts(vk::DescriptorSetLayout vertex, vk::DescriptorSetLayout heap,
+                vk::DescriptorSetLayout pixel);
 
 // A member of this type makes the struct that holds it non-copyable and non-movable. The part
 // structs below point into themselves with pNext and array pointers, so a copy would point into

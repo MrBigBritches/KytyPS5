@@ -85,8 +85,8 @@ template <class S, class Key> void IoKey(S& io, Key& key) {
 
 template <class S, class Module> void IoModule(S& io, Module& stage) {
 	// The handle comes from the SPIR-V; stored programs have no function code.
-	auto& [id, handle, info, specialization, function_code, vertex_formats, rect_parameters,
-	       mesh_task] = stage;
+	auto& [id, handle, gpl_handle, info, specialization, function_code, vertex_formats,
+	       rect_parameters, mesh_task] = stage;
 	IoAll(io, id, info, specialization, vertex_formats, rect_parameters, mesh_task);
 }
 
@@ -287,7 +287,8 @@ bool PipelineCache::LoadRecord(std::span<const uint8_t>& records) {
 				m_program_cache.erase(program);
 				return false;
 			}
-			module.module = CompileSPV(spirv, m_graphics.device);
+			module.module     = CompileSPV(spirv, m_graphics.device);
+			module.gpl_module = CompileSplitPixelModule(m_graphics, program->first.stage, spirv);
 			m_module_record_order.push_back(module.id);
 			program->second.modules.push_back(std::move(module));
 			break;

@@ -117,8 +117,10 @@
 
   // Makes the rig's vertex shader one that reads guest memory by address, which binds the BDA page
   // table and the fault buffer. What it reads is zero, added to a position, so the picture is the
-  // same. Another read address makes another shader. Returns the shader it replaced.
-  uint64_t UseAddressVertex(AsyncDrawRig &rig, uint64_t read_offset) {
+  // same. Another read address makes another shader. Returns the shader it replaced. With `scale`
+  // the read value multiplies the position instead, so the draw covers the target only if the
+  // shader read what the test wrote there.
+  uint64_t UseAddressVertex(AsyncDrawRig &rig, uint64_t read_offset, bool scale = false) {
     const uint64_t read_address = AsyncBase + read_offset;
     static std::map<uint64_t, std::vector<u32>> shaders;
     auto &code = shaders[read_address];
@@ -133,7 +135,8 @@
       AppendVMovLiteral(&code, 9, static_cast<u32>(read_address >> 32u));
       code.push_back(EncodeFlat0(0x0c, 0));
       code.push_back(EncodeFlat1(5, 0x7d, 0, 8));
-      code.push_back(EncodeVop2(0x03, 3, Vgpr(5), 3));
+      code.push_back(EncodeVop2(scale ? 0x08 : 0x03, 3, Vgpr(5), 3));
+      if (scale) code.push_back(EncodeVop2(0x08, 4, Vgpr(5), 4));
       AppendVMovU32(&code, 0, 0);
       AppendVMovLiteral(&code, 6, 0x3f800000u);
       code.push_back(EncodeExp0(0x0c, 0xf));
@@ -153,6 +156,54 @@
     const auto rig_vertex = rig.shaders.GetVs().es_regs.data_addr;
     rig.shaders.SetEsShaderBase(address);
     return rig_vertex;
+  }
+
+  // The code of a pixel shader that writes the rig's gray plus the word at `read_address`.
+  static std::vector<u32> AddressPixelCode(uint64_t read_address) {
+    std::vector<u32> code;
+    AppendVMovLiteral(&code, 1, 0x3e800000u);
+    AppendVMovLiteral(&code, 2, 0x3f800000u);
+    AppendVMovLiteral(&code, 8, static_cast<u32>(read_address));
+    AppendVMovLiteral(&code, 9, static_cast<u32>(read_address >> 32u));
+    code.push_back(EncodeFlat0(0x0c, 0));
+    code.push_back(EncodeFlat1(5, 0x7d, 0, 8));
+    code.push_back(EncodeVop2(0x03, 1, Vgpr(5), 1));
+    code.push_back(EncodeExp0(0x00, 0xf));
+    code.push_back(EncodeExp1(1, 1, 1, 2));
+    AppendEnd(&code);
+    return code;
+  }
+
+  // Makes the rig's pixel shader one that reads guest memory by address, which binds the BDA page
+  // table and the fault buffer in the pixel stage. It writes the rig's gray plus what it reads, and
+  // what it reads is zero unless a test wrote there, so the picture is the same. Another read
+  // address makes another shader. Returns the shader it replaced.
+  uint64_t UseAddressPixel(AsyncDrawRig &rig, uint64_t read_offset) {
+    const uint64_t read_address = AsyncBase + read_offset;
+    static std::map<uint64_t, std::vector<u32>> shaders;
+    auto &code = shaders[read_address];
+    if (code.empty()) code = AddressPixelCode(read_address);
+    const auto address = reinterpret_cast<uint64_t>(code.data());
+    ShaderMapUserData(address, {.type = Prospero::ShaderBinaryType::kPs,
+                                .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
+    const auto rig_pixel = rig.shaders.GetPs().ps_regs.data_addr;
+    rig.shaders.SetPsShaderBase(address);
+    return rig_pixel;
+  }
+
+  // The stage of the rig that reads guest memory by address, which gives that stage descriptors.
+  enum class AddressStage { Vertex, Pixel };
+
+  // Makes the given stage read guest memory by address, and returns the shader it replaced.
+  uint64_t UseAddressStage(AsyncDrawRig &rig, AddressStage stage, uint64_t read_offset) {
+    return stage == AddressStage::Vertex ? UseAddressVertex(rig, read_offset)
+                                         : UseAddressPixel(rig, read_offset);
+  }
+
+  // Puts back the shader UseAddressStage replaced.
+  static void RestoreAddressStage(AsyncDrawRig &rig, AddressStage stage, uint64_t replaced) {
+    if (stage == AddressStage::Vertex) rig.shaders.SetEsShaderBase(replaced);
+    else rig.shaders.SetPsShaderBase(replaced);
   }
 
   // Draws with the address vertex shader. The device's limit on push descriptors is set as given
@@ -924,13 +975,16 @@
 
   // The commands of the address vertex draw with no push descriptors allowed, so its descriptors go
   // in a set. With `hole` the draw is split into a hole and recorded at the flush.
-  std::vector<std::string> RecordNonPushDrawStream(const char *name, bool hole) {
+  // `stage` is the stage that reads by address, so under the split layout the set can be the VS
+  // set or the PS set.
+  std::vector<std::string> RecordNonPushDrawStream(const char *name, bool hole,
+                                                   AddressStage stage = AddressStage::Vertex) {
     AsyncDrawRig rig(*this, false);
     if (hole) CommandSchedulerTestAccess::AllowThisThread(rig.Scheduler());
     auto &graphics = rig.context->GetGraphics();
     const auto device_limit = graphics.max_push_descriptors;
     graphics.max_push_descriptors = 0;
-    const auto rig_vertex = UseAddressVertex(rig, NonPushStreamReadOffset);
+    const auto replaced = UseAddressStage(rig, stage, NonPushStreamReadOffset);
     rig.PaintSentinels();
     CommandStream::Recorder::Reset(true);
     if (hole) {
@@ -944,7 +998,7 @@
     rig.Scheduler().Flush();
     auto rows = CommandStream::Recorder::rows;
     CommandStream::Recorder::active = false;
-    rig.shaders.SetEsShaderBase(rig_vertex);
+    RestoreAddressStage(rig, stage, replaced);
     graphics.max_push_descriptors = device_limit;
     return rows;
   }
@@ -953,11 +1007,11 @@
   // two barriers of a hole added, as HoleRecordedStream shows for pushed descriptors. The set is
   // bound inside the hole's buffer, between its barriers, and nothing is pushed. A hole that bound
   // its set in the segment, or not at all, fails.
-  void CheckHoleRecordedStreamNonPush() {
+  void CheckHoleRecordedStreamNonPush(AddressStage stage = AddressStage::Vertex) {
     constexpr const char *name = "HoleRecordedStreamNonPush";
     CommandStream::Scope hooks;
-    const auto blocking = RecordNonPushDrawStream(name, false);
-    const auto rows = RecordNonPushDrawStream(name, true);
+    const auto blocking = RecordNonPushDrawStream(name, false, stage);
+    const auto rows = RecordNonPushDrawStream(name, true, stage);
     std::vector<std::string> without_barriers;
     std::vector<size_t> barrier_places;
     for (size_t index = 0; index < rows.size(); ++index) {

@@ -69,7 +69,10 @@ struct AddressBufferInfos {
 // write that runs while another is half done can never share its arrays.
 struct DescriptorScratch {
 	std::vector<vk::DescriptorImageInfo> images;
+	// The writes of the single set, or of the VS set (set 0) of the split layout.
 	std::vector<vk::WriteDescriptorSet>  writes;
+	// The writes of the PS set (set 2) of the split layout. Empty with the single set.
+	std::vector<vk::WriteDescriptorSet>  pixel_writes;
 };
 
 [[nodiscard]] vk::DescriptorType

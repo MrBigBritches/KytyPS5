@@ -278,9 +278,7 @@
       const std::array<const ShaderModule *, 4> stages {&vertex, nullptr, nullptr,
                                                         item.with_pixel ? &pixel : nullptr};
       CreatePipelineInternal(graphics, pipeline, item.key, stages, nullptr);
-      m_device.destroyPipeline(pipeline.pipeline, nullptr);
-      m_device.destroyPipelineLayout(pipeline.pipeline_layout, nullptr);
-      m_device.destroyDescriptorSetLayout(pipeline.descriptor_set_layout, nullptr);
+      DestroyPipelineObjects(m_device, pipeline);
     }
     SetGraphicsCreateInfoObserver(nullptr);
     graphics.attachment_feedback_loop_enabled = feedback_loop;

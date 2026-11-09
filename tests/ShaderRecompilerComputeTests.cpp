@@ -1248,9 +1248,7 @@ struct PipelineCacheTestAccess {
   static void RetireToBackground(PipelineCache &cache, const GraphicsPipelineKey &key) {
     const auto found = cache.m_graphics_pipelines.find(key);
     auto &device = cache.m_graphics.device;
-    device.destroyPipeline(found->second.pipeline, nullptr);
-    device.destroyPipelineLayout(found->second.pipeline_layout, nullptr);
-    device.destroyDescriptorSetLayout(found->second.descriptor_set_layout, nullptr);
+    DestroyPipelineObjects(device, found->second);
     cache.m_graphics_pipelines.erase(found);
     const auto modules = cache.MapModules();
     PipelineCache::Stages stages{};
@@ -1315,6 +1313,50 @@ struct PipelineCacheTestAccess {
     return counts;
   }
 
+  // How many built graphics pipelines have the split layout, and how many have the single set.
+  static std::array<size_t, 2> SplitPipelineCounts(const PipelineCache &cache) {
+    std::array<size_t, 2> counts{};
+    for (const auto &entry : cache.m_graphics_pipelines) {
+      ++counts[entry.second.uses_split_sets ? 0 : 1];
+    }
+    return counts;
+  }
+
+  // How many built pipelines use the image heap and have the split layout, or the single set.
+  static size_t HeapPipelines(const PipelineCache &cache, bool split) {
+    return static_cast<size_t>(std::ranges::count_if(cache.m_graphics_pipelines, [&](const auto &entry) {
+      return entry.second.uses_image_heap && entry.second.uses_split_sets == split;
+    }));
+  }
+
+  // The key of the one graphics pipeline the cache holds, or nothing when it holds another number.
+  static std::optional<GraphicsPipelineKey> OnlyKey(const PipelineCache &cache) {
+    if (cache.m_graphics_pipelines.size() != 1) return std::nullopt;
+    return cache.m_graphics_pipelines.begin()->first;
+  }
+
+  // The built pipeline of a key.
+  static const PipelineCache::Pipeline &PipelineOf(const PipelineCache &cache,
+                                                   const GraphicsPipelineKey &key) {
+    return cache.m_graphics_pipelines.at(key);
+  }
+
+  // The stage, plain handle and library handle of every module the cache compiled.
+  struct ModuleHandles {
+    ShaderType stage;
+    vk::ShaderModule module;
+    vk::ShaderModule gpl_module;
+  };
+  static std::vector<ModuleHandles> Modules(const PipelineCache &cache) {
+    std::vector<ModuleHandles> handles;
+    for (const auto &[key, program] : cache.m_program_cache) {
+      for (const auto &module : program.modules) {
+        handles.push_back({key.stage, module.module, module.gpl_module});
+      }
+    }
+    return handles;
+  }
+
   // The stages a key names, found among the cached modules.
   static PipelineCache::Stages StagesOf(const PipelineCache &cache, const GraphicsPipelineKey &key) {
     const auto modules = cache.MapModules();
@@ -1327,7 +1369,7 @@ struct PipelineCacheTestAccess {
 
   // What the layout code predicts for a key's shaders, before any pipeline exists for it.
   static bool PredictedPush(const PipelineCache &cache, const GraphicsPipelineKey &key) {
-    return PredictPushDescriptors(cache.m_graphics, StagesOf(cache, key));
+    return PredictPushDescriptors(cache.m_graphics, key, StagesOf(cache, key));
   }
 
   // Whether the pipeline built for a key pushes its descriptors.
@@ -3214,10 +3256,18 @@ class VulkanHarness {
 public:
   // With `sync_validation` the instance runs the Khronos validation layer with synchronization
   // validation, if the layer is installed. SyncValidationActive says whether it does.
-  explicit VulkanHarness(bool sync_validation = false) { Init(sync_validation); }
+  // With `library` the device is made with the graphics pipeline library, through the production
+  // enable code, when the device can have it. Only the split layout tests ask for that, so every
+  // other test runs on the device the emulator makes without --graphics-pipeline-library.
+  explicit VulkanHarness(bool sync_validation = false, bool library = false)
+      : m_library_requested(library) {
+    Init(sync_validation);
+  }
   ~VulkanHarness() { Destroy(); }
   // Whether the validation layer with synchronization validation is on for this device.
   [[nodiscard]] bool SyncValidationActive() const { return m_sync_validation_active; }
+  // Whether the device was made with the graphics pipeline library, so split layout tests can run.
+  [[nodiscard]] bool LibraryAvailable() const { return m_library_available; }
 
   // Tells the next render context whether to make a real occlusion query pool, as the emulator's
   // device does when the option is on. False if the device cannot reset queries from the host.
@@ -32627,6 +32677,7 @@ public:
 #include "DeferredResolveTests.inc"
 #include "DeferredDrawTests.inc"
 #include "GraphicsCreateInfoTests.inc"
+#include "SplitLayoutTests.inc"
 
 private:
   bool m_rasterization_supported = true;
@@ -32754,6 +32805,18 @@ private:
     extensions->push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
     extensions->push_back(VK_EXT_VALIDATION_FEATURES_EXTENSION_NAME);
     layers->push_back(layer);
+    // The layer reports one message at most ten times by default, which silences a scenario that
+    // runs after another has used the count up. Zero removes the limit. A value the user set stays.
+    constexpr const char *limit_variable = "VK_LAYER_DUPLICATE_MESSAGE_LIMIT";
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+    char *user_value = nullptr;
+    size_t user_length = 0;
+    const bool user_set = _dupenv_s(&user_value, &user_length, limit_variable) == 0 && user_value != nullptr;
+    std::free(user_value);
+    if (!user_set) _putenv_s(limit_variable, "0");
+#else
+    setenv(limit_variable, "0", 0);
+#endif
     return true;
   }
 
@@ -32770,6 +32833,29 @@ private:
               "vkCreateDebugUtilsMessengerEXT");
     Libs::Graphics::VulkanValidation::SetCountOnly(true);
     Libs::Graphics::VulkanValidation::ResetMessages();
+  }
+
+  // Asks the production query and enable code whether this device gets the graphics pipeline library,
+  // with the flag on, and chains the feature in when it does. Nothing is asked when the harness was
+  // not made for the library. The runtime context keeps the library mode off until a test turns it on
+  // with SplitLayoutScope. Config has no way to read its options back, so this loads the flag and then
+  // loads the silent defaults, which every mode of this binary starts with and every rig puts back
+  // when it ends, so no earlier option is lost today.
+  void EnableLibraryExtensions(std::vector<const char *> *extensions, vk::DeviceCreateInfo *info,
+                               vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT *features) {
+    if (!m_library_requested) return;
+    const auto available = m_physical_device.enumerateDeviceExtensionProperties();
+    Require("VulkanHarness", "extension list", available.result == vk::Result::eSuccess,
+            "could not list the device extensions");
+    Config::Load({.printf_direction = Config::LogDirection::Silent,
+                  .graphics_pipeline_library_enabled = true});
+    m_library_available = EnablePipelineLibrary(m_physical_device, available.value, *extensions);
+    Config::Load({.printf_direction = Config::LogDirection::Silent});
+    if (m_library_available) {
+      features->graphicsPipelineLibrary = true;
+      features->pNext = const_cast<void *>(info->pNext);
+      info->pNext = features;
+    }
   }
 
   void Init(bool sync_validation) {
@@ -33128,6 +33214,8 @@ private:
           VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
       device_extensions.push_back(VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME);
     }
+    vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT library_features{};
+    EnableLibraryExtensions(&device_extensions, &device_info, &library_features);
     device_info.enabledExtensionCount =
         static_cast<uint32_t>(device_extensions.size());
     device_info.ppEnabledExtensionNames = device_extensions.data();
@@ -33452,6 +33540,10 @@ private:
   vk::Instance m_instance = nullptr;
   vk::DebugUtilsMessengerEXT m_messenger = nullptr;
   bool m_sync_validation_active = false;
+  // Whether the production enable code gave the device the graphics pipeline library.
+  bool m_library_available = false;
+  // Whether the harness was made to ask for the library.
+  bool m_library_requested = false;
   // Whether the device was made with what the host-reset occlusion query pool needs.
   bool m_occlusion_queries_supported = false;
   bool m_occlusion_query_precise = false;
@@ -68431,6 +68523,16 @@ int main(int argc, char **argv) {
     vulkan.CheckDrawRecord();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--split-layout-only") == 0) {
+    VulkanHarness vulkan(false, true);
+    vulkan.CheckSplitLayout();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--split-layout-sync-only") == 0) {
+    VulkanHarness vulkan(true, true);
+    vulkan.CheckSplitLayoutUnderValidation();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--sync-validation-only") == 0) {
     VulkanHarness vulkan(true);
     vulkan.CheckHoleSyncValidation();
@@ -69885,6 +69987,11 @@ int main(int argc, char **argv) {
   }
   CheckColdDriverCache(vulkan);
   CheckDriverCacheSave(vulkan);
+  {
+    // The split layout tests run on a device made with the library, apart from the one above.
+    VulkanHarness library_vulkan(false, true);
+    library_vulkan.CheckSplitLayout();
+  }
   std::printf("ShaderRecompilerComputeTests: all cases passed\n");
   return 0;
 }

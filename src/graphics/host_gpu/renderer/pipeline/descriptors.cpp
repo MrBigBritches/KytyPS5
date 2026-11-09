@@ -1119,6 +1119,72 @@ void RenderExecutor::WriteBindingDescriptors(vk::CommandBuffer                  
 	                        CaptureAddressBuffers(modules), m_descriptor_scratch);
 }
 
+namespace {
+
+/// Gathers the descriptor writes of every stage into the scratch and the push data of the stages
+/// into `push_data`. With the split layout the writes of the pixel stage go to their own list, since
+/// that stage has a set of its own. Returns whether any stage had push data.
+bool GatherStageDescriptors(const PipelineCache::Pipeline&       pipeline,
+                            std::span<PreparedBindings* const>   prepared_bindings,
+                            std::span<const ShaderModule* const> modules,
+                            const AddressBufferInfos& address_buffers, DescriptorScratch& scratch,
+                            ShaderRecompiler::IR::PushData& push_data) {
+	bool   has_push_data = false;
+	size_t image_cursor  = 0;
+	for (size_t stage = 0; stage < prepared_bindings.size(); ++stage) {
+		const auto& program     = modules[stage]->info;
+		const auto& descriptors = *prepared_bindings[stage];
+		std::array<size_t, ShaderRecompiler::IR::ImageBindingCount> image_starts {};
+		const bool to_pixel_set = pipeline.uses_split_sets && program.stage == ShaderType::Pixel;
+		AppendStageWrites(*modules[stage], descriptors, address_buffers, scratch.images,
+		                  to_pixel_set ? scratch.pixel_writes : scratch.writes, image_cursor,
+		                  image_starts);
+		FillImageInfos(*modules[stage], descriptors, image_starts, scratch.images);
+		if (program.bindings.UsesPushData()) {
+			std::ranges::copy(descriptors.shader_data,
+			                  push_data.dwords.begin() + program.bindings.push_data_start_dword);
+			has_push_data = true;
+		}
+	}
+	return has_push_data;
+}
+
+/// Allocates a set of `layout`, writes `writes` into it and binds it at `set_index`.
+void BindWrittenSet(RenderContext& context, vk::CommandBuffer vk_buffer,
+                    vk::PipelineBindPoint bind_point, vk::PipelineLayout pipeline_layout,
+                    vk::DescriptorSetLayout layout, uint32_t set_index,
+                    std::vector<vk::WriteDescriptorSet>& writes) {
+	const auto set = context.GetDescriptorHeap().Commit(layout);
+	for (auto& write: writes) {
+		write.dstSet = set;
+	}
+	context.GetGraphics().device.updateDescriptorSets(static_cast<uint32_t>(writes.size()),
+	                                                  writes.data(), 0, nullptr);
+	vk_buffer.bindDescriptorSets(bind_point, pipeline_layout, set_index, 1, &set, 0, nullptr);
+}
+
+/// Records the writes of the split layout. The VS set is always a set from the heap, and the PS set
+/// is pushed when its layout is a push layout. A stage with nothing to write binds nothing.
+void RecordSplitDescriptors(RenderContext& context, vk::CommandBuffer vk_buffer,
+                            vk::PipelineBindPoint bind_point,
+                            const PipelineCache::Pipeline& pipeline, DescriptorScratch& scratch) {
+	if (!scratch.writes.empty()) {
+		BindWrittenSet(context, vk_buffer, bind_point, pipeline.pipeline_layout,
+		               pipeline.vertex_set_layout, SPLIT_VERTEX_SET, scratch.writes);
+	}
+	if (scratch.pixel_writes.empty()) return;
+	if (pipeline.pixel_set_is_push) {
+		vk_buffer.pushDescriptorSetKHR(bind_point, pipeline.pipeline_layout, SPLIT_PIXEL_SET,
+		                               static_cast<uint32_t>(scratch.pixel_writes.size()),
+		                               scratch.pixel_writes.data());
+		return;
+	}
+	BindWrittenSet(context, vk_buffer, bind_point, pipeline.pipeline_layout,
+	               pipeline.pixel_set_layout, SPLIT_PIXEL_SET, scratch.pixel_writes);
+}
+
+} // namespace
+
 void RenderExecutor::WriteBindingDescriptors(vk::CommandBuffer                  vk_buffer,
                                              vk::PipelineBindPoint              pipeline_bind_point,
                                              const PipelineCache::Pipeline&     pipeline,
@@ -1129,28 +1195,18 @@ void RenderExecutor::WriteBindingDescriptors(vk::CommandBuffer                  
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(prepared_bindings.size() != modules.size());
 	ShaderRecompiler::IR::PushData push_data;
-	bool                           has_push_data = false;
 	scratch.images.resize(CountImageDescriptors(pipeline, modules));
 	scratch.writes.clear();
-	size_t image_cursor = 0;
-
-	for (size_t stage = 0; stage < prepared_bindings.size(); ++stage) {
-		const auto& program     = modules[stage]->info;
-		const auto& descriptors = *prepared_bindings[stage];
-		std::array<size_t, ShaderRecompiler::IR::ImageBindingCount> image_starts {};
-		AppendStageWrites(*modules[stage], descriptors, address_buffers, scratch.images,
-		                  scratch.writes, image_cursor, image_starts);
-		FillImageInfos(*modules[stage], descriptors, image_starts, scratch.images);
-		if (program.bindings.UsesPushData()) {
-			std::ranges::copy(descriptors.shader_data,
-			                  push_data.dwords.begin() + program.bindings.push_data_start_dword);
-			has_push_data = true;
-		}
-	}
-
+	scratch.pixel_writes.clear();
+	const bool has_push_data = GatherStageDescriptors(pipeline, prepared_bindings, modules,
+	                                                  address_buffers, scratch, push_data);
 	if (has_push_data) {
 		vk_buffer.pushConstants(pipeline.pipeline_layout, pipeline.push_stages, 0,
 		                        sizeof(push_data), push_data.dwords.data());
+	}
+	if (pipeline.uses_split_sets) {
+		RecordSplitDescriptors(m_context, vk_buffer, pipeline_bind_point, pipeline, scratch);
+		return;
 	}
 	if (scratch.writes.empty()) return;
 	if (pipeline.uses_push_descriptors) {
@@ -1159,14 +1215,8 @@ void RenderExecutor::WriteBindingDescriptors(vk::CommandBuffer                  
 		                               scratch.writes.data());
 		return;
 	}
-	const auto set = m_context.GetDescriptorHeap().Commit(pipeline.descriptor_set_layout);
-	for (auto& write: scratch.writes) {
-		write.dstSet = set;
-	}
-	m_context.GetGraphics().device.updateDescriptorSets(
-	    static_cast<uint32_t>(scratch.writes.size()), scratch.writes.data(), 0, nullptr);
-	vk_buffer.bindDescriptorSets(pipeline_bind_point, pipeline.pipeline_layout, 0, 1, &set, 0,
-	                             nullptr);
+	BindWrittenSet(m_context, vk_buffer, pipeline_bind_point, pipeline.pipeline_layout,
+	               pipeline.descriptor_set_layout, 0, scratch.writes);
 }
 
 void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,

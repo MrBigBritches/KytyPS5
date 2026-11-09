@@ -1,5 +1,8 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineParts.h"
 
+#include "common/assert.h"
+#include "graphics/shader/recompiler/ir/ShaderIR.h"
+
 #include <xxhash.h>
 
 #include <algorithm>
@@ -118,6 +121,67 @@ bool GplEligible(const GraphicsPipelineKey&                 key,
 	const bool has_hull_domain = stages[1] != nullptr || stages[2] != nullptr;
 	const bool mesh            = vertex->info.stage == ShaderType::Mesh || vertex->mesh_task;
 	return !patched && !has_hull_domain && !mesh;
+}
+
+namespace {
+
+// The SPIR-V header is five words, and every instruction after it starts with one word that holds
+// its length in the high half and its opcode in the low half.
+constexpr std::size_t SPIRV_HEADER_WORDS   = 5;
+constexpr uint32_t    SPIRV_MAGIC          = 0x07230203u;
+constexpr uint32_t    SPIRV_OPCODE_MASK    = 0xffffu;
+constexpr uint32_t    SPIRV_LENGTH_SHIFT   = 16;
+constexpr uint32_t    SPIRV_OP_DECORATE    = 71;
+constexpr uint32_t    SPIRV_DECORATION_SET = 34;
+// OpDecorate is the instruction word, the target id, the decoration and one literal.
+constexpr uint32_t    SPIRV_DECORATE_WORDS_WITH_LITERAL = 4;
+constexpr std::size_t DECORATION_OFFSET    = 2;
+constexpr std::size_t LITERAL_OFFSET       = 3;
+
+} // namespace
+
+std::optional<std::vector<uint32_t>> TryMoveDescriptorSet(std::span<const uint32_t> code,
+                                                          uint32_t from_set, uint32_t to_set) {
+	if (code.size() < SPIRV_HEADER_WORDS || code[0] != SPIRV_MAGIC) {
+		return std::nullopt;
+	}
+	std::vector<uint32_t> moved(code.begin(), code.end());
+	// Walks instruction by instruction, so a word that only looks like a decoration is never edited.
+	std::size_t at = SPIRV_HEADER_WORDS;
+	while (at < moved.size()) {
+		const uint32_t length = moved[at] >> SPIRV_LENGTH_SHIFT;
+		// A zero length would never advance, and an instruction past the end is cut short.
+		if (length == 0 || at + length > moved.size()) {
+			return std::nullopt;
+		}
+		const bool set_decoration = (moved[at] & SPIRV_OPCODE_MASK) == SPIRV_OP_DECORATE &&
+		                            length == SPIRV_DECORATE_WORDS_WITH_LITERAL &&
+		                            moved[at + DECORATION_OFFSET] == SPIRV_DECORATION_SET;
+		if (set_decoration && moved[at + LITERAL_OFFSET] == from_set) {
+			moved[at + LITERAL_OFFSET] = to_set;
+		}
+		at += length;
+	}
+	return moved;
+}
+
+std::vector<uint32_t> MoveDescriptorSet(std::span<const uint32_t> code, uint32_t from_set,
+                                        uint32_t to_set) {
+	auto moved = TryMoveDescriptorSet(code, from_set, to_set);
+	EXIT_IF(!moved.has_value());
+	return std::move(*moved);
+}
+
+std::array<vk::DescriptorSetLayout, SPLIT_SET_COUNT>
+SplitSetLayouts(vk::DescriptorSetLayout vertex, vk::DescriptorSetLayout heap,
+                vk::DescriptorSetLayout pixel) {
+	static_assert(ShaderRecompiler::IR::ImageHeapSet > SPLIT_VERTEX_SET &&
+	              ShaderRecompiler::IR::ImageHeapSet < SPLIT_PIXEL_SET);
+	std::array<vk::DescriptorSetLayout, SPLIT_SET_COUNT> layouts {};
+	layouts[SPLIT_VERTEX_SET]                    = vertex;
+	layouts[ShaderRecompiler::IR::ImageHeapSet] = heap;
+	layouts[SPLIT_PIXEL_SET]                     = pixel;
+	return layouts;
 }
 
 void SetGraphicsCreateInfoObserver(GraphicsCreateInfoObserver observer) {

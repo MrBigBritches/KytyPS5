@@ -21,7 +21,9 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <fmt/format.h>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -96,8 +98,52 @@ GatherLayoutBindings(const std::array<const ShaderModule*, 4>& stages) {
 	return bindings;
 }
 
-bool PredictPushDescriptors(const GraphicContext&                       graphics,
+namespace {
+
+// The bindings of the two sets of the split layout, and how the PS set is bound. Both the layout code
+// and the prediction build it, so a draw is judged by the layout it will get.
+struct SplitSetPlan {
+	std::vector<vk::DescriptorSetLayoutBinding> vertex;
+	std::vector<vk::DescriptorSetLayoutBinding> pixel;
+	uint64_t                                    pixel_count = 0;
+	// The PS set is pushed. It is the only set that can be.
+	bool                                        pixel_push = false;
+	// No descriptor set has to be allocated, which needs a VS with no bindings and a pushed PS set.
+	bool                                        push_only = false;
+};
+
+} // namespace
+
+static SplitSetPlan PlanSplitSets(const GraphicContext&                       graphics,
+                                  const std::array<const ShaderModule*, 4>& stages) {
+	SplitSetPlan plan;
+	// A pipeline the split layout is used for has no tessellation stages, so only these two count.
+	const auto* vertex = stages[VERTEX_STAGE_INDEX];
+	const auto* pixel  = stages[PIXEL_STAGE_INDEX];
+	if (vertex != nullptr) {
+		AddLayoutBindings(plan.vertex, vertex->info, NativeShaderStage(vertex->info.stage));
+	}
+	if (pixel != nullptr) {
+		AddLayoutBindings(plan.pixel, pixel->info, NativeShaderStage(pixel->info.stage));
+	}
+	for (const auto& binding: plan.pixel) {
+		plan.pixel_count += binding.descriptorCount;
+	}
+	plan.pixel_push = UsesPushDescriptors(graphics, plan.pixel_count);
+	plan.push_only  = plan.vertex.empty() && plan.pixel_push;
+	return plan;
+}
+
+bool UsesSplitLayout(const GraphicContext& graphics, const GraphicsPipelineKey& key,
+                     const std::array<const ShaderModule*, 4>& stages) {
+	return graphics.graphics_pipeline_library_enabled && GplEligible(key, stages);
+}
+
+bool PredictPushDescriptors(const GraphicContext& graphics, const GraphicsPipelineKey& key,
                             const std::array<const ShaderModule*, 4>& stages) {
+	if (UsesSplitLayout(graphics, key, stages)) {
+		return PlanSplitSets(graphics, stages).push_only;
+	}
 	uint64_t descriptor_count = 0;
 	for (const auto& binding: GatherLayoutBindings(stages)) {
 		descriptor_count += binding.descriptorCount;
@@ -105,11 +151,32 @@ bool PredictPushDescriptors(const GraphicContext&                       graphics
 	return UsesPushDescriptors(graphics, descriptor_count);
 }
 
-// Creates the descriptor set layout and the pipeline layout that uses it.
-static void CreateLayouts(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
-                          std::span<const vk::DescriptorSetLayoutBinding> bindings) {
-	const auto& limits = graphics.GetPhysicalDeviceProperties().limits;
-	uint64_t descriptor_count = 0;
+vk::ShaderModule CompileSplitPixelModule(const GraphicContext& graphics, ShaderType stage,
+                                         std::span<const uint32_t> spirv) {
+	if (!graphics.graphics_pipeline_library_enabled || stage != ShaderType::Pixel) {
+		return nullptr;
+	}
+	// Only this copy is patched, so module ids and the shader store keep the plain SPIR-V.
+	const auto moved = MoveDescriptorSet(spirv, EMITTED_DESCRIPTOR_SET, SPLIT_PIXEL_SET);
+	return CompileSPV(moved, graphics.device);
+}
+
+void DestroyPipelineObjects(vk::Device device, const PipelineCache::Pipeline& pipeline) {
+	device.destroyPipeline(pipeline.pipeline, nullptr);
+	device.destroyPipelineLayout(pipeline.pipeline_layout, nullptr);
+	// A null handle is skipped, so a pipeline of the single-set layout makes the calls it always did.
+	for (const auto layout: {pipeline.descriptor_set_layout, pipeline.vertex_set_layout,
+	                         pipeline.pixel_set_layout}) {
+		if (layout != nullptr) {
+			device.destroyDescriptorSetLayout(layout, nullptr);
+		}
+	}
+}
+
+std::string DescriptorLimitError(const vk::PhysicalDeviceLimits&                limits,
+                                 std::span<const vk::DescriptorSetLayoutBinding> bindings,
+                                 uint64_t&                                       descriptor_count) {
+	descriptor_count = 0;
 	uint64_t storage_buffers = 0;
 	uint64_t samplers = 0;
 	std::array<uint64_t, 32> stage_buffers {}, stage_resources {}, stage_samplers {};
@@ -128,31 +195,71 @@ static void CreateLayouts(GraphicContext& graphics, PipelineCache::Pipeline& pip
 			if (stage_buffers[stage] > limits.maxPerStageDescriptorStorageBuffers ||
 			    stage_resources[stage] > limits.maxPerStageResources ||
 			    stage_samplers[stage] > limits.maxPerStageDescriptorSamplers) {
-				EXIT("native descriptor stage %u exceeds device limits: buffers=%" PRIu64
-				     "/%u resources=%" PRIu64 "/%u samplers=%" PRIu64 "/%u\n", stage, stage_buffers[stage],
-				     limits.maxPerStageDescriptorStorageBuffers, stage_resources[stage], limits.maxPerStageResources,
-				     stage_samplers[stage], limits.maxPerStageDescriptorSamplers);
+				return fmt::format(
+				    "native descriptor stage {} exceeds device limits: buffers={}/{} resources={}/{} "
+				    "samplers={}/{}\n", stage, stage_buffers[stage],
+				    limits.maxPerStageDescriptorStorageBuffers, stage_resources[stage],
+				    limits.maxPerStageResources, stage_samplers[stage],
+				    limits.maxPerStageDescriptorSamplers);
 			}
 		}
 	}
 	if (storage_buffers > limits.maxDescriptorSetStorageBuffers) {
-		EXIT("native storage-buffer descriptors exceed device limit: %" PRIu64 "/%u\n",
-		     storage_buffers, limits.maxDescriptorSetStorageBuffers);
+		return fmt::format("native storage-buffer descriptors exceed device limit: {}/{}\n",
+		                   storage_buffers, limits.maxDescriptorSetStorageBuffers);
 	}
 	if (samplers > limits.maxDescriptorSetSamplers) {
-		EXIT("native sampler descriptors exceed device limit: %" PRIu64 "/%u\n",
-		     samplers, limits.maxDescriptorSetSamplers);
+		return fmt::format("native sampler descriptors exceed device limit: {}/{}\n", samplers,
+		                   limits.maxDescriptorSetSamplers);
 	}
-	pipeline.uses_push_descriptors = UsesPushDescriptors(graphics, descriptor_count);
+	return {};
+}
 
+std::string SplitLayoutLimitError(const vk::PhysicalDeviceLimits&                limits,
+                                  std::span<const vk::DescriptorSetLayoutBinding> vertex,
+                                  std::span<const vk::DescriptorSetLayoutBinding> pixel) {
+	// The set counts of the limits cover a whole pipeline layout, so the two sets are judged together.
+	std::vector<vk::DescriptorSetLayoutBinding> both(vertex.begin(), vertex.end());
+	both.insert(both.end(), pixel.begin(), pixel.end());
+	uint64_t descriptor_count = 0;
+	return DescriptorLimitError(limits, both, descriptor_count);
+}
+
+// Checks the bindings of one descriptor set against the device limits, which stops the process when
+// one is exceeded, and returns how many descriptors the set has.
+static uint64_t CheckDescriptorLimits(const GraphicContext&                         graphics,
+                                      std::span<const vk::DescriptorSetLayoutBinding> bindings) {
+	uint64_t   descriptor_count = 0;
+	const auto error =
+	    DescriptorLimitError(graphics.GetPhysicalDeviceProperties().limits, bindings, descriptor_count);
+	if (!error.empty()) {
+		EXIT("%s", error.c_str());
+	}
+	return descriptor_count;
+}
+
+// Creates a descriptor set layout, which may have no bindings.
+static vk::DescriptorSetLayout CreateSetLayout(const GraphicContext&                         graphics,
+                                               std::span<const vk::DescriptorSetLayoutBinding> bindings,
+                                               bool push) {
 	vk::DescriptorSetLayoutCreateInfo create {};
-	create.flags        = pipeline.uses_push_descriptors
-	                          ? vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR
-	                          : vk::DescriptorSetLayoutCreateFlags {};
+	create.flags        = push ? vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR
+	                           : vk::DescriptorSetLayoutCreateFlags {};
 	create.bindingCount = static_cast<uint32_t>(bindings.size());
 	create.pBindings    = bindings.data();
-	EXIT_IF(graphics.device.createDescriptorSetLayout(
-	            &create, nullptr, &pipeline.descriptor_set_layout) != vk::Result::eSuccess);
+	vk::DescriptorSetLayout layout = nullptr;
+	EXIT_IF(graphics.device.createDescriptorSetLayout(&create, nullptr, &layout) !=
+	        vk::Result::eSuccess);
+	return layout;
+}
+
+// Creates the descriptor set layout and the pipeline layout that uses it.
+static void CreateLayouts(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+                          std::span<const vk::DescriptorSetLayoutBinding> bindings) {
+	const auto descriptor_count    = CheckDescriptorLimits(graphics, bindings);
+	pipeline.uses_push_descriptors = UsesPushDescriptors(graphics, descriptor_count);
+	pipeline.descriptor_set_layout =
+	    CreateSetLayout(graphics, bindings, pipeline.uses_push_descriptors);
 	const vk::PushConstantRange push_constants {pipeline.push_stages, 0,
 	                                            ShaderRecompiler::IR::NativePushConstantSize};
 	const std::array set_layouts {pipeline.descriptor_set_layout, graphics.image_heap_layout};
@@ -163,6 +270,46 @@ static void CreateLayouts(GraphicContext& graphics, PipelineCache::Pipeline& pip
 	pipeline_layout_info.pushConstantRangeCount = 1;
 	pipeline_layout_info.pPushConstantRanges    = &push_constants;
 
+	EXIT_NOT_IMPLEMENTED(graphics.device.createPipelineLayout(&pipeline_layout_info, nullptr,
+	                                                          &pipeline.pipeline_layout) !=
+	                     vk::Result::eSuccess);
+}
+
+// One push constant range for both stages, whatever the pipeline has, so that the layouts of
+// different pipelines agree and a library layout can be built from either stage alone.
+static constexpr vk::ShaderStageFlags SPLIT_PUSH_STAGES =
+    vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment;
+
+// Creates the split layout. Set 0 holds the VS bindings, set 1 is the image heap exactly as in the
+// single-set layout, and set 2 holds the PS bindings, pushed when the PS alone fits. The sets are
+// independent, so a pipeline library that knows one stage can still be given a layout.
+static void CreateSplitLayouts(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+                               const std::array<const ShaderModule*, 4>& stages) {
+	const auto plan = PlanSplitSets(graphics, stages);
+	const auto limit_error = SplitLayoutLimitError(graphics.GetPhysicalDeviceProperties().limits,
+	                                               plan.vertex, plan.pixel);
+	if (!limit_error.empty()) {
+		EXIT("%s", limit_error.c_str());
+	}
+	pipeline.uses_split_sets       = true;
+	pipeline.pixel_set_is_push     = plan.pixel_push;
+	pipeline.uses_push_descriptors = plan.push_only;
+	pipeline.vertex_set_layout     = CreateSetLayout(graphics, plan.vertex, false);
+	pipeline.pixel_set_layout      = CreateSetLayout(graphics, plan.pixel, plan.pixel_push);
+	pipeline.push_stages           = SPLIT_PUSH_STAGES;
+	const vk::PushConstantRange push_constants {pipeline.push_stages, 0,
+	                                            ShaderRecompiler::IR::NativePushConstantSize};
+	// The image heap is in the layout even when this pipeline does not use it, since the layout of a
+	// part library cannot know what the other stage uses.
+	const auto set_layouts = SplitSetLayouts(pipeline.vertex_set_layout, graphics.image_heap_layout,
+	                                         pipeline.pixel_set_layout);
+
+	vk::PipelineLayoutCreateInfo pipeline_layout_info {};
+	pipeline_layout_info.flags                  = vk::PipelineLayoutCreateFlagBits::eIndependentSetsEXT;
+	pipeline_layout_info.setLayoutCount         = SPLIT_SET_COUNT;
+	pipeline_layout_info.pSetLayouts            = set_layouts.data();
+	pipeline_layout_info.pushConstantRangeCount = 1;
+	pipeline_layout_info.pPushConstantRanges    = &push_constants;
 	EXIT_NOT_IMPLEMENTED(graphics.device.createPipelineLayout(&pipeline_layout_info, nullptr,
 	                                                          &pipeline.pipeline_layout) !=
 	                     vk::Result::eSuccess);
@@ -360,10 +507,21 @@ void FillDynamicStateParts(DynamicStateParts& out, const GraphicContext& graphic
 }
 
 // Sets up the push stages, the image heap flag and the layouts of a graphics pipeline. The layout
-// is shared by all four parts, so it is set up apart from them.
+// is shared by all four parts, so it is set up apart from them. A pipeline that libraries could
+// build gets the split layout when the library mode is on, and every other one gets the single set.
 static void CreateGraphicsLayouts(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+                                  const GraphicsPipelineKey&                 key,
                                   const std::array<const ShaderModule*, 4>& stages,
                                   bool                                       has_task_stage) {
+	for (const auto* stage: stages) {
+		if (stage != nullptr) {
+			pipeline.uses_image_heap |= stage->info.info.uses_image_heap;
+		}
+	}
+	if (UsesSplitLayout(graphics, key, stages)) {
+		CreateSplitLayouts(graphics, pipeline, stages);
+		return;
+	}
 	const auto descriptor_bindings = GatherLayoutBindings(stages);
 	pipeline.push_stages = vk::ShaderStageFlagBits::eFragment;
 	if (has_task_stage) {
@@ -371,7 +529,6 @@ static void CreateGraphicsLayouts(GraphicContext& graphics, PipelineCache::Pipel
 	}
 	for (const auto* stage: stages) {
 		if (stage != nullptr) {
-			pipeline.uses_image_heap |= stage->info.info.uses_image_heap;
 			pipeline.push_stages |= NativeShaderStage(stage->info.stage);
 		}
 	}
@@ -481,8 +638,13 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	FillFragmentShaderParts(parts.fragment_shader, key, pixel);
 	FillFragmentOutputParts(parts.fragment_output, key);
 	FillDynamicStateParts(parts.dynamic, graphics, key);
-	CreateGraphicsLayouts(graphics, pipeline, stages, static_cast<bool>(helpers.task));
+	CreateGraphicsLayouts(graphics, pipeline, key, stages, static_cast<bool>(helpers.task));
 
+	if (pipeline.uses_split_sets && pixel != nullptr) {
+		// The PS resources are in set 2 of this layout, which only the patched module says.
+		EXIT_IF(pixel->gpl_module == nullptr);
+		parts.fragment_shader.stage.module = pixel->gpl_module;
+	}
 	vk::GraphicsPipelineCreateInfo pipeline_info {};
 	AssembleMonolithicInfo(pipeline_info, parts, mesh, with_depth, pipeline.pipeline_layout);
 	if (const auto observer = GetGraphicsCreateInfoObserver()) {

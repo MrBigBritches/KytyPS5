@@ -381,7 +381,7 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 
 // Queries what --graphics-pipeline-library needs. The query is its own, so the device's shared
 // feature and property chains stay as they were, and with the flag off nothing is asked.
-static PipelineLibrarySupport QueryPipelineLibrarySupport(
+PipelineLibrarySupport QueryPipelineLibrarySupport(
     vk::PhysicalDevice physical_device, const std::vector<vk::ExtensionProperties>& available) {
 	PipelineLibrarySupport support {.flag = Config::GraphicsPipelineLibraryEnabled()};
 	if (!support.flag) {
@@ -409,9 +409,9 @@ static PipelineLibrarySupport QueryPipelineLibrarySupport(
 // Decides whether pipelines may be built from libraries, and if so adds the two extensions. Only a
 // device meeting every requirement gets them, so any other takes the path it always took. The
 // answer is logged and goes to the first-run report, so a run can tell asked for from in use.
-static bool EnablePipelineLibrary(vk::PhysicalDevice                          physical_device,
-                                  const std::vector<vk::ExtensionProperties>& available,
-                                  std::vector<const char*>&                   device_extensions) {
+bool EnablePipelineLibrary(vk::PhysicalDevice                          physical_device,
+                           const std::vector<vk::ExtensionProperties>& available,
+                           std::vector<const char*>&                   device_extensions) {
 	const char* blocker = GraphicsPipelineLibraryBlocker(QueryPipelineLibrarySupport(physical_device, available));
 	if (blocker == nullptr) {
 		device_extensions.push_back(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);

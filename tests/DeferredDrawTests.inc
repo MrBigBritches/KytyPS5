@@ -818,7 +818,8 @@
   // fault buffer go in a descriptor set. `deferred` turns on --deferred-pipeline-draws and holds
   // the build, and `non_push` turns on --deferred-non-push-draws. With both the draw becomes a hole
   // whose set is written at the resolve.
-  NonPushRun RunNonPushDraw(const char *name, bool deferred, bool non_push) {
+  NonPushRun RunNonPushDraw(const char *name, bool deferred, bool non_push,
+                            AddressStage stage = AddressStage::Vertex) {
     NonPushRun run;
     PipelineCacheTestAccess::BuildHold hold;
     AsyncDrawRig rig(*this, false, false, false, false, deferred, non_push);
@@ -829,10 +830,10 @@
     graphics.max_push_descriptors = 0;
     rig.PaintSentinels();
     if (deferred) PipelineCacheTestAccess::HoldBuildQueue(rig.Pipelines(), hold);
-    const auto rig_vertex = UseAddressVertex(rig, NonPushReadOffset);
+    const auto replaced = UseAddressStage(rig, stage, NonPushReadOffset);
     Common::FirstRunReport::Global().Reset();
     Require(name, "draw", DrawStreamAuto(rig, 3, 1), "the draw reported failure");
-    rig.shaders.SetEsShaderBase(rig_vertex);
+    RestoreAddressStage(rig, stage, replaced);
     run.holes = scheduler.PendingHoleCount();
     run.ineligible = DeferredIneligible();
     std::optional<GraphicsPipelineKey> key;
@@ -852,12 +853,12 @@
   // is pushed even at a limit of 0, cannot pass. Its picture must match the blocking run, which
   // covers the target. The address read returns 0 in this rig, so the picture does not show the
   // set's contents. HoleRecordedStreamNonPush pins the bind and DrawRecordDescriptorSet the writes.
-  void CheckDeferredNonPush() {
+  void CheckDeferredNonPush(AddressStage stage = AddressStage::Vertex) {
     constexpr const char *name = "DeferredNonPush";
-    const auto baseline = RunNonPushDraw(name, false, false);
-    const auto deferred = RunNonPushDraw(name, true, true);
+    const auto baseline = RunNonPushDraw(name, false, false, stage);
+    const auto deferred = RunNonPushDraw(name, true, true, stage);
     // The new flag needs --deferred-pipeline-draws, so on its own the draw blocks as the baseline.
-    const auto alone = RunNonPushDraw(name, false, true);
+    const auto alone = RunNonPushDraw(name, false, true, stage);
     Require(name, "baseline picture", baseline.holes == 0 && AllDrawn(baseline.color),
             "the blocking draw did not cover the target");
     Require(name, "flag alone blocks", alone.holes == 0 && alone.color == baseline.color,
@@ -890,7 +891,7 @@
   // resolve that ran after the submit took its tick would stamp the next one, and the pool could be
   // reset while the hole's set is still in use. A pool that did not change shows the hole took no
   // set, which would prove nothing.
-  void CheckDeferredNonPushPoolRetire() {
+  void CheckDeferredNonPushPoolRetire(AddressStage stage = AddressStage::Vertex) {
     constexpr const char *name = "DeferredNonPushPool";
     PipelineCacheTestAccess::BuildHold hold;
     AsyncDrawRig rig(*this, false, false, false, false, true, true);
@@ -901,10 +902,10 @@
     graphics.max_push_descriptors = 0;
     rig.PaintSentinels();
     PipelineCacheTestAccess::HoldBuildQueue(rig.Pipelines(), hold);
-    const auto rig_vertex = UseAddressVertex(rig, NonPushReadOffset);
+    const auto replaced = UseAddressStage(rig, stage, NonPushReadOffset);
     Require(name, "draw", DrawStreamAuto(rig, 3, 1) && scheduler.PendingHoleCount() == 1,
             "the draw with a descriptor set was not deferred");
-    rig.shaders.SetEsShaderBase(rig_vertex);
+    RestoreAddressStage(rig, stage, replaced);
     vk::DescriptorSetLayoutBinding binding{};
     binding.descriptorType = vk::DescriptorType::eStorageBuffer;
     binding.descriptorCount = 1;

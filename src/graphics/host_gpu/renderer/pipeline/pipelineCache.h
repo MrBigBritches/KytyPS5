@@ -26,6 +26,7 @@
 #include <memory>
 #include <mutex>
 #include <queue>
+#include <string>
 #include <span>
 #include <thread>
 #include <type_traits>
@@ -121,6 +122,10 @@ static_assert(std::has_unique_object_representations_v<GraphicsPipelineKey>);
 struct ShaderModule {
 	uint64_t                                     id     = 0;
 	vk::ShaderModule                             module = nullptr;
+	// PS only, and only with --graphics-pipeline-library on a device that has it. The same SPIR-V with
+	// its descriptor set 0 resources moved to the pixel set of the split layout. Pipelines built with
+	// that layout use this handle and every other pipeline keeps `module`. Null otherwise.
+	vk::ShaderModule                             gpl_module = nullptr;
 	ShaderRecompiler::IR::CompiledShaderInfo     info;
 	ShaderRecompiler::IR::ResourceSpecialization specialization;
 	std::vector<uint32_t>                        function_code;
@@ -246,8 +251,18 @@ public:
 		vk::DescriptorSetLayout descriptor_set_layout = nullptr;
 		// The push constant range's stages, which every update names.
 		vk::ShaderStageFlags    push_stages;
+		// No descriptor set has to be allocated for a draw of this pipeline. With the split layout
+		// that is a VS with no bindings and a PS set that is pushed.
 		bool                    uses_push_descriptors = false;
 		bool                    uses_image_heap       = false;
+		// The split layout of --graphics-pipeline-library. Set 0 holds the VS bindings, set 1 is the
+		// image heap and set 2 holds the PS bindings. `descriptor_set_layout` is null then, and the
+		// two layouts below are the ones the pipeline owns.
+		bool                    uses_split_sets       = false;
+		vk::DescriptorSetLayout vertex_set_layout     = nullptr;
+		vk::DescriptorSetLayout pixel_set_layout      = nullptr;
+		// Set 2 is a push set. The VS set is never one, since a layout may have only one push set.
+		bool                    pixel_set_is_push     = false;
 	};
 
 	// Reads the shaders and registers bound in `command` into the state's shader stages.
@@ -467,12 +482,13 @@ private:
 	// The reason a missing pipeline's draw cannot become a hole, or null when it can. The draw's own
 	// state comes from the policy, and the shaders add the image heap and, unless
 	// --deferred-non-push-draws is on, the descriptor kind.
-	[[nodiscard]] const char* DeferBlocker(const Stages&             stages,
+	[[nodiscard]] const char* DeferBlocker(const GraphicsPipelineKey& key, const Stages& stages,
 	                                       const PipelineSkipPolicy* policy) const;
 	// What a draw that missed its pipeline does. `may_skip` is set when the S2 rules allow a skip, and
 	// the reason the draw cannot be deferred, if any, is counted whatever the fate turns out to be and
 	// returned in `blocker`, which is null otherwise.
-	[[nodiscard]] DrawFate ChooseMissedDrawFate(const Stages& stages, const PipelineSkipPolicy* policy,
+	[[nodiscard]] DrawFate ChooseMissedDrawFate(const GraphicsPipelineKey& key, const Stages& stages,
+	                                            const PipelineSkipPolicy* policy,
 	                                            const DeferredDraw* deferred, bool& may_skip,
 	                                            const char*& blocker);
 	// Notes that the S2 rules would have skipped a draw that was deferred, to report how long it
@@ -536,11 +552,45 @@ std::filesystem::path ShaderStorePath();
 // Host capabilities that change the emitted SPIR-V.
 ShaderRecompiler::Spirv::Profile SpirvProfile(const GraphicContext& graphics);
 
+// The descriptor set numbers of the split layout. The image heap keeps ImageHeapSet (1), which is
+// hard-coded in the SPIR-V, so the VS set is below it and the PS set above it.
+inline constexpr uint32_t SPLIT_VERTEX_SET = 0;
+inline constexpr uint32_t SPLIT_PIXEL_SET  = 2;
+inline constexpr uint32_t SPLIT_SET_COUNT  = 3;
+
+// Whether a graphics pipeline is built with the split layout. That needs the library mode to be on
+// and a pipeline that libraries could build. The layout code and the prediction below both ask this.
+[[nodiscard]] bool UsesSplitLayout(const GraphicContext& graphics, const GraphicsPipelineKey& key,
+                                   const std::array<const ShaderModule*, 4>& stages);
+
 // Whether a pipeline over these stages uses push descriptors, answered from the shaders alone by the
-// code that builds the pipeline layout, so a draw can be judged before its pipeline is built.
+// code that builds the pipeline layout, so a draw can be judged before its pipeline is built. With
+// the split layout it also depends on the key, which says whether that layout is used.
 // Stages are indexed like GraphicsPipelineKey::stage_ids.
 [[nodiscard]] bool PredictPushDescriptors(const GraphicContext&                       graphics,
+                                          const GraphicsPipelineKey&                 key,
                                           const std::array<const ShaderModule*, 4>& stages);
+
+// Makes the PS module of the split layout, or returns null when the library mode is off or `stage`
+// is not a pixel shader. The SPIR-V is the one the plain module was made from.
+[[nodiscard]] vk::ShaderModule CompileSplitPixelModule(const GraphicContext& graphics,
+                                                       ShaderType stage,
+                                                       std::span<const uint32_t> spirv);
+
+// Judges the bindings of one descriptor set against the device limits. Returns the text of the
+// error the layout code stops with, or an empty string when they fit, and sets the descriptor count.
+[[nodiscard]] std::string DescriptorLimitError(const vk::PhysicalDeviceLimits&                limits,
+                                               std::span<const vk::DescriptorSetLayoutBinding> bindings,
+                                               uint64_t& descriptor_count);
+
+// The same for the VS set and the PS set of the split layout, which are judged together since the
+// limits on set contents count the whole pipeline layout.
+[[nodiscard]] std::string SplitLayoutLimitError(const vk::PhysicalDeviceLimits&                limits,
+                                                std::span<const vk::DescriptorSetLayoutBinding> vertex,
+                                                std::span<const vk::DescriptorSetLayoutBinding> pixel);
+
+// Destroys what a pipeline owns, whichever layout it has. Handles that were never made are skipped.
+void DestroyPipelineObjects(vk::Device device, const PipelineCache::Pipeline& pipeline);
 
 // Stages are indexed like GraphicsPipelineKey::stage_ids.
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,

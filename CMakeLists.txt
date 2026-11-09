@@ -811,6 +811,12 @@ if(BUILD_TESTING)
 	add_test(NAME shader_recompiler_cold_pipelines
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --cold-pipelines-only)
 	set_tests_properties(shader_recompiler_cold_pipelines PROPERTIES TIMEOUT 60)
+	add_test(NAME shader_recompiler_split_layout
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --split-layout-only)
+	set_tests_properties(shader_recompiler_split_layout PROPERTIES TIMEOUT 120)
+	add_test(NAME shader_recompiler_split_layout_sync
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --split-layout-sync-only)
+	set_tests_properties(shader_recompiler_split_layout_sync PROPERTIES TIMEOUT 180)
 	add_test(NAME shader_recompiler_async_pipelines
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --async-pipelines-only)
 	# A build that never finishes or a worker that is never released shows up as a hang.

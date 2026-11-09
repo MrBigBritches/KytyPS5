@@ -5,6 +5,7 @@
 
 #include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineLibrary.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <atomic>
@@ -28,6 +29,21 @@ struct WindowLoopState {
 	bool                  need_exit = false;
 	std::atomic<uint64_t> presented_frames {0};
 };
+
+// Queries what --graphics-pipeline-library needs from a physical device. The flag is read from the
+// config. The query is its own, so a device's shared feature and property chains stay as they were,
+// and with the flag off nothing is asked.
+[[nodiscard]] PipelineLibrarySupport
+QueryPipelineLibrarySupport(vk::PhysicalDevice                          physical_device,
+                            const std::vector<vk::ExtensionProperties>& available);
+
+// Decides whether pipelines may be built from libraries, and if so adds the two extensions to
+// `device_extensions`. The caller then also enables the graphicsPipelineLibrary feature. Only a
+// device meeting every requirement gets them, so any other takes the path it always took. The answer
+// is logged and goes to the first-run report. The device creation and the tests call this one.
+[[nodiscard]] bool EnablePipelineLibrary(vk::PhysicalDevice                          physical_device,
+                                         const std::vector<vk::ExtensionProperties>& available,
+                                         std::vector<const char*>&                   device_extensions);
 
 struct WindowContext {
 	WindowContext();
