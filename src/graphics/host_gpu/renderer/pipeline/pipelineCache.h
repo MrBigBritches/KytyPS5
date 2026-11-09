@@ -120,6 +120,8 @@ struct alignas(4) GraphicsPipelineKey {
 // Keys are compared and hashed as bytes.
 static_assert(std::has_unique_object_representations_v<GraphicsPipelineKey>);
 
+struct DecodedModuleRecord;
+
 // A compiled stage with what pipeline creation needs from it besides the key.
 struct ShaderModule {
 	uint64_t                                     id     = 0;
@@ -563,6 +565,7 @@ private:
 
 	// pipelineSerialization.cpp
 	bool LoadRecord(std::span<const uint8_t>& records);
+	bool LoadModuleRecord(DecodedModuleRecord&& decoded);
 	void StoreModule(const ProgramKey& key, const Program& program, const ShaderModule& module,
 	                 const std::vector<uint32_t>& spirv);
 	void StorePipeline(const GraphicsPipelineKey& key);

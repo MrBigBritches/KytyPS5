@@ -10,14 +10,12 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/ir/Serialize.h"
+#include "graphics/shader/shaderStoreRecord.h"
 
 #include <algorithm>
 #include <chrono>
-#include <cstring>
 #include <fmt/format.h>
 #include <ranges>
-#include <xxhash.h>
-#include <zstd.h>
 
 // The shader store: a header, then zstd-compressed records of everything a run created first.
 // Records are only appended, so a store cut short by a crash keeps every complete record.
@@ -28,15 +26,6 @@ namespace {
 using ShaderRecompiler::IR::IoAll;
 using ShaderRecompiler::IR::Reader;
 using ShaderRecompiler::IR::Writer;
-
-enum class Record : uint8_t { Module, GraphicsPipeline, TessellationLayout };
-
-// Precedes each record's zstd frame.
-struct Frame {
-	uint32_t compressed_size = 0;
-	uint32_t raw_size        = 0;
-	uint64_t checksum        = 0; // XXH3 of the compressed bytes.
-};
 
 // Changes with every build, so records never meet code that encodes them differently. Zero when
 // the executable cannot be found.
@@ -59,19 +48,6 @@ std::vector<uint8_t> StoreHeader(const GraphicContext& graphics) {
 	IoAll(header, stamp, Config::StructuredJumpTablesEnabled(), SpirvProfile(graphics),
 	      graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize);
 	return std::move(header.bytes);
-}
-
-// Record fields, shared by writing and reading.
-template <class S, class Key> void IoKey(S& io, Key& key) {
-	auto& [stage, hash, user_data_count, static_state] = key;
-	IoAll(io, stage, hash, user_data_count, static_state);
-}
-
-template <class S, class Module> void IoModule(S& io, Module& stage) {
-	// The handle comes from the SPIR-V; stored programs have no function code.
-	auto& [id, handle, gpl_handle, info, specialization, function_code, vertex_formats,
-	       rect_parameters, mesh_task] = stage;
-	IoAll(io, id, info, specialization, vertex_formats, rect_parameters, mesh_task);
 }
 
 } // namespace
@@ -105,16 +81,9 @@ void ShaderStoreWriter::Open(const std::filesystem::path& path, std::span<const 
 
 void ShaderStoreWriter::Append(std::vector<uint8_t>&& record) {
 	Post([this, record = std::move(record)] {
-		std::vector<uint8_t> bytes(sizeof(Frame) + ZSTD_compressBound(record.size()));
-		const auto size = ZSTD_compress(bytes.data() + sizeof(Frame), bytes.size() - sizeof(Frame),
-		                                record.data(), record.size(), 3);
-		EXIT_IF(ZSTD_isError(size));
-		const Frame frame {.compressed_size = static_cast<uint32_t>(size),
-		                   .raw_size        = static_cast<uint32_t>(record.size()),
-		                   .checksum        = XXH3_64bits(bytes.data() + sizeof(Frame), size)};
-		std::memcpy(bytes.data(), &frame, sizeof(frame));
+		const auto bytes = FrameStoreRecord(record);
 		// A failed write leaves a partial record; the next run drops it and everything after it.
-		m_file.Write(bytes.data(), static_cast<uint32_t>(sizeof(Frame) + size));
+		m_file.Write(bytes.data(), static_cast<uint32_t>(bytes.size()));
 	});
 }
 
@@ -231,53 +200,24 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 }
 
 bool PipelineCache::LoadRecord(std::span<const uint8_t>& records) {
-	Frame frame;
-	if (records.size() < sizeof(frame)) {
+	const auto unframed = UnframeStoreRecord(records);
+	if (!unframed) {
 		return false;
 	}
-	std::memcpy(&frame, records.data(), sizeof(frame));
-	if (records.size() - sizeof(frame) < frame.compressed_size) {
-		return false;
-	}
-	const auto compressed = records.subspan(sizeof(frame), frame.compressed_size);
-	if (XXH3_64bits(compressed.data(), compressed.size()) != frame.checksum ||
-	    ZSTD_getFrameContentSize(compressed.data(), compressed.size()) != frame.raw_size) {
-		return false;
-	}
-	std::vector<uint8_t> raw(frame.raw_size);
-	if (ZSTD_decompress(raw.data(), raw.size(), compressed.data(), compressed.size()) != raw.size()) {
-		return false;
-	}
-	Reader     reader {raw};
-	auto       type     = Record::Module;
+	Reader     reader {unframed->raw};
+	auto       type     = StoreRecord::Module;
 	const auto complete = [&] { return reader.ok && reader.bytes.empty(); };
 	IoAll(reader, type);
 	switch (type) {
-		case Record::Module: {
-			ProgramKey            key;
-			std::vector<uint8_t>  plan;
-			ShaderModule          module;
-			std::vector<uint32_t> spirv;
-			IoKey(reader, key);
-			IoAll(reader, plan);
-			IoModule(reader, module);
-			IoAll(reader, spirv);
-			if (!complete()) {
+		case StoreRecord::Module: {
+			DecodedModuleRecord decoded;
+			DecodeModuleRecord(reader, decoded);
+			if (!complete() || !LoadModuleRecord(std::move(decoded))) {
 				return false;
 			}
-			const auto [program, inserted] = m_program_cache.try_emplace(std::move(key));
-			if (inserted &&
-			    !ShaderRecompiler::IR::LoadResourcePlan(plan, program->second.resource_plan)) {
-				m_program_cache.erase(program);
-				return false;
-			}
-			module.module     = CompileSPV(spirv, m_graphics.device);
-			module.gpl_module = CompileSplitPixelModule(m_graphics, program->first.stage, spirv);
-			m_module_record_order.push_back(module.id);
-			program->second.modules.push_back(std::move(module));
 			break;
 		}
-		case Record::GraphicsPipeline: {
+		case StoreRecord::GraphicsPipeline: {
 			GraphicsPipelineKey key;
 			reader.Raw(&key, sizeof(key));
 			if (!complete()) {
@@ -287,7 +227,7 @@ bool PipelineCache::LoadRecord(std::span<const uint8_t>& records) {
 			m_graphics_pipelines.try_emplace(key);
 			break;
 		}
-		case Record::TessellationLayout: {
+		case StoreRecord::TessellationLayout: {
 			uint64_t                    key = 0;
 			ShaderTessellationInputInfo layout;
 			IoAll(reader, key, layout);
@@ -299,7 +239,29 @@ bool PipelineCache::LoadRecord(std::span<const uint8_t>& records) {
 		}
 		default: return false;
 	}
-	records = records.subspan(sizeof(frame) + compressed.size());
+	records = records.subspan(unframed->frame_bytes);
+	return true;
+}
+
+// Adds a module read from the store to its program, which a first record of the program creates.
+bool PipelineCache::LoadModuleRecord(DecodedModuleRecord&& decoded) {
+	ProgramKey key;
+	FillKeyFromRecord(decoded, key);
+	const auto [program, inserted] = m_program_cache.try_emplace(std::move(key));
+	if (inserted &&
+	    !ShaderRecompiler::IR::LoadResourcePlan(decoded.plan, program->second.resource_plan)) {
+		m_program_cache.erase(program);
+		return false;
+	}
+	// The handles come from the SPIR-V, and stored programs have no function code.
+	// The SPIR-V is taken out first, so nothing reads the record after it is moved.
+	const auto   spirv = std::move(decoded.spirv);
+	ShaderModule module;
+	FillModuleFromRecord(std::move(decoded), module);
+	module.module     = CompileSPV(spirv, m_graphics.device);
+	module.gpl_module = CompileSplitPixelModule(m_graphics, program->first.stage, spirv);
+	m_module_record_order.push_back(module.id);
+	program->second.modules.push_back(std::move(module));
 	return true;
 }
 
@@ -309,13 +271,9 @@ void PipelineCache::StoreModule(const ProgramKey& key, const Program& program,
 	if (!m_store) {
 		return;
 	}
-	Writer record;
-	IoAll(record, Record::Module);
-	IoKey(record, key);
-	IoAll(record, ShaderRecompiler::IR::SaveResourcePlan(program.resource_plan));
-	IoModule(record, module);
-	IoAll(record, spirv);
-	m_store.Append(std::move(record.bytes));
+	std::vector<int32_t> formats;
+	m_store.Append(
+	    EncodeModuleRecord(RecordInputsOf(key, program.resource_plan, module, formats, spirv)));
 }
 
 void PipelineCache::StorePipeline(const GraphicsPipelineKey& key) {
@@ -323,7 +281,7 @@ void PipelineCache::StorePipeline(const GraphicsPipelineKey& key) {
 		return;
 	}
 	Writer record;
-	IoAll(record, Record::GraphicsPipeline);
+	IoAll(record, StoreRecord::GraphicsPipeline);
 	record.Raw(&key, sizeof(key));
 	m_store.Append(std::move(record.bytes));
 }
@@ -333,7 +291,7 @@ void PipelineCache::StoreLayout(uint64_t key, const ShaderTessellationInputInfo&
 		return;
 	}
 	Writer record;
-	IoAll(record, Record::TessellationLayout, key, layout);
+	IoAll(record, StoreRecord::TessellationLayout, key, layout);
 	m_store.Append(std::move(record.bytes));
 }
 

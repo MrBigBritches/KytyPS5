@@ -694,6 +694,18 @@ add_executable(shader_store_keys_tests EXCLUDE_FROM_ALL
 target_link_libraries(shader_store_keys_tests common fmt::fmt xbyak::xbyak)
 target_include_directories(shader_store_keys_tests PRIVATE ${inc_headers})
 
+# The store record format. It encodes and decodes a plan, so it links the plan code like the keys
+# test does, plus the zstd frame and the checksum. It needs no graphics device.
+add_executable(shader_store_record_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ShaderStoreRecordTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/shaderStoreRecord.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/gpu_format.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
+)
+target_link_libraries(shader_store_record_tests common fmt::fmt xbyak::xbyak xxhash libzstd_static)
+target_include_directories(shader_store_record_tests PRIVATE ${inc_headers})
+
 set(gpu_test_generated_dir "${PROJECT_BINARY_DIR}/gpu_test_shaders")
 set(gpu_test_ms_depth_source
 	"${gpu_tiler_shader_dir}/gpu_test_ms_depth.comp")
@@ -862,6 +874,7 @@ if(BUILD_TESTING)
 	add_test(NAME shader_store_scan COMMAND $<TARGET_FILE:shader_store_scan_tests>)
 	add_test(NAME shader_store_predictor COMMAND $<TARGET_FILE:shader_store_predictor_tests>)
 	add_test(NAME shader_store_keys COMMAND $<TARGET_FILE:shader_store_keys_tests>)
+	add_test(NAME shader_store_record COMMAND $<TARGET_FILE:shader_store_record_tests>)
 	add_test(NAME shader_recompiler_submit_cadence
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --submit-cadence-only)
 	add_test(NAME shader_recompiler_submit_cadence_gpu
@@ -993,6 +1006,7 @@ if(BUILD_TESTING)
 		shader_store_scan_tests
 		shader_store_predictor_tests
 		shader_store_keys_tests
+		shader_store_record_tests
 		virtual_memory_allocation_tests
 		audio_out2_port_tests
 		audio_out_timing_tests
