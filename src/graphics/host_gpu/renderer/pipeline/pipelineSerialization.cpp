@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 
+#include "common/childProcess.h"
 #include "common/emulatorConfig.h"
 #include "common/firstRunReport.h"
 #include "common/logging/log.h"
@@ -17,13 +18,6 @@
 #include <ranges>
 #include <xxhash.h>
 #include <zstd.h>
-
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-#elif defined(__APPLE__)
-#include <mach-o/dyld.h>
-#endif
 
 // The shader store: a header, then zstd-compressed records of everything a run created first.
 // Records are only appended, so a store cut short by a crash keeps every complete record.
@@ -47,20 +41,9 @@ struct Frame {
 // Changes with every build, so records never meet code that encodes them differently. Zero when
 // the executable cannot be found.
 uint64_t BuildStamp() {
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	std::array<wchar_t, 32768> name {};
-	GetModuleFileNameW(nullptr, name.data(), static_cast<DWORD>(name.size()));
-	const std::filesystem::path path = name.data();
-#elif defined(__APPLE__)
-	std::array<char, 4096> name {};
-	auto size = static_cast<uint32_t>(name.size());
-	_NSGetExecutablePath(name.data(), &size);
-	const std::filesystem::path path = name.data();
-#else
-	const std::filesystem::path path = "/proc/self/exe";
-#endif
 	std::error_code error;
-	const auto      time = std::filesystem::last_write_time(path, error).time_since_epoch().count();
+	const auto      time =
+	    std::filesystem::last_write_time(Common::ExecutableStatPath(), error).time_since_epoch().count();
 	return error ? 0 : static_cast<uint64_t>(time);
 }
 

@@ -636,6 +636,10 @@ add_executable(gpu_stall_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/GpuStallTests
 target_link_libraries(gpu_stall_tests common fmt::fmt)
 target_include_directories(gpu_stall_tests PRIVATE ${inc_headers})
 
+add_executable(child_process_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/ChildProcessTests.cpp")
+target_link_libraries(child_process_tests common fmt::fmt)
+target_include_directories(child_process_tests PRIVATE ${inc_headers})
+
 add_executable(first_run_report_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/FirstRunReportTests.cpp")
 target_link_libraries(first_run_report_tests common fmt::fmt nlohmann_json::nlohmann_json)
 target_include_directories(first_run_report_tests PRIVATE ${inc_headers})
@@ -785,6 +789,9 @@ if(BUILD_TESTING)
 	add_test(NAME gpu_stall COMMAND $<TARGET_FILE:gpu_stall_tests>)
 	# A missed wakeup shows up as a hang, so fail fast instead of at the default timeout.
 	set_tests_properties(gpu_stall PROPERTIES TIMEOUT 30)
+	add_test(NAME child_process COMMAND $<TARGET_FILE:child_process_tests>)
+	# A child that is never killed makes ctest wait on it, so cap the run. The suite takes a few seconds.
+	set_tests_properties(child_process PROPERTIES TIMEOUT 120)
 	add_test(NAME first_run_report COMMAND $<TARGET_FILE:first_run_report_tests>)
 	add_test(NAME sync_on_address COMMAND $<TARGET_FILE:sync_on_address_tests>)
 	add_test(NAME audio_out2_port COMMAND $<TARGET_FILE:audio_out2_port_tests>)
@@ -941,6 +948,7 @@ if(BUILD_TESTING)
 		event_queue_lifetime_tests
 		kernel_file_system_tests
 		gpu_stall_tests
+		child_process_tests
 		first_run_report_tests
 		sync_on_address_tests
 		shader_recompiler_compute_tests
