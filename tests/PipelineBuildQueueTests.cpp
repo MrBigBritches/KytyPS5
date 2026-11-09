@@ -361,7 +361,7 @@ int LoweredPriority(int ordinary) {
 	(void)ordinary;
 	return THREAD_PRIORITY_BELOW_NORMAL;
 #else
-	// These mirror LOW_PRIORITY_NICE and MAX_NICE in pipelineBuildQueue.cpp.
+	// These mirror LOW_PRIORITY_NICE and MAX_NICE in src/common/threadPriority.cpp.
 	constexpr int EXPECTED_NICE_STEP = 5;
 	constexpr int MAX_NICE           = 19;
 	return std::min(ordinary + EXPECTED_NICE_STEP, MAX_NICE);

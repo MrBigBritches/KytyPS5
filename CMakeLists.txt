@@ -578,6 +578,10 @@ add_executable(pipeline_build_queue_tests EXCLUDE_FROM_ALL
 target_link_libraries(pipeline_build_queue_tests common fmt::fmt)
 target_include_directories(pipeline_build_queue_tests PRIVATE ${inc_headers})
 
+add_executable(thread_priority_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/ThreadPriorityTests.cpp")
+target_link_libraries(thread_priority_tests common fmt::fmt)
+target_include_directories(thread_priority_tests PRIVATE ${inc_headers})
+
 add_executable(pipeline_library_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/PipelineLibraryTests.cpp")
 target_include_directories(pipeline_library_tests PRIVATE ${inc_headers})
 
@@ -908,6 +912,7 @@ if(BUILD_TESTING)
 	add_test(NAME pipeline_build_queue COMMAND $<TARGET_FILE:pipeline_build_queue_tests>)
 	# A lost wakeup or a job run twice shows up as a hang, so fail fast.
 	set_tests_properties(pipeline_build_queue PROPERTIES TIMEOUT 60)
+	add_test(NAME thread_priority COMMAND $<TARGET_FILE:thread_priority_tests>)
 	add_test(NAME pipeline_library COMMAND $<TARGET_FILE:pipeline_library_tests>)
 	add_test(NAME pipeline_parts COMMAND $<TARGET_FILE:pipeline_parts_tests>)
 	add_test(NAME descriptor_set_layout_cache COMMAND $<TARGET_FILE:descriptor_set_layout_cache_tests>)
@@ -1073,6 +1078,7 @@ if(BUILD_TESTING)
 		jpeg_enc_tests
 		occlusion_queries_tests
 		pipeline_build_queue_tests
+		thread_priority_tests
 		pipeline_library_tests
 		pipeline_parts_tests
 		descriptor_set_layout_cache_tests

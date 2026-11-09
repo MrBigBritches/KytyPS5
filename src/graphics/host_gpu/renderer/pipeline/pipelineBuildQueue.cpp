@@ -2,36 +2,17 @@
 
 #include "common/config.h"
 #include "common/profiler.h"
+#include "common/threadPriority.h"
 
 #include <algorithm>
 #include <atomic>
-#include <cerrno>
 #include <cstdio>
 #include <thread>
 #include <utility>
 
-#if defined(__APPLE__)
-#include <pthread/qos.h>
-#elif KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
-#include <sys/resource.h>
-#include <sys/syscall.h>
-#include <unistd.h>
-#endif
-
 namespace Libs::Graphics {
 
 namespace {
-// How much nicer than the thread's current value the build threads become, so they lose to the
-// guest threads without starving.
-[[maybe_unused]] constexpr int LOW_PRIORITY_NICE = 5;
-// The largest nice value Linux accepts.
-[[maybe_unused]] constexpr int MAX_NICE = 19;
-
 // The hint is only worth reporting once per process, however many workers it fails on.
 std::atomic_flag g_priority_failure_logged;
 
@@ -42,43 +23,18 @@ void LogPriorityFailure(const char* api, long code) {
 	}
 }
 
-// Lowers the priority of the calling thread only, to below normal on Windows, by a few nice
-// steps on Linux and to the utility QoS class on macOS. Returns false when the system refused, and
-// the caller carries on at its old priority.
+// Lowers the priority of the calling thread through the shared helper. A refusal is logged once
+// and the caller carries on at its old priority.
 bool LowerCurrentThreadPriority() {
-#if defined(__APPLE__)
-	const int error = pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
-	if (error != 0) {
-		LogPriorityFailure("pthread_set_qos_class_self_np", error);
-		return false;
+	Common::PriorityFailure failure;
+	if (Common::LowerCurrentThreadPriority(&failure)) {
+		return true;
 	}
-	return true;
-#elif KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	if (SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL) == 0) {
-		LogPriorityFailure("SetThreadPriority", static_cast<long>(GetLastError()));
-		return false;
+	// A platform without priority support names no call, and nothing was logged for it before.
+	if (failure.api != nullptr) {
+		LogPriorityFailure(failure.api, failure.code);
 	}
-	return true;
-#elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
-	// On Linux the nice value belongs to the thread id, so this leaves the rest of the process alone.
-	// The value is absolute, so it is built from the current one and a process that already runs
-	// niced is not asked for something it may not do.
-	const auto thread_id = static_cast<id_t>(syscall(SYS_gettid));
-	// -1 is a valid nice value, so only errno says whether the read failed.
-	errno                = 0;
-	const int current    = getpriority(PRIO_PROCESS, thread_id);
-	if (current == -1 && errno != 0) {
-		LogPriorityFailure("getpriority", errno);
-		return false;
-	}
-	if (setpriority(PRIO_PROCESS, thread_id, std::min(current + LOW_PRIORITY_NICE, MAX_NICE)) != 0) {
-		LogPriorityFailure("setpriority", errno);
-		return false;
-	}
-	return true;
-#else
 	return false;
-#endif
 }
 } // namespace
 
