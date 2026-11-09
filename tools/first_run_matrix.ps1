@@ -57,14 +57,15 @@ $ArmTable = [ordered]@{
     "deferred-warm-up" = @{ Flags = @("--deferred-pipeline-draws", "--background-warm-up");                               Ready = $true }
     "deferred-pause" = @{ Flags = @("--deferred-pipeline-draws", "--background-warm-up", "--pause-warm-up-for-draws");   Ready = $true }
     "deferred-non-push" = @{ Flags = @("--deferred-pipeline-draws", "--background-warm-up", "--pause-warm-up-for-draws", "--deferred-non-push-draws"); Ready = $true }
-    "gpl"            = @{ Flags = @("--graphics-pipeline-library");                                                        Ready = $false }
+    "gpl"            = @{ Flags = @("--deferred-pipeline-draws", "--background-warm-up", "--pause-warm-up-for-draws", "--deferred-non-push-draws", "--graphics-pipeline-library"); Ready = $true }
     "lookahead"      = @{ Flags = @("--shader-lookahead");                                                                 Ready = $false }
 }
 
 # "all" turns on every strategy, so it is Ready only once every strategy arm is, and its flags are
 # theirs together. The depth-only arm is left out, because it is the default skip rule with a
 # stricter gate. Both flags can be on at once, and then depth-only wins, so "all" would measure the
-# depth-only mode instead of the default one.
+# depth-only mode instead of the default one. The gpl arm carries the deferred-non-push flags,
+# because GPL holes need them, so "all" gets the deferred strategies through it.
 $StrategyArms = @("async-graphics", "warm-up", "gpl", "lookahead")
 $ArmTable["all"] = @{
     Flags = @($StrategyArms | ForEach-Object { $ArmTable[$_].Flags })

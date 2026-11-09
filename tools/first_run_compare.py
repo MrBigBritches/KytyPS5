@@ -24,7 +24,8 @@ MEASUREMENT_FLAGS = {"--first-run-report", "--cold-pipelines"}
 # Flags that define an arm. These always show in its name, or a set of reports from one arm would be
 # labelled baseline. Add each new strategy's flag here.
 STRATEGY_FLAGS = {"--async-pipelines", "--async-pipelines-depth-only", "--background-warm-up",
-                  "--deferred-pipeline-draws", "--pause-warm-up-for-draws", "--deferred-non-push-draws"}
+                  "--deferred-pipeline-draws", "--pause-warm-up-for-draws", "--deferred-non-push-draws",
+                  "--graphics-pipeline-library"}
 # Histogram buckets whose lower bound is at least one second.
 LONG_PAUSE_BUCKETS = ("1000", "2500", "5000", "10000")
 MS_PER_SECOND = 1000.0
@@ -59,6 +60,11 @@ def arm_name(report, common=frozenset()):
     warmed = report.get("boot", {}).get("modules", 0)
     if warmed:
         label += f" (store {warmed})"
+    # A device that cannot link libraries runs the GPL arm as if the flag were off, so that run must
+    # not be merged with real GPL runs.
+    library = report.get("graphics_pipeline_library", {})
+    if report.get("flags", {}).get("--graphics-pipeline-library") and not library.get("active"):
+        label += " (gpl inactive)"
     return label if report.get("cold") else label + " (warm)"
 
 
