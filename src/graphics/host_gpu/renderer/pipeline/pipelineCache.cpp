@@ -363,6 +363,16 @@ ShaderModule* PipelineCache::Program::FindModule(const ShaderRecompiler::IR::Srt
 	return nullptr;
 }
 
+uint64_t PipelineCache::ModuleId(const ProgramKey& key, uint32_t push_data_start_dword,
+                                 const ShaderRecompiler::IR::ResourceSpecialization& specialization,
+                                 std::span<const uint32_t>                           function_code) {
+	ShaderRecompiler::IR::Writer inputs;
+	ShaderRecompiler::IR::IoAll(inputs, key.stage, key.hash, key.user_data_count, key.static_state,
+	                            push_data_start_dword, specialization);
+	inputs.Raw(function_code.data(), function_code.size_bytes()); // Last, so it needs no size.
+	return XXH3_64bits(inputs.bytes.data(), inputs.bytes.size());
+}
+
 ShaderModule& PipelineCache::CompileModule(Program& program, const ProgramKey& key,
                                            ShaderRecompiler::CompileOptions  options,
                                            ShaderRecompiler::TranslateResult translated,
@@ -376,13 +386,8 @@ ShaderModule& PipelineCache::CompileModule(Program& program, const ProgramKey& k
 	                                               program.specialization, push_data_cursor);
 	auto info = std::move(result.program).TakeCompiledInfo();
 
-	// The same inputs give the same module id across runs.
 	const auto function_code = program.FunctionCode();
-	ShaderRecompiler::IR::Writer inputs;
-	ShaderRecompiler::IR::IoAll(inputs, key.stage, key.hash, key.user_data_count, key.static_state,
-	                            info.bindings.push_data_start_dword, program.specialization);
-	inputs.Raw(function_code.data(), function_code.size_bytes()); // Last, so it needs no size.
-	const auto id = XXH3_64bits(inputs.bytes.data(), inputs.bytes.size());
+	const auto id = ModuleId(key, info.bindings.push_data_start_dword, program.specialization, function_code);
 
 	const auto* stage = ShaderRecompiler::StageName(key.stage);
 	DumpShader(result.spirv, fmt::format("{}_{:016x}_{:016x}.spv", stage, key.hash, id));

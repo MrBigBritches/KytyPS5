@@ -470,6 +470,12 @@ private:
 	                            ShaderRecompiler::CompileOptions  options,
 	                            ShaderRecompiler::TranslateResult translated,
 	                            uint32_t                          push_data_cursor);
+	// The id of a module compiled from these inputs. The same inputs give the same id in every
+	// run, and the shader store keys its module records by it, so it must never change for inputs
+	// an existing store already holds. Everything that makes a module must take its id from here.
+	[[nodiscard]] static uint64_t ModuleId(const ProgramKey& key, uint32_t push_data_start_dword,
+	                                       const ShaderRecompiler::IR::ResourceSpecialization& specialization,
+	                                       std::span<const uint32_t>                           function_code);
 	void InitializeDriverCache();
 	void CheckpointDriverCache();
 

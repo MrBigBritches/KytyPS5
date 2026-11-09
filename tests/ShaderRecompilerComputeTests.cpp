@@ -1111,6 +1111,42 @@ struct DescriptorHeapTestAccess {
 };
 
 struct PipelineCacheTestAccess {
+  // The module id of a fixed compute key, for the golden check. Each input is non-default, and the
+  // specialization holds one buffer, image and sampler with every field set, so a field left out
+  // of the id, or encoded another way, changes it.
+  static uint64_t FixedModuleId(uint32_t push_data_start_dword) {
+    using Spec = ShaderRecompiler::IR::ResourceSpecialization;
+    const PipelineCache::ProgramKey key{.stage = ShaderType::Compute,
+                                        .hash = 0x0123456789abcdefull,
+                                        .user_data_count = 12,
+                                        .static_state = {0x11u, 0x22u, 0x33u}};
+    const std::array<uint32_t, 3> function_code{0xaau, 0xbbu, 0xccu};
+    Spec specialization;
+    specialization.buffers.push_back({.packed_stride = 16,
+                                      .descriptor_format = static_cast<Prospero::BufferFormat>(3),
+                                      .descriptor_swizzle = 0x0123,
+                                      .zero_stride_oob = true,
+                                      .scalar_empty = true,
+                                      .indirect_root = 5,
+                                      .indirect_mapping_offset = 6,
+                                      .indirect_search_iterations = 7});
+    specialization.images.push_back({.numeric_class = static_cast<Prospero::TextureNumericClass>(2),
+                                     .dimension = static_cast<decltype(Spec::Image::dimension)>(1),
+                                     .mip_count = 4,
+                                     .conversion_format = static_cast<Prospero::BufferFormat>(9),
+                                     .shader_swizzle = 0x0456,
+                                     .srgb_decode = static_cast<Prospero::BufferFormat>(10),
+                                     .indirect_root = 8,
+                                     .indirect_mapping_offset = 9,
+                                     .indirect_search_iterations = 10,
+                                     .cube = true,
+                                     .skip_degamma = true,
+                                     .fmask = true,
+                                     .heap = true});
+    specialization.samplers.push_back({.indirect_root = 11, .indirect_mapping_offset = 12, .indirect_search_iterations = 13});
+    return PipelineCache::ModuleId(key, push_data_start_dword, specialization, function_code);
+  }
+
   // Replaces each graphics pipeline whose stage ids name compiled modules with one created
   // from only its key and those modules. The GPU must be idle. Returns how many it replaced.
   static uint32_t RecreateGraphicsPipelines(PipelineCache &cache) {
@@ -2394,6 +2430,23 @@ void CheckLeastRecentlyUsedCacheOrdering() {
           visited == std::vector<uint32_t>{1, 3, 2},
           "touching a non-tail item left a cycle or changed LRU order");
   std::printf("[host]    %-32s ok\n", "LeastRecentlyUsedCache");
+}
+
+// Shader store module records are keyed by their module id, so the id of given inputs must never
+// change, or every store on disk would stop matching. ModuleId writes the same bytes the id code
+// did before it moved there, and the golden pins them, including how specialization entries are
+// encoded. A different push start must give a different id, which shows the golden is not a
+// constant. The golden assumes a little-endian host and the vendored XXH3 version.
+void CheckModuleIdGolden() {
+  constexpr const char *name = "ModuleIdGolden";
+  constexpr uint64_t golden_id = 0xe7e70feb629b182full;
+  constexpr uint32_t push_start = 7;
+  const auto id = PipelineCacheTestAccess::FixedModuleId(push_start);
+  Require(name, "golden", id == golden_id,
+          "the module id of fixed inputs changed, so existing stores no longer match");
+  Require(name, "push start counts", PipelineCacheTestAccess::FixedModuleId(push_start + 1) != id,
+          "the module id ignored the push start");
+  std::printf("[host]    %-32s ok\n", name);
 }
 
 // The flag must be off by default and on when only its field is set.
@@ -68408,6 +68461,7 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--submit-cadence-only") == 0) {
     return 0;
   }
+  CheckModuleIdGolden();
   CheckNativeFloatMinMaxConfig();
   CheckSpirvProfileNativeFloatMinMax();
   if (argc == 2 && std::strcmp(argv[1], "--native-float-minmax-only") == 0) {
