@@ -472,7 +472,8 @@ private:
 	                            uint32_t                          push_data_cursor);
 	// The id of a module compiled from these inputs. The same inputs give the same id in every
 	// run, and the shader store keys its module records by it, so it must never change for inputs
-	// an existing store already holds. Everything that makes a module must take its id from here.
+	// an existing store already holds. This forwards to ShaderModuleId in graphics/shader/moduleId.h,
+	// which everything that makes a module must take its id from.
 	[[nodiscard]] static uint64_t ModuleId(const ProgramKey& key, uint32_t push_data_start_dword,
 	                                       const ShaderRecompiler::IR::ResourceSpecialization& specialization,
 	                                       std::span<const uint32_t>                           function_code);

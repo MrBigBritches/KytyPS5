@@ -56,6 +56,7 @@
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window/vulkanValidation.h"
 #include "graphics/presentation/window/windowInternal.h"
+#include "graphics/shader/moduleId.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/Tessellation.h"
@@ -1114,7 +1115,7 @@ struct PipelineCacheTestAccess {
   // The module id of a fixed compute key, for the golden check. Each input is non-default, and the
   // specialization holds one buffer, image and sampler with every field set, so a field left out
   // of the id, or encoded another way, changes it.
-  static uint64_t FixedModuleId(uint32_t push_data_start_dword) {
+  static uint64_t FixedModuleId(uint32_t push_data_start_dword, bool through_free_function = false) {
     using Spec = ShaderRecompiler::IR::ResourceSpecialization;
     const PipelineCache::ProgramKey key{.stage = ShaderType::Compute,
                                         .hash = 0x0123456789abcdefull,
@@ -1144,6 +1145,10 @@ struct PipelineCacheTestAccess {
                                      .fmask = true,
                                      .heap = true});
     specialization.samplers.push_back({.indirect_root = 11, .indirect_mapping_offset = 12, .indirect_search_iterations = 13});
+    if (through_free_function) {
+      return ShaderModuleId(key.stage, key.hash, key.user_data_count, key.static_state,
+                            push_data_start_dword, specialization, function_code);
+    }
     return PipelineCache::ModuleId(key, push_data_start_dword, specialization, function_code);
   }
 
@@ -2444,6 +2449,9 @@ void CheckModuleIdGolden() {
   const auto id = PipelineCacheTestAccess::FixedModuleId(push_start);
   Require(name, "golden", id == golden_id,
           "the module id of fixed inputs changed, so existing stores no longer match");
+  Require(name, "free function golden",
+          PipelineCacheTestAccess::FixedModuleId(push_start, true) == golden_id,
+          "ShaderModuleId gave another id than the golden, so the generator would disagree with the cache");
   Require(name, "push start counts", PipelineCacheTestAccess::FixedModuleId(push_start + 1) != id,
           "the module id ignored the push start");
   std::printf("[host]    %-32s ok\n", name);

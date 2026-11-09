@@ -19,6 +19,7 @@
 #include "graphics/host_gpu/renderer/pipeline/graphicsLibraryCache.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/shader/moduleId.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/Tessellation.h"
@@ -366,11 +367,8 @@ ShaderModule* PipelineCache::Program::FindModule(const ShaderRecompiler::IR::Srt
 uint64_t PipelineCache::ModuleId(const ProgramKey& key, uint32_t push_data_start_dword,
                                  const ShaderRecompiler::IR::ResourceSpecialization& specialization,
                                  std::span<const uint32_t>                           function_code) {
-	ShaderRecompiler::IR::Writer inputs;
-	ShaderRecompiler::IR::IoAll(inputs, key.stage, key.hash, key.user_data_count, key.static_state,
-	                            push_data_start_dword, specialization);
-	inputs.Raw(function_code.data(), function_code.size_bytes()); // Last, so it needs no size.
-	return XXH3_64bits(inputs.bytes.data(), inputs.bytes.size());
+	return ShaderModuleId(key.stage, key.hash, key.user_data_count, key.static_state,
+	                      push_data_start_dword, specialization, function_code);
 }
 
 ShaderModule& PipelineCache::CompileModule(Program& program, const ProgramKey& key,
