@@ -12,6 +12,7 @@ namespace Libs::Graphics {
 namespace HW {
 class Context;
 class UserConfig;
+struct CsStageRegisters;
 } // namespace HW
 
 struct ShaderParams {
@@ -29,6 +30,12 @@ struct ShaderParams {
 void BuildStageStaticKey(const ShaderVertexInputInfo& input_info, std::vector<uint32_t>& key);
 void BuildStageStaticKey(const ShaderPixelInputInfo& input_info, std::vector<uint32_t>& key);
 void BuildStageStaticKey(const ShaderComputeInputInfo& input_info, std::vector<uint32_t>& key);
+
+/// Fills the static part of a compute shader's input info from its stage registers.
+/// The runtime and the shader store generator both call this, so the two cannot disagree on how
+/// registers map to the key. The device fields host_subgroup_size and lds_storage are left alone.
+void ShaderGetStaticInputInfoCS(const HW::CsStageRegisters& cs_regs, uint32_t scratch_size_dwords,
+                                ShaderComputeInputInfo& info);
 
 ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context& context,
                             const HW::UserConfig& user_config, ShaderVertexInputInfo& input_info);

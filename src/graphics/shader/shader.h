@@ -342,6 +342,13 @@ struct ShaderMappedData {
 
 void ShaderInit();
 void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data);
+/// The length in bytes of the part of a shader binary that is hashed and translated, which is the
+/// code plus its literal buffer as sized by the footer that ends the binary. A binary without a
+/// valid footer is hashed whole, and then the result equals size.
+/// @param binary the binary, ending with the 0x30-byte footer. It must be 4-byte aligned and
+///               readable for `size` bytes.
+/// @param size   the binary's length in bytes, a multiple of 4.
+uint32_t ShaderProgramSize(const uint32_t* binary, uint32_t size);
 uint32_t ShaderPixelExportTarget(uint32_t shader_mask, uint32_t export_index);
 
 void     ShaderDbgDumpInputInfo(const ShaderVertexInputInfo& info);

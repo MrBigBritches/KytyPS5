@@ -213,6 +213,8 @@ file(GLOB kyty_emulator_src CONFIGURE_DEPENDS
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/*.h"
 	"${KYTY_SOURCE_DIR}/graphics/shader/*.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/*.h"
+	"${KYTY_SOURCE_DIR}/graphics/shader/storegen/*.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/storegen/*.h"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/*.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/*.h"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/frontend/cfg/*.cpp"
@@ -658,6 +660,16 @@ target_link_libraries(image_page_table_tests common fmt::fmt)
 target_include_directories(image_page_table_tests PRIVATE ${inc_headers})
 
 add_kyty_full_emulator_test(shader_recompiler_compute_tests "${KYTY_TESTS_DIR}/ShaderRecompilerComputeTests.cpp")
+# A light target. It links only the scan, the register decoder and the device-free key code.
+add_executable(shader_store_scan_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ShaderStoreScanTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/csRegisters.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/shaderStaticKey.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/storegen/ebootShaderScan.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/storegen/computeStaticKey.cpp"
+)
+target_link_libraries(shader_store_scan_tests common fmt::fmt xxhash)
+target_include_directories(shader_store_scan_tests PRIVATE ${inc_headers})
 
 set(gpu_test_generated_dir "${PROJECT_BINARY_DIR}/gpu_test_shaders")
 set(gpu_test_ms_depth_source
@@ -824,6 +836,7 @@ if(BUILD_TESTING)
 	add_test(NAME http_uri_parse COMMAND $<TARGET_FILE:http_uri_parse_tests>)
 	add_test(NAME rtc COMMAND $<TARGET_FILE:rtc_tests>)
 	add_test(NAME shader_recompiler_compute COMMAND $<TARGET_FILE:shader_recompiler_compute_tests>)
+	add_test(NAME shader_store_scan COMMAND $<TARGET_FILE:shader_store_scan_tests>)
 	add_test(NAME shader_recompiler_submit_cadence
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --submit-cadence-only)
 	add_test(NAME shader_recompiler_submit_cadence_gpu
@@ -952,6 +965,7 @@ if(BUILD_TESTING)
 		first_run_report_tests
 		sync_on_address_tests
 		shader_recompiler_compute_tests
+		shader_store_scan_tests
 		virtual_memory_allocation_tests
 		audio_out2_port_tests
 		audio_out_timing_tests

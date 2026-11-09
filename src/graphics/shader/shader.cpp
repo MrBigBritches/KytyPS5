@@ -1,6 +1,5 @@
 #include "graphics/shader/shader.h"
 
-#include "common/alignment.h"
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
@@ -54,21 +53,6 @@ void ShaderInit() {
 	EXIT_IF(g_shader_map != nullptr);
 
 	g_shader_map = std::make_unique<std::unordered_map<uint64_t, ShaderMapEntry>>();
-}
-
-// The program's code and, at align16(code size), its literal buffer, as sized by the 0x30-byte
-// footer that ends a binary; the whole binary when the footer is unknown.
-static uint32_t ShaderProgramSize(const uint32_t* binary, uint32_t size) {
-	constexpr uint32_t FooterSize = 0x30;
-	if (size < FooterSize) return size;
-	// Magic, then version, code size and literal buffer size at +0x10.
-	const auto* footer = binary + (size - FooterSize) / 4;
-	const auto  end    = Common::AlignUp(uint64_t {footer[5]}, 16) + footer[6];
-	if (std::memcmp(footer, "barefoot", 8) != 0 || footer[4] != 1 || footer[5] == 0 ||
-	    end % 4 != 0 || end > size - FooterSize) {
-		return size;
-	}
-	return static_cast<uint32_t>(end);
 }
 
 void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data) {
@@ -394,24 +378,6 @@ static void ShaderGetStaticInputInfoPS(
 	}
 }
 
-static void ShaderGetStaticInputInfoCS(const HW::ComputeShaderInfo& regs,
-                                       const ShaderMappedData& data, ShaderComputeInputInfo& info) {
-	info.threads_num[0]      = regs.cs_regs.num_thread_x;
-	info.threads_num[1]      = regs.cs_regs.num_thread_y;
-	info.threads_num[2]      = regs.cs_regs.num_thread_z;
-	info.lds_size_dwords     = static_cast<uint32_t>(regs.cs_regs.lds_size) * 128u;
-	info.scratch_size_dwords = data.scratch_size_dwords;
-	info.float_mode          = regs.cs_regs.float_mode;
-	info.group_id[0]         = regs.cs_regs.tgid_x_en != 0;
-	info.group_id[1]         = regs.cs_regs.tgid_y_en != 0;
-	info.group_id[2]         = regs.cs_regs.tgid_z_en != 0;
-	info.wave_size           = regs.cs_regs.wave_size;
-	info.thread_ids_num      = regs.cs_regs.tidig_comp_cnt + 1;
-	info.tg_size_en          = regs.cs_regs.tg_size_en != 0;
-
-	info.workgroup_register = regs.cs_regs.user_sgpr;
-}
-
 void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t>& key) {
 	EXIT_IF(info.resources_num < 0 || info.resources_num > ShaderVertexInputInfo::RES_MAX);
 	key.clear();
@@ -509,23 +475,6 @@ void BuildStageStaticKey(const ShaderPixelInputInfo& info, std::vector<uint32_t>
 	}
 	key.insert(key.end(), std::begin(info.interpolator_settings),
 	           std::begin(info.interpolator_settings) + info.input_num);
-}
-
-void BuildStageStaticKey(const ShaderComputeInputInfo& info, std::vector<uint32_t>& key) {
-	key.clear();
-	key.push_back(info.workgroup_register);
-	key.push_back(info.wave_size | (static_cast<uint32_t>(info.float_mode) << 8u));
-	key.push_back(info.host_subgroup_size);
-	key.push_back(info.thread_ids_num);
-	key.push_back(info.lds_size_dwords);
-	key.push_back(info.scratch_size_dwords);
-	key.push_back(static_cast<uint32_t>(info.dispatch_thread_dimensions) |
-	              (static_cast<uint32_t>(info.async_compute) << 1u));
-	for (int i = 0; i < 3; i++) {
-		key.push_back(info.threads_num[i]);
-		key.push_back(static_cast<uint32_t>(info.group_id[i]));
-	}
-	key.push_back(static_cast<uint32_t>(info.tg_size_en));
 }
 
 ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context& context,
@@ -684,7 +633,7 @@ ShaderParams PrepareProgram(
 
 ShaderParams PrepareProgram(const HW::ComputeShaderInfo& regs, ShaderComputeInputInfo& info) {
 	const auto [data, hash] = ShaderGetMappedData(regs.cs_regs.data_addr, "ShaderGetInputInfoCS():");
-	ShaderGetStaticInputInfoCS(regs, data, info);
+	ShaderGetStaticInputInfoCS(regs.cs_regs, data.scratch_size_dwords, info);
 	return GetShaderParams(
 	    regs.cs_regs.data_addr, hash,
 	    std::span<const uint32_t>(regs.cs_user_sgpr.value, regs.cs_regs.user_sgpr), data);
