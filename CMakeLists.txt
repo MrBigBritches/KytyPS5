@@ -706,6 +706,21 @@ add_executable(shader_store_record_tests EXCLUDE_FROM_ALL
 target_link_libraries(shader_store_record_tests common fmt::fmt xbyak::xbyak xxhash libzstd_static)
 target_include_directories(shader_store_record_tests PRIVATE ${inc_headers})
 
+# The tailer that follows a store worker's output file. It checks the generated file's header and
+# unframes records, so it links the same pieces as the record test plus the worker's file format. It
+# needs no graphics device.
+add_executable(shader_store_tailer_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ShaderStoreTailerTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/storegen/frameTailer.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/storegen/storeWorkerFormat.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/shaderStoreRecord.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/gpu_format.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
+)
+target_link_libraries(shader_store_tailer_tests common fmt::fmt xbyak::xbyak xxhash libzstd_static)
+target_include_directories(shader_store_tailer_tests PRIVATE ${inc_headers})
+
 # The store worker translates and compiles real programs, so this links the whole recompiler. It
 # still needs no graphics device and none of the emulator's libraries, so it does not build the
 # emulator's sources as the full emulator tests do.
@@ -908,6 +923,7 @@ if(BUILD_TESTING)
 	add_test(NAME shader_store_predictor COMMAND $<TARGET_FILE:shader_store_predictor_tests>)
 	add_test(NAME shader_store_keys COMMAND $<TARGET_FILE:shader_store_keys_tests>)
 	add_test(NAME shader_store_record COMMAND $<TARGET_FILE:shader_store_record_tests>)
+	add_test(NAME shader_store_tailer COMMAND $<TARGET_FILE:shader_store_tailer_tests>)
 	add_test(NAME shader_store_worker COMMAND $<TARGET_FILE:shader_store_worker_tests>)
 	add_test(NAME shader_recompiler_submit_cadence
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --submit-cadence-only)
@@ -1041,6 +1057,7 @@ if(BUILD_TESTING)
 		shader_store_predictor_tests
 		shader_store_keys_tests
 		shader_store_record_tests
+		shader_store_tailer_tests
 		shader_store_worker_tests
 		virtual_memory_allocation_tests
 		audio_out2_port_tests
