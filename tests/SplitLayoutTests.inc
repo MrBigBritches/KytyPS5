@@ -62,6 +62,7 @@
     bool push_only = false;
     bool pixel_set_push = false;
     bool vertex_layout = false;
+    bool from_libraries = false;
   };
 
   // Draws once with the library mode `split` and the given limit on push descriptors, and keeps the
@@ -92,6 +93,7 @@
     run.push_only = pipeline.uses_push_descriptors;
     run.pixel_set_push = pipeline.pixel_set_is_push;
     run.vertex_layout = pipeline.vertex_set_layout != nullptr;
+    run.from_libraries = pipeline.from_libraries;
     graphics.max_push_descriptors = device_limit;
     return run;
   }
@@ -138,6 +140,8 @@
             "the draw left another picture than both stages reading their values");
     Require(name, "layout", run.split_layout == split,
             "the pipeline did not get the layout under test");
+    Require(name, "libraries", run.from_libraries == split,
+            "the pipeline was not linked from libraries exactly when the library mode is on");
     if (split) {
       Require(name, "pixel set", run.vertex_layout && run.pixel_set_push == pixel_push,
               "the pipeline did not get the pixel set the limit allows");
@@ -533,6 +537,7 @@
   // fits is pushed and defers under both layouts, and one that does not is blocked under both.
   void CheckSplitDeferralPass(bool split) {
     constexpr const char *name = "SplitLayoutDeferral";
+    const auto linked_before = TotalLinkedPipelines();
     const auto vertex = RunSplitDeferral(split, AddressStage::Vertex, SplitPushLimit);
     if (split) {
       Require(name, "split blocks vertex bindings",
@@ -555,6 +560,10 @@
             pixel_set.holes == 0 && pixel_set.ineligible == IneligibleCounts{{"non_push", 1}} &&
                 AllDrawn(pixel_set.color),
             "a draw whose PS set is allocated was deferred, or not counted as non_push");
+    // The deferred pipelines are built on the build queue, so libraries are shared by its workers.
+    Require(name, split ? "linked on workers" : "not linked",
+            (TotalLinkedPipelines() != linked_before) == split,
+            "the deferred draws did not build their pipelines the way the library mode says");
   }
 
   // Runs the deferral check in the single set and in the split layout.
@@ -619,11 +628,17 @@
   // mode off these are the single set baselines, and with it on they use the split layout.
   void CheckSplitDrawsPass(bool split) {
     SplitLayoutScope layout(*this, split);
+    const auto linked_before = TotalLinkedPipelines();
     for (const auto stage : {AddressStage::Vertex, AddressStage::Pixel}) {
       CheckHoleRecordedStreamNonPush(stage);
       CheckDeferredNonPush(stage);
       CheckDeferredNonPushPoolRetire(stage);
     }
+    // These draws build their pipelines themselves, so this is how the check knows that they ran on
+    // libraries in the split layout and on whole pipelines in the baseline.
+    Require("SplitLayoutDraws", split ? "linked" : "not linked",
+            (TotalLinkedPipelines() != linked_before) == split,
+            "the draws did not build their pipelines the way the library mode says");
     if (!split) return;
     CheckSplitDrawRecordIntoSideBuffer(AddressStage::Vertex, true);
     CheckSplitDrawRecordIntoSideBuffer(AddressStage::Vertex, false);
@@ -724,6 +739,11 @@
     CheckCacheOwnedLayoutsUnderValidation();
     CheckSplitScenarioUnderValidation("sharing", [&](bool split) { CheckSharedLayouts(split); });
     CheckSplitScenarioUnderValidation("teardown", [&](bool split) { CheckSharedLayoutTeardown(split); });
+    // The single set run draws the whole pipelines only, and the split run also links libraries.
+    CheckSplitScenarioUnderValidation("libraries", [&](bool split) { RunLibraryEquivalence(split); });
+    CheckSplitScenarioUnderValidation("library threads", [&](bool split) { RunLibraryConcurrency(split); });
+    CheckSplitScenarioUnderValidation("library fallback", [&](bool) { CheckLibraryFallback(); });
+    CheckSplitScenarioUnderValidation("library ineligible", [&](bool) { CheckLibraryIneligible(); });
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
@@ -1064,6 +1084,7 @@
     CheckSplitLayoutStore();
     CheckSplitLayoutHeap();
     CheckSplitLayoutSharing();
+    CheckGraphicsLibraries();
     std::printf("[gpu]     %-32s ok\n", name);
   }
 

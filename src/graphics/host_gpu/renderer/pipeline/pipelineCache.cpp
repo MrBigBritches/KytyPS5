@@ -16,6 +16,7 @@
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
+#include "graphics/host_gpu/renderer/pipeline/graphicsLibraryCache.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
@@ -538,7 +539,8 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 // build workers.
 PipelineCache::PipelineCache(GraphicContext&                         graphics,
                              ShaderRecompiler::IR::ImageHeapSource* image_heap)
-    : m_graphics(graphics), m_set_layouts(graphics.device), m_image_heap(image_heap),
+    : m_graphics(graphics), m_set_layouts(graphics.device),
+      m_libraries(std::make_unique<GraphicsLibraryCache>(graphics.device)), m_image_heap(image_heap),
       m_next_driver_cache_save(std::chrono::steady_clock::now() + DriverCacheSaveInterval) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
@@ -565,6 +567,9 @@ PipelineCache::~PipelineCache() {
 	};
 	destroy(m_graphics_pipelines);
 	destroy(m_compute_pipelines);
+	// Every pipeline linked from a library is gone, so the libraries may go. The layouts they were made
+	// with are the set layouts cache's, which is destroyed after this body.
+	m_libraries.reset();
 	for (const auto& program: m_program_cache | std::views::values) {
 		for (const auto& module: program.modules) {
 			m_graphics.device.destroyShaderModule(module.module, nullptr);
@@ -1205,7 +1210,8 @@ PipelineCache::Pipeline& PipelineCache::CreateGraphicsPipelineHere(Pipeline&    
 		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::PipelinesCreated,
 		                                         Common::DebugCounters::Counter::PipelineCreateNs,
 		                                         Common::DebugCounters::Peak::PipelineCreateNs);
-		CreatePipelineInternal(m_graphics, m_set_layouts, slot, key, stages, m_driver_cache);
+		CreatePipelineInternal(m_graphics, m_set_layouts, slot, key, stages, m_driver_cache,
+		                       m_libraries.get());
 	}
 	StorePipeline(key);
 	CheckpointDriverCache();
@@ -1454,7 +1460,7 @@ void PipelineCache::RunBuild(const std::shared_ptr<GraphicsBuild>& build) {
 	// On a worker the compile records itself as worker time, and nothing here counts toward the
 	// GPU thread's compile counters.
 	CreatePipelineInternal(m_graphics, m_set_layouts, build->pipeline, build->key, build->stages,
-	                       m_driver_cache);
+	                       m_driver_cache, m_libraries.get());
 	build->ready_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
 	                                                            build->requested)
 	                      .count();
@@ -1713,7 +1719,8 @@ void PipelineCache::StopBuilds() {
 		PipelineCacheLog("Pipeline build: waiting for {} running background compiles", running);
 	}
 	// Nothing runs now. A finished build nobody took still owns its Vulkan objects, and a build
-	// that never ran owns none.
+	// that never ran owns none. A pipeline linked from libraries is destroyed on its own here, which
+	// is fine, since the libraries stay in the cache until the destructor and may serve later builds.
 	for (const auto& pending: m_pending_graphics | std::views::values) {
 		const auto& pipeline = pending.build->pipeline;
 		DestroyPipelineObjects(m_graphics.device, pipeline);

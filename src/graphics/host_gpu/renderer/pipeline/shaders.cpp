@@ -7,6 +7,7 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
+#include "graphics/host_gpu/renderer/pipeline/graphicsLibraryCache.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineParts.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
@@ -182,6 +183,9 @@ static void DestroyOwnedSetLayout(vk::Device device, vk::DescriptorSetLayout lay
 
 void DestroyPipelineObjects(vk::Device device, const PipelineCache::Pipeline& pipeline) {
 	device.destroyPipeline(pipeline.pipeline, nullptr);
+	if (pipeline.linked_from != nullptr) {
+		pipeline.linked_from->NoteUnlinked();
+	}
 	device.destroyPipelineLayout(pipeline.pipeline_layout, nullptr);
 	// Only this layout is the pipeline's own. A split pipeline has none, and its vertex and pixel set
 	// layouts are shared, so they are left for the DescriptorSetLayoutCache to destroy once.
@@ -495,39 +499,82 @@ void FillFragmentOutputParts(FragmentOutputParts& out, const GraphicsPipelineKey
 	FillMultisampleState(out.multisampling, key.static_params);
 }
 
-// Fills the one dynamic state list, which does not depend on the part.
+namespace {
+
+// Which libraries read a dynamic state, as bits.
+enum DynamicOwner : unsigned {
+	OwnerPreRaster = 1,
+	OwnerFragment  = 2,
+	OwnerOutput    = 4,
+};
+
+// A dynamic state and the libraries that read it, as OwnerPreRaster, OwnerFragment and OwnerOutput bits.
+struct OwnedState {
+	vk::DynamicState state;
+	unsigned         owners;
+};
+
+// Adds the state to the whole list and to the list of every library that reads it.
+void AddOwnedState(DynamicStateParts& out, const OwnedState& owned) {
+	out.states.push_back(owned.state);
+	if ((owned.owners & OwnerPreRaster) != 0) out.pre_raster_states.push_back(owned.state);
+	if ((owned.owners & OwnerFragment) != 0) out.fragment_states.push_back(owned.state);
+	if ((owned.owners & OwnerOutput) != 0) out.output_states.push_back(owned.state);
+}
+
+// Points a create info at a state list.
+void PointAtStates(vk::PipelineDynamicStateCreateInfo& info,
+                   const std::vector<vk::DynamicState>& states) {
+	info.dynamicStateCount = static_cast<uint32_t>(states.size());
+	info.pDynamicStates    = states.data();
+}
+
+} // namespace
+
+// Fills the whole dynamic state list in the order the monolithic pipeline has always had, and cuts
+// the list of each library from it. The viewport, scissor, rasterizer and depth bias states belong to
+// the pre-rasterization part. Depth and stencil states belong to the fragment shader part, and blend
+// constants and color write enable to the fragment output part. The feedback loop state replaces the
+// feedback loop create flags, which belong to the fragment output part. It is also listed with the
+// fragment shader part, since depth and stencil attachments are among what it switches, and the
+// validation layer accepts it there.
 void FillDynamicStateParts(DynamicStateParts& out, const GraphicContext& graphics,
                            const GraphicsPipelineKey& key) {
-	out.states = {
-	    vk::DynamicState::eViewportWithCount,
-	    vk::DynamicState::eScissorWithCount,
-	    vk::DynamicState::eLineWidth,
-	    vk::DynamicState::eCullMode,
-	    vk::DynamicState::eFrontFace,
-	    vk::DynamicState::eDepthTestEnable,
-	    vk::DynamicState::eDepthWriteEnable,
-	    vk::DynamicState::eDepthCompareOp,
-	    vk::DynamicState::eDepthBiasEnable,
-	    vk::DynamicState::eDepthBias,
-	    vk::DynamicState::eStencilTestEnable,
-	    vk::DynamicState::eStencilOp,
-	    vk::DynamicState::eStencilCompareMask,
-	    vk::DynamicState::eStencilReference,
-	    vk::DynamicState::eStencilWriteMask,
-	    vk::DynamicState::eBlendConstants,
-	};
+	using State = vk::DynamicState;
+	for (const auto& owned: {
+	         OwnedState {State::eViewportWithCount, OwnerPreRaster},
+	         OwnedState {State::eScissorWithCount, OwnerPreRaster},
+	         OwnedState {State::eLineWidth, OwnerPreRaster},
+	         OwnedState {State::eCullMode, OwnerPreRaster},
+	         OwnedState {State::eFrontFace, OwnerPreRaster},
+	         OwnedState {State::eDepthTestEnable, OwnerFragment},
+	         OwnedState {State::eDepthWriteEnable, OwnerFragment},
+	         OwnedState {State::eDepthCompareOp, OwnerFragment},
+	         OwnedState {State::eDepthBiasEnable, OwnerPreRaster},
+	         OwnedState {State::eDepthBias, OwnerPreRaster},
+	         OwnedState {State::eStencilTestEnable, OwnerFragment},
+	         OwnedState {State::eStencilOp, OwnerFragment},
+	         OwnedState {State::eStencilCompareMask, OwnerFragment},
+	         OwnedState {State::eStencilReference, OwnerFragment},
+	         OwnedState {State::eStencilWriteMask, OwnerFragment},
+	         OwnedState {State::eBlendConstants, OwnerOutput},
+	     }) {
+		AddOwnedState(out, owned);
+	}
 #if !defined(__APPLE__)
-	out.states.push_back(vk::DynamicState::eDepthBoundsTestEnable);
-	out.states.push_back(vk::DynamicState::eDepthBounds);
+	AddOwnedState(out, {State::eDepthBoundsTestEnable, OwnerFragment});
+	AddOwnedState(out, {State::eDepthBounds, OwnerFragment});
 	if (key.rendering.color_count != 0) {
-		out.states.push_back(vk::DynamicState::eColorWriteEnableEXT);
+		AddOwnedState(out, {State::eColorWriteEnableEXT, OwnerOutput});
 	}
 #endif
 	if (graphics.attachment_feedback_loop_enabled) {
-		out.states.push_back(vk::DynamicState::eAttachmentFeedbackLoopEnableEXT);
+		AddOwnedState(out, {State::eAttachmentFeedbackLoopEnableEXT, OwnerFragment | OwnerOutput});
 	}
-	out.info.dynamicStateCount = static_cast<uint32_t>(out.states.size());
-	out.info.pDynamicStates    = out.states.data();
+	PointAtStates(out.info, out.states);
+	PointAtStates(out.pre_raster_info, out.pre_raster_states);
+	PointAtStates(out.fragment_info, out.fragment_states);
+	PointAtStates(out.output_info, out.output_states);
 }
 
 // Sets up the push stages, the image heap flag and the layouts of a graphics pipeline. The layout
@@ -636,11 +683,38 @@ static HelperModules CreateHelperModules(GraphicContext& graphics, const ShaderM
 	return helpers;
 }
 
-void CreatePipelineInternal(GraphicContext& graphics, DescriptorSetLayoutCache& set_layouts,
-                            PipelineCache::Pipeline& pipeline,
-                            const GraphicsPipelineKey&                 key,
-                            const std::array<const ShaderModule*, 4>& stages,
-                            vk::PipelineCache                          driver_cache) {
+// Links the pipeline from libraries when the library mode is on and the pipeline is one libraries
+// cover. Returns true when the pipeline is made. A pipeline that libraries do not cover, or whose
+// libraries the driver refused, is counted as built whole and left to the caller, and `layouts_ready`
+// says whether its layouts were made here, so the caller does not make them twice.
+static bool TryLinkFromLibraries(GraphicContext& graphics, DescriptorSetLayoutCache& set_layouts,
+                                 GraphicsLibraryCache* libraries, PipelineCache::Pipeline& pipeline,
+                                 const GraphicsPipelineKey&                 key,
+                                 const std::array<const ShaderModule*, 4>& stages,
+                                 vk::PipelineCache driver_cache, bool& layouts_ready) {
+	layouts_ready = false;
+	if (!ShouldUseLibraries(graphics, libraries, key, stages)) {
+		return false;
+	}
+	// The link needs the full layout, which is the same one a whole pipeline would get.
+	CreateGraphicsLayouts(graphics, set_layouts, pipeline, key, stages, false);
+	layouts_ready = true;
+	if (CreatePipelineFromLibraries(graphics, *libraries, pipeline, key, stages, driver_cache)) {
+		pipeline.from_libraries = true;
+		pipeline.linked_from    = libraries;
+		return true;
+	}
+	libraries->NoteFallback(Common::FirstRunReport::FallbackKind::CreateFailed);
+	return false;
+}
+
+// Builds the pipeline whole, from the four builders and one create info. `layouts_ready` says that a
+// failed attempt at libraries already made the layouts.
+static void CreateWholePipeline(GraphicContext& graphics, DescriptorSetLayoutCache& set_layouts,
+                                PipelineCache::Pipeline&                   pipeline,
+                                const GraphicsPipelineKey&                 key,
+                                const std::array<const ShaderModule*, 4>& stages,
+                                vk::PipelineCache driver_cache, bool layouts_ready) {
 	const auto& rendering  = key.rendering;
 	const auto& vertex     = *stages[VERTEX_STAGE_INDEX];
 	const auto* pixel      = stages[PIXEL_STAGE_INDEX];
@@ -649,14 +723,7 @@ void CreatePipelineInternal(GraphicContext& graphics, DescriptorSetLayoutCache& 
 	const bool  mesh       = vertex.info.stage == ShaderType::Mesh;
 	EXIT_NOT_IMPLEMENTED(mesh && !graphics.mesh_shader_enabled);
 	const bool rect_list = key.static_params.patch_control_points != 0 && stages[1] == nullptr;
-
-	// Times the whole build, including the rect-list shaders and the helper modules, since all of
-	// it is spent before the pipeline can be used. Warm-up and worker threads record it too,
-	// tagged so they are not counted as GPU thread waiting.
-	Common::FirstRunReport::CompileScope compile_timer(
-	    Common::FirstRunReport::Kind::Graphics, vertex.id, pixel != nullptr ? pixel->id : 0,
-	    GuestGpu::IsGpuThread());
-	const auto helpers = CreateHelperModules(graphics, vertex, pixel, rect_list);
+	const auto helpers   = CreateHelperModules(graphics, vertex, pixel, rect_list);
 
 	MonolithicParts parts;
 	FillVertexInputParts(parts.vertex_input, key, vertex);
@@ -664,8 +731,10 @@ void CreatePipelineInternal(GraphicContext& graphics, DescriptorSetLayoutCache& 
 	FillFragmentShaderParts(parts.fragment_shader, key, pixel);
 	FillFragmentOutputParts(parts.fragment_output, key);
 	FillDynamicStateParts(parts.dynamic, graphics, key);
-	CreateGraphicsLayouts(graphics, set_layouts, pipeline, key, stages,
-	                      static_cast<bool>(helpers.task));
+	if (!layouts_ready) {
+		CreateGraphicsLayouts(graphics, set_layouts, pipeline, key, stages,
+		                      static_cast<bool>(helpers.task));
+	}
 
 	if (pipeline.uses_split_sets && pixel != nullptr) {
 		// The PS resources are in set 2 of this layout, which only the patched module says.
@@ -685,6 +754,29 @@ void CreatePipelineInternal(GraphicContext& graphics, DescriptorSetLayoutCache& 
 	graphics.device.destroyShaderModule(helpers.tess_control, nullptr);
 	graphics.device.destroyShaderModule(helpers.tess_eval, nullptr);
 	graphics.device.destroyShaderModule(helpers.task, nullptr);
+}
+
+void CreatePipelineInternal(GraphicContext& graphics, DescriptorSetLayoutCache& set_layouts,
+                            PipelineCache::Pipeline& pipeline,
+                            const GraphicsPipelineKey&                 key,
+                            const std::array<const ShaderModule*, 4>& stages,
+                            vk::PipelineCache                          driver_cache,
+                            GraphicsLibraryCache*                      libraries) {
+	const auto& vertex = *stages[VERTEX_STAGE_INDEX];
+	const auto* pixel  = stages[PIXEL_STAGE_INDEX];
+	// Times the whole build, including the rect-list shaders and the helper modules, since all of
+	// it is spent before the pipeline can be used. Warm-up and worker threads record it too,
+	// tagged so they are not counted as GPU thread waiting. The libraries are got or built inside the
+	// timer, so the row also covers the waits for other threads' libraries and the link.
+	Common::FirstRunReport::CompileScope compile_timer(
+	    Common::FirstRunReport::Kind::Graphics, vertex.id, pixel != nullptr ? pixel->id : 0,
+	    GuestGpu::IsGpuThread());
+	bool layouts_ready = false;
+	if (TryLinkFromLibraries(graphics, set_layouts, libraries, pipeline, key, stages, driver_cache,
+	                         layouts_ready)) {
+		return;
+	}
+	CreateWholePipeline(graphics, set_layouts, pipeline, key, stages, driver_cache, layouts_ready);
 }
 
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,

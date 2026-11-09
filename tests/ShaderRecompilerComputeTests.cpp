@@ -37,6 +37,7 @@
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
+#include "graphics/host_gpu/renderer/pipeline/graphicsLibraryCache.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineParts.h"
 #include "graphics/shader/recompiler/ir/Serialize.h"
@@ -76,6 +77,7 @@
 #include "libs/errno.h"
 #include "loader/symbolDatabase.h"
 #include "spirv-tools/libspirv.hpp"
+#include "PipelinePartsFixtures.h"
 #include "SrtWalkerTestMemory.h"
 
 #if __has_include("graphics/host_gpu/renderer/renderTargetBarriers.h")
@@ -1122,6 +1124,7 @@ struct PipelineCacheTestAccess {
       device.destroyPipeline(pipeline.pipeline, nullptr);
       device.destroyPipelineLayout(pipeline.pipeline_layout, nullptr);
       device.destroyDescriptorSetLayout(pipeline.descriptor_set_layout, nullptr);
+      if (pipeline.linked_from != nullptr) pipeline.linked_from->NoteUnlinked();
       pipeline = recreated;
       count++;
     }
@@ -32700,6 +32703,7 @@ public:
 #include "DeferredDrawTests.inc"
 #include "GraphicsCreateInfoTests.inc"
 #include "SplitLayoutTests.inc"
+#include "GraphicsLibraryTests.inc"
 
 private:
   bool m_rasterization_supported = true;

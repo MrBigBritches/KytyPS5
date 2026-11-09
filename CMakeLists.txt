@@ -585,6 +585,13 @@ add_executable(pipeline_parts_tests EXCLUDE_FROM_ALL
 target_link_libraries(pipeline_parts_tests common Vulkan::Headers xxhash fmt::fmt)
 target_include_directories(pipeline_parts_tests PRIVATE ${inc_headers})
 
+add_executable(graphics_library_cache_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/GraphicsLibraryCacheTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/graphicsLibraryCache.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/pipelineParts.cpp")
+target_link_libraries(graphics_library_cache_tests common Vulkan::Headers xxhash fmt::fmt)
+target_include_directories(graphics_library_cache_tests PRIVATE ${inc_headers})
+
 add_executable(descriptor_set_layout_cache_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/DescriptorSetLayoutCacheTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/descriptorSetLayoutCache.cpp")
@@ -802,6 +809,9 @@ if(BUILD_TESTING)
 	add_test(NAME pipeline_library COMMAND $<TARGET_FILE:pipeline_library_tests>)
 	add_test(NAME pipeline_parts COMMAND $<TARGET_FILE:pipeline_parts_tests>)
 	add_test(NAME descriptor_set_layout_cache COMMAND $<TARGET_FILE:descriptor_set_layout_cache_tests>)
+	# A second build of one library, or a thread that never wakes, shows up as a wrong count or a hang.
+	add_test(NAME graphics_library_cache COMMAND $<TARGET_FILE:graphics_library_cache_tests>)
+	set_tests_properties(graphics_library_cache PROPERTIES TIMEOUT 60)
 	add_test(NAME ces COMMAND $<TARGET_FILE:ces_tests>)
 	add_test(NAME save_data_dialog COMMAND $<TARGET_FILE:save_data_dialog_tests>)
 	add_test(NAME http_uri_parse COMMAND $<TARGET_FILE:http_uri_parse_tests>)
@@ -951,6 +961,7 @@ if(BUILD_TESTING)
 		pipeline_library_tests
 		pipeline_parts_tests
 		descriptor_set_layout_cache_tests
+		graphics_library_cache_tests
 		ces_tests
 		save_data_dialog_tests
 		http_uri_parse_tests

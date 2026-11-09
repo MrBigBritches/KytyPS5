@@ -150,6 +150,45 @@ PipelineLibraryInfo Report::PipelineLibrary() const {
 	return m_pipeline_library;
 }
 
+void Report::AddLibraryBuilt(LibraryKind kind, double ms) {
+	std::lock_guard lock(m_mutex);
+	auto& stats = m_library_stats.libraries[static_cast<size_t>(kind)];
+	stats.built++;
+	stats.ms += ms;
+}
+
+void Report::AddLibraryHit(LibraryKind kind) {
+	std::lock_guard lock(m_mutex);
+	m_library_stats.libraries[static_cast<size_t>(kind)].hits++;
+}
+
+void Report::AddLibraryFailed(LibraryKind kind) {
+	std::lock_guard lock(m_mutex);
+	m_library_stats.libraries[static_cast<size_t>(kind)].failed++;
+}
+
+void Report::AddLibraryRefusedHit(LibraryKind kind) {
+	std::lock_guard lock(m_mutex);
+	m_library_stats.libraries[static_cast<size_t>(kind)].refused_hits++;
+}
+
+void Report::AddLibraryLink(double ms) {
+	std::lock_guard lock(m_mutex);
+	m_library_stats.links++;
+	m_library_stats.link_ms_total += ms;
+	m_library_stats.link_ms_max = std::max(m_library_stats.link_ms_max, ms);
+}
+
+void Report::AddLibraryFallback(FallbackKind kind) {
+	std::lock_guard lock(m_mutex);
+	m_library_stats.fallback_full[static_cast<size_t>(kind)]++;
+}
+
+PipelineLibraryStats Report::LibraryStats() const {
+	std::lock_guard lock(m_mutex);
+	return m_library_stats;
+}
+
 void Report::AddBlockedLocked(Kind kind, double ms) {
 	m_blocked_ms[static_cast<size_t>(kind)] += ms;
 	FlushPendingPauseLocked(m_flip);
@@ -359,6 +398,7 @@ void Report::Reset() {
 	m_stamp_failures    = 0;
 	m_boot              = {};
 	m_pipeline_library  = {};
+	m_library_stats     = {};
 	m_blocked_ms        = {};
 	m_translate_ms      = 0.0;
 	m_translate_gpu_graphics_ms = 0.0;
@@ -680,6 +720,37 @@ nlohmann::json BootToJson(const BootInfo& boot) {
 	        {"pipelines", boot.pipelines}};
 }
 
+// The names of the library kinds and fallback reasons in the JSON, in enum order.
+constexpr std::array<const char*, LIBRARY_KIND_COUNT> LIBRARY_KIND_NAMES {
+    "vertex_input", "pre_raster", "fragment", "output"};
+constexpr std::array<const char*, FALLBACK_KIND_COUNT> FALLBACK_KIND_NAMES {
+    "rect_list", "tess", "mesh", "create_failed"};
+
+// The graphics_pipeline_library section, which says whether libraries were on and what they did.
+nlohmann::json PipelineLibraryToJson(const PipelineLibraryInfo&  info,
+                                     const PipelineLibraryStats& stats) {
+	nlohmann::json libraries = nlohmann::json::object();
+	for (size_t index = 0; index < LIBRARY_KIND_COUNT; index++) {
+		const auto& kind = stats.libraries[index];
+		libraries[LIBRARY_KIND_NAMES[index]] = {{"built", kind.built},
+		                                        {"hits", kind.hits},
+		                                        {"failed", kind.failed},
+		                                        {"refused_hits", kind.refused_hits},
+		                                        {"ms", Round3(kind.ms)}};
+	}
+	nlohmann::json fallback = nlohmann::json::object();
+	for (size_t index = 0; index < FALLBACK_KIND_COUNT; index++) {
+		fallback[FALLBACK_KIND_NAMES[index]] = stats.fallback_full[index];
+	}
+	return {{"active", info.active},
+	        {"inactive_reason", info.inactive_reason},
+	        {"libraries", libraries},
+	        {"links", {{"count", stats.links},
+	                   {"ms_total", Round3(stats.link_ms_total)},
+	                   {"ms_max", Round3(stats.link_ms_max)}}},
+	        {"fallback_full", fallback}};
+}
+
 } // namespace
 
 std::string Report::ToJson(const Metadata& metadata, uint64_t audio_holds, double run_seconds,
@@ -714,7 +785,7 @@ std::string Report::ToJson(const Metadata& metadata, uint64_t audio_holds, doubl
 	    {"cold_stamp_failures", summary.stamp_failures},
 	    {"partial", metadata.partial},
 	    {"boot", BootToJson(boot)},
-	    {"graphics_pipeline_library", {{"active", library.active}, {"inactive_reason", library.inactive_reason}}},
+	    {"graphics_pipeline_library", PipelineLibraryToJson(library, LibraryStats())},
 	    {"play", PlayToJson(summary)},
 	    {"pauses", PausesToJson(summary)},
 	    {"compiles", compile_rows},

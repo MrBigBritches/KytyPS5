@@ -441,6 +441,86 @@ void TestPipelineLibraryState() {
   Check(!report.PipelineLibrary().active, "Reset kept the pipeline library state");
 }
 
+// What a report that recorded no libraries says.
+void CheckLibraryCountersAreZero(const nlohmann::json &zero) {
+  for (const char *name : {"vertex_input", "pre_raster", "fragment", "output"}) {
+    const auto &kind = zero["libraries"][name];
+    Check(kind["built"] == 0 && kind["hits"] == 0 && kind["failed"] == 0 && kind["refused_hits"] == 0 && kind["ms"] == 0.0,
+          "a report with no libraries made claimed some");
+  }
+  Check(zero["links"]["count"] == 0 && zero["links"]["ms_total"] == 0.0 && zero["links"]["ms_max"] == 0.0,
+        "a report with no links claimed some");
+  for (const char *name : {"rect_list", "tess", "mesh", "create_failed"}) {
+    Check(zero["fallback_full"][name] == 0, "a report with no fallbacks claimed some");
+  }
+}
+
+// Records a different number of events of each kind, so a counter filed under another kind shows.
+void AddLibraryExample(Report &report) {
+  using Common::FirstRunReport::FallbackKind;
+  using Common::FirstRunReport::LibraryKind;
+  report.AddLibraryBuilt(LibraryKind::VertexInput, 1.0);
+  report.AddLibraryBuilt(LibraryKind::PreRaster, 2.5);
+  report.AddLibraryBuilt(LibraryKind::PreRaster, 0.5);
+  report.AddLibraryHit(LibraryKind::Fragment);
+  report.AddLibraryHit(LibraryKind::Fragment);
+  report.AddLibraryHit(LibraryKind::Fragment);
+  report.AddLibraryFailed(LibraryKind::Output);
+  report.AddLibraryRefusedHit(LibraryKind::Output);
+  report.AddLibraryRefusedHit(LibraryKind::Output);
+  report.AddLibraryLink(0.25);
+  report.AddLibraryLink(1.75);
+  report.AddLibraryLink(0.5);
+  report.AddLibraryFallback(FallbackKind::RectList);
+  report.AddLibraryFallback(FallbackKind::Tess);
+  report.AddLibraryFallback(FallbackKind::Tess);
+  report.AddLibraryFallback(FallbackKind::Mesh);
+  report.AddLibraryFallback(FallbackKind::Mesh);
+  report.AddLibraryFallback(FallbackKind::Mesh);
+  report.AddLibraryFallback(FallbackKind::CreateFailed);
+  report.AddLibraryFallback(FallbackKind::CreateFailed);
+  report.AddLibraryFallback(FallbackKind::CreateFailed);
+  report.AddLibraryFallback(FallbackKind::CreateFailed);
+}
+
+// What AddLibraryExample's events must read as.
+void CheckLibraryExample(const nlohmann::json &json) {
+  const auto &libraries = json["libraries"];
+  Check(libraries["vertex_input"]["built"] == 1 && libraries["vertex_input"]["ms"] == 1.0 &&
+            libraries["vertex_input"]["hits"] == 0,
+        "the vertex input library was not counted as built alone");
+  Check(libraries["pre_raster"]["built"] == 2 && libraries["pre_raster"]["ms"] == 3.0,
+        "the pre-rasterization builds were not summed");
+  Check(libraries["fragment"]["hits"] == 3 && libraries["fragment"]["built"] == 0,
+        "the fragment hits were not counted apart from builds");
+  Check(libraries["output"]["refused_hits"] == 2 && libraries["output"]["hits"] == 0,
+        "requests answered by a refused library were counted as hits");
+  Check(libraries["output"]["failed"] == 1 && libraries["output"]["built"] == 0,
+        "the failed output library was counted as built");
+  Check(json["links"]["count"] == 3 && json["links"]["ms_total"] == 2.5 && json["links"]["ms_max"] == 1.75,
+        "the links were not counted, summed and maximised");
+  Check(json["fallback_full"]["rect_list"] == 1 && json["fallback_full"]["tess"] == 2 &&
+            json["fallback_full"]["mesh"] == 3 && json["fallback_full"]["create_failed"] == 4,
+        "a fallback was counted under another reason");
+}
+
+// The library counters start at zero, which is the baseline every figure below is compared with. Each
+// kind of library and each fallback reason is written under its own name, with the figures it was
+// given and none of the others', so a counter filed under the wrong kind fails. The link maximum is the
+// largest link and not the last, and Reset forgets all of it.
+void TestPipelineLibraryCounters() {
+  Report report;
+  CheckLibraryCountersAreZero(
+      nlohmann::json::parse(report.ToJson({}, 0, 1.0, 0.0))["graphics_pipeline_library"]);
+  AddLibraryExample(report);
+  CheckLibraryExample(
+      nlohmann::json::parse(report.ToJson({}, 0, 1.0, 0.0))["graphics_pipeline_library"]);
+  report.Reset();
+  Check(report.LibraryStats().links == 0 && report.LibraryStats().fallback_full[3] == 0 &&
+            report.LibraryStats().libraries[1].built == 0,
+        "Reset kept the library counters");
+}
+
 // An empty report writes no waits of draws that could not be deferred, which is the baseline, so
 // each figure below can only come from AddDeferredIneligibleWait. Each row keeps its own reason,
 // stages and wait, the flip is the one running when it was added whatever the caller passed, and
@@ -868,6 +948,7 @@ int main() {
   TestWarmTakeRows();
   TestIneligibleWaits();
   TestPipelineLibraryState();
+  TestPipelineLibraryCounters();
   TestScopesRespectTheFlag();
   TestCompileRowsKeepSubmission();
   TestResumeKeepsStampAndCountsOnce();

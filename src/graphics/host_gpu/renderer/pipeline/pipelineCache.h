@@ -39,6 +39,7 @@ namespace Libs::Graphics {
 struct GraphicContext;
 struct ShaderParams;
 class CommandBuffer;
+class GraphicsLibraryCache;
 
 namespace ShaderRecompiler {
 struct CompileOptions;
@@ -265,6 +266,11 @@ public:
 		vk::DescriptorSetLayout pixel_set_layout      = nullptr;
 		// Set 2 is a push set. The VS set is never one, since a layout may have only one push set.
 		bool                    pixel_set_is_push     = false;
+		// The pipeline was linked from graphics pipeline libraries and not built whole.
+		bool                    from_libraries        = false;
+		// The cache whose libraries the pipeline was linked from, or null. Destroying the pipeline
+		// tells that cache, which checks that no pipeline outlives its libraries.
+		GraphicsLibraryCache*   linked_from           = nullptr;
 	};
 
 	// Reads the shaders and registers bound in `command` into the state's shader stages.
@@ -401,6 +407,13 @@ private:
 	// heap in RenderContext is destroyed after this cache and keeps handles only as map keys, which
 	// it never looks up again once the cache is gone.
 	DescriptorSetLayoutCache             m_set_layouts;
+	// The libraries of --graphics-pipeline-library, shared by the pipelines linked from them. It is
+	// always made and only used while the library mode is on. It is declared after the set layouts,
+	// which its libraries' pipeline layouts name, and the destructor body destroys it after every
+	// pipeline, since a
+	// linked pipeline is in use as long as the libraries are (Vulkan specification, Pipeline
+	// Libraries). Worker builds use it, so it is made before the build queue and outlives it.
+	std::unique_ptr<GraphicsLibraryCache> m_libraries;
 	ShaderRecompiler::IR::ImageHeapSource* m_image_heap;
 	std::unordered_map<ProgramKey, Program, ProgramKeyHash> m_program_cache;
 	// Modules compiled per stage.
@@ -605,12 +618,15 @@ void DestroyPipelineObjects(vk::Device device, const PipelineCache::Pipeline& pi
 [[nodiscard]] uint64_t PipelineSetLayoutDestroyCount();
 
 // Stages are indexed like GraphicsPipelineKey::stage_ids. The set layouts of a split pipeline come
-// from `set_layouts`, which must outlive the pipeline.
+// from `set_layouts`, which must outlive the pipeline. With `libraries` given and the library mode on,
+// an eligible pipeline is linked from the libraries of that cache, which must outlive the pipeline
+// too, and any other pipeline, or one whose libraries the driver refused, is built whole.
 void CreatePipelineInternal(GraphicContext& graphics, DescriptorSetLayoutCache& set_layouts,
                             PipelineCache::Pipeline& pipeline,
                             const GraphicsPipelineKey&                 key,
                             const std::array<const ShaderModule*, 4>& stages,
-                            vk::PipelineCache                          driver_cache);
+                            vk::PipelineCache                          driver_cache,
+                            GraphicsLibraryCache*                      libraries = nullptr);
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const ShaderModule& module, vk::PipelineCache driver_cache);
 

@@ -109,6 +109,11 @@ FragmentOutputKey MakeFragmentOutputKey(const GraphicsPipelineKey& key,
 	return result;
 }
 
+// A mesh pipeline, or an indirect mesh draw whose task shader is made for it.
+static bool IsMeshPipeline(const ShaderModule& vertex) {
+	return vertex.info.stage == ShaderType::Mesh || vertex.mesh_task;
+}
+
 bool GplEligible(const GraphicsPipelineKey&                 key,
                  const std::array<const ShaderModule*, 4>& stages) {
 	const auto* vertex = stages[VERTEX_STAGE_INDEX];
@@ -119,8 +124,24 @@ bool GplEligible(const GraphicsPipelineKey&                 key,
 	// are made from the PS, so this one test covers both.
 	const bool patched         = key.static_params.patch_control_points != 0;
 	const bool has_hull_domain = stages[1] != nullptr || stages[2] != nullptr;
-	const bool mesh            = vertex->info.stage == ShaderType::Mesh || vertex->mesh_task;
-	return !patched && !has_hull_domain && !mesh;
+	return !patched && !has_hull_domain && !IsMeshPipeline(*vertex);
+}
+
+Common::FirstRunReport::FallbackKind
+GplFallbackReason(const GraphicsPipelineKey& key, const std::array<const ShaderModule*, 4>& stages) {
+	using Common::FirstRunReport::FallbackKind;
+	// A pipeline with no VS is never built from libraries, but it is not tessellation either.
+	if (stages[VERTEX_STAGE_INDEX] == nullptr) {
+		return FallbackKind::CreateFailed;
+	}
+	if (IsMeshPipeline(*stages[VERTEX_STAGE_INDEX])) {
+		return FallbackKind::Mesh;
+	}
+	// Patch points with no HS and no TES are the rectangle list of CreatePipelineInternal.
+	const bool has_hull_domain = stages[1] != nullptr || stages[2] != nullptr;
+	return key.static_params.patch_control_points != 0 && !has_hull_domain
+	           ? FallbackKind::RectList
+	           : FallbackKind::Tess;
 }
 
 namespace {

@@ -5,6 +5,7 @@
 #include "common/logging/log.h"
 #include "common/parallelFor.h"
 #include "common/stringUtils.h"
+#include "graphics/host_gpu/renderer/pipeline/graphicsLibraryCache.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/ir/Serialize.h"
@@ -373,7 +374,8 @@ bool PipelineCache::CreateGraphicsPipeline(Pipeline& pipeline, const GraphicsPip
 		}
 		stages[i] = found->second;
 	}
-	CreatePipelineInternal(m_graphics, m_set_layouts, pipeline, key, stages, m_driver_cache);
+	CreatePipelineInternal(m_graphics, m_set_layouts, pipeline, key, stages, m_driver_cache,
+	                       m_libraries.get());
 	return true;
 }
 

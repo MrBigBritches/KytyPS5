@@ -7,6 +7,7 @@
 // part in place. The monolithic CreatePipelineInternal composes the four builders, and a library
 // build uses the same builders one by one, so the two cannot disagree about the state of a part.
 
+#include "common/firstRunReport.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 
 #include <array>
@@ -49,10 +50,10 @@ struct alignas(4) VertexInputKey {
 };
 
 // Everything the pre-rasterization library depends on. The stages are named by id, since the
-// ids stand for the SPIR-V that a module was made from. The descriptor set layout of the stages is
-// left out on purpose. That is only correct once each stage set layout depends on that stage alone
-// (independent sets, Step 3). Today the push range and the heap presence are unions over all the
-// stages of a pipeline, so a library built from this key must not use the pipeline layout.
+// ids stand for the SPIR-V that a module was made from. The descriptor set layout of the VS is left
+// out on purpose. With the split layout the VS set depends on the VS alone, the heap set and the push
+// range are the same for every pipeline, and the library is made with those, so equal keys give equal
+// libraries. A library of this key must only be linked into a pipeline with the split layout.
 struct alignas(8) PreRasterKey {
 	// VS or LS (or mesh), HS and TES.
 	std::array<uint64_t, PRE_RASTER_STAGE_COUNT> stage_ids {};
@@ -70,9 +71,11 @@ struct alignas(8) PreRasterKey {
 // Everything the fragment shader library depends on. The attachment formats are not here, since
 // fragment shader state uses only the view mask of the rendering info and the formats belong to the
 // fragment output library. A depth-stencil state is always passed to a fragment shader library,
-// which VUID-VkGraphicsPipelineCreateInfo-renderPass-09035 needs, and the builder passes a value-initialised one.
+// which VUID-VkGraphicsPipelineCreateInfo-renderPass-09035 needs, and the builder passes a
+// value-initialised one.
 // The descriptor set layout of the PS is left out on purpose, on the same condition as for
-// PreRasterKey. It is only correct once each stage set layout depends on that stage alone.
+// PreRasterKey. The PS set depends on the PS bindings and on the device's push descriptor limit, which
+// is the same for every pipeline of a cache, so equal keys give equal libraries.
 struct alignas(8) FragmentKey {
 	uint64_t   pixel_id                 = 0;
 	uint32_t   samples                  = 1;
@@ -85,7 +88,8 @@ struct alignas(8) FragmentKey {
 };
 
 // Everything the fragment output library depends on, which includes every attachment format. The
-// multisample fields are in the fragment key too, because both libraries carry a multisample state and they must agree.
+// multisample fields are in the fragment key too, because both libraries carry a multisample state
+// and they must agree.
 struct alignas(4) FragmentOutputKey {
 	PipelineRenderingState rendering;
 	uint32_t               samples                  = 1;
@@ -150,6 +154,12 @@ struct PartKeyHash {
 // built whole.
 [[nodiscard]] bool GplEligible(const GraphicsPipelineKey&                 key,
                                const std::array<const ShaderModule*, 4>& stages);
+
+// Why a pipeline that GplEligible refuses is built whole. A mesh or task pipeline is a mesh, a
+// tessellation control or evaluation stage makes it tessellation, and patch points with neither is a
+// rectangle list. The answer is only meaningful for a pipeline that has a VS and is not eligible.
+[[nodiscard]] Common::FirstRunReport::FallbackKind
+GplFallbackReason(const GraphicsPipelineKey& key, const std::array<const ShaderModule*, 4>& stages);
 
 // The descriptor set that the SPIR-V emitter gives every resource except the image heap.
 inline constexpr uint32_t EMITTED_DESCRIPTOR_SET = 0;
@@ -243,10 +253,23 @@ struct FragmentOutputParts {
 	InPlaceOnly                                                                     in_place;
 };
 
-// The dynamic states, which every part and the monolithic pipeline take from the same list.
+// The dynamic states of a pipeline. `states` is the whole list a monolithic pipeline takes. The three
+// lists below it hold the states each library takes, and they are cut from the whole list, so the
+// libraries together name exactly the states the monolithic pipeline does. A state that two parts
+// read is in both of their lists. Vulkan wants a dynamic state named by every library it applies
+// to, and wants a state that a library does not use to be left out of it.
 struct DynamicStateParts {
 	std::vector<vk::DynamicState>      states;
 	vk::PipelineDynamicStateCreateInfo info {};
+	// Viewport, scissor, rasterizer and depth bias states.
+	std::vector<vk::DynamicState>      pre_raster_states;
+	vk::PipelineDynamicStateCreateInfo pre_raster_info {};
+	// Depth and stencil states, which the fragment shader library owns.
+	std::vector<vk::DynamicState>      fragment_states;
+	vk::PipelineDynamicStateCreateInfo fragment_info {};
+	// Blend constants and color write enable.
+	std::vector<vk::DynamicState>      output_states;
+	vk::PipelineDynamicStateCreateInfo output_info {};
 	InPlaceOnly                        in_place;
 };
 
@@ -265,13 +288,16 @@ void FillFragmentShaderParts(FragmentShaderParts& out, const GraphicsPipelineKey
                              const ShaderModule* pixel);
 // Fills the blend attachments, blend state, rendering info and multisample state.
 void FillFragmentOutputParts(FragmentOutputParts& out, const GraphicsPipelineKey& key);
-// Fills the one dynamic state list that every part and the monolithic pipeline share.
+// Fills the whole dynamic state list and the list of each library, all cut from one table.
 void FillDynamicStateParts(DynamicStateParts& out, const GraphicContext& graphics,
                            const GraphicsPipelineKey& key);
 
 // A seam for tests. When set, CreatePipelineInternal calls it with the finished create info of
 // each monolithic graphics pipeline just before the driver call, so a test can read the state the
-// parts were composed into. `stages` is the draw's modules. Pass null to clear it. Pipelines are
+// parts were composed into. A pipeline built from libraries calls it once for each library it
+// makes instead, with that library's create info, which names its part in a
+// VkGraphicsPipelineLibraryCreateInfoEXT in the pNext chain. The link has none. `stages` is the
+// draw's modules. Pass null to clear it. Pipelines are
 // built on worker threads too, so the observer may be called concurrently and must be thread-safe.
 using GraphicsCreateInfoObserver = void (*)(const GraphicsPipelineKey&                 key,
                                             const std::array<const ShaderModule*, 4>& stages,

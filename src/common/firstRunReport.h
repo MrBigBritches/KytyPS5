@@ -220,6 +220,39 @@ struct PipelineLibraryInfo {
 	std::string inactive_reason;
 };
 
+/// The four libraries a graphics pipeline is linked from, in pipeline order.
+enum class LibraryKind : uint8_t { VertexInput, PreRaster, Fragment, Output };
+inline constexpr size_t LIBRARY_KIND_COUNT = 4;
+
+/// Why a pipeline was built whole although --graphics-pipeline-library was on. The first three are
+/// pipelines libraries do not cover, and CreateFailed is a driver refusal of a library or link.
+enum class FallbackKind : uint8_t { RectList, Tess, Mesh, CreateFailed };
+inline constexpr size_t FALLBACK_KIND_COUNT = 4;
+
+/// What one kind of library did. built counts libraries made, hits counts requests a finished
+/// library answered (including one still being made by another thread), failed counts libraries the
+/// driver refused, refused_hits counts requests that an entry the driver refused answered, and ms is
+/// the time spent making the built ones. ms is the CPU figure for library work. The compile rows of
+/// pipelines built from libraries also hold the time they waited for other threads' libraries and
+/// the link, so summing worker rows over-counts CPU when libraries are shared.
+struct LibraryKindStats {
+	uint32_t built        = 0;
+	uint32_t hits         = 0;
+	uint32_t failed       = 0;
+	uint32_t refused_hits = 0;
+	double   ms           = 0.0;
+};
+
+/// What building pipelines from libraries did over the run. Links are the fast links that joined
+/// four libraries into a pipeline, and fallback_full counts pipelines built whole, by reason.
+struct PipelineLibraryStats {
+	std::array<LibraryKindStats, LIBRARY_KIND_COUNT> libraries {};
+	uint32_t                                         links         = 0;
+	double                                           link_ms_total = 0.0;
+	double                                           link_ms_max   = 0.0;
+	std::array<uint32_t, FALLBACK_KIND_COUNT>        fallback_full {};
+};
+
 /// Identity of the run, written at the top of the file.
 struct Metadata {
 	std::string                                title_id;
@@ -309,6 +342,20 @@ public:
 	void SetPipelineLibrary(const PipelineLibraryInfo& info);
 	/// What SetPipelineLibrary stored.
 	[[nodiscard]] PipelineLibraryInfo PipelineLibrary() const;
+	/// Counts a library made in `ms`.
+	void AddLibraryBuilt(LibraryKind kind, double ms);
+	/// Counts a request that an existing library answered.
+	void AddLibraryHit(LibraryKind kind);
+	/// Counts a library the driver refused.
+	void AddLibraryFailed(LibraryKind kind);
+	/// Counts a request that a refused library answered.
+	void AddLibraryRefusedHit(LibraryKind kind);
+	/// Counts one fast link and how long it took.
+	void AddLibraryLink(double ms);
+	/// Counts a pipeline built whole although libraries were asked for.
+	void AddLibraryFallback(FallbackKind kind);
+	/// What the Add calls above recorded.
+	[[nodiscard]] PipelineLibraryStats LibraryStats() const;
 	/// Records a miss-path translation. Only GPU-thread time during play counts as blocked.
 	void AddTranslate(Kind kind, std::string_view stage, uint64_t hash, double ms, Thread thread);
 	/// Records a driver compile. Only GPU-thread time during play counts as blocked. start_ns is
@@ -398,6 +445,7 @@ private:
 	uint32_t                     m_stamp_failures = 0;
 	BootInfo                     m_boot;
 	PipelineLibraryInfo          m_pipeline_library;
+	PipelineLibraryStats         m_library_stats;
 	std::array<double, 2>        m_blocked_ms {};
 	double                       m_translate_ms = 0.0;
 	double                       m_translate_gpu_graphics_ms = 0.0;
@@ -588,6 +636,48 @@ inline void AddReady(Kind kind, uint64_t id, uint64_t id_ps, double ready_ms,
 	}
 }
 
+/// Counts a library made in `ms`.
+inline void AddLibraryBuilt(LibraryKind kind, double ms) {
+	if (Enabled()) {
+		Global().AddLibraryBuilt(kind, ms);
+	}
+}
+
+/// Counts a request that an existing library answered.
+inline void AddLibraryHit(LibraryKind kind) {
+	if (Enabled()) {
+		Global().AddLibraryHit(kind);
+	}
+}
+
+/// Counts a library the driver refused.
+inline void AddLibraryFailed(LibraryKind kind) {
+	if (Enabled()) {
+		Global().AddLibraryFailed(kind);
+	}
+}
+
+/// Counts a request that a refused library answered.
+inline void AddLibraryRefusedHit(LibraryKind kind) {
+	if (Enabled()) {
+		Global().AddLibraryRefusedHit(kind);
+	}
+}
+
+/// Counts one fast link and how long it took.
+inline void AddLibraryLink(double ms) {
+	if (Enabled()) {
+		Global().AddLibraryLink(ms);
+	}
+}
+
+/// Counts a pipeline built whole although libraries were asked for.
+inline void AddLibraryFallback(FallbackKind kind) {
+	if (Enabled()) {
+		Global().AddLibraryFallback(kind);
+	}
+}
+
 /// Times a shader translation from construction to destruction and records it. Declare it where
 /// the cache miss begins. Costs one relaxed load when the report is off.
 class TranslateScope {
@@ -607,7 +697,9 @@ private:
 };
 
 /// Times a whole pipeline creation function, not only the driver call inside it, from
-/// construction to destruction and records it.
+/// construction to destruction and records it. For a pipeline built from libraries that includes
+/// the time spent waiting for libraries other threads were making and the link, so worker rows
+/// over-count CPU when libraries are shared. The library figures hold the CPU time.
 class CompileScope {
 public:
 	CompileScope(Kind kind, uint64_t id, uint64_t id_ps, bool on_gpu_thread);
