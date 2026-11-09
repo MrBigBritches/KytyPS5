@@ -672,6 +672,28 @@ add_executable(shader_store_scan_tests EXCLUDE_FROM_ALL
 target_link_libraries(shader_store_scan_tests common fmt::fmt xxhash)
 target_include_directories(shader_store_scan_tests PRIVATE ${inc_headers})
 
+# The predictor rules, the header slots and the module id need no device and no translated program.
+add_executable(shader_store_predictor_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ShaderStorePredictorTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/moduleId.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/storegen/computePredictor.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/storegen/headerSlots.cpp"
+)
+target_link_libraries(shader_store_predictor_tests common fmt::fmt xxhash)
+target_include_directories(shader_store_predictor_tests PRIVATE ${inc_headers})
+
+# The route K classifier reads IR values, so its test builds a small plan out of the typed IR, like
+# scalar_provenance_tests does. It needs no graphics device.
+add_executable(shader_store_keys_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ShaderStoreKeysTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/gpu_format.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/storegen/resourceKeys.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
+)
+target_link_libraries(shader_store_keys_tests common fmt::fmt xbyak::xbyak)
+target_include_directories(shader_store_keys_tests PRIVATE ${inc_headers})
+
 set(gpu_test_generated_dir "${PROJECT_BINARY_DIR}/gpu_test_shaders")
 set(gpu_test_ms_depth_source
 	"${gpu_tiler_shader_dir}/gpu_test_ms_depth.comp")
@@ -838,6 +860,8 @@ if(BUILD_TESTING)
 	add_test(NAME rtc COMMAND $<TARGET_FILE:rtc_tests>)
 	add_test(NAME shader_recompiler_compute COMMAND $<TARGET_FILE:shader_recompiler_compute_tests>)
 	add_test(NAME shader_store_scan COMMAND $<TARGET_FILE:shader_store_scan_tests>)
+	add_test(NAME shader_store_predictor COMMAND $<TARGET_FILE:shader_store_predictor_tests>)
+	add_test(NAME shader_store_keys COMMAND $<TARGET_FILE:shader_store_keys_tests>)
 	add_test(NAME shader_recompiler_submit_cadence
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --submit-cadence-only)
 	add_test(NAME shader_recompiler_submit_cadence_gpu
@@ -967,6 +991,8 @@ if(BUILD_TESTING)
 		sync_on_address_tests
 		shader_recompiler_compute_tests
 		shader_store_scan_tests
+		shader_store_predictor_tests
+		shader_store_keys_tests
 		virtual_memory_allocation_tests
 		audio_out2_port_tests
 		audio_out_timing_tests
