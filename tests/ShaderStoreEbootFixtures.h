@@ -205,6 +205,9 @@ struct ProgramSpec {
 	uint32_t user_sgprs  = USER_SGPR_COUNT;
 	// Reads user SGPR 0 into a value that goes to LDS, and uses no buffer.
 	bool user_data_only = false;
+	// Words put in the code just before its end, as they are. A test uses them to put in an
+	// encoding that the recompiler does not take.
+	std::vector<uint32_t> extra_words;
 };
 
 BufferUse OutputBuffer(const ProgramSpec& spec) {
@@ -266,6 +269,7 @@ std::vector<uint32_t> BuildCode(const ProgramSpec& spec) {
 		AppendMubuf(code, MUBUF_STORE_DWORD, 1, spec.output_sgpr);
 	}
 	code.insert(code.end(), spec.padding_nops, S_NOP);
+	code.insert(code.end(), spec.extra_words.begin(), spec.extra_words.end());
 	code.push_back(S_ENDPGM);
 	return code;
 }

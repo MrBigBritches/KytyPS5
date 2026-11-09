@@ -758,6 +758,19 @@ if (KYTY_CLANG_CL)
 	set_source_files_properties(${shader_store_worker_recompiler_src} PROPERTIES COMPILE_FLAGS "-Wno-pragma-pack -Wno-deprecated-declarations -D_TIMESPEC_DEFINED")
 endif()
 
+# The store worker mode of the emulator binary. The test starts the real kyty_emulator through
+# ChildProcess, so it only builds the requests and eboots it sends and links no recompiler. The
+# emulator is built first, since the test runs it.
+add_executable(shader_store_dispatch_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ShaderStoreDispatchTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/storegen/storeWorkerFormat.cpp"
+)
+add_dependencies(shader_store_dispatch_tests kyty_emulator)
+target_compile_definitions(shader_store_dispatch_tests PRIVATE
+	KYTY_EMULATOR_PATH="$<TARGET_FILE:kyty_emulator>")
+target_link_libraries(shader_store_dispatch_tests common Vulkan::Headers fmt::fmt xxhash xbyak::xbyak)
+target_include_directories(shader_store_dispatch_tests PRIVATE ${inc_headers})
+
 set(gpu_test_generated_dir "${PROJECT_BINARY_DIR}/gpu_test_shaders")
 set(gpu_test_ms_depth_source
 	"${gpu_tiler_shader_dir}/gpu_test_ms_depth.comp")
@@ -930,6 +943,8 @@ if(BUILD_TESTING)
 	add_test(NAME shader_store_record COMMAND $<TARGET_FILE:shader_store_record_tests>)
 	add_test(NAME shader_store_tailer COMMAND $<TARGET_FILE:shader_store_tailer_tests>)
 	add_test(NAME shader_store_worker COMMAND $<TARGET_FILE:shader_store_worker_tests>)
+	add_test(NAME shader_store_dispatch COMMAND $<TARGET_FILE:shader_store_dispatch_tests>)
+	set_tests_properties(shader_store_dispatch PROPERTIES TIMEOUT 300)
 	add_test(NAME shader_recompiler_submit_cadence
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --submit-cadence-only)
 	add_test(NAME shader_recompiler_submit_cadence_gpu
@@ -1064,6 +1079,7 @@ if(BUILD_TESTING)
 		shader_store_record_tests
 		shader_store_tailer_tests
 		shader_store_worker_tests
+		shader_store_dispatch_tests
 		virtual_memory_allocation_tests
 		audio_out2_port_tests
 		audio_out_timing_tests

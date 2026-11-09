@@ -4,6 +4,7 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "emulator.h"
+#include "graphics/shader/storegen/workerProcess.h"
 #include "kytyGitVersion.h"
 
 #include <algorithm>
@@ -482,6 +483,14 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 }
 
 static int Main(int argc, char* argv[]) {
+	// A shader store worker is this same binary started by the emulator. It has to be first, before
+	// any thread or argument parsing, so that the guards it arms cover every thread it will make
+	// and so that extra words on its command line are never read as emulator options.
+	if (argc >= 3 &&
+	    std::string_view(argv[1]) == Libs::Graphics::StoreGen::WORKER_COMMAND_LINE_FLAG) {
+		return Libs::Graphics::StoreGen::RunShaderStoreWorkerProcess(Common::PathFromUtf8(argv[2]));
+	}
+
 	InitializeThreads();
 
 	RunOptions options;
