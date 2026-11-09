@@ -13,6 +13,7 @@
 #include "graphics/shader/storegen/computeStaticKey.h"
 #include "graphics/shader/storegen/ebootShaderScan.h"
 #include "graphics/shader/storegen/headerSlots.h"
+#include "graphics/shader/storegen/progressLog.h"
 #include "graphics/shader/storegen/shaderHeaderLayout.h"
 #include "graphics/shader/storegen/shaderStoreWorker.h"
 #include "graphics/shader/storegen/sl00Metadata.h"
@@ -163,6 +164,17 @@ RunOutput Run(const WorkerRequest& request, const WorkerHooks& hooks = {}) {
 	run.file   = ReadFile(PathFromUtf8(request.output_path));
 	run.log    = ReadLines(PathFromUtf8(request.progress_path));
 	return run;
+}
+
+// The log of a worker run, read from its first byte by the reader that the supervisor uses. The
+// worker's own writer made it, so a line that the parser does not take is a format that drifted
+// from the parser, and none may be.
+ProgressLogReader ReadRealLog(const WorkerRequest& request) {
+	ProgressLogReader reader(PathFromUtf8(request.progress_path));
+	reader.BeginSpawnAt(0, ProgressClock::now());
+	reader.PollToEnd(ProgressClock::now());
+	CHECK(reader.MalformedLines() == 0);
+	return reader;
 }
 
 // A record of the output, with the bytes it was framed from.
@@ -827,6 +839,19 @@ void TestPushStartTripwireOnRealMiss() {
 		    logged || line.find("push_start predicted=4294967295 actual=0") != std::string::npos;
 	}
 	CHECK(logged);
+	// The same run's log, read as the supervisor reads it: one drop, with the numbers the result
+	// has.
+	const auto log = ReadRealLog(wrong_request);
+	CHECK(log.KindCount(ProgressKind::Drop) == 1 && log.DropsSinceSpawn().size() == 1);
+	if (log.DropsSinceSpawn().size() == 1) {
+		const auto& drop = log.DropsSinceSpawn()[0];
+		CHECK(drop.reason == ProgressDropReason::PushStart && drop.rank_or_count == 0);
+		CHECK(drop.hash == scan.programs[0].code_hash);
+		CHECK(drop.predicted_push == IR::PushData::NoStart && drop.actual_push == 0);
+	}
+	// The run with no drop has none in its log either.
+	CHECK(ReadRealLog(MakeRequest(directory, right_eboot, "right")).KindCount(ProgressKind::Drop) ==
+	      0);
 }
 
 // A prediction made wrong on purpose drops the program, and only that program. Its later candidates
@@ -871,6 +896,13 @@ void TestPushStartTripwireDropsTheRest() {
 	}
 	// The ranks 4 to 6 have no start line, so nothing was translated for them.
 	CHECK(StartLines(run.log).size() == 3 + 1);
+	const auto log = ReadRealLog(request);
+	CHECK(log.KindCount(ProgressKind::Drop) == 1 && log.DropsSinceSpawn().size() == 1);
+	if (log.DropsSinceSpawn().size() == 1) {
+		const auto& drop = log.DropsSinceSpawn()[0];
+		CHECK(drop.reason == ProgressDropReason::PushStart && drop.rank_or_count == 2);
+		CHECK(drop.hash == big && drop.predicted_push == WRONG_START && drop.actual_push == 0);
+	}
 }
 
 // A restart with nothing left to write still cuts the file back to the kept bytes, so a torn record
@@ -1080,6 +1112,13 @@ void TestResourceCountMismatch() {
 		logged = logged || line.ends_with("resource_count");
 	}
 	CHECK(logged);
+	const auto log = ReadRealLog(request);
+	CHECK(log.KindCount(ProgressKind::Drop) == 1 && log.DropsSinceSpawn().size() == 1);
+	if (log.DropsSinceSpawn().size() == 1) {
+		const auto& drop = log.DropsSinceSpawn()[0];
+		CHECK(drop.reason == ProgressDropReason::ResourceCount && drop.rank_or_count == 2);
+		CHECK(drop.hash == big);
+	}
 }
 
 // A record whose compressed size is over the frame cap is dropped alone, with a log line and a
@@ -1131,6 +1170,17 @@ void TestOversizeRecordIsDroppedAlone() {
 	CHECK(logged == oversize);
 	// Every candidate still gets its start line, since the size is known only after translating.
 	CHECK(StartLines(run.log).size() == all.size());
+	const auto log = ReadRealLog(request);
+	CHECK(log.KindCount(ProgressKind::Drop) == oversize);
+	CHECK(log.DropsSinceSpawn().size() == run.result.drops.size());
+	for (size_t i = 0; i < log.DropsSinceSpawn().size() && i < run.result.drops.size(); i++) {
+		const auto& drop = log.DropsSinceSpawn()[i];
+		CHECK(drop.reason == ProgressDropReason::FrameTooLarge);
+		CHECK(drop.rank_or_count == run.result.drops[i].rank &&
+		      drop.hash == run.result.drops[i].hash);
+	}
+	// The run at the cap, which dropped nothing, has no drop line.
+	CHECK(ReadRealLog(MakeRequest(directory, eboot, "at_cap")).KindCount(ProgressKind::Drop) == 0);
 }
 
 } // namespace
