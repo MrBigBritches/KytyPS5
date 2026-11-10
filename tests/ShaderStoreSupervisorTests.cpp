@@ -359,11 +359,37 @@ void FakeWriteDamage(FakeRun& run) {
 	run.files.Frame(ModuleRecord(ModuleIdOf(9, 1), ProgramHash(9)));
 }
 
-// The predict lines, and the crash at one of them when the mode says so.
+// The `prediction` line of a program. Program 0 is predicted, with a count of candidates that
+// grows with the spawn so that a later spawn's row can be told from an earlier one. Program 1 has
+// calls and program 2 has problems, so each outcome word reaches the statistics.
+std::string FakePredictionLine(size_t program, int spawn) {
+	static const char* const OUTCOMES[PROGRAMS] = {"predicted", "calls", "problems"};
+	const uint64_t           candidates = program == 0 ? 1 + static_cast<uint64_t>(spawn) : 0;
+	return "prediction " + FakeFiles::Hex(ProgramHash(program)) + " " + OUTCOMES[program] + " " +
+	       std::to_string(candidates);
+}
+
+// Whether no program after this one is left in by the skip list.
+bool IsLastUnskipped(const std::vector<uint64_t>& skipped, size_t program) {
+	for (size_t later = program + 1; later < PROGRAMS; later++) {
+		if (!Contains(skipped, ProgramHash(later))) {
+			return false;
+		}
+	}
+	return true;
+}
+
+// The predict lines, each followed by its prediction line, and the crash at a predict line when the
+// mode says so. The crash comes before the prediction line, as the worker's does.
 void FakePredict(FakeRun& run) {
 	for (size_t program = 0; program < PROGRAMS; program++) {
 		const auto hash = ProgramHash(program);
 		if (Contains(run.request.skip_hashes, hash)) {
+			continue;
+		}
+		// After a fresh restart this mode predicts only program 0 again, so the others show whether
+		// the rows of the first spawn were kept.
+		if (run.Is("fresh_predictions") && run.spawn >= 1 && program != 0) {
 			continue;
 		}
 		run.files.Line("predict " + FakeFiles::Hex(hash));
@@ -373,6 +399,12 @@ void FakePredict(FakeRun& run) {
 		if (run.Is("crash_damaged_predict") && run.spawn == 0 && program == 1) {
 			std::_Exit(CRASH_EXIT);
 		}
+		// This mode ends at the predict line of the last program the request leaves in, which is
+		// where a crash while predicting that program would end it.
+		if (run.Is("exit_after_line") && IsLastUnskipped(run.request.skip_hashes, program)) {
+			std::_Exit(static_cast<int>(run.Arg(1)));
+		}
+		run.files.Line(FakePredictionLine(program, run.spawn));
 	}
 }
 
@@ -571,6 +603,14 @@ int RunFakeWorker(const std::string& mode_text, const fs::path& request_file) {
 		BurnCpu(BURN_CPU_MS);
 	}
 	FakePredict(run);
+	// The first spawn of this mode asks for a fresh start once it has predicted everything.
+	if (run.Is("fresh_predictions") && run.spawn == 0) {
+		return WORKER_EXIT_ORDER_MISMATCH;
+	}
+	// This one crashes between its last prediction line and the order line.
+	if (run.Is("crash_before_order") && run.spawn == 0) {
+		std::_Exit(CRASH_EXIT);
+	}
 	if (run.Is("exit_after_line")) {
 		return static_cast<int>(run.Arg(1));
 	}
@@ -1231,6 +1271,85 @@ void TestHashLists() {
 	CHECK(failed.stats.skip_hashes.empty());
 }
 
+// The prediction rows reach the statistics, with the outcome and the count of each program. The
+// baseline is the run's predicted_hashes, which has the same programs and none of the rest, so a
+// row cannot be told from a bare predict line by the hash alone.
+void TestPredictionRows() {
+	const auto                              normal = Run("normal");
+	const std::vector<SupervisorPrediction> expected {
+	    {ProgramHash(0), PredictionOutcome::Predicted, 1},
+	    {ProgramHash(1), PredictionOutcome::Calls, 0},
+	    {ProgramHash(2), PredictionOutcome::Problems, 0}};
+	CHECK(normal.stats.outcome == SupervisorOutcome::Finished);
+	CHECK(normal.stats.predictions.size() == expected.size());
+	for (size_t i = 0; i < expected.size() && i < normal.stats.predictions.size(); i++) {
+		const auto& row = normal.stats.predictions[i];
+		CHECK(row.hash == expected[i].hash && row.outcome == expected[i].outcome &&
+		      row.candidates == expected[i].candidates);
+	}
+
+	// A resume after a crash at a start line predicts every program again in the second spawn, and
+	// the latest row of program 0 is that spawn's, with one more candidate. The blame is unchanged.
+	const auto resumed = Run("crash_start:2");
+	CHECK(resumed.stats.spawns == 2 && resumed.stats.predictions.size() == 3);
+	if (resumed.stats.predictions.size() == 3) {
+		CHECK(resumed.stats.predictions[0].candidates == 2);
+	}
+	CHECK(resumed.stats.failed_hashes == std::vector<uint64_t> {ProgramHash(1)});
+	CHECK(resumed.stats.skip_hashes.empty());
+
+	// A crash while predicting program 1 gives it no row, since the line comes after, and it is
+	// blamed all the same: skipped, with `predict` as the last line.
+	const auto crashed = Run("crash_predict:1");
+	CHECK(crashed.stats.skip_hashes == std::vector<uint64_t> {ProgramHash(1)});
+	CHECK(crashed.stats.failures.size() == 1 && crashed.stats.failures[0].last_line == "predict");
+	bool has_one = false;
+	for (const auto& row: crashed.stats.predictions) {
+		has_one = has_one || row.hash == ProgramHash(1);
+	}
+	CHECK(!has_one && crashed.stats.predictions.size() == 2);
+}
+
+// A crash after the last `prediction` line and before `order` is in no program. It blames nothing,
+// where the last `predict` line used to be the last line and blamed its program. The baseline is
+// the crash at a predict line above, which still blames.
+void TestCrashBeforeOrderBlamesNothing() {
+	const auto run = Run("crash_before_order");
+	CHECK(run.stats.outcome == SupervisorOutcome::Finished && run.stats.restarts == 1);
+	CHECK(run.stats.failures.size() == 1);
+	if (run.stats.failures.size() == 1) {
+		CHECK(run.stats.failures[0].kind == FailureKind::Crash);
+		CHECK(run.stats.failures[0].last_line == "prediction" && run.stats.failures[0].hash == 0);
+	}
+	CHECK(run.stats.skip_hashes.empty() && run.stats.failed_hashes.empty());
+	CHECK(run.stats.requests.size() == 2 && run.stats.requests[1].skip_hashes.empty() &&
+	      run.stats.requests[1].failed_hashes.empty());
+	CHECK(run.ids == Run("normal").ids);
+}
+
+// A fresh restart keeps the rows of the first spawn that the second one does not repeat, and the
+// latest row of a program that it does repeat wins. The baseline is the first spawn alone, which
+// the failure record's spawn number shows was a fresh restart's cause.
+void TestPredictionRowsSurviveAFreshRestart() {
+	const auto run = Run("fresh_predictions");
+	CHECK(run.stats.outcome == SupervisorOutcome::Finished && run.stats.spawns == 2);
+	CHECK(run.stats.failures.size() == 1 &&
+	      run.stats.failures[0].kind == FailureKind::OrderMismatch);
+	CHECK(run.stats.requests.size() == 2 && run.stats.requests[1].kept == 0);
+	CHECK(run.stats.predictions.size() == 3);
+	if (run.stats.predictions.size() == 3) {
+		// The second spawn's row, in the place of the first.
+		CHECK(run.stats.predictions[0].hash == ProgramHash(0) &&
+		      run.stats.predictions[0].outcome == PredictionOutcome::Predicted &&
+		      run.stats.predictions[0].candidates == 2);
+		// Rows of the first spawn, which the fresh run did not write again.
+		CHECK(run.stats.predictions[1].hash == ProgramHash(1) &&
+		      run.stats.predictions[1].outcome == PredictionOutcome::Calls);
+		CHECK(run.stats.predictions[2].hash == ProgramHash(2) &&
+		      run.stats.predictions[2].outcome == PredictionOutcome::Problems);
+	}
+}
+
 // The drops of a run that finishes are listed too. They are in no restart's request, so the list of
 // failed programs stays empty, which tells the list of drops from it.
 void TestDropsAreListedForAFinishedRun() {
@@ -1554,6 +1673,9 @@ int main(int argc, char** argv) {
 	TestFinishedMsOnlyAfterTheEnd();
 	TestDecodeMsMax();
 	TestHashLists();
+	TestPredictionRows();
+	TestPredictionRowsSurviveAFreshRestart();
+	TestCrashBeforeOrderBlamesNothing();
 	TestDropsAreListedForAFinishedRun();
 	TestSpawnUsageCpu();
 	TestPeakSourceRank();

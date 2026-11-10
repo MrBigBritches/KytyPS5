@@ -81,6 +81,13 @@ struct SupervisorDrop {
 	ProgressDropReason reason = ProgressDropReason::PushStart;
 };
 
+/// What a program's prediction came to, from its latest `prediction` line.
+struct SupervisorPrediction {
+	uint64_t          hash       = 0;
+	PredictionOutcome outcome    = PredictionOutcome::Predicted;
+	uint64_t          candidates = 0;
+};
+
 /// What one run of the worker used, once it had ended.
 struct SupervisorSpawnUsage {
 	/// User and kernel time together.
@@ -135,6 +142,10 @@ struct SupervisorStats {
 	double decode_ms_max = 0.0;
 	/// The program of every `predict` line, each once, over all spawns.
 	std::vector<uint64_t> predicted_hashes;
+	/// The latest `prediction` line of each program, over all spawns, in the order the programs
+	/// were first seen. A program in predicted_hashes with no row here was cut off while it was
+	/// predicted or was not reached by a worker that wrote the line.
+	std::vector<SupervisorPrediction> predictions;
 	/// Every `drop` line, over all spawns, in order.
 	std::vector<SupervisorDrop> dropped;
 	/// The programs the supervisor kept out of the next run: `failed_hashes` of the request, which

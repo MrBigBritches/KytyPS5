@@ -113,6 +113,18 @@ enum class PredictKind {
 	Problems,
 };
 
+// The word a `prediction` line gives for what became of a program.
+const char* PredictOutcomeWord(PredictKind kind) {
+	switch (kind) {
+		case PredictKind::Predicted: return "predicted";
+		case PredictKind::HasCalls: return "calls";
+		case PredictKind::Unclassified: return "unclassified";
+		case PredictKind::Unreadable: return "unreadable";
+		case PredictKind::Problems: return "problems";
+	}
+	return "";
+}
+
 // Translates a program once to list its resources, then predicts its candidates.
 PredictKind PredictProgram(const ScannedProgram& scanned, const ComputeStaticKey& key,
                            const HostValues& host, std::vector<Candidate>& candidates) {
@@ -320,6 +332,8 @@ private:
 	int  Generate(const ScanResult& scan, const HostValues& host, std::span<const uint8_t> header);
 	bool LoadScan(ScanResult& scan, uint64_t& eboot_bytes);
 	bool Predict(const ScanResult& scan, const HostValues& host);
+	void CountPrediction(PredictKind kind, uint64_t code_hash, std::vector<Candidate>& candidates);
+	bool LogPrediction(uint64_t code_hash, PredictKind kind, size_t candidates);
 	void BuildRanks(const std::vector<RankedCandidate>& ranked, const HostValues& host, int& code);
 	bool BuildOne(uint64_t rank, const RankedCandidate& entry, const HostValues& host);
 	bool Drop(uint64_t rank, const PredictedProgram& program, const BuiltCandidate& built,
@@ -382,25 +396,51 @@ bool Worker::Predict(const ScanResult& scan, const HostValues& host) {
 		}
 		const auto key = BuildComputeStaticKey(scanned.header, device, MOTOR_DISPATCH);
 		if (!key) {
+			// No key means no prediction was tried, but the program still gets its line.
 			m_result.programs_unreadable++;
+			if (!LogPrediction(scanned.code_hash, PredictKind::Unreadable, 0)) {
+				return false;
+			}
 			continue;
 		}
 		PredictedProgram program {&scanned, *key, {}, failed.contains(scanned.code_hash)};
-		switch (PredictProgram(scanned, *key, host, program.candidates)) {
-			case PredictKind::Predicted:
-				m_result.programs_predicted++;
-				if (m_hooks.after_prediction) {
-					m_hooks.after_prediction(scanned.code_hash, program.candidates);
-				}
-				break;
-			case PredictKind::HasCalls: m_result.programs_with_calls++; continue;
-			case PredictKind::Unclassified: m_result.programs_unclassified++; continue;
-			case PredictKind::Unreadable: m_result.programs_unreadable++; continue;
-			case PredictKind::Problems: m_result.programs_with_problems++; continue;
+		const auto       kind = PredictProgram(scanned, *key, host, program.candidates);
+		CountPrediction(kind, scanned.code_hash, program.candidates);
+		// Only a predicted program has candidates to report, whatever a rejection left behind.
+		const size_t candidates = kind == PredictKind::Predicted ? program.candidates.size() : 0;
+		if (!LogPrediction(scanned.code_hash, kind, candidates)) {
+			return false;
 		}
-		m_programs.push_back(std::move(program));
+		if (kind == PredictKind::Predicted) {
+			m_programs.push_back(std::move(program));
+		}
 	}
 	return true;
+}
+
+// Counts what became of a predicted program in the result, and gives a test its hook.
+void Worker::CountPrediction(PredictKind kind, uint64_t code_hash,
+                             std::vector<Candidate>& candidates) {
+	switch (kind) {
+		case PredictKind::Predicted:
+			m_result.programs_predicted++;
+			if (m_hooks.after_prediction) {
+				m_hooks.after_prediction(code_hash, candidates);
+			}
+			break;
+		case PredictKind::HasCalls: m_result.programs_with_calls++; break;
+		case PredictKind::Unclassified: m_result.programs_unclassified++; break;
+		case PredictKind::Unreadable: m_result.programs_unreadable++; break;
+		case PredictKind::Problems: m_result.programs_with_problems++; break;
+	}
+}
+
+// Writes the line that says what came of a program's prediction. It goes in after the hook above,
+// so a crash in either still leaves `predict` as the last line. Returns false when the log could
+// not be written.
+bool Worker::LogPrediction(uint64_t code_hash, PredictKind kind, size_t candidates) {
+	return m_progress.Line(
+	    fmt::format("prediction {:016x} {} {}", code_hash, PredictOutcomeWord(kind), candidates));
 }
 
 // Records why a program's remaining candidates are dropped, in the result and in the log. Returns

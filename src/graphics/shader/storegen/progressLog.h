@@ -8,6 +8,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -19,11 +20,31 @@ namespace Libs::Graphics::StoreGen {
 
 /// What a progress line says.
 enum class ProgressKind : uint8_t {
-	Predict, ///< `predict <hash>`, before a program is predicted.
-	Order,   ///< `order <count> <hash>`, once the candidate ordering is known.
-	Start,   ///< `start <rank> <hash>`, before a candidate is translated.
-	Drop,    ///< `drop <rank> <hash> <reason>`, when a program's candidates are given up.
-	Summary, ///< `summary key=value ...`, the last line of a run. Keep it the last kind.
+	Predict,    ///< `predict <hash>`, before a program is predicted.
+	Order,      ///< `order <count> <hash>`, once the candidate ordering is known.
+	Start,      ///< `start <rank> <hash>`, before a candidate is translated.
+	Drop,       ///< `drop <rank> <hash> <reason>`, when a program's candidates are given up.
+	Prediction, ///< `prediction <hash> <outcome> <candidates>`, once a program's prediction is
+	            ///< over.
+	Summary,    ///< `summary key=value ...`, the last line of a run. Keep it the last kind.
+};
+
+/// What came of a program's prediction, as a `prediction` line says it.
+enum class PredictionOutcome : uint8_t {
+	Predicted,    ///< `predicted`, the program has candidates.
+	Calls,        ///< `calls`, it calls GPU-selected functions.
+	Unclassified, ///< `unclassified`, the classifier could not name its descriptors.
+	Unreadable,   ///< `unreadable`, no static key, header slots or metadata.
+	Problems,     ///< `problems`, a resource outside the predictor's rules, or no candidate.
+};
+
+/// The latest `prediction` line of one program.
+struct ProgressPrediction {
+	uint64_t          hash       = 0;
+	PredictionOutcome outcome    = PredictionOutcome::Predicted;
+	uint64_t          candidates = 0;
+
+	bool operator==(const ProgressPrediction&) const = default;
 };
 
 /// How many kinds there are, which sizes the reader's counts.
@@ -31,7 +52,8 @@ constexpr size_t PROGRESS_KIND_COUNT = static_cast<size_t>(ProgressKind::Summary
 static_assert(ProgressKind::Predict < ProgressKind::Order &&
                   ProgressKind::Order < ProgressKind::Start &&
                   ProgressKind::Start < ProgressKind::Drop &&
-                  ProgressKind::Drop < ProgressKind::Summary,
+                  ProgressKind::Drop < ProgressKind::Prediction &&
+                  ProgressKind::Prediction < ProgressKind::Summary,
               "Summary must be the last kind, since it sizes the counts");
 
 /// Why a `drop` line was written.
@@ -50,6 +72,8 @@ struct ProgressLine {
 	uint64_t rank_or_count = 0;
 	/// Drop only.
 	ProgressDropReason reason = ProgressDropReason::PushStart;
+	/// Prediction only, what came of the program. Its candidate count is in rank_or_count.
+	PredictionOutcome outcome = PredictionOutcome::Predicted;
 	/// Drop with PushStart only, the push data start the predictor assumed and the module has.
 	uint32_t predicted_push = 0;
 	uint32_t actual_push    = 0;
@@ -100,8 +124,9 @@ public:
 
 	/// Starts a run again from nothing, as the supervisor does for a fresh restart. What BeginSpawn
 	/// keeps across spawns, which is the latest `order` line and the last `start` line, belongs to
-	/// the ordering that the fresh run throws away, so it is cleared too. The same advice about
-	/// catching up holds.
+	/// the ordering that the fresh run throws away, so it is cleared too. The predictions are not,
+	/// since they say what the worker found of each program and not where in an ordering it was.
+	/// The same advice about catching up holds.
 	void BeginFreshRun(ProgressClock::time_point now);
 
 	/// Starts counting a spawn at a given offset of the log. For a supervisor that saved the
@@ -160,6 +185,13 @@ public:
 	/// The program of every `predict` line of the whole log, each once, in the order they came. It
 	/// is kept across spawns and fresh runs, since it says what the worker has looked at.
 	[[nodiscard]] const std::vector<uint64_t>& PredictedHashes() const { return m_predicted; }
+	/// The latest `prediction` line of each program of the whole log, in the order the programs
+	/// were first seen. A program predicted again, as in a fresh run, keeps its place and takes the
+	/// new row. It is kept across spawns and fresh runs, like PredictedHashes. A program with a
+	/// `predict` line and no row here was cut off while it was predicted.
+	[[nodiscard]] const std::vector<ProgressPrediction>& Predictions() const {
+		return m_predictions;
+	}
 	/// When the first `predict` line of the whole log was found, which is the time of the Poll that
 	/// found it and not of the line itself.
 	[[nodiscard]] const std::optional<ProgressClock::time_point>& FirstPredictTime() const {
@@ -188,6 +220,8 @@ private:
 	std::optional<ProgressLine>              m_last_start;
 	std::vector<uint64_t>                    m_predicted;
 	std::unordered_set<uint64_t>             m_predicted_seen;
+	std::vector<ProgressPrediction>          m_predictions;
+	std::unordered_map<uint64_t, size_t>     m_prediction_index;
 	std::optional<ProgressClock::time_point> m_first_predict_time;
 	size_t                                   m_malformed = 0;
 	size_t                                   m_resets    = 0;

@@ -298,6 +298,9 @@ void TestRecompilerExitIsCaptured() {
 	CHECK(crash_log.KindCount(ProgressKind::Order) == 0 && !crash_log.LatestOrder());
 	CHECK(crash_log.KindCount(ProgressKind::Start) == 0 && !crash_log.LastStart());
 	CHECK(crash_log.KindCount(ProgressKind::Summary) == 0 && !crash_log.Summary());
+	// A crash while predicting leaves no `prediction` line, which is written after it, so the
+	// blame stays on the predict line.
+	CHECK(crash_log.KindCount(ProgressKind::Prediction) == 0 && crash_log.Predictions().empty());
 
 	const fs::path plain_eboot = directory / "plain.eboot";
 	WriteFile(plain_eboot, BuildEboot({ProgramSmall()}));
@@ -316,6 +319,16 @@ void TestRecompilerExitIsCaptured() {
 	      plain_log.KindCount(ProgressKind::Order) >= 1);
 	CHECK(plain_log.KindCount(ProgressKind::Start) >= 1);
 	CHECK(plain_log.KindCount(ProgressKind::Summary) == 1 && plain_log.Summary());
+	// One program, predicted, and its candidate count is the one the ordering holds. The crashing
+	// run above has no such row, so the row is the worker's answer and not a leftover.
+	CHECK(plain_log.KindCount(ProgressKind::Prediction) == 1 &&
+	      plain_log.Predictions().size() == 1);
+	CHECK(plain_log.LatestOrder().has_value());
+	if (plain_log.Predictions().size() == 1 && plain_log.LatestOrder()) {
+		CHECK(plain_log.Predictions()[0].outcome == PredictionOutcome::Predicted);
+		CHECK(plain_log.Predictions()[0].candidates == plain_log.LatestOrder()->rank_or_count);
+		CHECK(plain_log.Predictions()[0].candidates >= 1);
+	}
 }
 
 // A worker whose parent is already gone ends at once, from EnterChildMode, and never runs. The

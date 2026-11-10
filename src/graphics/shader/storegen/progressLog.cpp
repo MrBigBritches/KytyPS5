@@ -111,6 +111,42 @@ std::optional<ProgressLine> ParseSummary(const std::vector<std::string_view>& wo
 	return has_exit ? std::optional<ProgressLine>(line) : std::nullopt;
 }
 
+// The outcome a `prediction` line names, or nothing for a word the worker does not write.
+std::optional<PredictionOutcome> ParseOutcome(std::string_view word) {
+	if (word == "predicted") {
+		return PredictionOutcome::Predicted;
+	}
+	if (word == "calls") {
+		return PredictionOutcome::Calls;
+	}
+	if (word == "unclassified") {
+		return PredictionOutcome::Unclassified;
+	}
+	if (word == "unreadable") {
+		return PredictionOutcome::Unreadable;
+	}
+	if (word == "problems") {
+		return PredictionOutcome::Problems;
+	}
+	return std::nullopt;
+}
+
+std::optional<ProgressLine> ParsePrediction(const std::vector<std::string_view>& words) {
+	// prediction <hash> <outcome> <candidates>
+	constexpr size_t WORD_COUNT = 4;
+	if (words.size() != WORD_COUNT) {
+		return std::nullopt;
+	}
+	ProgressLine line;
+	line.kind          = ProgressKind::Prediction;
+	const auto outcome = ParseOutcome(words[2]);
+	if (!outcome || !ParseHash(words[1], line.hash) || !ParseNumber(words[3], line.rank_or_count)) {
+		return std::nullopt;
+	}
+	line.outcome = *outcome;
+	return line;
+}
+
 } // namespace
 
 std::optional<ProgressLine> ParseProgressLine(std::string_view line) {
@@ -130,6 +166,9 @@ std::optional<ProgressLine> ParseProgressLine(std::string_view line) {
 	}
 	if (kind == "drop") {
 		return ParseDrop(words);
+	}
+	if (kind == "prediction") {
+		return ParsePrediction(words);
 	}
 	if (kind == "summary") {
 		return ParseSummary(words);
@@ -190,6 +229,18 @@ void ProgressLogReader::TakeLine(std::string_view line, ProgressClock::time_poin
 		case ProgressKind::Drop: m_drops.push_back(*parsed); break;
 		case ProgressKind::Order: m_order = parsed; break;
 		case ProgressKind::Summary: m_summary = parsed; break;
+		case ProgressKind::Prediction: {
+			// The latest row of a program wins, and it keeps the place of the first.
+			const ProgressPrediction row {parsed->hash, parsed->outcome, parsed->rank_or_count};
+			const auto [slot, added] =
+			    m_prediction_index.try_emplace(row.hash, m_predictions.size());
+			if (added) {
+				m_predictions.push_back(row);
+			} else {
+				m_predictions[slot->second] = row;
+			}
+			break;
+		}
 		case ProgressKind::Predict:
 			if (m_predicted_seen.insert(parsed->hash).second) {
 				m_predicted.push_back(parsed->hash);

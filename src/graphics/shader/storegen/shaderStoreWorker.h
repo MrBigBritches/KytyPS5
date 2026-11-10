@@ -135,16 +135,19 @@ struct WorkerHooks {
 /// rank is a position in this ordering, so it does not depend on the start rank, and not on the
 /// request's failed programs. It does depend on the request's skip hashes.
 ///
-/// Before it predicts a program the worker appends `predict <hash>` to the progress log. After
-/// the ordering is known it appends `order <count> <hash>`, and then, for each candidate from the
-/// start rank, `start <rank> <hash>` before it translates the candidate. It then appends one framed
-/// record to the output file. Every write goes straight to the operating system, so a crash is
-/// blamed on the last start line. A kept file is only truncated and extended after the ordering
-/// matched the request's `expected_order`.
-/// A candidate whose module has another push data start than predicted is not written, the rest
-/// of its program is dropped, and the drop is counted and logged as `drop <rank> <hash> ...`.
-/// A supervisor that restarts the worker adds the hash of each `drop` line to the request's
-/// failed_hashes, so the restart does not build the program again. The exception is a
+/// Before it predicts a program the worker appends `predict <hash>` to the progress log, and after
+/// it, on every path that ends the program's prediction, `prediction <hash> <outcome>
+/// <candidates>`. The outcome is predicted, calls, unclassified, unreadable or problems, matching
+/// the result's programs_ counters, and the candidates are the program's count, which is 0 unless
+/// it is predicted. A program the request skips gets neither line. After the ordering is known it
+/// appends `order <count> <hash>`, and then, for each candidate from the start rank, `start <rank>
+/// <hash>` before it translates the candidate. It then appends one framed record to the output
+/// file. Every write goes straight to the operating system, so a crash is blamed on the last start
+/// line. A kept file is only truncated and extended after the ordering matched the request's
+/// `expected_order`. A candidate whose module has another push data start than predicted is not
+/// written, the rest of its program is dropped, and the drop is counted and logged as `drop <rank>
+/// <hash> ...`. A supervisor that restarts the worker adds the hash of each `drop` line to the
+/// request's failed_hashes, so the restart does not build the program again. The exception is a
 /// `frame_too_large` drop, which drops one candidate only and leaves the program's others to be
 /// built.
 /// The last line of the log is `summary` with the counts, whenever the log was opened.

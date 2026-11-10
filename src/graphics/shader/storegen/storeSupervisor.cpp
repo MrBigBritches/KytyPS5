@@ -57,6 +57,7 @@ const char* KindName(ProgressKind kind) {
 		case ProgressKind::Order: return "order";
 		case ProgressKind::Start: return "start";
 		case ProgressKind::Drop: return "drop";
+		case ProgressKind::Prediction: return "prediction";
 		case ProgressKind::Summary: return "summary";
 	}
 	return "";
@@ -192,9 +193,11 @@ struct StoreSupervisor::Impl {
 	Clock::time_point                     first_spawn_time;
 	// What the statistics of the current spawn have taken already, so ending a spawn in two places
 	// counts it once.
-	bool                  stats_collected     = false;
-	size_t                predicted_published = 0;
-	std::optional<double> last_cpu_ms;
+	bool   stats_collected     = false;
+	size_t predicted_published = 0;
+	// The prediction rows last copied into the statistics, to see when they change.
+	std::vector<ProgressPrediction> predictions_published;
+	std::optional<double>           last_cpu_ms;
 };
 
 StoreSupervisor::Impl::Impl(SupervisorConfig supplied)
@@ -514,7 +517,9 @@ void StoreSupervisor::Impl::RecordFailure(const Verdict& verdict, int exit_code)
 	failure.exit_code = exit_code;
 	failure.kind      = verdict.kind;
 	if (const auto& last = progress.LastLine()) {
-		failure.hash      = last->hash;
+		// A crash after a program's `prediction` line and before `order` is in no program, so it
+		// names none. BlameLastLine ignores that line for the same reason.
+		failure.hash      = last->kind == ProgressKind::Prediction ? 0 : last->hash;
 		failure.rank      = last->kind == ProgressKind::Start ? last->rank_or_count : 0;
 		failure.last_line = KindName(last->kind);
 	}
@@ -546,18 +551,27 @@ void StoreSupervisor::Impl::CollectSpawnStats() {
 void StoreSupervisor::Impl::NoteProgress() {
 	const auto& predicted = progress.PredictedHashes();
 	const auto  first     = progress.FirstPredictTime();
-	if (predicted.size() == predicted_published && !first) {
+	// A program predicted again changes a row and not the count, so the rows are compared whole.
+	const bool predictions_changed = progress.Predictions() != predictions_published;
+	if (predicted.size() == predicted_published && !first && !predictions_changed) {
 		return;
 	}
 	Update([&](SupervisorStats& s) {
 		if (predicted.size() != predicted_published) {
 			s.predicted_hashes = predicted;
 		}
+		if (predictions_changed) {
+			s.predictions.clear();
+			for (const auto& row: progress.Predictions()) {
+				s.predictions.push_back({row.hash, row.outcome, row.candidates});
+			}
+		}
 		if (first && !s.child_open_ms) {
 			s.child_open_ms = MillisecondsBetween(first_spawn_time, *first);
 		}
 	});
-	predicted_published = predicted.size();
+	predicted_published   = predicted.size();
+	predictions_published = progress.Predictions();
 }
 
 // Adds the drops of this spawn to the list of all of them.

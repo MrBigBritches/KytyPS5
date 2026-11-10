@@ -111,6 +111,12 @@ ProgressLine WithRank(ProgressKind kind, uint64_t rank_or_count, uint64_t hash) 
 	return line;
 }
 
+ProgressLine Prediction(uint64_t hash, PredictionOutcome outcome, uint64_t candidates) {
+	auto line    = WithRank(ProgressKind::Prediction, candidates, hash);
+	line.outcome = outcome;
+	return line;
+}
+
 ProgressLine Drop(uint64_t rank, uint64_t hash, ProgressDropReason reason) {
 	auto line   = WithRank(ProgressKind::Drop, rank, hash);
 	line.reason = reason;
@@ -146,6 +152,15 @@ void TestEveryLineKind() {
 	    {"drop 9 " + Hex(HASH_C) + " frame_too_large",
 	     Drop(RANK_NINE, HASH_C, ProgressDropReason::FrameTooLarge)},
 	    {"summary exit=0 scanned=12 worst_ms=340 order=" + Hex(ORDER_ONE), summary},
+	    {"prediction " + Hex(HASH_A) + " predicted 7",
+	     Prediction(HASH_A, PredictionOutcome::Predicted, COUNT_7)},
+	    {"prediction " + Hex(HASH_B) + " calls 0", Prediction(HASH_B, PredictionOutcome::Calls, 0)},
+	    {"prediction " + Hex(HASH_C) + " unclassified 0",
+	     Prediction(HASH_C, PredictionOutcome::Unclassified, 0)},
+	    {"prediction " + Hex(HASH_A) + " unreadable 0",
+	     Prediction(HASH_A, PredictionOutcome::Unreadable, 0)},
+	    {"prediction " + Hex(HASH_B) + " problems 0",
+	     Prediction(HASH_B, PredictionOutcome::Problems, 0)},
 	};
 	for (const auto& row: cases) {
 		const auto parsed = ParseProgressLine(row.text);
@@ -188,6 +203,17 @@ void TestMalformedLines() {
 	     "drop 1 " + hash + " push_start predicted=1 actual=2"},
 	    {"drop 1 " + hash + " push_start actual=2 predicted=1",
 	     "drop 1 " + hash + " push_start predicted=1 actual=2"},
+	    {"prediction " + hash + " predicted", "prediction " + hash + " predicted 2"},
+	    {"prediction " + hash + " 2", "prediction " + hash + " predicted 2"},
+	    {"prediction predicted 2", "prediction " + hash + " predicted 2"},
+	    {"prediction " + hash + " maybe 2", "prediction " + hash + " predicted 2"},
+	    {"prediction " + hash + " Predicted 2", "prediction " + hash + " predicted 2"},
+	    {"prediction " + hash + " calls two", "prediction " + hash + " calls 2"},
+	    {"prediction " + hash + " unclassified -1", "prediction " + hash + " unclassified 1"},
+	    {"prediction " + hash.substr(0, 15) + " unreadable 0",
+	     "prediction " + hash + " unreadable 0"},
+	    {"prediction " + hash + " problems 0 extra", "prediction " + hash + " problems 0"},
+	    {"prediction " + hash + " problems 0x", "prediction " + hash + " problems 0"},
 	    {"summary", "summary exit=0"},
 	    {"summary exit=x", "summary exit=0"},
 	    {"summary scanned=1", "summary exit=0 scanned=1"},
@@ -461,6 +487,51 @@ void TestFreshRunForgets() {
 	CHECK(fresh.Poll(T3) == 1 && !fresh.AnyStartSeen());
 }
 
+// The prediction rows outlive a spawn and a fresh run, and the latest row of a program wins while
+// it keeps the place of the first. The baselines are the order row, which a fresh run does forget,
+// and a second program whose row is not replaced.
+void TestPredictionsKept() {
+	TempDirectory directory;
+	const auto    path = directory / "log.txt";
+	AppendText(path, "predict " + Hex(HASH_A) + "\nprediction " + Hex(HASH_A) + " calls 0\n" +
+	                     "predict " + Hex(HASH_B) + "\nprediction " + Hex(HASH_B) +
+	                     " predicted 3\norder 3 " + Hex(ORDER_ONE) + "\n");
+	ProgressLogReader reader(path);
+	reader.BeginSpawnAt(0, T0);
+	CHECK(reader.PollToEnd(T1) == 5 && reader.MalformedLines() == 0);
+	const std::vector<ProgressPrediction> first {{HASH_A, PredictionOutcome::Calls, 0},
+	                                             {HASH_B, PredictionOutcome::Predicted, 3}};
+	CHECK(reader.Predictions() == first);
+	CHECK(reader.KindCount(ProgressKind::Prediction) == 2);
+
+	// A new spawn counts its own lines, and still holds the rows.
+	reader.BeginSpawn(T2);
+	CHECK(reader.KindCount(ProgressKind::Prediction) == 0 && reader.Predictions() == first);
+
+	// A program predicted again in the next spawn takes the new row in its old place.
+	AppendText(path, "prediction " + Hex(HASH_A) + " predicted 5\n");
+	CHECK(reader.PollToEnd(T3) == 1);
+	const std::vector<ProgressPrediction> replaced {{HASH_A, PredictionOutcome::Predicted, 5},
+	                                                {HASH_B, PredictionOutcome::Predicted, 3}};
+	CHECK(reader.Predictions() == replaced);
+
+	// A fresh run forgets the order and keeps the rows.
+	ProgressLogReader fresh(path);
+	fresh.BeginSpawnAt(0, T0);
+	fresh.PollToEnd(T1);
+	CHECK(fresh.LatestOrder().has_value());
+	fresh.BeginFreshRun(T2);
+	CHECK(!fresh.LatestOrder().has_value());
+	CHECK(fresh.Predictions() == replaced);
+	AppendText(path, "prediction " + Hex(HASH_C) + " problems 0\nprediction " + Hex(HASH_B) +
+	                     " unreadable 0\n");
+	CHECK(fresh.PollToEnd(T3) == 2);
+	const std::vector<ProgressPrediction> after_fresh {{HASH_A, PredictionOutcome::Predicted, 5},
+	                                                   {HASH_B, PredictionOutcome::Unreadable, 0},
+	                                                   {HASH_C, PredictionOutcome::Problems, 0}};
+	CHECK(fresh.Predictions() == after_fresh);
+}
+
 // PollToEnd reads a log of more than one poll whole, where Poll stops at its bound, and says that
 // it caught up. It is what a supervisor calls before BeginSpawn, so that a dead child's last line
 // is not skipped.
@@ -571,6 +642,7 @@ int main() {
 	TestOrderSummaryAndStart();
 	TestLargeLogIsReadInPolls();
 	TestFreshRunForgets();
+	TestPredictionsKept();
 	TestPollToEndCatchesUp();
 	TestShrunkLogIsReadAgain();
 	TestPollToEndStopsWithoutProgress();

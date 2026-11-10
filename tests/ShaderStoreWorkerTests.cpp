@@ -785,6 +785,136 @@ void TestProgramsLeftOut() {
 	CHECK(ReadRecords(run.file, HeaderBytes(request), exact).size() == 1 && exact);
 }
 
+// The `prediction` lines of a log, as the words of each line.
+std::vector<std::vector<std::string>> PredictionLines(const std::vector<std::string>& log) {
+	std::vector<std::vector<std::string>> lines;
+	for (const auto& line: log) {
+		const auto words = Words(line);
+		if (!words.empty() && words[0] == "prediction") {
+			lines.push_back(words);
+		}
+	}
+	return lines;
+}
+
+// Whether every `predict` line of a log is followed at once by the `prediction` line of the same
+// program. A line that came later or not at all would leave a crash blamed on the wrong step.
+bool PredictionFollowsPredict(const std::vector<std::string>& log) {
+	size_t pairs = 0;
+	for (size_t index = 0; index < log.size(); index++) {
+		const auto words = Words(log[index]);
+		if (words.size() != 2 || words[0] != "predict") {
+			continue;
+		}
+		const auto next =
+		    index + 1 < log.size() ? Words(log[index + 1]) : std::vector<std::string> {};
+		if (next.size() != 4 || next[0] != "prediction" || next[1] != words[1]) {
+			return false;
+		}
+		pairs++;
+	}
+	return pairs > 0;
+}
+
+// Every program gets one `prediction` line, with the outcome the result counts it under. The
+// programs are of every kind the fixture makes. The unreadable one has no static key, so it takes
+// the early exit of the loop, which is the path that a line written only after the prediction would
+// miss. The others do not name the outcome by accident, since each is a program of its own kind
+// and the four outcomes are counted apart in the result.
+void TestPredictionLinePerProgram() {
+	TempDirectory directory;
+	ProgramSpec   calls          = ProgramSmall();
+	calls.calls                  = true;
+	ProgramSpec derived          = ProgramSmall();
+	derived.derived_descriptor   = true;
+	derived.padding_nops         = 1;
+	ProgramSpec odd              = ProgramMiddle();
+	odd.loads[0].no_rule         = true;
+	ProgramSpec unreadable       = ProgramSmall();
+	unreadable.without_registers = true;
+	unreadable.padding_nops      = 2;
+	auto good                    = ProgramSmall();
+	good.padding_nops            = 3;
+	const auto eboot             = BuildEboot({calls, derived, odd, unreadable, good});
+	const auto scan              = ScanEbootShaders(eboot);
+	CHECK(scan.programs.size() == 5);
+	const auto request = MakeRequest(directory, eboot);
+	const auto run     = Run(request);
+	const auto lines   = PredictionLines(run.log);
+	CHECK(lines.size() == run.result.programs_scanned && PredictionFollowsPredict(run.log));
+	const std::array<std::pair<const char*, uint64_t>, 5> expected = {
+	    {{"calls", 0}, {"unclassified", 0}, {"problems", 0}, {"unreadable", 0}, {"predicted", 1}}};
+	for (size_t index = 0; index < expected.size() && index < scan.programs.size(); index++) {
+		const auto& line = index < lines.size() ? lines[index] : std::vector<std::string> {};
+		CHECK(line.size() == 4 && line[1] == HashText(scan.programs[index].code_hash));
+		CHECK(line.size() == 4 && line[2] == expected[index].first);
+		CHECK(line.size() == 4 && line[3] == std::to_string(expected[index].second));
+	}
+	// The totals by outcome are the result's counters, so no line is in the wrong class.
+	std::unordered_map<std::string, uint32_t> by_outcome;
+	uint64_t                                  candidates = 0;
+	for (const auto& line: lines) {
+		by_outcome[line.size() == 4 ? line[2] : ""]++;
+		candidates += line.size() == 4 ? std::stoull(line[3]) : 0;
+	}
+	CHECK(by_outcome["predicted"] == run.result.programs_predicted);
+	CHECK(by_outcome["calls"] == run.result.programs_with_calls);
+	CHECK(by_outcome["unclassified"] == run.result.programs_unclassified);
+	CHECK(by_outcome["unreadable"] == run.result.programs_unreadable);
+	CHECK(by_outcome["problems"] == run.result.programs_with_problems);
+	CHECK(candidates == run.result.candidates);
+
+	// The same log through the reader the supervisor uses.
+	const auto log = ReadRealLog(request);
+	CHECK(log.KindCount(ProgressKind::Prediction) == 5 && log.Predictions().size() == 5);
+	if (log.Predictions().size() == 5) {
+		CHECK(log.Predictions()[3].outcome == PredictionOutcome::Unreadable);
+		CHECK(log.Predictions()[3].hash == scan.programs[3].code_hash);
+		CHECK(log.Predictions()[4].outcome == PredictionOutcome::Predicted &&
+		      log.Predictions()[4].candidates == 1);
+	}
+
+	// A program the request skips is never predicted, so it has neither line. The baseline is the
+	// run above, where the same program has both.
+	auto skipping         = MakeRequest(directory, eboot, "skipping");
+	skipping.skip_hashes  = {scan.programs[4].code_hash};
+	const auto skipped    = Run(skipping);
+	const auto kept_lines = PredictionLines(skipped.log);
+	CHECK(skipped.result.programs_skipped_by_request == 1 && kept_lines.size() == 4);
+	for (const auto& line: kept_lines) {
+		CHECK(line.size() == 4 && line[1] != HashText(scan.programs[4].code_hash));
+	}
+}
+
+// A program with several candidates reports how many, which is the count that the ordering holds
+// for it. The baseline is a count of one, as the program above has, so a line that always said 1
+// fails.
+void TestPredictionCandidateCounts() {
+	TempDirectory directory;
+	const auto    eboot   = BuildEboot(MainPrograms());
+	const auto    scan    = ScanEbootShaders(eboot);
+	const auto    request = MakeRequest(directory, eboot);
+	const auto    run     = Run(request);
+	const auto    lines   = PredictionLines(run.log);
+	CHECK(lines.size() == scan.programs.size() && run.result.candidates == MAIN_CANDIDATES);
+	uint64_t total   = 0;
+	uint64_t largest = 0;
+	for (const auto& line: lines) {
+		CHECK(line.size() == 4 && line[2] == "predicted");
+		const uint64_t count = line.size() == 4 ? std::stoull(line[3]) : 0;
+		total += count;
+		largest = std::max(largest, count);
+	}
+	CHECK(total == MAIN_CANDIDATES && largest > 1);
+	const auto log = ReadRealLog(request);
+	CHECK(log.Predictions().size() == scan.programs.size());
+	uint64_t reader_total = 0;
+	for (const auto& row: log.Predictions()) {
+		reader_total += row.candidates;
+	}
+	CHECK(reader_total == MAIN_CANDIDATES);
+}
+
 // A program with no buffer that reads user data. The rule says a program with no buffers has no
 // push data, but the module keeps the user data it reads there, so it starts at 0.
 ProgramSpec ProgramUserDataOnly() {
@@ -1198,6 +1328,8 @@ int main() {
 	TestVerifyUpToDate();
 	TestVerifyRegenerates();
 	TestProgramsLeftOut();
+	TestPredictionLinePerProgram();
+	TestPredictionCandidateCounts();
 	TestPushStartTripwireOnRealMiss();
 	TestPushStartTripwireDropsTheRest();
 	TestKeptTruncatesTornBytes();
