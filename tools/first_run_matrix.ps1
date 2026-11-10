@@ -62,6 +62,9 @@ $ArmTable = [ordered]@{
     # --shader-cache, which the base args give. The helper's files match the title's cache names,
     # so they move into the hold folder with the rest.
     "gen"            = @{ Flags = @("--deferred-pipeline-draws", "--background-warm-up", "--pause-warm-up-for-draws", "--deferred-non-push-draws", "--graphics-pipeline-library", "--generate-shader-store"); Ready = $true }
+    # The gen arm with the generator's extra variants of programs with many variants built last,
+    # so it can alternate with gen on one build.
+    "gen-wide"       = @{ Flags = @("--deferred-pipeline-draws", "--background-warm-up", "--pause-warm-up-for-draws", "--deferred-non-push-draws", "--graphics-pipeline-library", "--generate-shader-store", "--warm-wide-tail-last"); Ready = $true }
     "lookahead"      = @{ Flags = @("--shader-lookahead");                                                                 Ready = $false }
 }
 

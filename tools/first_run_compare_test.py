@@ -114,6 +114,34 @@ def row_cells(output, title, arm):
     return None
 
 
+class ArmNames(unittest.TestCase):
+    """A strategy flag stays in the arm name even when every report has it on, so a set of runs
+    all made with --warm-wide-tail-last is still named for it. A setting on in every report is
+    left out, which is the baseline the flag is compared against."""
+
+    @staticmethod
+    def report(*flags):
+        return {"flags": {name: True for name in flags}, "cold": True}
+
+    def test_wide_tail_last_stays_in_the_name_when_every_run_has_it(self):
+        reports = [self.report("--hdr", "--generate-shader-store", "--warm-wide-tail-last")] * 2
+        common = SCRIPT.common_flags(reports)
+        self.assertNotIn("--warm-wide-tail-last", common)
+        self.assertEqual(SCRIPT.arm_name(reports[0], common), "--generate-shader-store --warm-wide-tail-last")
+
+    def test_a_setting_on_in_every_run_is_left_out(self):
+        # The same runs with --hdr standing in for the strategy flag. A setting is dropped from the
+        # name, so the line above can only pass because the flag is a strategy flag.
+        reports = [self.report("--hdr", "--generate-shader-store")] * 2
+        self.assertEqual(SCRIPT.arm_name(reports[0], SCRIPT.common_flags(reports)), "--generate-shader-store")
+
+    def test_runs_with_and_without_it_are_two_arms(self):
+        with_flag = self.report("--generate-shader-store", "--warm-wide-tail-last")
+        without = self.report("--generate-shader-store")
+        common = SCRIPT.common_flags([with_flag, without])
+        self.assertNotEqual(SCRIPT.arm_name(with_flag, common), SCRIPT.arm_name(without, common))
+
+
 class OldReports(unittest.TestCase):
     """Reports from before the new fields print exactly as the old script printed them."""
 
