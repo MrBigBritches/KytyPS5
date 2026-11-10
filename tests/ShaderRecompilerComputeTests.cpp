@@ -1246,6 +1246,11 @@ struct PipelineCacheTestAccess {
   // tests use for what StartStoreGeneration will make. It owns the inbox and the counters, and no
   // thread.
   static void EnableGeneration(PipelineCache &cache) { cache.EnableStoreGeneration(); }
+  // Gives the first-run report the cache's figures, as StartStoreGeneration does.
+  static void RegisterGenerationReport(PipelineCache &cache) { cache.RegisterGenerationReport(); }
+  // Counts a module whose plan could not be decoded, as the generator's thread does. A test uses it
+  // to change a figure after the stop and see whether the report still follows the cache.
+  static void NoteBadPlan(PipelineCache &cache) { cache.m_generation->bad_plans++; }
 
   // Posts a record the way the generator's thread does, with the changes a test may make to the
   // module on its way: its plan hash changed, which stands for a plan that is not the program's, or
@@ -61783,6 +61788,96 @@ void CheckGeneratedDrainBudget(VulkanHarness &vulkan, GuestGpu &gpu,
   std::printf("[gpu]     %-32s ok\n", name);
 }
 
+// The number after a key in the generation block of the process-wide report, or nothing.
+std::optional<uint64_t> GenerationFigure(const std::string &key) {
+  const auto json = Common::FirstRunReport::Global().ToJson({}, 0, 1.0, 0.0);
+  const auto block = json.find("\"shader_store_generation\"");
+  if (block == std::string::npos) return std::nullopt;
+  const std::string needle = "\"" + key + "\": ";
+  const auto at = json.find(needle, block);
+  if (at == std::string::npos) return std::nullopt;
+  return std::stoull(json.substr(at + needle.size()));
+}
+
+// Whether the process-wide report's text holds this text, for the parts of the block that are not
+// numbers.
+bool GenerationReportHas(const std::string &text) {
+  return Common::FirstRunReport::Global().ToJson({}, 0, 1.0, 0.0).find(text) != std::string::npos;
+}
+
+// The report reads the generation's figures from its own thread while the GPU thread drains, and
+// after the stop and the destruction of the cache it still has the final figures and calls nothing
+// that is gone. A module posted after the last drain is counted as undrained, which only a figure
+// taken after the stop's cleanup can show.
+void CheckGeneratedReport(VulkanHarness &vulkan, GuestGpu &gpu,
+                          const std::vector<DecodedModuleRecord> &records) {
+  constexpr const char *name = "GeneratedReport";
+  constexpr size_t module_count = 20;
+  constexpr size_t late_count = 3;
+  Common::FirstRunReport::Global().Reset();
+  Require(name, "no block without generation", !GenerationFigure("adopted").has_value(),
+          "the report had a generation block before any generation started");
+  {
+    PipelineCache cache(vulkan.RuntimeContext(), nullptr);
+    PipelineCacheTestAccess::EnableWarmCompute(cache);
+    PipelineCacheTestAccess::EnableGeneration(cache);
+    PipelineCacheTestAccess::RegisterGenerationReport(cache);
+    for (size_t index = 0; index < module_count; index++) {
+      auto record = DecodedModuleRecord(records[0]);
+      record.id += 1000 + index;
+      cache.PostGeneratedModule(std::move(record));
+    }
+    Require(name, "the live block counts what was posted",
+            GenerationFigure("adopted") == 0u && GenerationFigure("pending") == module_count,
+            "the live block did not show the posted modules waiting");
+    // A writer on its own thread reads the block all the while the GPU thread drains.
+    std::atomic<bool> done{false};
+    std::atomic<bool> went_back{false};
+    std::thread writer([&] {
+      uint64_t seen = 0;
+      while (!done) {
+        const auto adopted = GenerationFigure("adopted").value_or(0);
+        if (adopted < seen) went_back = true;
+        seen = adopted;
+      }
+    });
+    ShaderComputeInputInfo input{};
+    for (int lookups = 0; lookups < 10 && cache.GenerationStats()->pending != 0; lookups++) {
+      gpu.SendCommandSync([&] { GeneratedLookup(cache, GENERATED_STRIDE_A, input); });
+    }
+    done = true;
+    writer.join();
+    Require(name, "the drained count never went back", !went_back, "the live figure went down");
+    const auto stats = cache.GenerationStats();
+    Require(name, "the live block has the drain's figures",
+            stats && GenerationFigure("adopted") == stats->drain.adopted &&
+                GenerationFigure("adopted") == module_count &&
+                GenerationFigure("calls") == stats->drain.drain_calls &&
+                GenerationFigure("pending") == 0u,
+            "the block did not hold what the drain counted");
+    // These stay in the inbox, since no lookup follows.
+    for (size_t index = 0; index < late_count; index++) {
+      auto record = DecodedModuleRecord(records[0]);
+      record.id += 2000 + index;
+      cache.PostGeneratedModule(std::move(record));
+    }
+    cache.StopBuilds();
+    // The figures are final from the stop on. One that changes afterwards is not followed, which is
+    // also what keeps the report from reading a cache that is on its way out.
+    const auto frozen = GenerationFigure("bad_plans");
+    PipelineCacheTestAccess::NoteBadPlan(cache);
+    Require(name, "the final figures are frozen", frozen.has_value() && GenerationFigure("bad_plans") == frozen,
+            "the report followed the cache after the stop");
+  }
+  // The cache is gone, and the writer must not reach for it.
+  Require(name, "the final block outlives the cache",
+          GenerationFigure("adopted") == module_count && GenerationFigure("undrained_at_stop") == late_count &&
+              GenerationFigure("pending") == 0u,
+          "the figures after the stop were not the final ones");
+  Common::FirstRunReport::Global().Reset();
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
 // The stop destroys the modules no drain took, and a module posted after it is destroyed at once, so
 // the shader modules that were made are all destroyed. A module whose plan was left out for a program
 // that is new is not kept either, and its program goes.
@@ -61865,6 +61960,7 @@ void CheckGeneratedModules(VulkanHarness &vulkan) {
       CheckGeneratedPlanDecodedOnce(vulkan, records);
       CheckGeneratedReverseTripwire(vulkan, gpu, records);
       CheckGeneratedDrainBudget(vulkan, gpu, records);
+      CheckGeneratedReport(vulkan, gpu, records);
       CheckGeneratedStop(vulkan, gpu, records);
     });
   }
@@ -61960,6 +62056,7 @@ void CheckStoreGenerationNormal(VulkanHarness &vulkan, GuestGpu &gpu) {
                    fmt::format("kyty_store_generation_{}",
                                std::chrono::steady_clock::now().time_since_epoch().count());
   Common::DebugCounters::SetEnabled(true);
+  Common::FirstRunReport::Global().Reset();
   {
     // The baseline: no flag, no generator, and a lookup that compiles its module.
     auto cache = BootGeneratingCache(vulkan, dir / "off", eboot, false, true);
@@ -61974,6 +62071,9 @@ void CheckStoreGenerationNormal(VulkanHarness &vulkan, GuestGpu &gpu) {
                 PipelineCacheTestAccess::ModuleCount(*cache) == 1,
             "a lookup without generation did not compile its module");
     cache->StopBuilds();
+    Require(name, "no flag, no report block",
+            !GenerationFigure("adopted").has_value() && !GenerationReportHas("shader_store_generation"),
+            "a run without the flag put a generation block in the report");
   }
   {
     // The flag without background warm-up has nothing to build on, so there is no generator.
@@ -61982,6 +62082,12 @@ void CheckStoreGenerationNormal(VulkanHarness &vulkan, GuestGpu &gpu) {
             !PipelineCacheTestAccess::HasSupervisor(*cache) && !HasGeneratedFiles(dir / "no_warm"),
             "the flag started a generator without --background-warm-up");
     cache->StopBuilds();
+    // The report says why, so the run that asked for generation can be told from one that did not.
+    Require(name, "the refusal is in the report",
+            GenerationReportHas("\"inactive_reason\": \"needs_background_warm_up\"") &&
+                !GenerationFigure("adopted").has_value(),
+            "a refused generation did not say so in the report");
+    Common::FirstRunReport::Global().Reset();
   }
   {
     auto cache = BootGeneratingCache(vulkan, dir / "on", eboot, true, true);
@@ -62016,7 +62122,14 @@ void CheckStoreGenerationNormal(VulkanHarness &vulkan, GuestGpu &gpu) {
     Require(name, "the output is left for Step 7", HasGeneratedFiles(dir / "on"),
             "the generator left no file of its own");
     cache->StopBuilds();
+    // The report holds the run: the supervisor finished once and the drain took every record in.
+    Require(name, "the report holds the run",
+            GenerationReportHas("\"outcome\": \"finished\"") && GenerationReportHas("\"finished_ms\"") &&
+                GenerationFigure("spawns") == 1u && GenerationFigure("adopted") == candidates &&
+                GenerationFigure("posted") == candidates,
+            "the report block did not match what the generation did");
   }
+  Common::FirstRunReport::Global().Reset();
   Common::DebugCounters::SetEnabled(false);
   std::filesystem::remove_all(dir);
   std::printf("[gpu]     %-32s ok\n", name);

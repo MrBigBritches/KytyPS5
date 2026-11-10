@@ -15,6 +15,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 // Runs a shader store worker in a child process and follows what it writes. One thread owns the
@@ -140,6 +141,9 @@ struct SupervisorStats {
 	/// keep their ranks, and `skip_hashes`, which change the ordering.
 	std::vector<uint64_t> failed_hashes;
 	std::vector<uint64_t> skip_hashes;
+	/// The fields of the last `summary` line a worker wrote, in the order it wrote them, `exit`
+	/// first. Empty when no worker finished far enough to write one.
+	std::vector<std::pair<std::string, std::string>> worker_summary;
 	/// One entry for each spawn whose usage the system gave, in order.
 	std::vector<SupervisorSpawnUsage> spawn_usage;
 	/// The largest peak memory of the spawns, among those measured by one source. Missing when no

@@ -6,6 +6,7 @@
 #include "common/childProcess.h"
 #include "common/file.h"
 #include "graphics/shader/shaderStoreRecord.h"
+#include "graphics/shader/storegen/generationReport.h"
 #include "graphics/shader/storegen/progressLog.h"
 #include "graphics/shader/storegen/shaderStoreWorker.h"
 #include "graphics/shader/storegen/storeGenerationGate.h"
@@ -1361,6 +1362,165 @@ void TestPeakMemoryIsTheLargest() {
 	CHECK(normal.stats.spawn_usage.size() == 1);
 }
 
+// ---- The generation block of the first-run report. ----
+
+// The worker's summary line, which the supervisor keeps from the last run that wrote one. The
+// baseline is a run whose worker wrote none.
+void TestWorkerSummaryFields() {
+	const auto run = Run("normal");
+	CHECK(run.stats.worker_summary ==
+	      (std::vector<std::pair<std::string, std::string>> {{"exit", "0"}, {"candidates", "6"}}));
+	const auto silent = Run("exit:3");
+	CHECK(silent.stats.worker_summary.empty());
+	// A crashed first run wrote none, and the run that finished wrote one, which is what stays.
+	const auto restarted = Run("crash_start:2");
+	CHECK(restarted.stats.outcome == SupervisorOutcome::Finished);
+	CHECK(!restarted.stats.worker_summary.empty());
+}
+
+// Each enumerated name of the report, which compare scripts depend on.
+void TestReportNames() {
+	CHECK(std::string(OutcomeName(SupervisorOutcome::Running)) == "running");
+	CHECK(std::string(OutcomeName(SupervisorOutcome::Finished)) == "finished");
+	CHECK(std::string(OutcomeName(SupervisorOutcome::Fatal)) == "fatal");
+	CHECK(std::string(OutcomeName(SupervisorOutcome::RestartsCapped)) == "restarts_capped");
+	CHECK(std::string(OutcomeName(SupervisorOutcome::Stopped)) == "stopped");
+	CHECK(std::string(FailureKindName(FailureKind::Crash)) == "crash");
+	CHECK(std::string(FailureKindName(FailureKind::Hang)) == "hang");
+	CHECK(std::string(FailureKindName(FailureKind::OrderMismatch)) == "order_mismatch");
+	CHECK(std::string(FailureKindName(FailureKind::BadOutput)) == "bad_output");
+	CHECK(std::string(FailureKindName(FailureKind::Truncated)) == "truncated");
+	CHECK(std::string(DropReasonName(ProgressDropReason::PushStart)) == "push_start");
+	CHECK(std::string(DropReasonName(ProgressDropReason::ResourceCount)) == "resource_count");
+	CHECK(std::string(DropReasonName(ProgressDropReason::FrameTooLarge)) == "frame_too_large");
+	CHECK(std::string(PeakSourceName(Common::PeakMemorySource::WorkingSet)) == "working_set");
+	CHECK(std::string(PeakSourceName(Common::PeakMemorySource::WorkingSetSampled)) ==
+	      "working_set_sampled");
+	CHECK(std::string(PeakSourceName(Common::PeakMemorySource::Commit)) == "commit");
+}
+
+// A finished run gives an active block with both times, and every ending that is not a finish gives
+// ended_ms without finished_ms. Each differs from the finished run in the outcome only.
+void TestReportFromFinishedAndEndedRuns() {
+	const auto finished = Run("normal");
+	const auto block    = MakeSupervisorReport(finished.stats);
+	CHECK(block.active && block.inactive_reason.empty() && block.outcome == "finished");
+	CHECK(block.finished_ms.has_value() && block.ended_ms.has_value() &&
+	      *block.finished_ms == *block.ended_ms && *block.finished_ms > 0.0);
+	CHECK(block.spawns == 1 && block.restarts == 0 && block.failures.empty());
+	CHECK(block.posted == finished.stats.posted && block.posted == 6);
+	CHECK(block.first_record_ms.has_value() && block.last_record_ms.has_value() &&
+	      block.child_open_ms.has_value());
+	CHECK(block.predicted_programs == PROGRAMS);
+	CHECK(block.worker == finished.stats.worker_summary && !block.worker.empty());
+	CHECK(block.spawn_usage.size() == 1 && block.spawn_usage[0].spawn == 1);
+
+	// Fatal: no restart can help. The block is inactive with the reason, and the run has an end.
+	const auto fatal       = Run("exit:3");
+	const auto fatal_block = MakeSupervisorReport(fatal.stats);
+	CHECK(!fatal_block.active && fatal_block.inactive_reason == "child_silent" &&
+	      fatal_block.outcome == "fatal");
+	CHECK(!fatal_block.finished_ms.has_value() && fatal_block.ended_ms.has_value());
+
+	// Capped: the cap is reached and what was delivered is kept.
+	const auto capped =
+	    Run("crash_always", [](SupervisorConfig& config) { config.max_restarts = 2; });
+	const auto capped_block = MakeSupervisorReport(capped.stats);
+	CHECK(capped_block.outcome == "restarts_capped" && !capped_block.active &&
+	      capped_block.inactive_reason == "restarts_capped");
+	CHECK(!capped_block.finished_ms.has_value() && capped_block.ended_ms.has_value());
+	CHECK(capped_block.restarts == 2 && capped_block.failures.size() == 3);
+
+	// Running and then stopped: nothing is over while it runs, and a stop is an end and no finish.
+	TempDirectory   directory;
+	Collected       collected;
+	StoreSupervisor supervisor(MakeConfig(directory, "sleep_silent", collected));
+	supervisor.Start();
+	std::this_thread::sleep_for(200ms);
+	const auto running = MakeSupervisorReport(supervisor.Stats());
+	CHECK(running.active && running.outcome == "running");
+	CHECK(!running.finished_ms.has_value() && !running.ended_ms.has_value());
+	supervisor.Stop();
+	const auto stopped = MakeSupervisorReport(supervisor.Stats());
+	CHECK(stopped.active && stopped.outcome == "stopped");
+	CHECK(!stopped.finished_ms.has_value() && stopped.ended_ms.has_value());
+}
+
+// The rows of a failure and of the drops, with the names the report uses.
+void TestReportRows() {
+	const auto crashed = Run("crash_start_out:2");
+	const auto block   = MakeSupervisorReport(crashed.stats);
+	CHECK(block.failures.size() == 1);
+	if (block.failures.size() == 1) {
+		const auto& failure = block.failures[0];
+		CHECK(failure.kind == "crash" && failure.last_line == "start" && failure.rank == 2);
+		CHECK(failure.hash == ProgramHash(1) && failure.spawn == 1);
+		CHECK(failure.cpu_ms.has_value());
+		CHECK(failure.out_tail == crashed.stats.failures[0].out_tail && !failure.out_tail.empty());
+	}
+	CHECK(block.failed_hashes == std::vector<uint64_t> {ProgramHash(1)} &&
+	      block.skip_hashes.empty());
+	CHECK(block.spawn_usage.size() == 2 && block.spawn_usage[1].spawn == 2);
+
+	const auto hung =
+	    Run("hang_start:2", [](SupervisorConfig& config) { config.candidate_timeout = 2s; });
+	const auto hung_block = MakeSupervisorReport(hung.stats);
+	CHECK(hung_block.failures.size() == 1 && hung_block.failures[0].kind == "hang");
+
+	const auto dropped       = Run("drops_normal");
+	const auto dropped_block = MakeSupervisorReport(dropped.stats);
+	CHECK(dropped_block.dropped.size() == 3);
+	if (dropped_block.dropped.size() == 3) {
+		CHECK(dropped_block.dropped[0].reason == "resource_count" &&
+		      dropped_block.dropped[0].hash == DROPPED_HASH && dropped_block.dropped[0].rank == 1);
+		CHECK(dropped_block.dropped[1].reason == "frame_too_large");
+		CHECK(dropped_block.dropped[2].reason == "push_start");
+	}
+	// The peak comes with the name of its source, where the system measured one.
+#ifndef __linux__
+	CHECK(block.peak_bytes.has_value() && !block.peak_source.empty());
+	CHECK(block.peak_source == PeakSourceName(crashed.stats.peak_memory->source));
+	CHECK(!block.spawn_usage.empty() && block.spawn_usage[0].peak_bytes.has_value() &&
+	      !block.spawn_usage[0].peak_source.empty());
+#endif
+}
+
+// Every counter has its own place in the block: each is given a different number, so two that were
+// swapped cannot both match.
+void TestDrainFiguresAreMapped() {
+	GeneratedDrainCounters drain;
+	drain.drain_calls           = 1;
+	drain.drain_over_1ms        = 2;
+	drain.drain_over_4ms        = 3;
+	drain.drain_max_ms          = 4.5;
+	drain.drain_total_ms        = 5.5;
+	drain.drain_lag_ms_max      = 6.5;
+	drain.item_max_ms           = 7.5;
+	drain.adopted               = 8;
+	drain.duplicates            = 9;
+	drain.plan_mismatch         = 10;
+	drain.plan_mismatch_reverse = 11;
+	drain.failed_installs       = 12;
+	drain.dropped_stopped       = 13;
+	GenerationCounts counts;
+	counts.posted            = 14;
+	counts.handles_created   = 15;
+	counts.handles_destroyed = 16;
+	counts.bad_plans         = 17;
+	counts.undrained_at_stop = 18;
+	counts.pending           = 19;
+	const auto  block        = MakeGenerationReport(SupervisorStats {}, drain, counts);
+	const auto& out          = block.drain;
+	CHECK(out.calls == 1 && out.over_1ms == 2 && out.over_4ms == 3);
+	CHECK(out.max_ms == 4.5 && out.total_ms == 5.5 && out.lag_ms_max == 6.5 &&
+	      out.item_max_ms == 7.5);
+	CHECK(out.adopted == 8 && out.duplicates == 9 && out.plan_mismatch == 10);
+	CHECK(out.plan_mismatch_reverse == 11 && out.failed_installs == 12 &&
+	      out.dropped_stopped == 13);
+	CHECK(out.posted == 14 && out.handles_created == 15 && out.handles_destroyed == 16);
+	CHECK(out.bad_plans == 17 && out.undrained_at_stop == 18 && out.pending == 19);
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -1400,6 +1560,11 @@ int main(int argc, char** argv) {
 	TestFailureCpuAtATimeout();
 	TestFailureOutTail();
 	TestPeakMemoryIsTheLargest();
+	TestWorkerSummaryFields();
+	TestReportNames();
+	TestReportFromFinishedAndEndedRuns();
+	TestReportRows();
+	TestDrainFiguresAreMapped();
 	if (g_failures == 0) {
 		std::puts("Shader store supervisor tests passed");
 	}

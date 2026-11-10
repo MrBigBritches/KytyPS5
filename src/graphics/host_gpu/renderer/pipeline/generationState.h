@@ -52,6 +52,13 @@ struct PipelineCache::GenerationState {
 	std::deque<GeneratedModule>     backlog;
 	StoreGen::GeneratedDrainPlanner planner;
 
+	// What the drain last counted, copied under the mutex at the end of each drain so the report's
+	// writer can read it from another thread. The planner's own counters belong to the GPU thread.
+	StoreGen::GeneratedDrainCounters published_drain;
+	uint64_t                         published_backlog = 0;
+	// Whether the report was given a source, which StopStoreGeneration must then replace.
+	bool report_registered = false;
+
 	std::atomic<uint64_t> posted {0};
 	std::atomic<uint64_t> created {0};
 	std::atomic<uint64_t> destroyed {0};

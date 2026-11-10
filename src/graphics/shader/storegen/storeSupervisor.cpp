@@ -153,6 +153,7 @@ struct StoreSupervisor::Impl {
 	void NoteProgress();
 	void CollectSpawnStats();
 	void CollectDrops();
+	void CollectSummary();
 	void RecordUsage();
 	void PublishHashLists();
 
@@ -537,6 +538,7 @@ void StoreSupervisor::Impl::CollectSpawnStats() {
 	progress.PollToEnd(ProgressClock::now());
 	NoteProgress();
 	CollectDrops();
+	CollectSummary();
 	RecordUsage();
 }
 
@@ -570,6 +572,16 @@ void StoreSupervisor::Impl::CollectDrops() {
 			    {.hash = drop.hash, .rank = drop.rank_or_count, .reason = drop.reason});
 		}
 	});
+}
+
+// Keeps the fields of the summary line of this spawn, if it wrote one. A later spawn's summary
+// replaces an earlier one, since only the last run is the one that ended the generation.
+void StoreSupervisor::Impl::CollectSummary() {
+	const auto& summary = progress.Summary();
+	if (!summary) {
+		return;
+	}
+	Update([&](SupervisorStats& s) { s.worker_summary = summary->fields; });
 }
 
 // Keeps what the ended child used. A figure the system did not give is left out, not zeroed.

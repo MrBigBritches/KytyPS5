@@ -1,17 +1,18 @@
 #include "common/firstRunReport.h"
 
-#include <nlohmann/json.hpp>
-
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iterator>
-#include <thread>
+#include <nlohmann/json.hpp>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -1017,6 +1018,278 @@ void TestReportPath() {
 
 } // namespace
 
+// ---- The generation block of --generate-shader-store. ----
+
+using Common::FirstRunReport::ShaderStoreGenerationReport;
+
+constexpr const char* GENERATION_KEY = "shader_store_generation";
+
+// The generation block of a report's JSON, or null when it has none.
+nlohmann::json GenerationBlock(const Report& report) {
+	const auto json = nlohmann::json::parse(report.ToJson({}, 0, 1.0, 0.0));
+	return json.contains(GENERATION_KEY) ? json[GENERATION_KEY] : nlohmann::json(nullptr);
+}
+
+// A report that had no generation asked of it has no block, and one that was refused has the
+// reason and nothing else. Every other key of the two reports is the same, which is what a run
+// without the flag must keep.
+void TestGenerationBlockFlagOffAndInactive() {
+	Report     off;
+	const auto off_json = nlohmann::json::parse(off.ToJson({}, 0, 1.0, 0.0));
+	Check(!off_json.contains(GENERATION_KEY), "a report without the flag had a generation block");
+
+	Report refused;
+	refused.SetGenerationInactive("no_eboot");
+	const auto refused_json = nlohmann::json::parse(refused.ToJson({}, 0, 1.0, 0.0));
+	Check(refused_json.contains(GENERATION_KEY), "a refused generation left no block");
+	const nlohmann::json expected = {{"active", false}, {"inactive_reason", "no_eboot"}};
+	Check(refused_json[GENERATION_KEY] == expected, "the inactive block is not just the reason");
+	auto without_block = refused_json;
+	without_block.erase(GENERATION_KEY);
+	Check(without_block == off_json, "the block changed another part of the report");
+
+	// Reset, which tests use between cases, takes the generation state away again.
+	refused.Reset();
+	Check(!nlohmann::json::parse(refused.ToJson({}, 0, 1.0, 0.0)).contains(GENERATION_KEY),
+	      "Reset kept the generation block");
+}
+
+// One change of one figure, and where it shows in the block.
+struct FieldCase {
+	const char*                                       name;
+	std::function<void(ShaderStoreGenerationReport&)> change;
+	const char*                                       pointer;
+	nlohmann::json                                    expected;
+};
+
+// Every figure of the block has its own place. Each case changes one figure of an empty block and
+// the block then differs from the empty one in that place only, which is how the baseline is
+// the same block without the change.
+void TestGenerationBlockFields() {
+	const auto block_of = [](const ShaderStoreGenerationReport& figures) {
+		Report report;
+		report.SetGenerationFinal(figures);
+		return GenerationBlock(report);
+	};
+	const auto base = block_of({});
+	Check(base["active"] == true && base["supervisor"]["outcome"] == "" &&
+	          !base["supervisor"].contains("finished_ms") &&
+	          !base["supervisor"].contains("ended_ms") &&
+	          !base["supervisor"].contains("child_open_ms") &&
+	          base["supervisor"]["failures"].empty() && base["worker"].empty() &&
+	          base["drain"]["calls"] == 0,
+	      "the empty block is not empty");
+	const std::vector<FieldCase> cases = {
+	    {"active", [](auto& b) { b.active = false; }, "/active", false},
+	    {"inactive_reason", [](auto& b) { b.inactive_reason = "restarts_capped"; },
+	     "/inactive_reason", "restarts_capped"},
+	    {"outcome", [](auto& b) { b.outcome = "finished"; }, "/supervisor/outcome", "finished"},
+	    {"spawns", [](auto& b) { b.spawns = 4; }, "/supervisor/spawns", 4},
+	    {"restarts", [](auto& b) { b.restarts = 3; }, "/supervisor/restarts", 3},
+	    {"spawn_ms", [](auto& b) { b.spawn_ms = 12.5; }, "/supervisor/spawn_ms", 12.5},
+	    {"child_open_ms", [](auto& b) { b.child_open_ms = 700.25; }, "/supervisor/child_open_ms",
+	     700.25},
+	    {"first_record_ms", [](auto& b) { b.first_record_ms = 800.0; },
+	     "/supervisor/first_record_ms", 800.0},
+	    {"last_record_ms", [](auto& b) { b.last_record_ms = 9000.5; }, "/supervisor/last_record_ms",
+	     9000.5},
+	    {"finished_ms", [](auto& b) { b.finished_ms = 70000.0; }, "/supervisor/finished_ms",
+	     70000.0},
+	    {"ended_ms", [](auto& b) { b.ended_ms = 71000.0; }, "/supervisor/ended_ms", 71000.0},
+	    {"decode_ms_max", [](auto& b) { b.decode_ms_max = 6.5; }, "/supervisor/decode_ms_max", 6.5},
+	    {"terminate_wait_ms", [](auto& b) { b.terminate_wait_ms = 3.25; },
+	     "/supervisor/terminate_wait_ms", 3.25},
+	    {"frames_delivered", [](auto& b) { b.frames_delivered = 203; },
+	     "/supervisor/frames_delivered", 203},
+	    {"bad_records", [](auto& b) { b.bad_records = 2; }, "/supervisor/bad_records", 2},
+	    {"duplicates", [](auto& b) { b.duplicates = 5; }, "/supervisor/duplicates", 5},
+	    {"posted", [](auto& b) { b.posted = 201; }, "/supervisor/posted", 201},
+	    {"predicted_programs", [](auto& b) { b.predicted_programs = 119; },
+	     "/supervisor/predicted_programs", 119},
+	    {"failed_hashes", [](auto& b) { b.failed_hashes = {0xabcull, 0x1ull}; },
+	     "/supervisor/failed_hashes",
+	     nlohmann::json::array({"0000000000000abc", "0000000000000001"})},
+	    {"skip_hashes", [](auto& b) { b.skip_hashes = {0x933533ed9726680dull}; },
+	     "/supervisor/skip_hashes", nlohmann::json::array({"933533ed9726680d"})},
+	    {"dropped",
+	     [](auto& b) { b.dropped = {{.hash = 0x77, .rank = 5, .reason = "push_start"}}; },
+	     "/supervisor/dropped",
+	     nlohmann::json::array(
+	         {{{"hash", "0000000000000077"}, {"rank", 5}, {"reason", "push_start"}}})},
+	    {"worker_number", [](auto& b) { b.worker = {{"exit", "0"}}; }, "/worker/exit", 0},
+	    {"worker_text", [](auto& b) { b.worker = {{"worst", "abc"}}; }, "/worker/worst", "abc"},
+	    // Hashes made only of decimal digits stay text, with their leading zeros.
+	    {"worker_hash_digits", [](auto& b) { b.worker = {{"worst_hash", "0012345678901234"}}; },
+	     "/worker/worst_hash", "0012345678901234"},
+	    {"worker_order_digits", [](auto& b) { b.worker = {{"order", "0000000000000042"}}; },
+	     "/worker/order", "0000000000000042"},
+	    {"drain_calls", [](auto& b) { b.drain.calls = 30; }, "/drain/calls", 30},
+	    {"drain_over_1ms", [](auto& b) { b.drain.over_1ms = 4; }, "/drain/over_1ms", 4},
+	    {"drain_over_4ms", [](auto& b) { b.drain.over_4ms = 1; }, "/drain/over_4ms", 1},
+	    {"drain_max_ms", [](auto& b) { b.drain.max_ms = 1.75; }, "/drain/max_ms", 1.75},
+	    {"drain_total_ms", [](auto& b) { b.drain.total_ms = 22.5; }, "/drain/total_ms", 22.5},
+	    {"drain_lag_ms_max", [](auto& b) { b.drain.lag_ms_max = 55.5; }, "/drain/lag_ms_max", 55.5},
+	    {"drain_item_max_ms", [](auto& b) { b.drain.item_max_ms = 0.5; }, "/drain/item_max_ms",
+	     0.5},
+	    {"drain_adopted", [](auto& b) { b.drain.adopted = 200; }, "/drain/adopted", 200},
+	    {"drain_duplicates", [](auto& b) { b.drain.duplicates = 6; }, "/drain/duplicates", 6},
+	    {"drain_plan_mismatch", [](auto& b) { b.drain.plan_mismatch = 7; }, "/drain/plan_mismatch",
+	     7},
+	    {"drain_plan_mismatch_reverse", [](auto& b) { b.drain.plan_mismatch_reverse = 8; },
+	     "/drain/plan_mismatch_reverse", 8},
+	    {"drain_failed_installs", [](auto& b) { b.drain.failed_installs = 9; },
+	     "/drain/failed_installs", 9},
+	    {"drain_dropped_stopped", [](auto& b) { b.drain.dropped_stopped = 10; },
+	     "/drain/dropped_stopped", 10},
+	    {"drain_posted", [](auto& b) { b.drain.posted = 11; }, "/drain/posted", 11},
+	    {"drain_handles_created", [](auto& b) { b.drain.handles_created = 12; },
+	     "/drain/handles_created", 12},
+	    {"drain_handles_destroyed", [](auto& b) { b.drain.handles_destroyed = 13; },
+	     "/drain/handles_destroyed", 13},
+	    {"drain_bad_plans", [](auto& b) { b.drain.bad_plans = 14; }, "/drain/bad_plans", 14},
+	    {"drain_undrained_at_stop", [](auto& b) { b.drain.undrained_at_stop = 15; },
+	     "/drain/undrained_at_stop", 15},
+	    {"drain_pending", [](auto& b) { b.drain.pending = 16; }, "/drain/pending", 16},
+	};
+	for (const auto& field: cases) {
+		ShaderStoreGenerationReport figures;
+		field.change(figures);
+		auto expected_block                                         = base;
+		expected_block[nlohmann::json::json_pointer(field.pointer)] = field.expected;
+		const auto actual                                           = block_of(figures);
+		if (actual != expected_block || actual == base) {
+			std::fprintf(stderr, "FirstRunReportTests: the figure %s is not where it belongs\n",
+			             field.name);
+			std::abort();
+		}
+	}
+
+	// The cap is read from the outcome, so it is true for that outcome and false for another.
+	ShaderStoreGenerationReport capped;
+	capped.outcome = "restarts_capped";
+	Check(block_of(capped)["supervisor"]["restarts_capped"] == true &&
+	          base["supervisor"]["restarts_capped"] == false,
+	      "restarts_capped does not follow the outcome");
+
+	// The peak comes with its source, and a block without one has neither.
+	ShaderStoreGenerationReport peak;
+	peak.peak_bytes       = 123456789ull;
+	peak.peak_source      = "commit";
+	const auto peak_block = block_of(peak)["supervisor"];
+	Check(peak_block["peak_bytes"] == 123456789ull && peak_block["peak_source"] == "commit" &&
+	          !base["supervisor"].contains("peak_bytes") &&
+	          !base["supervisor"].contains("peak_source"),
+	      "the peak and its source are not shown together");
+
+	// Rows of the lists carry every field of the row, the optional ones only when present.
+	ShaderStoreGenerationReport rows;
+	rows.failures    = {{.hash      = 0xf1,
+	                     .rank      = 9,
+	                     .exit_code = 321,
+	                     .kind      = "hang",
+	                     .last_line = "start",
+	                     .spawn     = 2,
+	                     .cpu_ms    = 250.5,
+	                     .out_tail  = "EXIT text"},
+	                    {.hash = 0xf2, .kind = "crash", .spawn = 3}};
+	rows.spawn_usage = {
+	    {.spawn = 1, .cpu_ms = 10.5, .peak_bytes = 4096, .peak_source = "working_set"},
+	    {.spawn = 2, .cpu_ms = 20.0}};
+	const auto  row_block = block_of(rows)["supervisor"];
+	const auto& failures  = row_block["failures"];
+	Check(failures.size() == 2 && failures[0]["hash"] == "00000000000000f1" &&
+	          failures[0]["rank"] == 9 && failures[0]["exit_code"] == 321 &&
+	          failures[0]["kind"] == "hang" && failures[0]["last_line"] == "start" &&
+	          failures[0]["spawn"] == 2 && failures[0]["cpu_ms"] == 250.5 &&
+	          failures[0]["out_tail"] == "EXIT text",
+	      "a failure row lacks a figure");
+	Check(failures[1]["spawn"] == 3 && !failures[1].contains("cpu_ms"),
+	      "a failure without a processor time has one");
+	const auto& usage = row_block["spawn_usage"];
+	Check(usage.size() == 2 && usage[0]["spawn"] == 1 && usage[0]["cpu_ms"] == 10.5 &&
+	          usage[0]["peak_bytes"] == 4096 && usage[0]["peak_source"] == "working_set" &&
+	          usage[1]["spawn"] == 2 && !usage[1].contains("peak_bytes") &&
+	          !usage[1].contains("peak_source"),
+	      "a usage row lacks a figure, or a missing peak is shown as zero");
+}
+
+// With a source, the writer asks it each time. A final figure replaces it at once and the source is
+// never called again, so the owner may destroy what the source reads. The baseline is the same
+// report before the final figure.
+void TestGenerationSourceThenFinal() {
+	Report           report;
+	std::atomic<int> calls {0};
+	report.SetGenerationSource([&calls] {
+		ShaderStoreGenerationReport figures;
+		figures.spawns = 3;
+		calls++;
+		return figures;
+	});
+	Check(GenerationBlock(report)["supervisor"]["spawns"] == 3 && calls == 1,
+	      "the writer did not use the source");
+	Check(GenerationBlock(report)["supervisor"]["spawns"] == 3 && calls == 2,
+	      "the source was not asked again");
+	ShaderStoreGenerationReport final_figures;
+	final_figures.spawns = 9;
+	report.SetGenerationFinal(final_figures);
+	Check(GenerationBlock(report)["supervisor"]["spawns"] == 9, "the final figures were not used");
+	Check(calls == 2, "the source was called after the final figures replaced it");
+}
+
+// The owner destroys what the source reads right after SetGenerationFinal returns. A writer that
+// called the source after that would read a destroyed object, which this test models as a flag that
+// the source checks.
+void TestGenerationWriterNeverTouchesADestroyedSource() {
+	Report            report;
+	std::atomic<bool> alive {true};
+	std::atomic<int>  violations {0};
+	report.SetGenerationSource([&] {
+		if (!alive) violations++;
+		return ShaderStoreGenerationReport {};
+	});
+	Check(GenerationBlock(report).contains("supervisor") && violations == 0,
+	      "the live source failed");
+	report.SetGenerationFinal({});
+	alive            = false;
+	const auto after = GenerationBlock(report);
+	Check(violations == 0, "the writer called a source that was destroyed");
+	Check(after["active"] == true, "the final figures were not written after the source went");
+}
+
+// The writer is inside the source when the owner hands over the final figures. The hand-over must
+// wait for the writer, because the owner destroys the state right after it, and the writer must be
+// out of the source by then. The source here is slow on purpose.
+void TestGenerationFinalWaitsForAWriterInTheSource() {
+	Report            report;
+	std::atomic<bool> inside {false};
+	std::atomic<bool> release {false};
+	std::atomic<bool> left_source {false};
+	report.SetGenerationSource([&] {
+		inside = true;
+		while (!release) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		}
+		left_source = true;
+		return ShaderStoreGenerationReport {};
+	});
+	std::thread writer([&] { (void)GenerationBlock(report); });
+	while (!inside) {
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+	}
+	std::atomic<bool> handed_over {false};
+	std::thread       owner([&] {
+        report.SetGenerationFinal({});
+        handed_over = true;
+    });
+	// A hand-over that did not wait would be done by now.
+	std::this_thread::sleep_for(std::chrono::milliseconds(200));
+	Check(!handed_over, "the final figures were handed over while a writer was in the source");
+	release = true;
+	writer.join();
+	owner.join();
+	Check(handed_over && left_source, "the hand-over or the writer never finished");
+}
+
 int main() {
   TestPausesMergeByFlip();
   TestPendingPauseCounts();
@@ -1047,6 +1320,11 @@ int main() {
   TestStampRejectsBadModules();
   TestReportPath();
   TestWriteReportOnce();
+  TestGenerationBlockFlagOffAndInactive();
+  TestGenerationBlockFields();
+  TestGenerationSourceThenFinal();
+  TestGenerationWriterNeverTouchesADestroyedSource();
+  TestGenerationFinalWaitsForAWriterInTheSource();
   std::puts("FirstRunReportTests: all cases passed");
   return 0;
 }

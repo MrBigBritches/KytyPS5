@@ -1,4 +1,5 @@
 #include "common/childProcess.h"
+#include "common/firstRunReport.h"
 #include "common/logging/log.h"
 #include "graphics/host_gpu/renderer/pipeline/generationState.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
@@ -7,6 +8,7 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shaderStoreRecord.h"
 #include "graphics/shader/storegen/ebootSource.h"
+#include "graphics/shader/storegen/generationReport.h"
 #include "graphics/shader/storegen/storeWorkerFormat.h"
 
 #include <algorithm>
@@ -44,6 +46,15 @@ void PipelineCache::EnableStoreGeneration() {
 	}
 }
 
+// The report asks for the figures from its own thread, at exit, which may come without any
+// destructor running. StopStoreGeneration takes the source away again, and the source must not
+// outlive this cache.
+void PipelineCache::RegisterGenerationReport() {
+	m_generation->report_registered = true;
+	Common::FirstRunReport::Global().SetGenerationSource(
+	    [this] { return BuildGenerationReport(false); });
+}
+
 void PipelineCache::StartStoreGeneration(const std::filesystem::path& store_path,
                                          std::span<const uint8_t>     header) {
 	EnableStoreGeneration();
@@ -64,6 +75,7 @@ void PipelineCache::StartStoreGeneration(const std::filesystem::path& store_path
 	}
 	m_generation->supervisor = std::make_unique<StoreGen::StoreSupervisor>(std::move(config));
 	m_generation->supervisor->Start();
+	RegisterGenerationReport();
 	Log::WriteToConsoleAndLog("Shader store generation: started\n");
 }
 
@@ -178,6 +190,13 @@ void PipelineCache::DrainGenerated() {
 		m_has_generated.store(true, std::memory_order_relaxed);
 	}
 	state.planner.NoteDrain(Clock::now() - start, oldest_wait);
+	// Handed to the report's writer. A copy of a few counters under the mutex that a post already
+	// takes, so it costs the GPU thread no more than a post costs the generator.
+	{
+		std::scoped_lock lock(state.mutex);
+		state.published_drain   = state.planner.Counters();
+		state.published_backlog = state.backlog.size();
+	}
 }
 
 void PipelineCache::AdoptGenerated(GeneratedModule&& item) {
@@ -266,6 +285,38 @@ void PipelineCache::StopStoreGeneration() {
 		DestroyGeneratedHandles(item);
 	}
 	m_has_generated.store(false, std::memory_order_relaxed);
+	// The final figures are taken now that nothing posts and nothing drains, and handed to the
+	// report in one step that also takes the source away. The writer may be calling the source at
+	// this moment, which is safe since the state still exists. After this it never calls it again,
+	// so the state can be destroyed. No lock is held across the two steps, since building the
+	// figures takes the state's mutex and handing them over takes the report's.
+	if (state.report_registered) {
+		state.report_registered = false;
+		Common::FirstRunReport::Global().SetGenerationFinal(BuildGenerationReport(true));
+	}
+}
+
+Common::FirstRunReport::ShaderStoreGenerationReport
+PipelineCache::BuildGenerationReport(bool final_figures) const {
+	auto&                            state = *m_generation;
+	StoreGen::GenerationCounts       counts;
+	StoreGen::GeneratedDrainCounters drain;
+	{
+		std::scoped_lock lock(state.mutex);
+		drain = final_figures ? state.planner.Counters() : state.published_drain;
+		counts.pending =
+		    state.inbox.size() + (final_figures ? state.backlog.size() : state.published_backlog);
+	}
+	counts.posted            = state.posted;
+	counts.handles_created   = state.created;
+	counts.handles_destroyed = state.destroyed;
+	counts.bad_plans         = state.bad_plans;
+	counts.undrained_at_stop = state.undrained_at_stop;
+	StoreGen::SupervisorStats stats;
+	if (state.supervisor) {
+		stats = state.supervisor->Stats();
+	}
+	return StoreGen::MakeGenerationReport(stats, drain, counts);
 }
 
 std::optional<StoreGenerationStats> PipelineCache::GenerationStats() const {

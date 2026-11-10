@@ -153,6 +153,9 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 		if (generation_off_reason) {
 			Log::WriteToConsoleAndLog(
 			    fmt::format("Shader store generation: inactive ({})\n", *generation_off_reason));
+			// The report says so too, so a run that asked for generation and did not get it shows
+			// why. A run without the flag never reaches this, and has no block.
+			Common::FirstRunReport::Global().SetGenerationInactive(*generation_off_reason);
 		}
 	}
 	if (path.empty()) {

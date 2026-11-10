@@ -7,7 +7,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -195,6 +197,100 @@ struct WarmTake {
 	double      stopped_ms = 0.0;
 	int64_t     at_ns      = NO_TIME_NS;
 	int64_t     flip       = 0;
+};
+
+/// One run of the shader store worker that ended badly, as the report lists it.
+struct GenerationFailure {
+	uint64_t    hash      = 0;
+	uint64_t    rank      = 0;
+	int         exit_code = 0;
+	std::string kind;
+	std::string last_line;
+	/// Which spawn ended, counting from 1, so the row joins with its usage row.
+	uint32_t spawn = 0;
+	/// The worker's processor time when it ended, when the system said.
+	std::optional<double> cpu_ms;
+	/// The end of the worker's text file at that time.
+	std::string out_tail;
+};
+
+/// What one spawn of the worker used.
+struct GenerationSpawnUsage {
+	uint32_t                spawn  = 0;
+	double                  cpu_ms = 0.0;
+	std::optional<uint64_t> peak_bytes;
+	/// What peak_bytes measures: working_set, working_set_sampled or commit. Empty without a peak.
+	std::string peak_source;
+};
+
+/// A program that the worker gave up on.
+struct GenerationDrop {
+	uint64_t    hash = 0;
+	uint64_t    rank = 0;
+	std::string reason;
+};
+
+/// What the GPU thread's drain of generated modules counted.
+struct GenerationDrain {
+	uint64_t calls                 = 0;
+	uint64_t over_1ms              = 0;
+	uint64_t over_4ms              = 0;
+	double   max_ms                = 0.0;
+	double   total_ms              = 0.0;
+	double   lag_ms_max            = 0.0;
+	double   item_max_ms           = 0.0;
+	uint64_t adopted               = 0;
+	uint64_t duplicates            = 0;
+	uint64_t plan_mismatch         = 0;
+	uint64_t plan_mismatch_reverse = 0;
+	uint64_t failed_installs       = 0;
+	uint64_t dropped_stopped       = 0;
+	uint64_t posted                = 0;
+	uint64_t handles_created       = 0;
+	uint64_t handles_destroyed     = 0;
+	uint64_t bad_plans             = 0;
+	uint64_t undrained_at_stop     = 0;
+	uint64_t pending               = 0;
+};
+
+/// The report's view of --generate-shader-store: plain numbers and text, since this library cannot
+/// see the generator. The pipeline cache builds it, from a copy of what the supervisor and the
+/// drain counted.
+struct ShaderStoreGenerationReport {
+	/// False when the supervisor ended for a reason that stops generation (outcome fatal or
+	/// restarts_capped), and then inactive_reason says why.
+	bool        active = true;
+	std::string inactive_reason;
+	/// running, finished, fatal, restarts_capped or stopped.
+	std::string outcome;
+	uint32_t    spawns   = 0;
+	uint32_t    restarts = 0;
+	double      spawn_ms = 0.0;
+	/// Missing until the first predict line, the first record and the last record arrive.
+	std::optional<double> child_open_ms;
+	std::optional<double> first_record_ms;
+	std::optional<double> last_record_ms;
+	/// Set only when the worker finished, and the end of the run for any outcome except running.
+	std::optional<double>             finished_ms;
+	std::optional<double>             ended_ms;
+	double                            decode_ms_max      = 0.0;
+	double                            terminate_wait_ms  = 0.0;
+	uint32_t                          frames_delivered   = 0;
+	uint32_t                          bad_records        = 0;
+	uint32_t                          duplicates         = 0;
+	uint32_t                          posted             = 0;
+	uint32_t                          predicted_programs = 0;
+	std::vector<GenerationFailure>    failures;
+	std::vector<GenerationSpawnUsage> spawn_usage;
+	/// The largest peak memory of the spawns, with its source. Missing when none was measured.
+	std::optional<uint64_t>     peak_bytes;
+	std::string                 peak_source;
+	std::vector<GenerationDrop> dropped;
+	std::vector<uint64_t>       failed_hashes;
+	std::vector<uint64_t>       skip_hashes;
+	/// The fields of the worker's summary line, in the order it wrote them. Empty when none came.
+	std::vector<std::pair<std::string, std::string>> worker;
+	GenerationDrain                                  drain;
 };
 
 /// The GPU thread's blocking within one guest flip, merged into a single pause.
@@ -447,6 +543,20 @@ public:
 	/// Copy of the warm-up take rows, for tests.
 	[[nodiscard]] std::vector<WarmTake> WarmTakes() const;
 
+	/// Says generation was asked for and refused, so the report has a block with active false and
+	/// this reason. With nothing said, the report has no generation block at all, which is how a
+	/// run without the flag looks.
+	void SetGenerationInactive(std::string reason);
+	/// Registers the function the writer calls for the figures of a running generation. The writer
+	/// holds the generation lock while it calls, so the owner clears the source with
+	/// SetGenerationFinal before what the function reads is destroyed. The function must not call
+	/// back into the report's generation functions, and takes no lock the owner holds while it
+	/// calls them.
+	void SetGenerationSource(std::function<ShaderStoreGenerationReport()> source);
+	/// Stores the final figures and removes the source, in one step under the generation lock, so
+	/// the writer sees either the source or the final figures and never a source that is gone.
+	void SetGenerationFinal(ShaderStoreGenerationReport final_figures);
+
 private:
 	// Moves the pause being merged to the finished ones when it belongs to another flip. Caller
 	// holds the lock.
@@ -457,6 +567,13 @@ private:
 	void CopyDeferredLocked(Summary& summary) const;
 	// Pauses including the one still being merged. Caller holds the lock.
 	[[nodiscard]] std::vector<Pause> AllPausesLocked() const;
+
+	// Guards the three generation members only, and is never held together with m_mutex. The
+	// writer holds it while it calls the source.
+	mutable std::mutex                           m_generation_mutex;
+	std::optional<std::string>                   m_generation_inactive;
+	std::function<ShaderStoreGenerationReport()> m_generation_source;
+	std::optional<ShaderStoreGenerationReport>   m_generation_final;
 
 	mutable std::mutex           m_mutex;
 	Phase                        m_phase = Phase::Play;

@@ -5,6 +5,7 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/file.h"
+#include "common/firstRunReport.h"
 #include "common/uniqueFunction.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
@@ -30,8 +31,8 @@
 #include <mutex>
 #include <optional>
 #include <queue>
-#include <string>
 #include <span>
+#include <string>
 #include <thread>
 #include <type_traits>
 #include <unordered_map>
@@ -628,6 +629,15 @@ private:
 	// Takes posted modules into the program cache and queues their builds. GPU thread only. It takes
 	// a bounded number, and stops after a bounded time, so a drain is always short.
 	void DrainGenerated();
+	// Gives the first-run report the source of the generation's figures. StartStoreGeneration calls
+	// it, and a test of the stand-in intake does the same.
+	void RegisterGenerationReport();
+	// The figures of the generation for the first-run report. Live, they come from what the drain
+	// last published, and the writer's thread may call it at any time. Final, they come from the
+	// planner itself, which is only exact once nothing drains. It takes the state's mutex briefly
+	// and holds no lock across anything else.
+	[[nodiscard]] Common::FirstRunReport::ShaderStoreGenerationReport
+	BuildGenerationReport(bool final_figures) const;
 	// Takes one module in, or drops it as the planner says.
 	void AdoptGenerated(GeneratedModule&& item);
 	// Destroys the Vulkan handles of a module that was never taken in.

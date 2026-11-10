@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <charconv>
 #include <cmath>
 #include <exception>
 #include <fmt/format.h>
@@ -396,7 +397,30 @@ void Report::AddStampFailure() {
 	m_stamp_failures++;
 }
 
+void Report::SetGenerationInactive(std::string reason) {
+	std::lock_guard lock(m_generation_mutex);
+	m_generation_inactive = std::move(reason);
+}
+
+void Report::SetGenerationSource(std::function<ShaderStoreGenerationReport()> source) {
+	std::lock_guard lock(m_generation_mutex);
+	m_generation_source = std::move(source);
+	m_generation_final.reset();
+}
+
+void Report::SetGenerationFinal(ShaderStoreGenerationReport final_figures) {
+	std::lock_guard lock(m_generation_mutex);
+	m_generation_source = nullptr;
+	m_generation_final  = std::move(final_figures);
+}
+
 void Report::Reset() {
+	{
+		std::lock_guard lock(m_generation_mutex);
+		m_generation_inactive.reset();
+		m_generation_source = nullptr;
+		m_generation_final.reset();
+	}
 	std::lock_guard lock(m_mutex);
 	m_phase             = Phase::Play;
 	m_flip              = 0;
@@ -725,6 +749,136 @@ nlohmann::json WarmTakesToJson(const std::vector<WarmTake>& takes, int64_t epoch
 	return rows;
 }
 
+// A worker summary value is a number when it reads as one, and text otherwise.
+nlohmann::json SummaryValueToJson(const std::string& name, const std::string& value) {
+	// The worker writes hashes as 16 hex digits, and one made only of decimal digits must not turn
+	// into a number, or the same key would change type between runs and lose its leading zeros.
+	if (name == "order" || name.ends_with("_hash")) {
+		return value;
+	}
+	int64_t     number = 0;
+	const auto* end    = value.data() + value.size();
+	const auto  parsed = std::from_chars(value.data(), end, number);
+	if (parsed.ec == std::errc() && parsed.ptr == end) {
+		return number;
+	}
+	return value;
+}
+
+nlohmann::json HashListToJson(const std::vector<uint64_t>& hashes) {
+	nlohmann::json list = nlohmann::json::array();
+	for (const auto hash: hashes) {
+		list.push_back(Hex(hash));
+	}
+	return list;
+}
+
+nlohmann::json GenerationFailureToJson(const GenerationFailure& failure) {
+	nlohmann::json row = {{"hash", Hex(failure.hash)},      {"rank", failure.rank},
+	                      {"exit_code", failure.exit_code}, {"kind", failure.kind},
+	                      {"last_line", failure.last_line}, {"spawn", failure.spawn},
+	                      {"out_tail", failure.out_tail}};
+	if (failure.cpu_ms) {
+		row["cpu_ms"] = Round3(*failure.cpu_ms);
+	}
+	return row;
+}
+
+nlohmann::json GenerationSpawnUsageToJson(const GenerationSpawnUsage& usage) {
+	nlohmann::json row = {{"spawn", usage.spawn}, {"cpu_ms", Round3(usage.cpu_ms)}};
+	if (usage.peak_bytes) {
+		row["peak_bytes"]  = *usage.peak_bytes;
+		row["peak_source"] = usage.peak_source;
+	}
+	return row;
+}
+
+nlohmann::json GenerationDrainToJson(const GenerationDrain& drain) {
+	return {{"calls", drain.calls},
+	        {"over_1ms", drain.over_1ms},
+	        {"over_4ms", drain.over_4ms},
+	        {"max_ms", Round3(drain.max_ms)},
+	        {"total_ms", Round3(drain.total_ms)},
+	        {"lag_ms_max", Round3(drain.lag_ms_max)},
+	        {"item_max_ms", Round3(drain.item_max_ms)},
+	        {"adopted", drain.adopted},
+	        {"duplicates", drain.duplicates},
+	        {"plan_mismatch", drain.plan_mismatch},
+	        {"plan_mismatch_reverse", drain.plan_mismatch_reverse},
+	        {"failed_installs", drain.failed_installs},
+	        {"dropped_stopped", drain.dropped_stopped},
+	        {"posted", drain.posted},
+	        {"handles_created", drain.handles_created},
+	        {"handles_destroyed", drain.handles_destroyed},
+	        {"bad_plans", drain.bad_plans},
+	        {"undrained_at_stop", drain.undrained_at_stop},
+	        {"pending", drain.pending}};
+}
+
+// Sets a key only when the figure is there, so a missing time is missing and not zero.
+void SetOptional(nlohmann::json& object, const char* key, const std::optional<double>& value) {
+	if (value) {
+		object[key] = Round3(*value);
+	}
+}
+
+// The supervisor's part of the block: what the child did, over its whole run.
+nlohmann::json GenerationSupervisorToJson(const ShaderStoreGenerationReport& block) {
+	nlohmann::json supervisor = {{"outcome", block.outcome},
+	                             {"spawns", block.spawns},
+	                             {"restarts", block.restarts},
+	                             {"restarts_capped", block.outcome == "restarts_capped"},
+	                             {"spawn_ms", Round3(block.spawn_ms)},
+	                             {"decode_ms_max", Round3(block.decode_ms_max)},
+	                             {"terminate_wait_ms", Round3(block.terminate_wait_ms)},
+	                             {"frames_delivered", block.frames_delivered},
+	                             {"bad_records", block.bad_records},
+	                             {"duplicates", block.duplicates},
+	                             {"posted", block.posted},
+	                             {"predicted_programs", block.predicted_programs}};
+	SetOptional(supervisor, "child_open_ms", block.child_open_ms);
+	SetOptional(supervisor, "first_record_ms", block.first_record_ms);
+	SetOptional(supervisor, "last_record_ms", block.last_record_ms);
+	SetOptional(supervisor, "finished_ms", block.finished_ms);
+	SetOptional(supervisor, "ended_ms", block.ended_ms);
+	if (block.peak_bytes) {
+		supervisor["peak_bytes"]  = *block.peak_bytes;
+		supervisor["peak_source"] = block.peak_source;
+	}
+	supervisor["failures"] = nlohmann::json::array();
+	for (const auto& failure: block.failures) {
+		supervisor["failures"].push_back(GenerationFailureToJson(failure));
+	}
+	supervisor["spawn_usage"] = nlohmann::json::array();
+	for (const auto& usage: block.spawn_usage) {
+		supervisor["spawn_usage"].push_back(GenerationSpawnUsageToJson(usage));
+	}
+	supervisor["dropped"] = nlohmann::json::array();
+	for (const auto& drop: block.dropped) {
+		supervisor["dropped"].push_back(
+		    {{"hash", Hex(drop.hash)}, {"rank", drop.rank}, {"reason", drop.reason}});
+	}
+	supervisor["failed_hashes"] = HashListToJson(block.failed_hashes);
+	supervisor["skip_hashes"]   = HashListToJson(block.skip_hashes);
+	return supervisor;
+}
+
+// The whole block of an active generation.
+nlohmann::json GenerationToJson(const ShaderStoreGenerationReport& block) {
+	nlohmann::json json = {{"active", block.active}};
+	if (!block.inactive_reason.empty()) {
+		json["inactive_reason"] = block.inactive_reason;
+	}
+	json["supervisor"]    = GenerationSupervisorToJson(block);
+	nlohmann::json worker = nlohmann::json::object();
+	for (const auto& [name, value]: block.worker) {
+		worker[name] = SummaryValueToJson(name, value);
+	}
+	json["worker"] = worker;
+	json["drain"]  = GenerationDrainToJson(block.drain);
+	return json;
+}
+
 nlohmann::json BootToJson(const BootInfo& boot) {
 	return {{"warm_up_ms", Round3(boot.warm_up_ms)},
 	        {"programs", boot.programs},
@@ -839,6 +993,22 @@ std::string Report::ToJson(const Metadata& metadata, uint64_t audio_holds, doubl
 		epoch_ns = m_epoch_ns;
 	}
 
+	// The generation block exists only when the flag asked for it. The source is called with the
+	// generation lock held, so the owner cannot destroy what it reads meanwhile, and no other lock
+	// of the report is held then.
+	std::optional<nlohmann::json> generation;
+	{
+		std::lock_guard lock(m_generation_mutex);
+		if (m_generation_source) {
+			generation = GenerationToJson(m_generation_source());
+		} else if (m_generation_final) {
+			generation = GenerationToJson(*m_generation_final);
+		} else if (m_generation_inactive) {
+			generation =
+			    nlohmann::json {{"active", false}, {"inactive_reason", *m_generation_inactive}};
+		}
+	}
+
 	nlohmann::json flags = nlohmann::json::object();
 	for (const auto& [name, on]: metadata.flags) {
 		flags[name] = on;
@@ -851,7 +1021,7 @@ std::string Report::ToJson(const Metadata& metadata, uint64_t audio_holds, doubl
 	for (const auto& ready: Readies()) {
 		ready_rows.push_back(ReadyToJson(ready));
 	}
-	const nlohmann::json report = {
+	nlohmann::json report = {
 	    {"title_id", metadata.title_id},
 	    {"build", metadata.build},
 	    {"flags", flags},
@@ -859,7 +1029,8 @@ std::string Report::ToJson(const Metadata& metadata, uint64_t audio_holds, doubl
 	    {"cold_stamp_failures", summary.stamp_failures},
 	    {"partial", metadata.partial},
 	    {"boot", BootToJson(boot)},
-	    {"graphics_pipeline_library", PipelineLibraryToJson(library, LibraryStats(), LibraryPipelines())},
+	    {"graphics_pipeline_library",
+	     PipelineLibraryToJson(library, LibraryStats(), LibraryPipelines())},
 	    {"play", PlayToJson(summary)},
 	    {"pauses", PausesToJson(summary)},
 	    {"compiles", compile_rows},
@@ -874,6 +1045,9 @@ std::string Report::ToJson(const Metadata& metadata, uint64_t audio_holds, doubl
 	     {{"total", summary.submissions}, {"per_flip", summary.submissions_per_flip}}},
 	    {"run_seconds", Round3(run_seconds)},
 	};
+	if (generation) {
+		report["shader_store_generation"] = std::move(*generation);
+	}
 	// The title id is not filtered, so bytes that are not UTF-8 are replaced instead of throwing.
 	return report.dump(JSON_INDENT, ' ', false, nlohmann::json::error_handler_t::replace);
 }
