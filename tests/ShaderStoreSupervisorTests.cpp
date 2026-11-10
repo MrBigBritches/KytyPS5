@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -83,6 +84,29 @@ constexpr auto CREATE_DELAY = 2000ms;
 constexpr auto HEADER_PAUSE = 1000ms;
 // Lines of 25 bytes that are more than the 1 MiB that one poll of the log reads.
 constexpr size_t NOISE_LINES = 130000;
+// How much processor time the burning fakes spend, and the least a report must then show. The
+// baseline pays only for starting the process, which stays under the baseline limit.
+constexpr double BURN_CPU_MS          = 400.0;
+constexpr double BURN_MIN_REPORTED_MS = 250.0;
+constexpr double BASELINE_MAX_CPU_MS  = 150.0;
+// The memory the alloc fake takes, and the threshold that a measured peak must pass. A child that
+// took nothing stays far below it.
+constexpr uint64_t ALLOC_MEGABYTES      = 64;
+constexpr uint64_t BYTES_PER_MEGABYTE   = 1024 * 1024;
+constexpr uint64_t ALLOC_MIN_PEAK_BYTES = 48 * BYTES_PER_MEGABYTE;
+constexpr size_t   PAGE_STRIDE_BYTES    = 4096;
+// The text file of the out mode is larger than what a failure keeps, with a marker at each end so
+// that the part that was kept can be told.
+constexpr size_t      OUT_FILE_BYTES = 6000;
+constexpr const char* OUT_HEAD_MARK  = "HEAD-MARK";
+constexpr const char* OUT_TAIL_MARK  = "TAIL-MARK";
+// How long the slow fake waits before its first predict line, and how long a slow sink takes.
+constexpr int SLOW_OPEN_MS = 600;
+// How much of the 600 ms delay the supervisor's view of it may lose, to poll granularity and a
+// loaded machine. The slow run must show at least the delay less this over the normal run.
+constexpr int    OPEN_MARGIN_MS   = 200;
+constexpr auto   SLOW_SINK_DELAY  = 200ms;
+constexpr double SLOW_SINK_MIN_MS = 150.0;
 
 uint64_t ProgramHash(size_t program) {
 	return PROGRAM_BASE + program;
@@ -208,6 +232,76 @@ void SleepSeconds(int seconds) {
 	std::this_thread::sleep_for(std::chrono::seconds(seconds));
 }
 
+// The processor time this process has used, in milliseconds.
+double OwnCpuMs() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	FILETIME creation {};
+	FILETIME exited {};
+	FILETIME kernel {};
+	FILETIME user {};
+	GetProcessTimes(GetCurrentProcess(), &creation, &exited, &kernel, &user);
+	constexpr double TICKS_PER_MILLISECOND = 10000.0;
+	const auto       ticks                 = [](const FILETIME& time) {
+        return static_cast<double>((static_cast<uint64_t>(time.dwHighDateTime) << 32) |
+		                                                 time.dwLowDateTime);
+	};
+	return (ticks(kernel) + ticks(user)) / TICKS_PER_MILLISECOND;
+#else
+	timespec now {};
+	clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &now);
+	constexpr double MS_PER_SECOND      = 1000.0;
+	constexpr double NANOSECONDS_PER_MS = 1e6;
+	return (static_cast<double>(now.tv_sec) * MS_PER_SECOND) +
+	       (static_cast<double>(now.tv_nsec) / NANOSECONDS_PER_MS);
+#endif
+}
+
+// Spins until this process has used the given processor time. It reads its own clock, so a loaded
+// machine only makes it take longer in wall time.
+void BurnCpu(double milliseconds) {
+	const double       start = OwnCpuMs();
+	volatile uint64_t  sink  = 0;
+	constexpr uint64_t BATCH = 100000;
+	while (OwnCpuMs() - start < milliseconds) {
+		for (uint64_t i = 0; i < BATCH; ++i) {
+			sink = sink + i;
+		}
+	}
+}
+
+// Where the alloc fake keeps its block. A volatile pointer stops the compiler from dropping an
+// allocation that nothing reads.
+char* volatile g_block = nullptr;
+
+// Takes memory and makes every page resident.
+void TakeResidentMemory(uint64_t megabytes) {
+	const uint64_t bytes = megabytes * BYTES_PER_MEGABYTE;
+	g_block              = static_cast<char*>(std::malloc(bytes));
+	if (g_block == nullptr) {
+		return;
+	}
+	for (uint64_t offset = 0; offset < bytes; offset += PAGE_STRIDE_BYTES) {
+		g_block[offset] = static_cast<char>(offset);
+	}
+}
+
+// Appends to the text file of the worker, which the worker process writes its output to.
+void AppendWorkerOutText(const WorkerRequest& request, const std::string& text) {
+	std::ofstream(PathFromUtf8(request.progress_path + ".out"), std::ios::app | std::ios::binary)
+	    << text;
+}
+
+// A text file larger than what a failure keeps, with a marker at the very start and at the very
+// end, and filler between.
+std::string LargeOutText() {
+	std::string text = OUT_HEAD_MARK;
+	text.append(OUT_FILE_BYTES - std::string(OUT_HEAD_MARK).size() -
+	                std::string(OUT_TAIL_MARK).size(),
+	            '.');
+	text += OUT_TAIL_MARK;
+	return text;
+}
+
 // The index of this spawn, kept in a file next to the request, which a worker restarted by the
 // supervisor can tell apart from the first.
 int SpawnIndex(const WorkerRequest& request) {
@@ -297,6 +391,22 @@ bool FakeFaultAtStart(FakeRun& run, uint64_t rank, const FakeCandidate& candidat
 	if (run.Is("drops_crash") && run.Arg(1) == rank) {
 		std::_Exit(CRASH_EXIT);
 	}
+	if (run.Is("crash_start_out") && run.Arg(1) == rank) {
+		AppendWorkerOutText(run.request, LargeOutText());
+		std::_Exit(CRASH_EXIT);
+	}
+	// Takes memory in the first run only, and crashes at the rank like crash_start.
+	if (run.Is("alloc_crash_start") && run.Arg(1) == rank) {
+		if (run.spawn == 0) {
+			TakeResidentMemory(ALLOC_MEGABYTES);
+		}
+		std::_Exit(CRASH_EXIT);
+	}
+	if (run.Is("burn_hang_start") && run.Arg(1) == rank) {
+		BurnCpu(BURN_CPU_MS);
+		SleepSeconds(HANG_SECONDS);
+		return true;
+	}
 	if (run.Is("hang_start") && run.Arg(1) == rank) {
 		SleepSeconds(run.Arg(2) != 0 ? static_cast<int>(run.Arg(2)) : HANG_SECONDS);
 		return true;
@@ -375,7 +485,7 @@ int FakeBuild(FakeRun& run) {
 		if (Contains(run.request.failed_hashes, candidate.hash)) {
 			continue;
 		}
-		if (run.Is("drops_crash") && rank == 1 + 0) {
+		if ((run.Is("drops_crash") || run.Is("drops_normal")) && rank == 1 + 0) {
 			FakeDrops(run);
 		}
 		if (run.Is("crash_damaged_start") && run.spawn == 0 && rank == CRASH_DAMAGED_RANK) {
@@ -451,6 +561,13 @@ int RunFakeWorker(const std::string& mode_text, const fs::path& request_file) {
 	if (run.Is("crash_damaged_predict") && run.spawn == 0) {
 		run.files.OpenOutput(GeneratedHeaderBytes(run.request));
 		FakeWriteDamage(run);
+	}
+	// These two wait or burn before the first predict line, which is what the time to it measures.
+	if (run.Is("slow_open")) {
+		std::this_thread::sleep_for(std::chrono::milliseconds(run.Arg(1)));
+	}
+	if (run.Is("burn_normal")) {
+		BurnCpu(BURN_CPU_MS);
 	}
 	FakePredict(run);
 	if (run.Is("exit_after_line")) {
@@ -1019,6 +1136,231 @@ void TestGatePrecedence() {
 	CHECK(StoreGenerationAvailability(nothing) == "no_shader_store");
 }
 
+// ---- What a run leaves in the statistics. ----
+
+// The times of a run. The baseline is the normal worker, and the slow one differs only in the time
+// before its first predict line.
+void TestTimingStats() {
+	const auto normal = Run("normal");
+	CHECK(normal.ended && normal.stats.outcome == SupervisorOutcome::Finished);
+	const auto& stats = normal.stats;
+	CHECK(stats.finished_ms > 0.0 && stats.finished_ms >= stats.spawn_ms);
+	// A finished run ends where it finishes.
+	CHECK(stats.ended_ms == stats.finished_ms);
+	CHECK(stats.child_open_ms.has_value());
+	CHECK(stats.first_record_ms.has_value() && stats.last_record_ms.has_value());
+	if (stats.child_open_ms && stats.first_record_ms && stats.last_record_ms) {
+		CHECK(*stats.first_record_ms <= *stats.last_record_ms);
+		CHECK(*stats.last_record_ms <= stats.finished_ms);
+		// The first record comes after the first predict line, and neither is after the end.
+		CHECK(stats.spawn_ms + *stats.child_open_ms <= stats.finished_ms);
+	}
+	const auto slow = Run("slow_open:" + std::to_string(SLOW_OPEN_MS));
+	CHECK(slow.ended && slow.stats.outcome == SupervisorOutcome::Finished);
+	// Compared with the normal run, so a slow machine that stretches both cannot fail it.
+	CHECK(slow.stats.child_open_ms.has_value() && stats.child_open_ms.has_value() &&
+	      *slow.stats.child_open_ms >= *stats.child_open_ms + (SLOW_OPEN_MS - OPEN_MARGIN_MS));
+	// The first record cannot come before the first predict line, so it shows the delay as well.
+	CHECK(slow.stats.first_record_ms.has_value() &&
+	      *slow.stats.first_record_ms >= SLOW_OPEN_MS * 0.8);
+}
+
+// finished_ms is zero while the supervisor runs and is set by the end, and nothing is known of the
+// child's open time before a predict line arrives.
+void TestFinishedMsOnlyAfterTheEnd() {
+	TempDirectory   directory;
+	Collected       collected;
+	auto            config = MakeConfig(directory, "sleep_silent", collected);
+	StoreSupervisor supervisor(std::move(config));
+	supervisor.Start();
+	std::this_thread::sleep_for(300ms);
+	const auto running = supervisor.Stats();
+	CHECK(running.outcome == SupervisorOutcome::Running);
+	CHECK(running.finished_ms == 0.0 && running.ended_ms == 0.0 &&
+	      !running.child_open_ms.has_value());
+	supervisor.Stop();
+	const auto stopped = supervisor.Stats();
+	CHECK(stopped.outcome == SupervisorOutcome::Stopped);
+	// The stop came after the 300 ms above, so the end cannot be earlier than that. The run did not
+	// finish, so finished_ms stays zero, which tells it from ended_ms.
+	CHECK(stopped.ended_ms >= 250.0);
+	CHECK(stopped.finished_ms == 0.0);
+	// A run that ends for good has an end and no finish.
+	const auto fatal = Run("exit:3");
+	CHECK(fatal.stats.outcome == SupervisorOutcome::Fatal);
+	CHECK(fatal.stats.ended_ms > 0.0 && fatal.stats.finished_ms == 0.0);
+}
+
+// The longest record is the one with the slow sink. The baseline is the same run with the normal
+// sink.
+void TestDecodeMsMax() {
+	const auto fast = Run("normal");
+	CHECK(fast.stats.decode_ms_max < SLOW_SINK_MIN_MS);
+	const auto slow = Run("normal", [](SupervisorConfig& config) {
+		config.sink = [](DecodedModuleRecord&& record) {
+			if (record.id == ModuleIdOf(1, 0)) {
+				std::this_thread::sleep_for(SLOW_SINK_DELAY);
+			}
+		};
+	});
+	CHECK(slow.stats.outcome == SupervisorOutcome::Finished);
+	CHECK(slow.stats.decode_ms_max >= SLOW_SINK_MIN_MS);
+}
+
+// The programs of the predict lines, of the drops, and of the lists that the next run leaves out.
+// Each differs from the normal run in one thing.
+void TestHashLists() {
+	const auto normal = Run("normal");
+	CHECK(normal.stats.predicted_hashes ==
+	      (std::vector<uint64_t> {ProgramHash(0), ProgramHash(1), ProgramHash(2)}));
+	CHECK(normal.stats.dropped.empty() && normal.stats.failed_hashes.empty() &&
+	      normal.stats.skip_hashes.empty());
+
+	// A crash at a predict line skips its program. The predicted list holds it once, though the
+	// two spawns both looked at program 0.
+	const auto skipped = Run("crash_predict:1");
+	CHECK(skipped.stats.skip_hashes == std::vector<uint64_t> {ProgramHash(1)});
+	CHECK(skipped.stats.failed_hashes.empty());
+	CHECK(skipped.stats.predicted_hashes ==
+	      (std::vector<uint64_t> {ProgramHash(0), ProgramHash(1), ProgramHash(2)}));
+
+	// A crash at a start line fails its program and skips none.
+	const auto failed = Run("crash_start:2");
+	CHECK(failed.stats.failed_hashes == std::vector<uint64_t> {ProgramHash(1)});
+	CHECK(failed.stats.skip_hashes.empty());
+}
+
+// The drops of a run that finishes are listed too. They are in no restart's request, so the list of
+// failed programs stays empty, which tells the list of drops from it.
+void TestDropsAreListedForAFinishedRun() {
+	const auto run = Run("drops_normal");
+	CHECK(run.ended && run.stats.outcome == SupervisorOutcome::Finished);
+	CHECK(run.stats.failed_hashes.empty());
+	CHECK(run.stats.dropped.size() == 3);
+	if (run.stats.dropped.size() == 3) {
+		CHECK(run.stats.dropped[0].hash == DROPPED_HASH &&
+		      run.stats.dropped[0].reason == ProgressDropReason::ResourceCount);
+		CHECK(run.stats.dropped[1].hash == TOO_LARGE_HASH &&
+		      run.stats.dropped[1].reason == ProgressDropReason::FrameTooLarge);
+		CHECK(run.stats.dropped[2].hash == PUSH_DROPPED_HASH &&
+		      run.stats.dropped[2].reason == ProgressDropReason::PushStart);
+		CHECK(run.stats.dropped[0].rank == 1);
+	}
+	// A run that crashes after drops lists them once, and not again for the restart's request.
+	const auto crashed = Run("drops_crash:4");
+	CHECK(crashed.stats.dropped.size() == 3);
+}
+
+// Each spawn that ended has one usage entry. The burning worker is credited with its processor
+// time, and the normal one is not, which is the baseline that only differs in that.
+void TestSpawnUsageCpu() {
+	const auto normal = Run("normal");
+	CHECK(normal.stats.spawn_usage.size() == normal.stats.spawns);
+	CHECK(!normal.stats.spawn_usage.empty() && normal.stats.spawn_usage[0].spawn == 1);
+	const auto burned = Run("burn_normal");
+	CHECK(burned.ended && burned.stats.outcome == SupervisorOutcome::Finished);
+	CHECK(burned.stats.spawn_usage.size() == 1);
+	if (normal.stats.spawn_usage.size() == 1 && burned.stats.spawn_usage.size() == 1) {
+		CHECK(normal.stats.spawn_usage[0].cpu_ms < BASELINE_MAX_CPU_MS);
+		CHECK(burned.stats.spawn_usage[0].cpu_ms >= BURN_MIN_REPORTED_MS);
+	}
+	// One restart means two spawns and two entries.
+	const auto crashed = Run("crash_start:2");
+	CHECK(crashed.stats.spawns == 2 && crashed.stats.spawn_usage.size() == 2);
+	// The entries and the failure carry the number of their spawn, so they can be joined.
+	if (crashed.stats.spawn_usage.size() == 2 && crashed.stats.failures.size() == 1) {
+		CHECK(crashed.stats.spawn_usage[0].spawn == 1 && crashed.stats.spawn_usage[1].spawn == 2);
+		CHECK(crashed.stats.failures[0].spawn == 1);
+	}
+}
+
+// A peak of a better source replaces the held one, whatever the sizes, and the same source only
+// with a larger value. A commit figure is not comparable with a working set.
+void TestPeakSourceRank() {
+	using Common::PeakMemory;
+	using Common::PeakMemorySource;
+	constexpr uint64_t SMALL = 10 * BYTES_PER_MEGABYTE;
+	constexpr uint64_t LARGE = 100 * BYTES_PER_MEGABYTE;
+	const PeakMemory   commit_large {LARGE, PeakMemorySource::Commit};
+	const PeakMemory   commit_small {SMALL, PeakMemorySource::Commit};
+	const PeakMemory   set_small {SMALL, PeakMemorySource::WorkingSet};
+	const PeakMemory   set_large {LARGE, PeakMemorySource::WorkingSet};
+	const PeakMemory   sampled_small {SMALL, PeakMemorySource::WorkingSetSampled};
+	// A commit peak followed by a working set peak gives the working set one, though it is smaller.
+	CHECK(PeakReplaces(commit_large, set_small));
+	// The other way round keeps the working set one, though the commit is larger.
+	CHECK(!PeakReplaces(set_small, commit_large));
+	CHECK(PeakReplaces(sampled_small, set_small) && !PeakReplaces(set_small, sampled_small));
+	CHECK(PeakReplaces(commit_large, sampled_small) && !PeakReplaces(sampled_small, commit_large));
+	// The same source takes the larger value only.
+	CHECK(PeakReplaces(set_small, set_large) && !PeakReplaces(set_large, set_small));
+	CHECK(PeakReplaces(commit_small, commit_large) && !PeakReplaces(commit_large, commit_small));
+	CHECK(!PeakReplaces(set_large, set_large));
+}
+
+// A worker that is ended for a hang has its processor time in the failure. The baseline hangs the
+// same way without burning.
+void TestFailureCpuAtATimeout() {
+	const auto set_timeout = [](SupervisorConfig& config) { config.candidate_timeout = 2s; };
+	const auto idle        = Run("hang_start:2", set_timeout);
+	const auto burned      = Run("burn_hang_start:2", set_timeout);
+	CHECK(idle.stats.failures.size() == 1 && burned.stats.failures.size() == 1);
+	if (idle.stats.failures.size() == 1 && burned.stats.failures.size() == 1) {
+		const auto& idle_failure   = idle.stats.failures[0];
+		const auto& burned_failure = burned.stats.failures[0];
+		CHECK(idle_failure.kind == FailureKind::Hang && burned_failure.kind == FailureKind::Hang);
+		CHECK(idle_failure.cpu_ms.has_value() && *idle_failure.cpu_ms < BASELINE_MAX_CPU_MS);
+		CHECK(burned_failure.cpu_ms.has_value() && *burned_failure.cpu_ms >= BURN_MIN_REPORTED_MS);
+	}
+}
+
+// The text file's tail is kept by a failure, bounded, from its end. The baseline crashes the same
+// way and has no text file.
+void TestFailureOutTail() {
+	const auto plain = Run("crash_start:2");
+	CHECK(plain.stats.failures.size() == 1 && plain.stats.failures[0].out_tail.empty());
+	const auto with_text = Run("crash_start_out:2");
+	CHECK(with_text.stats.failures.size() == 1);
+	if (with_text.stats.failures.size() == 1) {
+		const auto& tail = with_text.stats.failures[0].out_tail;
+		CHECK(tail.size() == GENERATION_OUT_TAIL_BYTES);
+		CHECK(tail.ends_with(OUT_TAIL_MARK));
+		CHECK(tail.find(OUT_HEAD_MARK) == std::string::npos);
+	}
+}
+
+// The largest peak of the spawns is kept, and not the last one. The first run takes 64 MB and the
+// restart takes none. Linux samples a live child, which a worker this short may not give, so only
+// the other systems are held to a figure.
+void TestPeakMemoryIsTheLargest() {
+	const auto run = Run("alloc_crash_start:2");
+	CHECK(run.ended && run.stats.outcome == SupervisorOutcome::Finished);
+	CHECK(run.stats.spawn_usage.size() == 2);
+#ifndef __linux__
+	if (run.stats.spawn_usage.size() == 2) {
+		const auto& first  = run.stats.spawn_usage[0];
+		const auto& second = run.stats.spawn_usage[1];
+		CHECK(first.peak.has_value() && second.peak.has_value());
+		if (first.peak && second.peak && run.stats.peak_memory) {
+			CHECK(first.peak->bytes >= ALLOC_MIN_PEAK_BYTES);
+			CHECK(second.peak->bytes < ALLOC_MIN_PEAK_BYTES);
+			CHECK(run.stats.peak_memory->bytes == first.peak->bytes);
+			CHECK(run.stats.peak_memory->source == first.peak->source);
+		} else {
+			CHECK(false);
+		}
+	}
+#endif
+	// A run with no spawn that took memory has a peak below the threshold, so the figure above is
+	// the allocation and not the process.
+	const auto normal = Run("normal");
+#ifndef __linux__
+	CHECK(normal.stats.peak_memory.has_value() &&
+	      normal.stats.peak_memory->bytes < ALLOC_MIN_PEAK_BYTES);
+#endif
+	CHECK(normal.stats.spawn_usage.size() == 1);
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -1048,6 +1390,16 @@ int main(int argc, char** argv) {
 	TestBlameReadsTheWholeLog();
 	TestPriorityRefusalIsLogged();
 	TestOutputResetFailure();
+	TestTimingStats();
+	TestFinishedMsOnlyAfterTheEnd();
+	TestDecodeMsMax();
+	TestHashLists();
+	TestDropsAreListedForAFinishedRun();
+	TestSpawnUsageCpu();
+	TestPeakSourceRank();
+	TestFailureCpuAtATimeout();
+	TestFailureOutTail();
+	TestPeakMemoryIsTheLargest();
 	if (g_failures == 0) {
 		std::puts("Shader store supervisor tests passed");
 	}

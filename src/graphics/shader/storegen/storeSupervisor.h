@@ -1,8 +1,10 @@
 #ifndef GRAPHICS_SHADER_STOREGEN_STORE_SUPERVISOR_H
 #define GRAPHICS_SHADER_STOREGEN_STORE_SUPERVISOR_H
 
+#include "common/childProcess.h"
 #include "common/threadPriority.h"
 #include "graphics/shader/shaderStoreRecord.h"
+#include "graphics/shader/storegen/progressLog.h"
 #include "graphics/shader/storegen/storeWorkerFormat.h"
 
 #include <chrono>
@@ -10,6 +12,7 @@
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -33,6 +36,10 @@ constexpr std::chrono::seconds GENERATION_CANDIDATE_TIMEOUT {60};
 constexpr uint32_t GENERATION_MAX_RESTARTS = 5;
 /// A stop that takes the child longer than this to end is logged.
 constexpr std::chrono::milliseconds GENERATION_TERMINATE_LOG_THRESHOLD {100};
+/// How much of the end of the worker's text file a failure keeps. The file holds what the
+/// recompiler printed, and the line that explains a crash is the last one. A real file can be
+/// hundreds of kilobytes.
+constexpr size_t GENERATION_OUT_TAIL_BYTES = 2048;
 
 /// How the supervisor ended.
 enum class SupervisorOutcome : uint8_t {
@@ -56,6 +63,33 @@ struct SupervisorFailure {
 	FailureKind kind      = FailureKind::Crash;
 	/// The kind of the last progress line, as text, or empty when the log had none.
 	std::string last_line;
+	/// Which spawn ended, counting from 1 as `spawns` does.
+	uint32_t spawn = 0;
+	/// The processor time the worker had used when it ended, user and kernel together, when the
+	/// system said. A worker that was ended for a timeout shows what it spent before that.
+	std::optional<double> cpu_ms;
+	/// The last GENERATION_OUT_TAIL_BYTES of the worker's text file at that time, or empty when
+	/// there is none.
+	std::string out_tail;
+};
+
+/// A program that a `drop` line gave up on.
+struct SupervisorDrop {
+	uint64_t           hash   = 0;
+	uint64_t           rank   = 0;
+	ProgressDropReason reason = ProgressDropReason::PushStart;
+};
+
+/// What one run of the worker used, once it had ended.
+struct SupervisorSpawnUsage {
+	/// User and kernel time together.
+	double cpu_ms = 0.0;
+	/// Which spawn this is, counting from 1 as `spawns` does, so a usage entry can be joined with
+	/// the failure of the same spawn.
+	uint32_t spawn = 0;
+	/// Peak memory with the source that measured it. Missing when the system gave none, which is
+	/// not zero. See Common::PeakMemorySource for what each source means.
+	std::optional<Common::PeakMemory> peak;
 };
 
 /// What a supervisor did, for the tests and the report.
@@ -81,7 +115,44 @@ struct SupervisorStats {
 	double spawn_ms = 0.0;
 	/// The longest Terminate took.
 	double terminate_wait_ms = 0.0;
+	/// From the start of the thread to the end of the run, whatever the outcome was (Finished,
+	/// Fatal, RestartsCapped or Stopped). Zero while it runs.
+	double ended_ms = 0.0;
+	/// The same moment, but only when the outcome is Finished, so the worker really completed.
+	/// Zero for every other outcome. A comparison that cuts a run at the end of generation uses
+	/// this one, and ended_ms for when the supervisor stopped doing anything.
+	double finished_ms = 0.0;
+	/// From the first spawn to the first `predict` line, as the supervisor's poll saw it, so it is
+	/// exact to about a poll interval. Missing until a `predict` line arrives. It covers starting
+	/// the process, opening the eboot and the scan.
+	std::optional<double> child_open_ms;
+	/// From the start of the thread to the first and the last record given to the sink.
+	std::optional<double> first_record_ms;
+	std::optional<double> last_record_ms;
+	/// The longest one record took on the supervisor's thread: decoding it and the sink, which for
+	/// the pipeline cache makes the shader modules.
+	double decode_ms_max = 0.0;
+	/// The program of every `predict` line, each once, over all spawns.
+	std::vector<uint64_t> predicted_hashes;
+	/// Every `drop` line, over all spawns, in order.
+	std::vector<SupervisorDrop> dropped;
+	/// The programs the supervisor kept out of the next run: `failed_hashes` of the request, which
+	/// keep their ranks, and `skip_hashes`, which change the ordering.
+	std::vector<uint64_t> failed_hashes;
+	std::vector<uint64_t> skip_hashes;
+	/// One entry for each spawn whose usage the system gave, in order.
+	std::vector<SupervisorSpawnUsage> spawn_usage;
+	/// The largest peak memory of the spawns, among those measured by one source. Missing when no
+	/// spawn had one.
+	std::optional<Common::PeakMemory> peak_memory;
 };
+
+/// Whether a measured peak replaces the held one. Sources rank WorkingSet, then WorkingSetSampled,
+/// then Commit, since the first is the system's own figure for resident memory and the last counts
+/// memory that was never used. A better source replaces the held one whatever the sizes are, and
+/// the same source replaces it only with a larger value.
+[[nodiscard]] bool PeakReplaces(const Common::PeakMemory& held,
+                                const Common::PeakMemory& candidate);
 
 /// What a supervisor is made with.
 struct SupervisorConfig {

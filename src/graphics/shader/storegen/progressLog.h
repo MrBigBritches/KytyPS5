@@ -8,6 +8,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -156,6 +157,14 @@ public:
 	[[nodiscard]] const std::optional<ProgressLine>& LatestOrder() const { return m_order; }
 	/// The `summary` line of this spawn, when it arrived.
 	[[nodiscard]] const std::optional<ProgressLine>& Summary() const { return m_summary; }
+	/// The program of every `predict` line of the whole log, each once, in the order they came. It
+	/// is kept across spawns and fresh runs, since it says what the worker has looked at.
+	[[nodiscard]] const std::vector<uint64_t>& PredictedHashes() const { return m_predicted; }
+	/// When the first `predict` line of the whole log was found, which is the time of the Poll that
+	/// found it and not of the line itself.
+	[[nodiscard]] const std::optional<ProgressClock::time_point>& FirstPredictTime() const {
+		return m_first_predict_time;
+	}
 	/// Lines that were complete but not a line of the worker's, since the reader was made.
 	[[nodiscard]] size_t MalformedLines() const { return m_malformed; }
 
@@ -169,18 +178,21 @@ private:
 	/// Whether the bytes up to the next newline belong to a line that was too long.
 	bool m_skipping = false;
 
-	size_t                      m_lines_since_spawn = 0;
-	std::optional<ProgressLine> m_last_line;
-	ProgressClock::time_point   m_last_line_time {};
-	bool                        m_start_since_spawn = false;
-	std::vector<ProgressLine>   m_drops;
-	std::optional<ProgressLine> m_summary;
-	std::optional<ProgressLine> m_order;
-	std::optional<ProgressLine> m_last_start;
-	size_t                      m_malformed = 0;
-	size_t                      m_resets    = 0;
-	bool                        m_caught_up = true;
-	size_t                      m_kind_counts[PROGRESS_KIND_COUNT] {};
+	size_t                                   m_lines_since_spawn = 0;
+	std::optional<ProgressLine>              m_last_line;
+	ProgressClock::time_point                m_last_line_time {};
+	bool                                     m_start_since_spawn = false;
+	std::vector<ProgressLine>                m_drops;
+	std::optional<ProgressLine>              m_summary;
+	std::optional<ProgressLine>              m_order;
+	std::optional<ProgressLine>              m_last_start;
+	std::vector<uint64_t>                    m_predicted;
+	std::unordered_set<uint64_t>             m_predicted_seen;
+	std::optional<ProgressClock::time_point> m_first_predict_time;
+	size_t                                   m_malformed = 0;
+	size_t                                   m_resets    = 0;
+	bool                                     m_caught_up = true;
+	size_t                                   m_kind_counts[PROGRESS_KIND_COUNT] {};
 };
 
 /// Where a reader stands, for judging whether a poll made progress. The offset and the number of

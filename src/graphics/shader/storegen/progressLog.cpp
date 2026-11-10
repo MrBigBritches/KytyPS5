@@ -190,7 +190,14 @@ void ProgressLogReader::TakeLine(std::string_view line, ProgressClock::time_poin
 		case ProgressKind::Drop: m_drops.push_back(*parsed); break;
 		case ProgressKind::Order: m_order = parsed; break;
 		case ProgressKind::Summary: m_summary = parsed; break;
-		case ProgressKind::Predict: break;
+		case ProgressKind::Predict:
+			if (m_predicted_seen.insert(parsed->hash).second) {
+				m_predicted.push_back(parsed->hash);
+			}
+			if (!m_first_predict_time) {
+				m_first_predict_time = now;
+			}
+			break;
 	}
 	m_last_line = std::move(parsed);
 }

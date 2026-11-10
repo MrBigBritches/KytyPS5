@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <condition_variable>
 #include <fmt/format.h>
+#include <fstream>
 #include <mutex>
 #include <optional>
 #include <stop_token>
@@ -61,6 +62,37 @@ const char* KindName(ProgressKind kind) {
 	return "";
 }
 
+// The last max_bytes of a file as it is, or nothing when it cannot be read. Only the end is read,
+// since the file can be large and the line that explains a crash is the last one.
+std::string ReadFileTail(const fs::path& path, size_t max_bytes) {
+	std::ifstream file(path, std::ios::binary | std::ios::ate);
+	if (!file) {
+		return {};
+	}
+	const auto  size  = static_cast<uint64_t>(file.tellg());
+	const auto  count = std::min<uint64_t>(size, max_bytes);
+	std::string tail(static_cast<size_t>(count), '\0');
+	file.seekg(static_cast<std::streamoff>(size - count));
+	file.read(tail.data(), static_cast<std::streamsize>(count));
+	tail.resize(static_cast<size_t>(std::max<std::streamsize>(file.gcount(), 0)));
+	return tail;
+}
+
+// How good a peak memory source is. Higher is better.
+int PeakSourceRank(Common::PeakMemorySource source) {
+	switch (source) {
+		case Common::PeakMemorySource::WorkingSet: return 2;
+		case Common::PeakMemorySource::WorkingSetSampled: return 1;
+		case Common::PeakMemorySource::Commit: return 0;
+	}
+	return -1;
+}
+
+// Milliseconds between two times of the steady clock.
+double MillisecondsBetween(Clock::time_point from, Clock::time_point to) {
+	return std::chrono::duration<double, std::milli>(to - from).count();
+}
+
 // Adds a hash to a list that holds each once.
 void AddUnique(std::vector<uint64_t>& list, uint64_t hash) {
 	if (std::ranges::find(list, hash) == list.end()) {
@@ -69,6 +101,13 @@ void AddUnique(std::vector<uint64_t>& list, uint64_t hash) {
 }
 
 } // namespace
+
+bool PeakReplaces(const Common::PeakMemory& held, const Common::PeakMemory& candidate) {
+	if (candidate.source != held.source) {
+		return PeakSourceRank(candidate.source) > PeakSourceRank(held.source);
+	}
+	return candidate.bytes > held.bytes;
+}
 
 std::filesystem::path WorkerProgramPath() {
 #if defined(__linux__)
@@ -95,6 +134,7 @@ struct StoreSupervisor::Impl {
 	bool               Spawn();
 	void               Deliver(std::vector<TailedFrame>&& frames);
 	void               DeliverRecord(const TailedFrame& frame);
+	void               HandleRecord(const TailedFrame& frame);
 	void               CatchUp();
 	[[nodiscard]] bool TimedOut(ProgressClock::time_point now) const;
 	std::optional<int> TerminateChild();
@@ -108,6 +148,13 @@ struct StoreSupervisor::Impl {
 	void                  AbsorbDrops();
 	bool                  PrepareFresh();
 	void                  RecordFailure(const Verdict& verdict, int exit_code);
+
+	// ---- What a spawn leaves in the statistics. ----
+	void NoteProgress();
+	void CollectSpawnStats();
+	void CollectDrops();
+	void RecordUsage();
+	void PublishHashLists();
 
 	// ---- The shared state. ----
 	template <typename Change>
@@ -141,6 +188,12 @@ struct StoreSupervisor::Impl {
 	std::unordered_set<uint64_t>          seen_ids;
 	Clock::time_point                     thread_start;
 	Clock::time_point                     spawn_time;
+	Clock::time_point                     first_spawn_time;
+	// What the statistics of the current spawn have taken already, so ending a spawn in two places
+	// counts it once.
+	bool                  stats_collected     = false;
+	size_t                predicted_published = 0;
+	std::optional<double> last_cpu_ms;
 };
 
 StoreSupervisor::Impl::Impl(SupervisorConfig supplied)
@@ -173,6 +226,10 @@ void StoreSupervisor::Impl::End(SupervisorOutcome outcome, const std::string& re
 		}
 		stats.outcome         = outcome;
 		stats.inactive_reason = reason;
+		stats.ended_ms        = MillisecondsBetween(thread_start, Clock::now());
+		if (outcome == SupervisorOutcome::Finished) {
+			stats.finished_ms = stats.ended_ms;
+		}
 	}
 	end_changed.notify_all();
 }
@@ -215,8 +272,10 @@ void StoreSupervisor::Impl::Run(std::stop_token token) {
 			Iterate();
 		}
 	}
-	// A stop ends the child here, on the thread that owns it.
+	// A stop ends the child here, on the thread that owns it. What the spawn used and wrote is
+	// counted after it ends, unless a verdict has counted it already.
 	TerminateChild();
+	CollectSpawnStats();
 	End(SupervisorOutcome::Stopped, "");
 	// Destroyed on this thread, which is the one that spawned it.
 	child.reset();
@@ -253,11 +312,13 @@ bool StoreSupervisor::Impl::Spawn() {
 		End(SupervisorOutcome::Fatal, "spawn_failed");
 		return false;
 	}
-	spawn_time = Clock::now();
+	spawn_time      = Clock::now();
+	stats_collected = false;
+	last_cpu_ms.reset();
 	Update([&](SupervisorStats& s) {
 		if (s.spawns == 0) {
-			s.spawn_ms =
-			    std::chrono::duration<double, std::milli>(spawn_time - thread_start).count();
+			first_spawn_time = spawn_time;
+			s.spawn_ms       = MillisecondsBetween(thread_start, spawn_time);
 		}
 		s.spawns++;
 		s.last_pid = child->Pid();
@@ -297,6 +358,7 @@ void StoreSupervisor::Impl::Iterate() {
 	const auto exited = child->Poll();
 	const auto now    = ProgressClock::now();
 	progress.Poll(now);
+	NoteProgress();
 	Deliver(poller->Poll(exited.has_value()));
 	if (exited) {
 		Conclude(*exited, false);
@@ -319,6 +381,7 @@ void StoreSupervisor::Impl::Iterate() {
 // a final answer. A blame is only fair on all of it.
 void StoreSupervisor::Impl::CatchUp() {
 	progress.PollToEnd(ProgressClock::now());
+	NoteProgress();
 	int stuck = 0;
 	while (!tailer->IsFinal() && stuck < STUCK_POLL_LIMIT && !stop.stop_requested()) {
 		const auto before  = poller->BytesRead();
@@ -338,6 +401,16 @@ void StoreSupervisor::Impl::Deliver(std::vector<TailedFrame>&& frames) {
 // Decodes one frame, and gives its module to the sink unless an earlier record had its id. A fresh
 // restart sends the records again, so the ids are what makes them arrive once.
 void StoreSupervisor::Impl::DeliverRecord(const TailedFrame& frame) {
+	const auto begin = Clock::now();
+	HandleRecord(frame);
+	const auto end = Clock::now();
+	Update([&](SupervisorStats& s) {
+		s.decode_ms_max = std::max(s.decode_ms_max, MillisecondsBetween(begin, end));
+	});
+}
+
+// The work of DeliverRecord, which it times.
+void StoreSupervisor::Impl::HandleRecord(const TailedFrame& frame) {
 	using ShaderRecompiler::IR::IoAll;
 	using ShaderRecompiler::IR::Reader;
 	Update([](SupervisorStats& s) { s.frames_delivered++; });
@@ -360,7 +433,14 @@ void StoreSupervisor::Impl::DeliverRecord(const TailedFrame& frame) {
 	if (config.sink) {
 		config.sink(std::move(decoded));
 	}
-	Update([](SupervisorStats& s) { s.posted++; });
+	const auto since_start = MillisecondsBetween(thread_start, Clock::now());
+	Update([&](SupervisorStats& s) {
+		s.posted++;
+		if (!s.first_record_ms) {
+			s.first_record_ms = since_start;
+		}
+		s.last_record_ms = since_start;
+	});
 }
 
 // What the end of a worker run means, by the plan's restart contract.
@@ -409,6 +489,7 @@ Verdict StoreSupervisor::Impl::Judge(int exit_code, bool killed) const {
 
 void StoreSupervisor::Impl::Conclude(int exit_code, bool killed) {
 	CatchUp();
+	CollectSpawnStats();
 	const auto verdict = Judge(exit_code, killed);
 	if (verdict.action == Verdict::Action::Finish) {
 		End(SupervisorOutcome::Finished, "");
@@ -436,7 +517,86 @@ void StoreSupervisor::Impl::RecordFailure(const Verdict& verdict, int exit_code)
 		failure.rank      = last->kind == ProgressKind::Start ? last->rank_or_count : 0;
 		failure.last_line = KindName(last->kind);
 	}
-	Update([&](SupervisorStats& s) { s.failures.push_back(failure); });
+	failure.cpu_ms = last_cpu_ms;
+	failure.out_tail =
+	    ReadFileTail(fs::path(progress_path).concat(".out"), GENERATION_OUT_TAIL_BYTES);
+	Update([&](SupervisorStats& s) {
+		failure.spawn = s.spawns;
+		s.failures.push_back(failure);
+	});
+}
+
+// Takes what a spawn leaves into the statistics after it ended: the program of each `predict` line,
+// the drops, and what the process used. It does it once for each spawn, and only after the child
+// has ended, since the usage is only there then.
+void StoreSupervisor::Impl::CollectSpawnStats() {
+	if (stats_collected || !child) {
+		return;
+	}
+	stats_collected = true;
+	progress.PollToEnd(ProgressClock::now());
+	NoteProgress();
+	CollectDrops();
+	RecordUsage();
+}
+
+// Publishes the predicted programs, and times the first `predict` line against the first spawn.
+void StoreSupervisor::Impl::NoteProgress() {
+	const auto& predicted = progress.PredictedHashes();
+	const auto  first     = progress.FirstPredictTime();
+	if (predicted.size() == predicted_published && !first) {
+		return;
+	}
+	Update([&](SupervisorStats& s) {
+		if (predicted.size() != predicted_published) {
+			s.predicted_hashes = predicted;
+		}
+		if (first && !s.child_open_ms) {
+			s.child_open_ms = MillisecondsBetween(first_spawn_time, *first);
+		}
+	});
+	predicted_published = predicted.size();
+}
+
+// Adds the drops of this spawn to the list of all of them.
+void StoreSupervisor::Impl::CollectDrops() {
+	const auto& drops = progress.DropsSinceSpawn();
+	if (drops.empty()) {
+		return;
+	}
+	Update([&](SupervisorStats& s) {
+		for (const auto& drop: drops) {
+			s.dropped.push_back(
+			    {.hash = drop.hash, .rank = drop.rank_or_count, .reason = drop.reason});
+		}
+	});
+}
+
+// Keeps what the ended child used. A figure the system did not give is left out, not zeroed.
+void StoreSupervisor::Impl::RecordUsage() {
+	const auto usage = child->Usage();
+	if (!usage) {
+		return;
+	}
+	SupervisorSpawnUsage spawn;
+	spawn.cpu_ms = usage->cpu_user_ms + usage->cpu_kernel_ms;
+	spawn.peak   = usage->peak;
+	last_cpu_ms  = spawn.cpu_ms;
+	Update([&](SupervisorStats& s) {
+		spawn.spawn = s.spawns;
+		s.spawn_usage.push_back(spawn);
+		if (spawn.peak && (!s.peak_memory || PeakReplaces(*s.peak_memory, *spawn.peak))) {
+			s.peak_memory = spawn.peak;
+		}
+	});
+}
+
+// Copies the programs the next run leaves out into the statistics.
+void StoreSupervisor::Impl::PublishHashLists() {
+	Update([&](SupervisorStats& s) {
+		s.failed_hashes = request.failed_hashes;
+		s.skip_hashes   = request.skip_hashes;
+	});
 }
 
 // Every program that a `drop` line gave up on stays out of the next run, except for the drop of a
@@ -502,6 +662,7 @@ void StoreSupervisor::Impl::Restart(const Verdict& verdict) {
 	} else if (verdict.blame) {
 		BlameLastLine();
 	}
+	PublishHashLists();
 	if (stats.restarts >= config.max_restarts) {
 		End(SupervisorOutcome::RestartsCapped, "restarts_capped");
 		return;
