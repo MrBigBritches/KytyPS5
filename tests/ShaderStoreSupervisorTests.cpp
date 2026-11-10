@@ -26,6 +26,7 @@
 #include <functional>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -73,6 +74,9 @@ constexpr size_t   STORE_HEADER_SIZE = 16;
 constexpr uint64_t EBOOT_SIZE        = 1234;
 constexpr uint64_t IDENTITY_HASH     = 0xFEED;
 constexpr int      CRASH_EXIT        = 321;
+// The stale file that the stale_gone fake looks for, and its exit when the file is still there.
+constexpr const char* STALE_PROBE_NAME       = "title.generated.4243.tmp";
+constexpr int         STALE_STILL_THERE_EXIT = WORKER_EXIT_EBOOT_UNREADABLE;
 // How long the fake sleeps where it is meant to hang, which is longer than any test waits.
 constexpr int HANG_SECONDS = 30;
 // The rank at which crash_damaged_start crashes, which is the first candidate of program 1.
@@ -509,7 +513,10 @@ void FakeWriteRecord(FakeRun& run, uint64_t rank, const FakeCandidate& candidate
 int FakeBuild(FakeRun& run) {
 	// This mode crashes at the start line of the rank it is asked to begin at, whatever the request
 	// says about failed programs, so that every restart meets a crash.
-	if (run.Is("crash_always")) {
+	if (run.Is("crash_always") || run.Is("crash_always_out")) {
+		if (run.Is("crash_always_out")) {
+			AppendWorkerOutText(run.request, "worker text before the crash\n");
+		}
 		const auto rank = run.request.start_rank % run.order.size();
 		run.files.Line("start " + std::to_string(run.request.start_rank) + " " +
 		               FakeFiles::Hex(run.order[rank].hash));
@@ -593,6 +600,17 @@ int RunFakeWorker(const std::string& mode_text, const fs::path& request_file) {
 	auto      words = SplitMode(mode_text);
 	const int spawn = SpawnIndex(*request);
 	FakeRun   run(*request, words, spawn);
+	// This mode writes its text file and then runs as a normal worker, which leaves the file for a
+	// finish to delete. It comes first so that a Verify answer leaves it too.
+	if (run.Is("out_normal")) {
+		AppendWorkerOutText(run.request, "worker text of a good run\n");
+	}
+	// This mode ends fatally when a stale file of a dead process is still in the folder at its
+	// start, which shows the cleanup came before the spawn.
+	if (run.Is("stale_gone") &&
+	    fs::exists(PathFromUtf8(run.request.output_path).parent_path() / STALE_PROBE_NAME)) {
+		return STALE_STILL_THERE_EXIT;
+	}
 	if (run.Is("exit")) {
 		return static_cast<int>(run.Arg(1));
 	}
@@ -2417,6 +2435,403 @@ void TestLoadFiguresInTheReport() {
 	CHECK(flagged.source == "generated" && !flagged.verify_ms.has_value());
 }
 
+// ---- Removing the helper files of dead and of finished runs. ----
+
+// Process ids of the fixtures. The injected check calls LIVE_PID running and every other id dead,
+// so no real dead process is needed. OWN_PID is what the direct calls give as the current process.
+constexpr uint32_t DEAD_PID = 4243;
+constexpr uint32_t LIVE_PID = 4242;
+constexpr uint32_t OWN_PID  = 7777;
+// The suffixes of one run's files.
+const std::vector<std::string> RUN_SUFFIXES = {".tmp", ".tmp.progress", ".tmp.request",
+                                               ".tmp.progress.out"};
+
+// Makes a small file, and the folders above it.
+void Touch(const fs::path& path) {
+	fs::create_directories(path.parent_path());
+	std::ofstream(path, std::ios::binary) << "x";
+}
+
+// The four files of one run of a title and a pid.
+std::vector<std::string> RunFileNames(const std::string& title, uint32_t pid) {
+	std::vector<std::string> names;
+	for (const auto& suffix: RUN_SUFFIXES) {
+		names.push_back(title + ".generated." + std::to_string(pid) + suffix);
+	}
+	return names;
+}
+
+// Every file and folder below a folder, as paths relative to it. Links are listed and not followed.
+std::set<std::string> ListFolder(const fs::path& folder) {
+	std::set<std::string> names;
+	std::error_code       error;
+	for (fs::recursive_directory_iterator it(folder, error), end; !error && it != end;
+	     it.increment(error)) {
+		names.insert(it->path().lexically_relative(folder).generic_string());
+	}
+	return names;
+}
+
+bool OnlyLivePidRuns(uint32_t pid) {
+	return pid == LIVE_PID;
+}
+bool EverythingRuns(uint32_t) {
+	return true;
+}
+// How long the slow check takes for a dead pid. A cleanup that came after the first spawn would
+// finish after the worker had looked, so the delay makes the order observable.
+constexpr auto SLOW_CHECK_DELAY = 400ms;
+bool           SlowCheckLivePidRuns(uint32_t pid) {
+    if (pid != LIVE_PID) {
+        std::this_thread::sleep_for(SLOW_CHECK_DELAY);
+    }
+    return pid == LIVE_PID;
+}
+
+// The name of a file is a stale one of the title only when all of it matches, with the title taken
+// literally, a numeric pid and one of the four suffixes. Each near miss differs from a good name in
+// one place.
+void TestStaleFileNames() {
+	CHECK(StaleFilePid("title.generated.4243.tmp", "title") == DEAD_PID);
+	CHECK(StaleFilePid("title.generated.4243.tmp.progress", "title") == DEAD_PID);
+	CHECK(StaleFilePid("title.generated.4243.tmp.request", "title") == DEAD_PID);
+	CHECK(StaleFilePid("title.generated.4243.tmp.progress.out", "title") == DEAD_PID);
+	const std::vector<std::string> near_misses = {
+	    "title.generated",
+	    "title.shaders",
+	    "title.bin",
+	    "title2.generated.4243.tmp",
+	    "xtitle.generated.4243.tmp",
+	    "title.generated.abc.tmp",
+	    "title.generated.-5.tmp",
+	    "title.generated..tmp",
+	    "title.generated.4243",
+	    "title.generated.4243.tmp.progress.bak",
+	    "title.generated.4243.tmp.progress.out.bak",
+	    "title.generated.4243.tmp.requests",
+	    "title.generated.4243.tmpx",
+	    "title.generated.4243x.tmp",
+	    "title.generated.99999999999999999999.tmp",
+	    "Title.generated.4243.tmp",
+	    "title_generated.4243.tmp",
+	};
+	for (const auto& name: near_misses) {
+		CHECK(!StaleFilePid(name, "title").has_value());
+	}
+	// A title with characters that a pattern would read specially is still taken literally.
+	CHECK(StaleFilePid("a+b(1).generated.7.tmp", "a+b(1)") == 7);
+	CHECK(!StaleFilePid("aab(1).generated.7.tmp", "a+b(1)").has_value());
+	CHECK(!StaleFilePid("a.b.generated.7.tmp", "axb").has_value());
+}
+
+// Creates the files of the cleanup test in a folder, and tells what is meant to go and what stays.
+struct StaleFixture {
+	std::vector<std::string> doomed;
+	std::vector<std::string> kept;
+	bool                     symlink_made = false;
+};
+
+StaleFixture MakeStaleFixture(const fs::path& folder) {
+	StaleFixture fixture;
+	fixture.doomed = RunFileNames("title", DEAD_PID);
+	for (const auto& name: fixture.doomed) {
+		Touch(folder / name);
+	}
+	// What is never deleted: the live run's four files, the current process's, the generated file,
+	// the main store, another title that this one is a prefix of, names that do not match in full
+	// and a matching name in a subfolder.
+	fixture.kept = RunFileNames("title", LIVE_PID);
+	for (const auto& name: RunFileNames("title", OWN_PID)) {
+		fixture.kept.push_back(name);
+	}
+	for (const auto& name: RunFileNames("title2", DEAD_PID)) {
+		fixture.kept.push_back(name);
+	}
+	for (const auto& name:
+	     {"title.generated", "title.shaders", "title.bin", "title.generated.abc.tmp",
+	      "title.generated.4243.tmp.progress.bak", "sub/title.generated.4243.tmp",
+	      "sub/title.generated.4243.tmp.request"}) {
+		fixture.kept.push_back(name);
+	}
+	for (const auto& name: fixture.kept) {
+		Touch(folder / name);
+	}
+	fixture.kept.push_back("sub");
+	// A directory with a matching name, with a file in it that goes with it if it were removed.
+	fs::create_directories(folder / "title.generated.4244.tmp");
+	Touch(folder / "title.generated.4244.tmp" / "inner.txt");
+	fixture.kept.push_back("title.generated.4244.tmp");
+	fixture.kept.push_back("title.generated.4244.tmp/inner.txt");
+	// A link with a matching name, to a file outside the folder. Creating one may be refused.
+	std::error_code error;
+	Touch(folder.parent_path() / "link_target.txt");
+	fs::create_symlink(folder.parent_path() / "link_target.txt",
+	                   folder / "title.generated.4245.tmp", error);
+	fixture.symlink_made = !error;
+	if (fixture.symlink_made) {
+		fixture.kept.push_back("title.generated.4245.tmp");
+	}
+	return fixture;
+}
+
+// The cleaner removes the four kinds of dead pid and nothing else. The folder holds the same names
+// beside them for every case that must stay: a live pid, the current pid (which the check calls
+// dead, so only the current pid rule keeps it), other titles, near misses, a directory, a link and
+// a subfolder.
+void TestStaleCleanupRemovesOnlyDeadRuns() {
+	TempDirectory directory;
+	const auto    folder  = (directory / "x").parent_path() / "store";
+	const auto    fixture = MakeStaleFixture(folder);
+	if (!fixture.symlink_made) {
+		std::fprintf(stderr, "skipped the symlink case, the system refused to create a link\n");
+	}
+	std::vector<std::string> log;
+	const auto               result =
+	    RemoveStaleGenerationFiles(folder, "title", OWN_PID, OnlyLivePidRuns,
+	                               [&](std::string_view line) { log.emplace_back(line); });
+	CHECK(result.removed == fixture.doomed.size() && result.failed == 0);
+	for (const auto& name: fixture.doomed) {
+		CHECK(!fs::exists(folder / name));
+		CHECK(std::ranges::any_of(
+		    log, [&](const std::string& line) { return line.find(name) != std::string::npos; }));
+	}
+	for (const auto& name: fixture.kept) {
+		std::error_code error;
+		CHECK(fs::exists(fs::symlink_status(folder / name, error)));
+	}
+	CHECK(log.size() == fixture.doomed.size());
+	// A link's target is as it was, so nothing followed the link.
+	CHECK(fs::exists(folder.parent_path() / "link_target.txt"));
+	// The folder holds exactly what was meant to stay and nothing more.
+	std::set<std::string> expected(fixture.kept.begin(), fixture.kept.end());
+	CHECK(ListFolder(folder) == expected);
+}
+
+// What a run in a folder left behind.
+struct FolderRun {
+	SupervisorStats          stats;
+	bool                     ended = false;
+	std::set<std::string>    remaining;
+	std::vector<std::string> log;
+	// The names that were there when the loader step ran, which is the last moment before the files
+	// of a finished run are deleted.
+	std::set<std::string> at_loader_end;
+	// The same at the moment of the rename.
+	std::set<std::string> at_rename;
+};
+
+// What a run in a folder is given.
+struct FolderOptions {
+	std::function<void(const fs::path&)>                    setup;
+	std::function<bool(uint32_t)>                           process_running = EverythingRuns;
+	std::optional<Bytes>                                    earlier;
+	bool                                                    rename_works = true;
+	std::function<void(SupervisorConfig&, const fs::path&)> tweak;
+	std::optional<std::chrono::milliseconds>                stop_after;
+};
+
+// Runs the supervisor over the fake in a folder of its own, listing the folder at the loader step
+// and the rename and at the end.
+FolderRun RunInFolder(const std::string& mode, const FolderOptions& options = {}) {
+	TempDirectory directory;
+	Collected     collected;
+	auto          config = MakeConfig(directory, mode, collected);
+	const auto    folder = (directory / "x").parent_path();
+	FolderRun     result;
+	std::mutex    seen_mutex;
+	config.process_running = options.process_running;
+	config.end_loader      = [&](std::stop_token, std::chrono::milliseconds) {
+        std::scoped_lock lock(seen_mutex);
+        result.at_loader_end = ListFolder(folder);
+	};
+	config.rename_file = [&, works = options.rename_works](const fs::path& from,
+	                                                       const fs::path& to) {
+		{
+			std::scoped_lock lock(seen_mutex);
+			result.at_rename = ListFolder(folder);
+		}
+		return works && Common::File::RenameFile(from, to);
+	};
+	if (options.tweak) {
+		options.tweak(config, folder);
+	}
+	if (options.setup) {
+		options.setup(folder);
+	}
+	if (options.earlier) {
+		std::ofstream(folder / "title.generated", std::ios::binary)
+		    .write(reinterpret_cast<const char*>(options.earlier->data()),
+		           static_cast<std::streamsize>(options.earlier->size()));
+	}
+	{
+		StoreSupervisor supervisor(std::move(config));
+		supervisor.Start();
+		if (options.stop_after) {
+			std::this_thread::sleep_for(*options.stop_after);
+		} else {
+			result.ended = supervisor.WaitForEnd(END_LIMIT);
+		}
+		supervisor.Stop();
+		result.stats = supervisor.Stats();
+	}
+	result.remaining = ListFolder(folder);
+	std::scoped_lock lock(collected.mutex);
+	result.log = collected.log;
+	return result;
+}
+
+// The names of this run's three helper files, as the supervisor names them.
+const std::vector<std::string> OWN_HELPERS = {"title.generated.1.tmp.progress",
+                                              "title.generated.1.tmp.request",
+                                              "title.generated.1.tmp.progress.out"};
+
+bool HasAll(const std::set<std::string>& names, const std::vector<std::string>& wanted) {
+	return std::ranges::all_of(wanted, [&](const auto& name) { return names.contains(name); });
+}
+bool HasNone(const std::set<std::string>& names, const std::vector<std::string>& unwanted) {
+	return std::ranges::none_of(unwanted, [&](const auto& name) { return names.contains(name); });
+}
+
+// At the start of a run the files of a dead process are gone, and the files of a live one are not.
+// The first worker finds the stale file already gone, which only a cleanup before the spawn gives,
+// and so does the first record of an earlier file given to the sink. The live pid is the baseline
+// of the same folder, the worker's check differs from it only in the pid.
+void TestStaleCleanupAtStart() {
+	const auto dead_names = RunFileNames("title", DEAD_PID);
+	const auto live_names = RunFileNames("title", LIVE_PID);
+	const auto run        = RunInFolder("stale_gone", {.setup =
+	                                                       [&](const fs::path& folder) {
+                                                        for (const auto& name: dead_names) {
+                                                            Touch(folder / name);
+                                                        }
+                                                        for (const auto& name: live_names) {
+                                                            Touch(folder / name);
+                                                        }
+                                                    },
+	                                                   .process_running = SlowCheckLivePidRuns});
+	// The worker saw no stale file, so it was not fatal, and it finished and renamed.
+	CHECK(run.ended && run.stats.outcome == SupervisorOutcome::Finished);
+	CHECK(run.stats.files_removed >= dead_names.size());
+	CHECK(HasNone(run.remaining, dead_names));
+	CHECK(HasAll(run.remaining, live_names));
+	CHECK(std::ranges::any_of(run.log, [](const std::string& line) {
+		return line.find("title.generated.4243.tmp.progress.out") != std::string::npos;
+	}));
+	// The same folder with the pid called running keeps the stale file, and the worker then ends
+	// fatally with the exit that says so, which is what shows the check is the worker's own.
+	const auto kept = RunInFolder(
+	    "stale_gone", {.setup = [&](const fs::path& folder) { Touch(folder / STALE_PROBE_NAME); }});
+	CHECK(kept.stats.outcome == SupervisorOutcome::Fatal &&
+	      kept.stats.inactive_reason == "worker_exit_" + std::to_string(STALE_STILL_THERE_EXIT));
+	CHECK(kept.remaining.contains(STALE_PROBE_NAME) && kept.stats.files_removed == 0);
+
+	// Before the load: the first record of the earlier file reaches the sink with the stale file
+	// already gone.
+	std::atomic<bool> stale_seen_at_first_record {true};
+	std::atomic<bool> got_record {false};
+	const auto        loaded = RunInFolder(
+        "normal",
+        {.setup = [&](const fs::path& folder) { Touch(folder / STALE_PROBE_NAME); },
+	            .process_running = OnlyLivePidRuns,
+	            .earlier         = EarlierFileBytes(LoadedIds(LOADED_RECORDS)),
+	            .tweak =
+	                [&](SupervisorConfig& config, const fs::path& folder) {
+                 config.sink = [&, probe = folder / STALE_PROBE_NAME](DecodedModuleRecord&&) {
+                     if (!got_record.exchange(true)) {
+                         stale_seen_at_first_record = fs::exists(probe);
+                     }
+                 };
+             }});
+	CHECK(loaded.stats.source == GenerationSource::Loaded && got_record);
+	CHECK(!stale_seen_at_first_record);
+}
+
+// A successful generation removes its three helper files after the rename, and not before. The
+// listing at the rename shows they were there to remove, and the end shows they are gone and the
+// generated file is in place. The text file is written by the worker only in this mode.
+void TestFinishRemovesOwnHelpers() {
+	const auto run = RunInFolder("out_normal");
+	CHECK(run.ended && run.stats.outcome == SupervisorOutcome::Finished);
+	CHECK(run.stats.persisted == GeneratedPersistence::Renamed);
+	CHECK(HasAll(run.at_rename, OWN_HELPERS));
+	CHECK(run.remaining.contains("title.generated"));
+	CHECK(HasNone(run.remaining, OWN_HELPERS));
+	CHECK(!run.remaining.contains("title.generated.1.tmp"));
+	CHECK(run.stats.files_removed == OWN_HELPERS.size() && run.stats.remove_failures == 0);
+	CHECK(MakeSupervisorReport(run.stats).files_removed == OWN_HELPERS.size());
+
+	// The same run whose rename fails keeps all three, and the temporary file. Differing only in
+	// the rename, it shows the success is what removes them.
+	const auto failed = RunInFolder("out_normal", {.rename_works = false});
+	CHECK(failed.stats.persisted == GeneratedPersistence::RenameFailed);
+	CHECK(HasAll(failed.remaining, OWN_HELPERS));
+	CHECK(failed.remaining.contains("title.generated.1.tmp") &&
+	      !failed.remaining.contains("title.generated"));
+	CHECK(failed.stats.files_removed == 0);
+}
+
+// A run that fails keeps its files for the next boot to remove as the files of a dead process.
+// Each ends in a way that leaves the request file at least, and the capped one leaves all three.
+void TestFailedRunKeepsItsFiles() {
+	const auto capped = RunInFolder(
+	    "crash_always_out",
+	    {.tweak = [](SupervisorConfig& config, const fs::path&) { config.max_restarts = 2; }});
+	CHECK(capped.stats.outcome == SupervisorOutcome::RestartsCapped);
+	CHECK(capped.stats.failures.size() == 3 && capped.stats.failures[0].exit_code == CRASH_EXIT);
+	CHECK(HasAll(capped.remaining, OWN_HELPERS));
+	CHECK(capped.stats.files_removed == 0);
+
+	const auto fatal = RunInFolder("exit:3");
+	CHECK(fatal.stats.outcome == SupervisorOutcome::Fatal);
+	CHECK(fatal.remaining.contains("title.generated.1.tmp.request"));
+	CHECK(fatal.stats.files_removed == 0);
+
+	const auto stopped = RunInFolder("sleep_silent", {.stop_after = STOP_AFTER_START});
+	CHECK(stopped.stats.outcome == SupervisorOutcome::Stopped);
+	CHECK(stopped.remaining.contains("title.generated.1.tmp.request"));
+	CHECK(stopped.stats.files_removed == 0);
+}
+
+// A finish of a loaded file has no temporary file and no rename, and Verify still left the text
+// file, so it goes with the request file. The listing at the loader step shows the text file was
+// there, which the worker wrote in this mode, and the generated file is untouched.
+void TestLoadedFinishRemovesTheOutFile() {
+	const auto file = EarlierFileBytes(LoadedIds(LOADED_RECORDS));
+	const auto run  = RunInFolder("out_normal", {.earlier = file});
+	CHECK(run.ended && run.stats.outcome == SupervisorOutcome::Finished);
+	CHECK(run.stats.source == GenerationSource::Loaded &&
+	      run.stats.persisted == GeneratedPersistence::Existing);
+	CHECK(run.at_loader_end.contains("title.generated.1.tmp.progress.out"));
+	CHECK(run.at_loader_end.contains("title.generated.1.tmp.request"));
+	CHECK(HasNone(run.remaining, OWN_HELPERS));
+	CHECK(run.remaining.contains("title.generated"));
+	CHECK(run.stats.files_removed >= 2 && run.stats.remove_failures == 0);
+}
+
+// A helper that cannot be deleted is logged by name and counted, the other helpers still go, and
+// the run still finishes. The worker text file is replaced by a folder with a file in it just
+// before the deletion, which no system lets fs::remove delete, and the same run without it is the
+// baseline that removes all three.
+void TestHelperRemovalFailureIsLogged() {
+	const auto run =
+	    RunInFolder("normal", {.tweak = [](SupervisorConfig& config, const fs::path& folder) {
+		                config.end_loader = [folder](std::stop_token, std::chrono::milliseconds) {
+			                Touch(folder / "title.generated.1.tmp.progress.out" / "held.txt");
+		                };
+	                }});
+	CHECK(run.ended && run.stats.outcome == SupervisorOutcome::Finished);
+	CHECK(run.stats.persisted == GeneratedPersistence::Renamed);
+	CHECK(run.stats.remove_failures == 1);
+	CHECK(run.remaining.contains("title.generated.1.tmp.progress.out/held.txt"));
+	CHECK(!run.remaining.contains("title.generated.1.tmp.request"));
+	CHECK(std::ranges::any_of(run.log, [](const std::string& line) {
+		return line.find("could not remove") != std::string::npos &&
+		       line.find("title.generated.1.tmp.progress.out") != std::string::npos;
+	}));
+	const auto baseline = RunInFolder("normal");
+	CHECK(baseline.stats.remove_failures == 0);
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -2484,6 +2899,13 @@ int main(int argc, char** argv) {
 	TestBadFrameLargerThanAReadIsDamaged();
 	TestStoppedRunReportsLoaded();
 	TestLoadFiguresInTheReport();
+	TestStaleFileNames();
+	TestStaleCleanupRemovesOnlyDeadRuns();
+	TestStaleCleanupAtStart();
+	TestFinishRemovesOwnHelpers();
+	TestFailedRunKeepsItsFiles();
+	TestLoadedFinishRemovesTheOutFile();
+	TestHelperRemovalFailureIsLogged();
 	if (g_failures == 0) {
 		std::puts("Shader store supervisor tests passed");
 	}

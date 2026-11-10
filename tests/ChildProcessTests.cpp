@@ -424,6 +424,38 @@ void TestTerminateHangingChild() {
 #endif
 }
 
+// ProcessIsRunning calls a live process running and a reaped one gone. The caller is the running
+// case that cannot be a stand in, and a hanging child that is then terminated is the same process
+// before and after, so only its end can have changed the answer.
+void TestProcessIsRunning() {
+	CHECK(Common::ProcessIsRunning(Common::CurrentProcessId()));
+	const auto     dir = MakeWorkDir("is_running");
+	ChildProcess   child;
+	const fs::path ready = dir / "child.pid";
+	CHECK(SpawnFake(child, {"hang", std::to_string(Common::CurrentProcessId()), Utf8(ready)}));
+	CHECK(WaitForFile(ready, FILE_WAIT_TIMEOUT));
+	const uint32_t pid = child.Pid();
+	CHECK(Common::ProcessIsRunning(pid));
+	child.Terminate();
+	CHECK(WaitUntilGone(pid, GONE_DEADLINE));
+	CHECK(!Common::ProcessIsRunning(pid));
+}
+
+// The mapping of a failed probe to gone or running, which is a pure function so that each system's
+// error numbers are tried on every system. Only the one error that means no such process is gone.
+void TestProcessProbeErrorMapping() {
+	constexpr uint32_t ACCESS_DENIED = 5;
+	constexpr uint32_t UNKNOWN_ERROR = 0xDEAD;
+	CHECK(Common::WindowsOpenErrorMeansGone(Common::WINDOWS_ERROR_INVALID_PARAMETER));
+	CHECK(Common::WINDOWS_ERROR_INVALID_PARAMETER == 87);
+	CHECK(!Common::WindowsOpenErrorMeansGone(ACCESS_DENIED));
+	CHECK(!Common::WindowsOpenErrorMeansGone(UNKNOWN_ERROR));
+	CHECK(!Common::WindowsOpenErrorMeansGone(0));
+	CHECK(Common::PosixKillErrorMeansGone(ESRCH));
+	CHECK(!Common::PosixKillErrorMeansGone(EPERM));
+	CHECK(!Common::PosixKillErrorMeansGone(EINVAL));
+}
+
 // A finished child leaves no process entry once the object is gone, and a running one is killed.
 void TestDestructor() {
 	const auto dir = MakeWorkDir("destructor");
@@ -812,6 +844,8 @@ int main(int argc, char** argv) {
 	TestPollWhileRunning();
 	TestTerminateHangingChild();
 	TestDestructor();
+	TestProcessIsRunning();
+	TestProcessProbeErrorMapping();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	TestNoHandleLeak();
 #endif

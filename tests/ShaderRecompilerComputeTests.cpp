@@ -62488,8 +62488,24 @@ BootGeneratingCache(VulkanHarness &vulkan, const std::filesystem::path &dir,
 }
 
 // Whether the directory holds a file the generator made, which is named like the store with
-// `.generated.` in it.
+// `.generated` in it.
 bool HasGeneratedFiles(const std::filesystem::path &dir) {
+  for (const auto &entry : std::filesystem::directory_iterator(dir))
+    if (entry.path().filename().string().find(".generated") != std::string::npos) return true;
+  return false;
+}
+
+// Whether the directory holds the finished generated file, which a good run renames its output to.
+// The helper and temporary files of the run are gone by then, so this is the one file that is left.
+bool HasFinishedGeneratedFile(const std::filesystem::path &dir) {
+  for (const auto &entry : std::filesystem::directory_iterator(dir))
+    if (entry.path().filename().string().ends_with(".generated")) return true;
+  return false;
+}
+
+// Whether the directory holds a temporary file of a generator or one of its helper files, which are
+// named `.generated.<pid>.tmp` with a suffix or without.
+bool HasStaleOrHelperFile(const std::filesystem::path &dir) {
   for (const auto &entry : std::filesystem::directory_iterator(dir))
     if (entry.path().filename().string().find(".generated.") != std::string::npos) return true;
   return false;
@@ -62583,8 +62599,9 @@ void CheckStoreGenerationNormal(VulkanHarness &vulkan, GuestGpu &gpu) {
       done += PipelineCacheTestAccess::WarmDone(*cache, id) ? 1 : 0;
     Require(name, "their builds are done", done == candidates,
             "the warm builds of the generated modules did not all finish");
-    Require(name, "the output is left for Step 7", HasGeneratedFiles(dir / "on"),
-            "the generator left no file of its own");
+    Require(name, "the finished file is left and its helpers are gone",
+            HasFinishedGeneratedFile(dir / "on") && !HasStaleOrHelperFile(dir / "on"),
+            "the generator left no finished file, or left a temporary or helper file");
     cache->StopBuilds();
     // The report holds the run: the supervisor finished once and the drain took every record in.
     Require(name, "the report holds the run",

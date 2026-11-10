@@ -246,7 +246,38 @@ struct SupervisorStats {
 	/// The size of the generated file once the run finished, which is the new file after a rename
 	/// and the loaded one after a Verify. Zero for a run that did not finish.
 	uint64_t file_bytes = 0;
+	/// Helper and temporary files that were deleted, the stale ones of dead processes at the start
+	/// and the run's own helpers after a success.
+	uint32_t files_removed = 0;
+	/// Deletions that failed. The file stays, and the failure is logged with its name.
+	uint32_t remove_failures = 0;
 };
+
+/// What the removal of stale files did.
+struct StaleCleanup {
+	uint32_t removed = 0;
+	uint32_t failed  = 0;
+};
+
+/// Removes the files that dead runs of this title left in a folder. A file qualifies when its whole
+/// name is `<title>.generated.<pid>.tmp`, or that with `.progress`, `.request` or `.progress.out`
+/// added, the title is taken literally, the pid is not current_pid and is_running says it is not
+/// running, and it is a regular file that is not a symlink. Only the folder itself is looked at.
+/// Each removal and each failure is logged by name.
+/// @param folder      the store's own folder.
+/// @param title       the store's title, which the names start with.
+/// @param current_pid the process id of this run, whose files are never touched here.
+/// @param is_running  tells whether a process id belongs to a running process.
+/// @param log         receives one line per removal or failure. May be empty.
+StaleCleanup RemoveStaleGenerationFiles(const std::filesystem::path& folder, std::string_view title,
+                                        uint32_t                                     current_pid,
+                                        const std::function<bool(uint32_t)>&         is_running,
+                                        const std::function<void(std::string_view)>& log);
+
+/// Whether a file name is one of the temporary or helper names of a run of this title, and the
+/// process id in it. The whole name has to match, so `<title>.generated`, another title that this
+/// one is a prefix of, a non numeric id and any other suffix do not.
+[[nodiscard]] std::optional<uint32_t> StaleFilePid(std::string_view name, std::string_view title);
 
 /// Whether a measured peak replaces the held one. Sources rank WorkingSet, then WorkingSetSampled,
 /// then Commit, since the first is the system's own figure for resident memory and the last counts
@@ -301,6 +332,10 @@ struct SupervisorConfig {
 	/// Renames the finished file over the generated one and tells whether it worked. Empty means
 	/// Common::File::RenameFile. A test replaces it to see when it is called and to make it fail.
 	std::function<bool(const std::filesystem::path&, const std::filesystem::path&)> rename_file;
+	/// Tells whether a process id belongs to a running process, for removing the files of dead
+	/// runs. Empty means Common::ProcessIsRunning. A test replaces it so that it needs no real dead
+	/// pid.
+	std::function<bool(uint32_t)> process_running;
 };
 
 /// The program a worker is started from: the running emulator. Linux gives the path whose file is

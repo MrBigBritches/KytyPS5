@@ -125,6 +125,8 @@ MakeSupervisorReport(const SupervisorStats& stats) {
 	block.loader_abandoned         = stats.loader_abandoned;
 	block.regenerated_after_damage = stats.regenerated_after_damage;
 	block.file_bytes               = stats.file_bytes;
+	block.files_removed            = stats.files_removed;
+	block.remove_failures          = stats.remove_failures;
 	block.spawns                   = stats.spawns;
 	block.restarts                 = stats.restarts;
 	block.spawn_ms                 = stats.spawn_ms;

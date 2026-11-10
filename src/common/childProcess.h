@@ -1,6 +1,7 @@
 #ifndef KYTY_COMMON_CHILD_PROCESS_H_
 #define KYTY_COMMON_CHILD_PROCESS_H_
 
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
@@ -26,6 +27,30 @@ namespace Common {
 
 /// Process id of the caller, in the form the child side needs for EnterChildMode.
 [[nodiscard]] uint32_t CurrentProcessId();
+
+/// The Windows error number of ERROR_INVALID_PARAMETER, which OpenProcess gives for a process id
+/// that no process has. Named here so the mapping below is testable on every system.
+constexpr uint32_t WINDOWS_ERROR_INVALID_PARAMETER = 87;
+
+/// Whether the error of a failed Windows OpenProcess says the process is gone. Only
+/// ERROR_INVALID_PARAMETER does. Access denied and every unknown error say nothing about it, so
+/// they count as running, since a file kept wrongly costs only disk and one deleted wrongly is
+/// lost.
+[[nodiscard]] constexpr bool WindowsOpenErrorMeansGone(uint32_t error) {
+	return error == WINDOWS_ERROR_INVALID_PARAMETER;
+}
+
+/// Whether the errno of a failed kill(pid, 0) says the process is gone. Only ESRCH does. EPERM
+/// means the process exists and belongs to someone else.
+[[nodiscard]] constexpr bool PosixKillErrorMeansGone(int error) {
+	return error == ESRCH;
+}
+
+/// Whether a process with this id is running. Anything that cannot be told apart from running
+/// counts as running, so a process that cannot be inspected is never called gone. A process that
+/// ended but was not yet reaped (a zombie child on POSIX) is called running. Ids are reused, so the
+/// answer is a snapshot.
+[[nodiscard]] bool ProcessIsRunning(uint32_t pid);
 
 /// Quotes one argument so CommandLineToArgvW and the Microsoft C runtime parse it back unchanged.
 [[nodiscard]] std::string QuoteWindowsArgument(std::string_view argument);

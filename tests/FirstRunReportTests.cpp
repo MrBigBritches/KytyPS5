@@ -1098,6 +1098,8 @@ void TestGenerationBlockFields() {
 	    {"source", [](auto& b) { b.source = "loaded_regenerated"; }, "/source",
 	     "loaded_regenerated"},
 	    {"file_bytes", [](auto& b) { b.file_bytes = 65000000; }, "/file_bytes", 65000000},
+	    {"files_removed", [](auto& b) { b.files_removed = 3; }, "/files_removed", 3},
+	    {"remove_failures", [](auto& b) { b.remove_failures = 2; }, "/remove_failures", 2},
 	    {"verify_ms", [](auto& b) { b.verify_ms = 312.5; }, "/verify_ms", 312.5},
 	    {"loader_abandoned", [](auto& b) { b.loader_abandoned = true; }, "/loader_abandoned", true},
 	    {"regenerated_after_damage", [](auto& b) { b.regenerated_after_damage = true; },

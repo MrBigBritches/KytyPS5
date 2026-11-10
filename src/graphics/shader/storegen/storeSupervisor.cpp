@@ -10,6 +10,8 @@
 #include "graphics/shader/storegen/workerProcess.h"
 
 #include <algorithm>
+#include <array>
+#include <charconv>
 #include <condition_variable>
 #include <deque>
 #include <fmt/format.h>
@@ -190,7 +192,77 @@ private:
 	bool                    m_stalled            = false;
 };
 
+// What follows the title in the name of a temporary file, then the process id, then one of the
+// suffixes. The temporary file itself and the three helper files of its run.
+constexpr std::string_view                GENERATED_INFIX   = ".generated.";
+constexpr std::array<std::string_view, 4> RUN_FILE_SUFFIXES = {".tmp", ".tmp.progress",
+                                                               ".tmp.request", ".tmp.progress.out"};
+
 } // namespace
+
+std::optional<uint32_t> StaleFilePid(std::string_view name, std::string_view title) {
+	// The title and the infix are matched as plain text, so a title with dots or other characters
+	// that a pattern would read specially is still taken literally.
+	if (!name.starts_with(title)) {
+		return std::nullopt;
+	}
+	name.remove_prefix(title.size());
+	if (!name.starts_with(GENERATED_INFIX)) {
+		return std::nullopt;
+	}
+	name.remove_prefix(GENERATED_INFIX.size());
+	uint32_t   pid    = 0;
+	const auto digits = std::from_chars(name.data(), name.data() + name.size(), pid);
+	// No digits, a sign or a number too large for an id is not one of ours. from_chars reads no
+	// sign for an unsigned type, so a leading minus gives no digits.
+	if (digits.ec != std::errc() || digits.ptr == name.data()) {
+		return std::nullopt;
+	}
+	const std::string_view rest(digits.ptr,
+	                            static_cast<size_t>(name.data() + name.size() - digits.ptr));
+	if (std::ranges::find(RUN_FILE_SUFFIXES, rest) == RUN_FILE_SUFFIXES.end()) {
+		return std::nullopt;
+	}
+	return pid;
+}
+
+StaleCleanup RemoveStaleGenerationFiles(const fs::path& folder, std::string_view title,
+                                        uint32_t                                     current_pid,
+                                        const std::function<bool(uint32_t)>&         is_running,
+                                        const std::function<void(std::string_view)>& log) {
+	StaleCleanup    result;
+	std::error_code error;
+	// A plain directory_iterator reads the folder itself and never descends, so a matching name in
+	// a subfolder is out of reach.
+	for (fs::directory_iterator it(folder, error), end; !error && it != end; it.increment(error)) {
+		const auto name = Utf8FromPath(it->path().filename());
+		const auto pid  = StaleFilePid(name, title);
+		if (!pid || *pid == current_pid || is_running(*pid)) {
+			continue;
+		}
+		// symlink_status looks at the link itself, so a link is never a regular file here and is
+		// kept, as is a directory with a matching name.
+		std::error_code status_error;
+		const auto      status = fs::symlink_status(it->path(), status_error);
+		if (status_error || !fs::is_regular_file(status)) {
+			continue;
+		}
+		std::error_code remove_error;
+		if (fs::remove(it->path(), remove_error) && !remove_error) {
+			result.removed++;
+			if (log) {
+				log("Shader store generation: removed the stale file " + name);
+			}
+		} else {
+			result.failed++;
+			if (log) {
+				log("Shader store generation: could not remove the stale file " + name + ", " +
+				    remove_error.message());
+			}
+		}
+	}
+	return result;
+}
 
 bool PeakReplaces(const Common::PeakMemory& held, const Common::PeakMemory& candidate) {
 	if (candidate.source != held.source) {
@@ -240,7 +312,9 @@ struct StoreSupervisor::Impl {
 	void                  Conclude(int exit_code, bool killed);
 	void                  Finish(bool verified_current);
 	void                  EndLoader();
-	void                  Persist();
+	GeneratedPersistence  Persist();
+	void                  RemoveStaleFiles();
+	void                  RemoveOwnHelperFiles();
 	void                  NoteExistingFile();
 	void                  NoteSource(bool verified_current);
 	[[nodiscard]] Verdict Judge(int exit_code, bool killed) const;
@@ -321,6 +395,9 @@ StoreSupervisor::Impl::Impl(SupervisorConfig supplied)
 	config.output_path = fs::absolute(config.output_path);
 	if (!config.generated_path.empty()) {
 		config.generated_path = fs::absolute(config.generated_path);
+	}
+	if (!config.process_running) {
+		config.process_running = &Common::ProcessIsRunning;
 	}
 	if (!config.rename_file) {
 		config.rename_file = [](const fs::path& from, const fs::path& to) {
@@ -414,6 +491,7 @@ void StoreSupervisor::Impl::Run(std::stop_token token) {
 // first worker. Returns false when that failed, and the outcome says why.
 bool StoreSupervisor::Impl::Begin() {
 	Common::File::CreateDirectories(config.output_path.parent_path());
+	RemoveStaleFiles();
 	std::error_code ignored;
 	for (const auto& stale: {request_path, progress_path, config.output_path,
 	                         fs::path(progress_path).concat(".out")}) {
@@ -747,18 +825,25 @@ void StoreSupervisor::Impl::Conclude(int exit_code, bool killed) {
 // outcome is set last, so a reader that sees Finished also sees what became of the file. A stop
 // that comes while the loader ends renames nothing, and the thread ends as Stopped. A run whose
 // worker found the earlier file current has written no file, so there is nothing to rename and the
-// earlier file is what persists.
+// earlier file is what persists. The helper files of the run are deleted after a rename that worked
+// and after such a loaded finish, and are kept after a failed rename.
 void StoreSupervisor::Impl::Finish(bool verified_current) {
 	EndLoader();
 	if (stop.stop_requested()) {
 		return;
 	}
+	auto persisted = GeneratedPersistence::Existing;
 	if (verified_current) {
 		NoteExistingFile();
 	} else {
-		Persist();
+		persisted = Persist();
 	}
 	NoteSource(verified_current);
+	// A failed rename keeps the helper files with the temporary file, which is what explains it,
+	// and so does a run that renamed nothing because it had no generated path.
+	if (persisted == GeneratedPersistence::Renamed || persisted == GeneratedPersistence::Existing) {
+		RemoveOwnHelperFiles();
+	}
 	End(SupervisorOutcome::Finished, "");
 }
 
@@ -814,10 +899,10 @@ void StoreSupervisor::Impl::NoteSource(bool verified_current) {
 // Renames the finished temporary file to the generated file and records the result. A failure keeps
 // the temporary file where it is, so the next boot finds nothing to load and generates again. An
 // empty generated_path (only a test leaves it so) renames nothing, and the run still ends Finished
-// with persisted left at NotFinished.
-void StoreSupervisor::Impl::Persist() {
+// with persisted left at NotFinished. Returns what persisted became.
+GeneratedPersistence StoreSupervisor::Impl::Persist() {
 	if (config.generated_path.empty()) {
-		return;
+		return GeneratedPersistence::NotFinished;
 	}
 	std::string error;
 	if (!config.rename_file(config.output_path, config.generated_path)) {
@@ -832,12 +917,55 @@ void StoreSupervisor::Impl::Persist() {
 	}
 	// A failed rename leaves no new generated file, so the size is only taken after a good one.
 	const auto bytes = error.empty() ? GeneratedFileSize(config.generated_path) : 0;
+	const auto result =
+	    error.empty() ? GeneratedPersistence::Renamed : GeneratedPersistence::RenameFailed;
 	Update([&](SupervisorStats& s) {
-		s.persisted =
-		    error.empty() ? GeneratedPersistence::Renamed : GeneratedPersistence::RenameFailed;
+		s.persisted     = result;
 		s.persist_error = std::move(error);
 		s.file_bytes    = bytes;
 	});
+	return result;
+}
+
+// Deletes the files of dead runs of this title that sit in the store's folder, once, before the
+// first worker is started and before the generated file is read. It does nothing without a
+// generated path, which is where the title is taken from.
+void StoreSupervisor::Impl::RemoveStaleFiles() {
+	constexpr std::string_view GENERATED_SUFFIX = ".generated";
+	const auto                 name             = Utf8FromPath(config.generated_path.filename());
+	if (config.generated_path.empty() || !name.ends_with(GENERATED_SUFFIX)) {
+		return;
+	}
+	const auto title   = std::string_view(name).substr(0, name.size() - GENERATED_SUFFIX.size());
+	const auto cleaned = RemoveStaleGenerationFiles(
+	    config.output_path.parent_path(), title, Common::CurrentProcessId(), config.process_running,
+	    [this](std::string_view line) { Log(std::string(line)); });
+	Update([&](SupervisorStats& s) {
+		s.files_removed += cleaned.removed;
+		s.remove_failures += cleaned.failed;
+	});
+}
+
+// Deletes this run's progress log, request file and worker text file once the run has succeeded,
+// since they only explain a run that went wrong. The worker has exited by now, so nothing holds the
+// text file, but a delete that still fails (a scanner, or a permission) is logged by name and
+// counted, and the file is left for the next boot to remove as the file of a dead process.
+void StoreSupervisor::Impl::RemoveOwnHelperFiles() {
+	const fs::path helpers[] = {progress_path, request_path,
+	                            fs::path(progress_path).concat(".out")};
+	for (const auto& helper: helpers) {
+		std::error_code error;
+		if (!fs::exists(helper, error)) {
+			continue;
+		}
+		if (fs::remove(helper, error) && !error) {
+			Update([](SupervisorStats& s) { s.files_removed++; });
+			continue;
+		}
+		Update([](SupervisorStats& s) { s.remove_failures++; });
+		Log("Shader store generation: could not remove " + Utf8FromPath(helper) + ", " +
+		    error.message());
+	}
 }
 
 void StoreSupervisor::Impl::RecordFailure(const Verdict& verdict, int exit_code) {

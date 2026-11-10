@@ -171,6 +171,20 @@ uint32_t CurrentProcessId() {
 	return GetCurrentProcessId();
 }
 
+bool ProcessIsRunning(uint32_t pid) {
+	// Only the query right is asked for, which is the one that most processes allow.
+	HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+	if (process == nullptr) {
+		return !WindowsOpenErrorMeansGone(GetLastError());
+	}
+	DWORD      code   = 0;
+	const BOOL gotten = GetExitCodeProcess(process, &code);
+	CloseHandle(process);
+	// An exit code that could not be read says nothing, so the process counts as running. A handle
+	// stays valid after the process ended, which is why the exit code is what tells.
+	return !gotten || code == STILL_ACTIVE;
+}
+
 struct ChildProcess::Impl {
 	HANDLE             process = nullptr;
 	HANDLE             job     = nullptr;
@@ -493,6 +507,18 @@ std::filesystem::path ExecutableStatPath() {
 
 uint32_t CurrentProcessId() {
 	return static_cast<uint32_t>(getpid());
+}
+
+bool ProcessIsRunning(uint32_t pid) {
+	// An id above the range of pid_t would wrap to a negative one, and kill would then signal a
+	// process group. Nothing is gone that cannot be asked about.
+	if (pid > static_cast<uint32_t>(INT32_MAX)) {
+		return true;
+	}
+	if (kill(static_cast<pid_t>(pid), 0) == 0) {
+		return true;
+	}
+	return !PosixKillErrorMeansGone(errno);
 }
 
 struct ChildProcess::Impl {

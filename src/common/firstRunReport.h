@@ -376,6 +376,10 @@ struct ShaderStoreGenerationReport {
 	bool regenerated_after_damage = false;
 	/// The size of the generated file once the run finished, or zero.
 	uint64_t file_bytes = 0;
+	/// Helper and temporary files of dead runs that were deleted at the start, and of this run
+	/// after it succeeded, and the deletions that failed.
+	uint32_t files_removed   = 0;
+	uint32_t remove_failures = 0;
 	/// running, finished, fatal, restarts_capped or stopped.
 	std::string outcome;
 	uint32_t    spawns   = 0;

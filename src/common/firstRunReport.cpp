@@ -1031,6 +1031,8 @@ nlohmann::json GenerationToJson(const ShaderStoreGenerationReport& block, int64_
 	}
 	json["source"]                   = block.source;
 	json["file_bytes"]               = block.file_bytes;
+	json["files_removed"]            = block.files_removed;
+	json["remove_failures"]          = block.remove_failures;
 	json["loader_abandoned"]         = block.loader_abandoned;
 	json["regenerated_after_damage"] = block.regenerated_after_damage;
 	SetOptional(json, "verify_ms", block.verify_ms);
