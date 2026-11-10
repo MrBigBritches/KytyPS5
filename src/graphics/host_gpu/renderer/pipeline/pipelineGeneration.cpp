@@ -1,9 +1,13 @@
+#include "common/childProcess.h"
+#include "common/logging/log.h"
 #include "graphics/host_gpu/renderer/pipeline/generationState.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shaderStoreRecord.h"
+#include "graphics/shader/storegen/ebootSource.h"
+#include "graphics/shader/storegen/storeWorkerFormat.h"
 
 #include <algorithm>
 #include <chrono>
@@ -38,6 +42,29 @@ void PipelineCache::EnableStoreGeneration() {
 	if (m_generation == nullptr) {
 		m_generation = std::make_unique<GenerationState>();
 	}
+}
+
+void PipelineCache::StartStoreGeneration(const std::filesystem::path& store_path,
+                                         std::span<const uint8_t>     header) {
+	EnableStoreGeneration();
+	StoreGen::SupervisorConfig config;
+	config.request.store_header.assign(header.begin(), header.end());
+	config.request.host_subgroup_size = HostComputeSubgroupSize(m_graphics);
+	config.request.eboot_path         = StoreGen::Utf8FromPath(StoreGen::EbootPath());
+	// The output is next to the store and named for this process, so two emulators of one title do
+	// not write one file.
+	const auto stem       = store_path.stem().string();
+	const auto pid        = std::to_string(Common::CurrentProcessId());
+	config.output_path    = store_path.parent_path() / (stem + ".generated." + pid + ".tmp");
+	config.generated_path = store_path.parent_path() / (stem + ".generated");
+	config.sink = [this](DecodedModuleRecord&& record) { PostGeneratedModule(std::move(record)); };
+	config.log = [](std::string_view text) { Log::WriteToConsoleAndLog(std::string(text) + "\n"); };
+	if (m_supervisor_tweak) {
+		m_supervisor_tweak(config);
+	}
+	m_generation->supervisor = std::make_unique<StoreGen::StoreSupervisor>(std::move(config));
+	m_generation->supervisor->Start();
+	Log::WriteToConsoleAndLog("Shader store generation: started\n");
 }
 
 // Runs on the generator's thread. It touches no cache map, only the device, which creates shader
@@ -213,7 +240,13 @@ void PipelineCache::StopStoreGeneration() {
 	if (m_generation == nullptr) {
 		return;
 	}
-	auto&                      state = *m_generation;
+	auto& state = *m_generation;
+	// The generator is stopped and joined first: it ends its child process on its own thread, and
+	// it is the only thing that posts into the state below. The destructor of the supervisor would
+	// do the same, but the order here does not depend on it.
+	if (state.supervisor) {
+		state.supervisor->Stop();
+	}
 	std::list<GeneratedModule> inbox;
 	{
 		std::scoped_lock lock(state.mutex);

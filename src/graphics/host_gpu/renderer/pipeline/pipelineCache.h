@@ -25,6 +25,7 @@
 #include <cstddef>
 #include <deque>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -52,6 +53,11 @@ struct TranslateResult;
 namespace ShaderRecompiler::IR {
 class ImageHeapSource;
 } // namespace ShaderRecompiler::IR
+
+namespace StoreGen {
+struct SupervisorConfig;
+class StoreSupervisor;
+} // namespace StoreGen
 
 namespace ShaderRecompiler::Spirv {
 struct Profile;
@@ -507,6 +513,9 @@ private:
 	struct GenerationState;
 	std::unique_ptr<GenerationState> m_generation;
 	std::atomic<bool>                m_has_generated {false};
+	// A test changes the generator's settings here, such as the program it starts and its timeouts,
+	// before WarmUp.
+	std::function<void(StoreGen::SupervisorConfig&)> m_supervisor_tweak;
 
 	template <typename InputInfo>
 	const ShaderModule* GetProgram(const ShaderParams& params, InputInfo& input_info,
@@ -608,6 +617,9 @@ private:
 
 	// Makes the state of the generated modules intake. Called once, before the generator starts.
 	void EnableStoreGeneration();
+	// Starts the shader store generator for the title whose store is at `store_path`, which WarmUp
+	// calls after the player's own records were queued. The generator writes next to the store.
+	void StartStoreGeneration(const std::filesystem::path& store_path, std::span<const uint8_t> header);
 	// Builds the module of a record on the generator's thread. Nothing when its plan cannot be
 	// decoded.
 	[[nodiscard]] std::optional<GeneratedModule> MakeGeneratedModule(DecodedModuleRecord&& record);
@@ -643,6 +655,9 @@ private:
 std::filesystem::path ShaderStorePath();
 // Host capabilities that change the emitted SPIR-V.
 ShaderRecompiler::Spirv::Profile SpirvProfile(const GraphicContext& graphics);
+// The subgroup size a compute shader runs with on this host, which the compute static key depends on.
+// The pipeline cache and the shader store worker's request both use it.
+uint32_t HostComputeSubgroupSize(const GraphicContext& graphics);
 
 // The descriptor set numbers of the split layout. The image heap keeps ImageHeapSet (1), which is
 // hard-coded in the SPIR-V, so the VS set is below it and the PS set above it.

@@ -3,11 +3,13 @@
 
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/shader/storegen/generatedDrainPlanner.h"
+#include "graphics/shader/storegen/storeSupervisor.h"
 
 #include <atomic>
 #include <chrono>
 #include <deque>
 #include <list>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <unordered_set>
@@ -55,6 +57,11 @@ struct PipelineCache::GenerationState {
 	std::atomic<uint64_t> destroyed {0};
 	std::atomic<uint64_t> bad_plans {0};
 	std::atomic<uint64_t> undrained_at_stop {0};
+
+	// The generator, which posts into this state. It is declared last so it is destroyed first, and
+	// StopStoreGeneration stops and joins it before anything else, so nothing posts after the rest
+	// is gone.
+	std::unique_ptr<StoreGen::StoreSupervisor> supervisor;
 };
 
 } // namespace Libs::Graphics

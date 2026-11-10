@@ -272,6 +272,10 @@ bool BackgroundWarmUpEnabled() {
 	return g_config->background_warm_up_enabled;
 }
 
+bool GenerateShaderStoreEnabled() {
+	return g_config->generate_shader_store_enabled;
+}
+
 bool DeferredPipelineDrawsEnabled() {
 	return g_config->deferred_pipeline_draws_enabled;
 }

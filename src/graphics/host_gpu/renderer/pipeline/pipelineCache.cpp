@@ -296,6 +296,10 @@ void LogHostFloatMinMaxVerdict(HostFloatMinMaxVerdict verdict) {
 
 } // namespace
 
+uint32_t HostComputeSubgroupSize(const GraphicContext& graphics) {
+	return graphics.SupportsComputeWave64() ? 64u : 32u;
+}
+
 ShaderRecompiler::Spirv::Profile SpirvProfile(const GraphicContext& graphics) {
 	const bool flag_on = Config::NativeFloatMinMaxEnabled();
 	const auto verdict = HostFloatMinMaxVerdictFor(graphics, flag_on);
@@ -984,7 +988,7 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 
 const ShaderModule* PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs,
                                                      ShaderComputeInputInfo&      input_info) {
-	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
+	input_info.host_subgroup_size = HostComputeSubgroupSize(m_graphics);
 	const auto        params      = PrepareProgram(regs, input_info);
 	input_info.lds_storage = input_info.lds_size_dwords * 4u >
 	    m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize;
@@ -1730,6 +1734,9 @@ void PipelineCache::StopWarmBuilds() {
 }
 
 void PipelineCache::StopBuilds() {
+	// The generator goes first: it posts modules whose builds belong to the warm queue, and the
+	// child process it owns must be gone before the queue is.
+	StopStoreGeneration();
 	StopWarmBuilds();
 	if (m_build_queue == nullptr) {
 		return;

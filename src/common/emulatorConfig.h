@@ -113,6 +113,10 @@ struct ConfigOptions {
 	// Builds the compute pipelines of the shader store on low priority workers while the game runs,
 	// instead of making boot wait for all of them.
 	bool                   background_warm_up_enabled  = false;
+	// Predicts the compute shaders of a Motor title from its eboot and translates them in a low
+	// priority helper process, so the warm-up finds them ready. Needs shader_cache_enabled and
+	// background_warm_up_enabled, and does nothing without both.
+	bool                   generate_shader_store_enabled = false;
 	// Lets a draw that misses its graphics pipeline carry on while the pipeline builds, with the
 	// draw recorded afterwards. Stands alone and enables no draw skips.
 	bool                   deferred_pipeline_draws_enabled = false;
@@ -229,6 +233,9 @@ bool AsyncPipelinesEnabled();
 bool AsyncPipelinesDepthOnly();
 /// True when --background-warm-up builds the shader store's compute pipelines after boot.
 bool BackgroundWarmUpEnabled();
+/// True when --generate-shader-store asks for the shader store to be generated from the eboot. The
+/// pipeline cache decides whether it can, and says why not.
+bool GenerateShaderStoreEnabled();
 /// True when --deferred-pipeline-draws lets draws wait for their pipeline out of line.
 bool DeferredPipelineDrawsEnabled();
 /// True when --pause-warm-up-for-draws holds the warm-up queue while deferred draws resolve.

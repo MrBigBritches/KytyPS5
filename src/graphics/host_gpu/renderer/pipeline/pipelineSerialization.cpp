@@ -11,6 +11,9 @@
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/ir/Serialize.h"
 #include "graphics/shader/shaderStoreRecord.h"
+#include "graphics/shader/storegen/ebootSource.h"
+#include "graphics/shader/storegen/storeGenerationGate.h"
+#include "graphics/shader/storegen/storeSupervisor.h"
 
 #include <algorithm>
 #include <chrono>
@@ -48,6 +51,17 @@ std::vector<uint8_t> StoreHeader(const GraphicContext& graphics) {
 	IoAll(header, stamp, Config::StructuredJumpTablesEnabled(), SpirvProfile(graphics),
 	      graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize);
 	return std::move(header.bytes);
+}
+
+// Why --generate-shader-store cannot run for this store, or nothing when it can.
+std::optional<std::string> StoreGenerationReason(const GraphicContext&          graphics,
+                                                 const std::filesystem::path& path) {
+	return StoreGen::StoreGenerationAvailability(
+	    {.background_warm_up_enabled = Config::BackgroundWarmUpEnabled(),
+	     .shader_store_path_empty    = path.empty(),
+	     .store_header_empty         = StoreHeader(graphics).empty(),
+	     .eboot_path                 = StoreGen::EbootPath(),
+	     .executable_path            = StoreGen::WorkerProgramPath()});
 }
 
 } // namespace
@@ -130,6 +144,17 @@ void PipelineCache::AddComputeWarmUp(const ModuleMap&                           
 }
 
 void PipelineCache::WarmUp(const std::filesystem::path& path) {
+	// Asked before the early return, since an empty store path is one of the reasons. With the flag
+	// off none of this runs and nothing is logged.
+	const bool                 generation_wanted = Config::GenerateShaderStoreEnabled();
+	std::optional<std::string> generation_off_reason;
+	if (generation_wanted) {
+		generation_off_reason = StoreGenerationReason(m_graphics, path);
+		if (generation_off_reason) {
+			Log::WriteToConsoleAndLog(
+			    fmt::format("Shader store generation: inactive ({})\n", *generation_off_reason));
+		}
+	}
 	if (path.empty()) {
 		return;
 	}
@@ -173,6 +198,10 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 	}
 	AddComputeWarmUp(modules, jobs);
 	std::vector<uint64_t>().swap(m_module_record_order);
+	// The player's own records are queued by now, so what the generator makes comes behind them.
+	if (generation_wanted && !generation_off_reason) {
+		StartStoreGeneration(path, header);
+	}
 	Common::ParallelFor(jobs.size(), [&](size_t i) { jobs[i](); });
 	// A key with a stage missing from the store keeps no pipeline.
 	std::erase_if(m_graphics_pipelines,

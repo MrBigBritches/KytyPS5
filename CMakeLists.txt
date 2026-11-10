@@ -890,6 +890,14 @@ if(BUILD_TESTING)
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --async-pipelines-depth-only)
 	add_test(NAME emulator_background_warm_up_cli
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --background-warm-up)
+	add_test(NAME emulator_generate_shader_store_cli
+	         COMMAND $<TARGET_FILE:kyty_emulator> --help --generate-shader-store)
+	# A pass regex ignores the exit code, and the usage printed on a parse error also has this
+	# line, so the help text is checked separately from the flag parsing above.
+	add_test(NAME emulator_generate_shader_store_help
+	         COMMAND $<TARGET_FILE:kyty_emulator> --help --generate-shader-store)
+	set_tests_properties(emulator_generate_shader_store_help PROPERTIES
+	                     PASS_REGULAR_EXPRESSION "--generate-shader-store +Predict a Motor title")
 	add_test(NAME emulator_deferred_pipeline_draws_cli
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --deferred-pipeline-draws)
 	add_test(NAME emulator_pause_warm_up_for_draws_cli
@@ -984,6 +992,9 @@ if(BUILD_TESTING)
 	add_test(NAME shader_store_worker COMMAND $<TARGET_FILE:shader_store_worker_tests>)
 	add_test(NAME shader_store_dispatch COMMAND $<TARGET_FILE:shader_store_dispatch_tests>)
 	set_tests_properties(shader_store_dispatch PROPERTIES TIMEOUT 300)
+	add_test(NAME shader_recompiler_store_generation
+	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --store-generation-only)
+	set_tests_properties(shader_recompiler_store_generation PROPERTIES TIMEOUT 600)
 	add_test(NAME shader_recompiler_generated_modules
 	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --generated-modules-only)
 	add_test(NAME shader_recompiler_submit_cadence

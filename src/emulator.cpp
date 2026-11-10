@@ -14,6 +14,7 @@
 #include "common/threads.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/window.h"
+#include "graphics/shader/storegen/ebootSource.h"
 #include "kernel/fileSystem.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
@@ -220,6 +221,12 @@ void Run(const RunOptions& options) {
 
 	Libs::LibKernel::FileSystem::Mount(options.app0_dir, "/app0");
 	Libs::LibKernel::FileSystem::Mount(options.app0_dir, "/hostapp");
+	// Only for --generate-shader-store, so a run without it does nothing more here. The worker reads
+	// the eboot by this path, which for an archive is a member of it, and it needs no mount.
+	if (options.config.generate_shader_store_enabled) {
+		Libs::Graphics::StoreGen::SetEbootPath(Libs::LibKernel::FileSystem::GetRealFilename(
+		    Common::PathToGenericString(options.elf)));
+	}
 
 	MountSandboxDirs();
 
