@@ -1077,7 +1077,8 @@ void TestGenerationBlockFields() {
 		return GenerationBlock(report);
 	};
 	const auto base = block_of({});
-	Check(base["active"] == true && base["supervisor"]["outcome"] == "" &&
+	Check(base["active"] == true && base["persisted"] == "not_finished" &&
+	          !base.contains("persist_error") && base["supervisor"]["outcome"] == "" &&
 	          !base["supervisor"].contains("finished_ms") &&
 	          !base["supervisor"].contains("ended_ms") &&
 	          !base["supervisor"].contains("child_open_ms") &&
@@ -1088,6 +1089,9 @@ void TestGenerationBlockFields() {
 	    {"active", [](auto& b) { b.active = false; }, "/active", false},
 	    {"inactive_reason", [](auto& b) { b.inactive_reason = "restarts_capped"; },
 	     "/inactive_reason", "restarts_capped"},
+	    {"persisted", [](auto& b) { b.persisted = "renamed"; }, "/persisted", "renamed"},
+	    {"persist_error", [](auto& b) { b.persist_error = "rename of a to b failed"; },
+	     "/persist_error", "rename of a to b failed"},
 	    {"outcome", [](auto& b) { b.outcome = "finished"; }, "/supervisor/outcome", "finished"},
 	    {"spawns", [](auto& b) { b.spawns = 4; }, "/supervisor/spawns", 4},
 	    {"restarts", [](auto& b) { b.restarts = 3; }, "/supervisor/restarts", 3},

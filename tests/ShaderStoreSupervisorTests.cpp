@@ -14,7 +14,9 @@
 #include "graphics/shader/storegen/storeWorkerFormat.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -622,7 +624,13 @@ int RunFakeWorker(const std::string& mode_text, const fs::path& request_file) {
 		return WORKER_EXIT_ORDER_MISMATCH;
 	}
 	FakeOpenOutput(run);
-	return FakeBuild(run);
+	const int code = FakeBuild(run);
+	// This mode has written everything, summary line included, and then stays alive for a while
+	// with the output file still open, as a worker that is slow to exit would.
+	if (run.Is("linger")) {
+		std::this_thread::sleep_for(std::chrono::milliseconds(run.Arg(1)));
+	}
+	return code;
 }
 
 // ---- The harness. ----
@@ -1653,6 +1661,294 @@ void TestDrainFiguresAreMapped() {
 	CHECK(out.bad_plans == 17 && out.undrained_at_stop == 18 && out.pending == 19);
 }
 
+// ---- Finishing: the rename of the generated file. ----
+
+// How long the lingering fake stays alive after it wrote everything, which is far more than the
+// settle time below and short enough to wait out.
+constexpr int      LINGER_MS          = 2000;
+constexpr auto     LINGER_SETTLE      = 400ms;
+constexpr auto     WAIT_STEP          = 10ms;
+constexpr auto     WAIT_LIMIT         = 10s;
+constexpr auto     STOP_AFTER_START   = 300ms;
+constexpr auto     HANG_KILL_TIMEOUT  = 300ms;
+constexpr uint32_t REPEATED_CRASH_CAP = 2;
+
+// A file's bytes, or nothing when it does not exist.
+std::optional<Bytes> ReadBytes(const fs::path& path) {
+	std::ifstream in(path, std::ios::binary);
+	if (!in) {
+		return std::nullopt;
+	}
+	return Bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+}
+
+// The bytes a fake worker that finishes leaves in its output: the header and then one frame for
+// each candidate, in the order it writes them.
+Bytes ExpectedOutput() {
+	Bytes bytes = GeneratedHeaderBytes({});
+	for (const auto& candidate: FakeOrder({})) {
+		const auto frame = FrameStoreRecord(ModuleRecord(candidate.id, candidate.hash));
+		bytes.insert(bytes.end(), frame.begin(), frame.end());
+	}
+	return bytes;
+}
+
+// Waits until the supervisor has taken every record of the fake.
+bool WaitForAllRecords(StoreSupervisor& supervisor) {
+	for (auto waited = 0ms; waited < WAIT_LIMIT; waited += WAIT_STEP) {
+		if (supervisor.Stats().posted == PROGRAMS * CANDIDATES_EACH) {
+			return true;
+		}
+		std::this_thread::sleep_for(WAIT_STEP);
+	}
+	return false;
+}
+
+// What the loader and rename hooks saw, in the order they were called.
+struct FinishEvents {
+	std::mutex                mutex;
+	std::vector<std::string>  order;
+	std::chrono::milliseconds loader_wait {0};
+
+	void Add(const std::string& name) {
+		std::scoped_lock lock(mutex);
+		order.push_back(name);
+	}
+	std::vector<std::string> Order() {
+		std::scoped_lock lock(mutex);
+		return order;
+	}
+};
+
+// What a run of a finish test is given.
+struct FinishOptions {
+	bool with_loader  = false;
+	bool rename_works = true;
+	// A file that is in the generated file's place when the run starts.
+	std::optional<std::string> old_generated;
+	// Stops the run this long after it started instead of waiting for its end.
+	std::optional<std::chrono::milliseconds> stop_after;
+	// Stops the run once the worker has written everything and has had time to be found alive.
+	bool                                   stop_after_records = false;
+	std::function<void(SupervisorConfig&)> tweak;
+};
+
+// Records a call of the loader step and of the rename. The rename does what the supervisor's
+// own does, or fails, as the options say.
+void InstallFinishHooks(SupervisorConfig& config, FinishEvents& events,
+                        const FinishOptions& options) {
+	if (options.with_loader) {
+		config.end_loader = [&events](std::stop_token, std::chrono::milliseconds wait) {
+			events.loader_wait = wait;
+			events.Add("loader");
+		};
+	}
+	config.rename_file = [&events, works = options.rename_works](const fs::path& from,
+	                                                             const fs::path& to) {
+		events.Add("rename");
+		return works && Common::File::RenameFile(from, to);
+	};
+}
+
+// What a finish test looks at once the run is over, taken before the folder is gone.
+struct FinishRun {
+	SupervisorStats          stats;
+	bool                     ended = false;
+	std::vector<std::string> events;
+	std::optional<Bytes>     generated;
+	std::optional<Bytes>     temporary;
+	std::vector<std::string> log;
+};
+
+// Runs the supervisor over a fake with the hooks installed and reads the two files at the end.
+FinishRun RunFinish(const std::string& mode, const FinishOptions& options = {}) {
+	TempDirectory directory;
+	Collected     collected;
+	auto          config = MakeConfig(directory, mode, collected);
+	FinishEvents  events;
+	InstallFinishHooks(config, events, options);
+	if (options.tweak) {
+		options.tweak(config);
+	}
+	if (options.old_generated) {
+		std::ofstream(directory / "title.generated", std::ios::binary) << *options.old_generated;
+	}
+	FinishRun result;
+	{
+		StoreSupervisor supervisor(std::move(config));
+		supervisor.Start();
+		if (options.stop_after_records) {
+			CHECK(WaitForAllRecords(supervisor));
+			std::this_thread::sleep_for(LINGER_SETTLE);
+		} else if (options.stop_after) {
+			std::this_thread::sleep_for(*options.stop_after);
+		} else {
+			result.ended = supervisor.WaitForEnd(END_LIMIT);
+		}
+		supervisor.Stop();
+		result.stats = supervisor.Stats();
+	}
+	result.events    = events.Order();
+	result.generated = ReadBytes(directory / "title.generated");
+	result.temporary = ReadBytes(directory / "title.generated.1.tmp");
+	std::scoped_lock lock(collected.mutex);
+	result.log = collected.log;
+	return result;
+}
+
+// A finished worker's file is renamed to the generated file, over an older one, and the temporary
+// is gone. The bytes are the worker's own, which nothing else in the folder could be. The loader
+// step runs first when there is one and the run is the same without it.
+void TestFinishRenamesTheFile() {
+	const auto plain = RunFinish("normal", {.old_generated = "OLD"});
+	CHECK(plain.ended && plain.stats.outcome == SupervisorOutcome::Finished);
+	CHECK(plain.stats.persisted == GeneratedPersistence::Renamed &&
+	      plain.stats.persist_error.empty());
+	CHECK(plain.generated == ExpectedOutput());
+	CHECK(!plain.temporary.has_value());
+	// No loader gives no loader step, and the rename is all there is.
+	CHECK(plain.events == std::vector<std::string> {"rename"});
+
+	const auto loaded = RunFinish("normal", {.with_loader = true});
+	CHECK(loaded.stats.outcome == SupervisorOutcome::Finished);
+	CHECK(loaded.events == (std::vector<std::string> {"loader", "rename"}));
+	CHECK(loaded.generated == ExpectedOutput() && !loaded.temporary.has_value());
+}
+
+// The worker has written the whole file and its summary and is still alive. Nothing is renamed
+// then, since the worker may still hold the file, and the rename comes after its exit. The same
+// run after the exit is the baseline: it differs only in the child having ended.
+void TestNoRenameWhileTheChildIsAlive() {
+	TempDirectory directory;
+	Collected     collected;
+	auto          config = MakeConfig(directory, "linger:" + std::to_string(LINGER_MS), collected);
+	FinishEvents  events;
+	InstallFinishHooks(config, events, {.with_loader = true});
+	StoreSupervisor supervisor(std::move(config));
+	supervisor.Start();
+	CHECK(WaitForAllRecords(supervisor));
+	std::this_thread::sleep_for(LINGER_SETTLE);
+	// Every record is in, the file is complete and the summary is written, so the only thing that
+	// holds the finish back is that the child lives.
+	CHECK(supervisor.Stats().outcome == SupervisorOutcome::Running);
+	CHECK(events.Order().empty());
+	CHECK(!ReadBytes(directory / "title.generated").has_value());
+	CHECK(ReadBytes(directory / "title.generated.1.tmp") == ExpectedOutput());
+	CHECK(supervisor.Stats().persisted == GeneratedPersistence::NotFinished);
+
+	CHECK(supervisor.WaitForEnd(END_LIMIT));
+	supervisor.Stop();
+	CHECK(supervisor.Stats().outcome == SupervisorOutcome::Finished);
+	CHECK(events.Order() == (std::vector<std::string> {"loader", "rename"}));
+	CHECK(ReadBytes(directory / "title.generated") == ExpectedOutput());
+}
+
+// A run that does not finish leaves no generated file and calls neither the loader step nor the
+// rename. Each case ends a different way and the finished run above is their baseline.
+void TestNoRenameWithoutAFinish() {
+	const auto check_unfinished = [](const FinishRun& run, SupervisorOutcome outcome) {
+		CHECK(run.stats.outcome == outcome);
+		CHECK(run.stats.persisted == GeneratedPersistence::NotFinished);
+		CHECK(run.events.empty());
+		CHECK(!run.generated.has_value());
+	};
+	// Killed for a hang, with no restart left. The partial file is still there as a temporary.
+	const auto killed = RunFinish("hang_start:3", {.with_loader = true, .tweak = [](auto& config) {
+		                                               config.candidate_timeout = HANG_KILL_TIMEOUT;
+		                                               config.max_restarts      = 0;
+	                                               }});
+	check_unfinished(killed, SupervisorOutcome::RestartsCapped);
+	CHECK(killed.stats.failures.size() == 1 && killed.stats.failures[0].kind == FailureKind::Hang);
+	CHECK(killed.temporary.has_value());
+	// Crashes up to the cap.
+	const auto capped = RunFinish("crash_always", {.with_loader = true, .tweak = [](auto& config) {
+		                                               config.max_restarts = REPEATED_CRASH_CAP;
+	                                               }});
+	check_unfinished(capped, SupervisorOutcome::RestartsCapped);
+	CHECK(capped.stats.failures.size() == REPEATED_CRASH_CAP + 1);
+	// A fatal exit.
+	check_unfinished(RunFinish("exit:3", {.with_loader = true}), SupervisorOutcome::Fatal);
+	// Told to stop while the child works, and told to stop after it wrote everything and before it
+	// exited.
+	check_unfinished(
+	    RunFinish("sleep_silent", {.with_loader = true, .stop_after = STOP_AFTER_START}),
+	    SupervisorOutcome::Stopped);
+	const auto stopped_late = RunFinish("linger:" + std::to_string(LINGER_MS),
+	                                    {.with_loader = true, .stop_after_records = true});
+	check_unfinished(stopped_late, SupervisorOutcome::Stopped);
+	CHECK(stopped_late.temporary == ExpectedOutput());
+}
+
+// A rename that fails is reported with its reason, keeps the temporary file with the worker's
+// bytes, and leaves no generated file. The run is the successful one with the rename replaced.
+void TestRenameFailureKeepsTheTemporary() {
+	const auto failed = RunFinish("normal", {.with_loader = true, .rename_works = false});
+	CHECK(failed.ended && failed.stats.outcome == SupervisorOutcome::Finished);
+	CHECK(failed.stats.persisted == GeneratedPersistence::RenameFailed);
+	CHECK(failed.stats.persist_error.find("title.generated") != std::string::npos);
+	CHECK(failed.stats.persist_error.find("source kept") != std::string::npos);
+	CHECK(failed.events == (std::vector<std::string> {"loader", "rename"}));
+	CHECK(!failed.generated.has_value());
+	CHECK(failed.temporary == ExpectedOutput());
+	CHECK(std::ranges::any_of(failed.log, [&](const std::string& line) {
+		return line.find(failed.stats.persist_error) != std::string::npos;
+	}));
+	// The report carries the same two facts, which the successful run does not.
+	const auto block = MakeSupervisorReport(failed.stats);
+	CHECK(block.persisted == "rename_failed" && block.persist_error == failed.stats.persist_error);
+	const auto good = MakeSupervisorReport(RunFinish("normal").stats);
+	CHECK(good.persisted == "renamed" && good.persist_error.empty());
+}
+
+// A stop that comes while the loader step waits ends the wait at once, and renames nothing. The
+// hook gets the stop token and the bounded wait, so a loader can check the one and honour the
+// other. A loader that returns at once is the baseline, which renames.
+void TestStopDuringTheLoaderStep() {
+	TempDirectory     directory;
+	Collected         collected;
+	auto              config = MakeConfig(directory, "normal", collected);
+	FinishEvents      events;
+	std::atomic<bool> entered {false};
+	InstallFinishHooks(config, events, {});
+	config.end_loader = [&](std::stop_token token, std::chrono::milliseconds wait) {
+		events.loader_wait = wait;
+		entered            = true;
+		std::mutex                  idle;
+		std::condition_variable_any wake;
+		std::unique_lock            lock(idle);
+		wake.wait_for(lock, token, wait, [] { return false; });
+	};
+	StoreSupervisor supervisor(std::move(config));
+	supervisor.Start();
+	for (auto waited = 0ms; waited < WAIT_LIMIT && !entered; waited += WAIT_STEP) {
+		std::this_thread::sleep_for(WAIT_STEP);
+	}
+	CHECK(entered);
+	const auto begin = std::chrono::steady_clock::now();
+	supervisor.Stop();
+	// The wait is 5 s, so a prompt return shows the token was checked.
+	CHECK(std::chrono::steady_clock::now() - begin < STOP_LIMIT);
+	CHECK(events.loader_wait == GENERATION_LOADER_END_WAIT);
+	const auto stats = supervisor.Stats();
+	CHECK(stats.outcome == SupervisorOutcome::Stopped);
+	CHECK(stats.persisted == GeneratedPersistence::NotFinished);
+	CHECK(events.Order().empty());
+	CHECK(!ReadBytes(directory / "title.generated").has_value());
+}
+
+// persisted is carried to the report whatever the outcome is, so a stop that came after a rename
+// shows as stopped with renamed. A run that did not finish says not_finished.
+void TestPersistedInTheReport() {
+	SupervisorStats stats;
+	stats.outcome              = SupervisorOutcome::Stopped;
+	stats.persisted            = GeneratedPersistence::Renamed;
+	const auto stopped_renamed = MakeSupervisorReport(stats);
+	CHECK(stopped_renamed.outcome == "stopped" && stopped_renamed.persisted == "renamed");
+	stats.persisted = GeneratedPersistence::NotFinished;
+	CHECK(MakeSupervisorReport(stats).persisted == "not_finished");
+	CHECK(std::string(PersistedName(GeneratedPersistence::RenameFailed)) == "rename_failed");
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -1700,6 +1996,12 @@ int main(int argc, char** argv) {
 	TestReportFromFinishedAndEndedRuns();
 	TestReportRows();
 	TestDrainFiguresAreMapped();
+	TestFinishRenamesTheFile();
+	TestNoRenameWhileTheChildIsAlive();
+	TestNoRenameWithoutAFinish();
+	TestRenameFailureKeepsTheTemporary();
+	TestStopDuringTheLoaderStep();
+	TestPersistedInTheReport();
 	if (g_failures == 0) {
 		std::puts("Shader store supervisor tests passed");
 	}

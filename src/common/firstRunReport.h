@@ -359,6 +359,11 @@ struct ShaderStoreGenerationReport {
 	/// restarts_capped), and then inactive_reason says why.
 	bool        active = true;
 	std::string inactive_reason;
+	/// What became of the finished file: renamed, rename_failed or not_finished. It is the field to
+	/// trust for what is on disk, since a run reported as stopped can still have renamed its file.
+	std::string persisted = "not_finished";
+	/// Why the rename failed. Empty for any other value of persisted.
+	std::string persist_error;
 	/// running, finished, fatal, restarts_capped or stopped.
 	std::string outcome;
 	uint32_t    spawns   = 0;

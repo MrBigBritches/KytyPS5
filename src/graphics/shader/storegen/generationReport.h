@@ -41,6 +41,16 @@ struct GenerationCounts {
 	return "";
 }
 
+/// The name of what became of the finished file in the report.
+[[nodiscard]] inline const char* PersistedName(GeneratedPersistence persisted) {
+	switch (persisted) {
+		case GeneratedPersistence::NotFinished: return "not_finished";
+		case GeneratedPersistence::Renamed: return "renamed";
+		case GeneratedPersistence::RenameFailed: return "rename_failed";
+	}
+	return "";
+}
+
 /// The name of a failure kind in the report.
 [[nodiscard]] inline const char* FailureKindName(FailureKind kind) {
 	switch (kind) {
@@ -97,6 +107,8 @@ MakeSupervisorReport(const SupervisorStats& stats) {
 	block.active          = !stopped_for_good;
 	block.inactive_reason = stopped_for_good ? stats.inactive_reason : std::string();
 	block.outcome         = OutcomeName(stats.outcome);
+	block.persisted       = PersistedName(stats.persisted);
+	block.persist_error   = stats.persist_error;
 	block.spawns          = stats.spawns;
 	block.restarts        = stats.restarts;
 	block.spawn_ms        = stats.spawn_ms;

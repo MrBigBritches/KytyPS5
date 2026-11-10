@@ -148,6 +148,9 @@ struct StoreSupervisor::Impl {
 
 	// ---- Deciding. ----
 	void                  Conclude(int exit_code, bool killed);
+	void                  Finish();
+	void                  EndLoader();
+	void                  Persist();
 	[[nodiscard]] Verdict Judge(int exit_code, bool killed) const;
 	void                  Restart(const Verdict& verdict);
 	void                  BlameLastLine();
@@ -211,6 +214,14 @@ StoreSupervisor::Impl::Impl(SupervisorConfig supplied)
       progress_path(fs::absolute(config.output_path).concat(".progress")),
       request_path(fs::absolute(config.output_path).concat(".request")), progress(progress_path) {
 	config.output_path = fs::absolute(config.output_path);
+	if (!config.generated_path.empty()) {
+		config.generated_path = fs::absolute(config.generated_path);
+	}
+	if (!config.rename_file) {
+		config.rename_file = [](const fs::path& from, const fs::path& to) {
+			return Common::File::RenameFile(from, to);
+		};
+	}
 	if (config.program.empty()) {
 		config.program = WorkerProgramPath();
 	}
@@ -507,7 +518,7 @@ void StoreSupervisor::Impl::Conclude(int exit_code, bool killed) {
 	CollectSpawnStats();
 	const auto verdict = Judge(exit_code, killed);
 	if (verdict.action == Verdict::Action::Finish) {
-		End(SupervisorOutcome::Finished, "");
+		Finish();
 		return;
 	}
 	RecordFailure(verdict, exit_code);
@@ -521,6 +532,53 @@ void StoreSupervisor::Impl::Conclude(int exit_code, bool killed) {
 		return;
 	}
 	Restart(verdict);
+}
+
+// Finishes a run whose worker exited with 0 and left a complete file, in the order that keeps the
+// old generated file safe. The loader is ended first, so nothing still reads a file the rename
+// replaces. The rename comes next, since only a worker that has exited has closed its file. The
+// outcome is set last, so a reader that sees Finished also sees what became of the file. A stop
+// that comes while the loader ends renames nothing, and the thread ends as Stopped.
+void StoreSupervisor::Impl::Finish() {
+	EndLoader();
+	if (stop.stop_requested()) {
+		return;
+	}
+	Persist();
+	End(SupervisorOutcome::Finished, "");
+}
+
+// The loader step of a finish. With no loader it does nothing.
+void StoreSupervisor::Impl::EndLoader() {
+	if (config.end_loader) {
+		config.end_loader(stop, GENERATION_LOADER_END_WAIT);
+	}
+}
+
+// Renames the finished temporary file to the generated file and records the result. A failure keeps
+// the temporary file where it is, so the next boot finds nothing to load and generates again. An
+// empty generated_path (only a test leaves it so) renames nothing, and the run still ends Finished
+// with persisted left at NotFinished.
+void StoreSupervisor::Impl::Persist() {
+	if (config.generated_path.empty()) {
+		return;
+	}
+	std::string error;
+	if (!config.rename_file(config.output_path, config.generated_path)) {
+		// File::RenameFile deletes the destination first, so a failure can leave neither the old
+		// generated file nor the new one, and the report shows which of them exist.
+		std::error_code ignored;
+		error = fmt::format("rename of {} to {} failed, source {}, destination {}",
+		                    Utf8FromPath(config.output_path), Utf8FromPath(config.generated_path),
+		                    fs::exists(config.output_path, ignored) ? "kept" : "missing",
+		                    fs::exists(config.generated_path, ignored) ? "present" : "absent");
+		Log("Shader store generation: " + error);
+	}
+	Update([&](SupervisorStats& s) {
+		s.persisted =
+		    error.empty() ? GeneratedPersistence::Renamed : GeneratedPersistence::RenameFailed;
+		s.persist_error = std::move(error);
+	});
 }
 
 void StoreSupervisor::Impl::RecordFailure(const Verdict& verdict, int exit_code) {

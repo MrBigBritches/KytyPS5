@@ -13,6 +13,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -41,11 +42,15 @@ constexpr std::chrono::milliseconds GENERATION_TERMINATE_LOG_THRESHOLD {100};
 /// recompiler printed, and the line that explains a crash is the last one. A real file can be
 /// hundreds of kilobytes.
 constexpr size_t GENERATION_OUT_TAIL_BYTES = 2048;
+/// The longest the loader step of a finish may wait for the loader to reach its end. The new
+/// generation took minutes, so the old file's few seconds of loading are worth the wait, and a
+/// loader that is slower than this is abandoned.
+constexpr std::chrono::seconds GENERATION_LOADER_END_WAIT {5};
 
 /// How the supervisor ended.
 enum class SupervisorOutcome : uint8_t {
 	Running,        ///< Not ended.
-	Finished,       ///< The worker finished and every record was taken.
+	Finished,       ///< The worker finished, every record was taken and the rename was tried.
 	Fatal,          ///< Stopped for a reason that a restart cannot mend. See inactive_reason.
 	RestartsCapped, ///< Restarted GENERATION_MAX_RESTARTS times and gave up. What it got is kept.
 	Stopped,        ///< Told to stop.
@@ -72,6 +77,14 @@ struct SupervisorFailure {
 	/// The last GENERATION_OUT_TAIL_BYTES of the worker's text file at that time, or empty when
 	/// there is none.
 	std::string out_tail;
+};
+
+/// What became of the finished output file. It is the field to trust for what is on disk, since the
+/// outcome can be Stopped by a stop that came after the rename.
+enum class GeneratedPersistence : uint8_t {
+	NotFinished,  ///< Nothing was renamed, because the run did not finish or has not yet.
+	Renamed,      ///< The temporary file is now the generated file.
+	RenameFailed, ///< The rename failed and the temporary file is kept. See persist_error.
 };
 
 /// A program that a `drop` line gave up on.
@@ -166,6 +179,13 @@ struct SupervisorStats {
 	/// The largest peak memory of the spawns, among those measured by one source. Missing when no
 	/// spawn had one.
 	std::optional<Common::PeakMemory> peak_memory;
+	/// Whether the finished file was renamed to the generated file. It is set before the outcome
+	/// becomes Finished, so a reader that sees Finished sees the answer. A config with an empty
+	/// generated_path (only tests) renames nothing, so Finished then has persisted NotFinished.
+	GeneratedPersistence persisted = GeneratedPersistence::NotFinished;
+	/// Why the rename failed, when persisted is RenameFailed: what the rename was asked and which
+	/// of the two files existed afterwards. Empty otherwise.
+	std::string persist_error;
 };
 
 /// Whether a measured peak replaces the held one. Sources rank WorkingSet, then WorkingSetSampled,
@@ -203,6 +223,16 @@ struct SupervisorConfig {
 	std::function<void(std::string_view)> log;
 	/// How the supervisor lowers its own thread. A test replaces it to make the system refuse.
 	Common::PriorityStep priority_step = &Common::SystemLowerStep;
+	/// The loader step of a finish, which the loader of an earlier generated file fills. Empty
+	/// means no loader, and the step does nothing. It runs once, on the supervisor's thread, after
+	/// the child has exited and every record was taken, and before the rename, so that nothing
+	/// still reads a file the rename replaces. It must return within the wait it is given, which is
+	/// GENERATION_LOADER_END_WAIT, by letting the loader reach its end or abandoning it, and it
+	/// must check the stop token while it waits, so that Stop stays prompt.
+	std::function<void(std::stop_token, std::chrono::milliseconds)> end_loader;
+	/// Renames the finished file over the generated one and tells whether it worked. Empty means
+	/// Common::File::RenameFile. A test replaces it to see when it is called and to make it fail.
+	std::function<bool(const std::filesystem::path&, const std::filesystem::path&)> rename_file;
 };
 
 /// The program a worker is started from: the running emulator. Linux gives the path whose file is

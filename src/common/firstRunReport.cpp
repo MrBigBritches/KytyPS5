@@ -1025,6 +1025,10 @@ nlohmann::json GenerationToJson(const ShaderStoreGenerationReport& block, int64_
 	if (!block.inactive_reason.empty()) {
 		json["inactive_reason"] = block.inactive_reason;
 	}
+	json["persisted"] = block.persisted;
+	if (!block.persist_error.empty()) {
+		json["persist_error"] = block.persist_error;
+	}
 	json["supervisor"] = GenerationSupervisorToJson(block);
 	// The finish on the run's clock, so it can be set against an underrun's at_ms. finished_ms is a
 	// duration from the supervisor thread's start and can't be. Written only for a finished run.
