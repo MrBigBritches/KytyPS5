@@ -1,5 +1,6 @@
 #include "common/firstRunReport.h"
 
+#include "common/config.h"
 #include "common/file.h"
 #include "common/gpuStall.h"
 #include "common/logging/log.h"
@@ -10,10 +11,30 @@
 #include <cctype>
 #include <charconv>
 #include <cmath>
+#include <cstring>
 #include <exception>
 #include <fmt/format.h>
+#include <fstream>
 #include <nlohmann/json.hpp>
 #include <random>
+#include <string_view>
+#include <thread>
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+// psapi.h needs windows.h first.
+#include <psapi.h>
+#if defined(_M_X64) || defined(_M_IX86)
+#include <intrin.h>
+#endif
+#else
+#include <sys/resource.h>
+#include <unistd.h>
+#ifdef __APPLE__
+#include <sys/sysctl.h>
+#endif
+#endif
 
 namespace Common::FirstRunReport {
 
@@ -246,7 +267,7 @@ void Report::SetEpoch(int64_t epoch_ns) {
 }
 
 void Report::AddCompile(Kind kind, uint64_t id, uint64_t id_ps, double create_ms, Thread thread,
-                        int64_t start_ns) {
+                        int64_t start_ns, CompileContext context) {
 	std::lock_guard lock(m_mutex);
 	CompileEntry    entry {.kind      = kind,
 	                       .id        = id,
@@ -255,6 +276,13 @@ void Report::AddCompile(Kind kind, uint64_t id, uint64_t id_ps, double create_ms
 	                       .phase     = m_phase,
 	                       .thread    = thread,
 	                       .flip      = m_flip};
+	// A worker row shows when it began and what it met, which the GPU rows get from their
+	// submission.
+	if (thread == Thread::Worker) {
+		entry.at_ns        = start_ns;
+		entry.warm_running = context.warm_running;
+		entry.child_alive  = context.child_alive;
+	}
 	// Only the GPU thread works through submissions, so a worker row never takes the current one.
 	if (thread == Thread::Gpu && m_phase == Phase::Play && m_stamp.id != NO_SUBMISSION &&
 	    start_ns != NO_TIME_NS) {
@@ -268,6 +296,36 @@ void Report::AddCompile(Kind kind, uint64_t id, uint64_t id_ps, double create_ms
 	if (thread == Thread::Gpu && m_phase == Phase::Play) {
 		AddBlockedLocked(kind, create_ms);
 	}
+}
+
+void Report::AddAudioUnderrun() noexcept {
+	// The count is read before the increment, so a long run of underruns past the capacity does not
+	// keep moving the index.
+	if (m_underrun_next.load(std::memory_order_relaxed) >= AUDIO_UNDERRUN_CAPACITY) {
+		m_underrun_overflow.fetch_add(1, std::memory_order_relaxed);
+		return;
+	}
+	const size_t slot = m_underrun_next.fetch_add(1, std::memory_order_relaxed);
+	if (slot >= AUDIO_UNDERRUN_CAPACITY) {
+		// Several calls passed the check together and took the last slots.
+		m_underrun_overflow.fetch_add(1, std::memory_order_relaxed);
+		return;
+	}
+	m_underrun_ns[slot].store(NowNs(), std::memory_order_relaxed);
+}
+
+AudioUnderruns Report::AudioUnderrunsSoFar() const {
+	AudioUnderruns result;
+	result.overflow = m_underrun_overflow.load(std::memory_order_relaxed);
+	const size_t taken =
+	    std::min(m_underrun_next.load(std::memory_order_relaxed), AUDIO_UNDERRUN_CAPACITY);
+	for (size_t slot = 0; slot < taken; slot++) {
+		const auto time = m_underrun_ns[slot].load(std::memory_order_relaxed);
+		if (time != 0) {
+			result.at_ns.push_back(time);
+		}
+	}
+	return result;
 }
 
 void Report::AddWait(Kind kind, double ms) {
@@ -465,6 +523,11 @@ void Report::Reset() {
 	m_warm_waited_ms                = 0.0;
 	m_warm_waited_over              = 0;
 	m_warm_takes.clear();
+	for (auto& slot: m_underrun_ns) {
+		slot.store(0, std::memory_order_relaxed);
+	}
+	m_underrun_next.store(0, std::memory_order_relaxed);
+	m_underrun_overflow.store(0, std::memory_order_relaxed);
 }
 
 std::vector<Pause> Report::AllPausesLocked() const {
@@ -582,7 +645,15 @@ nlohmann::json CompileToJson(const CompileEntry& compile, int64_t epoch_ns) {
 	row["phase"]     = compile.phase == Phase::Boot ? "boot" : "play";
 	row["thread"]    = compile.thread == Thread::Gpu ? "gpu" : "worker";
 	row["flip"]      = compile.flip;
-	// Left out when unset, so older readers and worker rows see no new keys.
+	// A worker row shows when it began and what it met. The other rows get their time from the
+	// submission below, and are left unchanged.
+	if (compile.thread == Thread::Worker && compile.at_ns != NO_TIME_NS) {
+		const int64_t base  = epoch_ns == NO_TIME_NS ? 0 : epoch_ns;
+		row["at_ms"]        = Round3(static_cast<double>(compile.at_ns - base) / NS_PER_MS);
+		row["warm_running"] = compile.warm_running;
+		row["child_alive"]  = compile.child_alive;
+	}
+	// Left out when unset, so older readers see no new keys.
 	if (compile.submission != NO_SUBMISSION) {
 		row["submission"] = compile.submission;
 		row["queue"]      = compile.queue;
@@ -965,6 +1036,38 @@ nlohmann::json GenerationToJson(const ShaderStoreGenerationReport& block, int64_
 	return json;
 }
 
+// The guest audio underruns with each one's time from the run start. count includes the ones that
+// came past the capacity and have no time.
+nlohmann::json AudioUnderrunsToJson(const AudioUnderruns& underruns, int64_t epoch_ns) {
+	nlohmann::json times = nlohmann::json::array();
+	const int64_t  base  = epoch_ns == NO_TIME_NS ? 0 : epoch_ns;
+	for (const auto at_ns: underruns.at_ns) {
+		times.push_back(Round3(static_cast<double>(at_ns - base) / NS_PER_MS));
+	}
+	return {{"count", underruns.at_ns.size() + underruns.overflow},
+	        {"overflow", underruns.overflow},
+	        {"at_ms", times}};
+}
+
+nlohmann::json MachineToJson(const MachineInfo& info) {
+	return {{"cpu_model", info.cpu_model},
+	        {"logical_cores", info.logical_cores},
+	        {"warm_workers", info.warm_workers},
+	        {"ram_bytes", info.ram_bytes}};
+}
+
+// The emulator's own peaks, with a figure the system did not give left out.
+nlohmann::json ProcessToJson(const MachineInfo& info) {
+	nlohmann::json process = nlohmann::json::object();
+	if (info.peak_working_set_bytes) {
+		process["peak_working_set_bytes"] = *info.peak_working_set_bytes;
+	}
+	if (info.peak_commit_bytes) {
+		process["peak_commit_bytes"] = *info.peak_commit_bytes;
+	}
+	return process;
+}
+
 nlohmann::json BootToJson(const BootInfo& boot) {
 	return {{"warm_up_ms", Round3(boot.warm_up_ms)},
 	        {"programs", boot.programs},
@@ -1095,6 +1198,9 @@ std::string Report::ToJson(const Metadata& metadata, uint64_t audio_holds, doubl
 		}
 	}
 
+	// Read once, so the two blocks that come from it agree.
+	const auto machine = ReadMachineInfo();
+
 	nlohmann::json flags = nlohmann::json::object();
 	for (const auto& [name, on]: metadata.flags) {
 		flags[name] = on;
@@ -1126,6 +1232,9 @@ std::string Report::ToJson(const Metadata& metadata, uint64_t audio_holds, doubl
 	    {"deferred_draws", DeferredToJson(summary)},
 	    {"audio_holds", audio_holds},
 	    {"audio_held_ms", Round3(audio_held_ms)},
+	    {"audio_underruns", AudioUnderrunsToJson(AudioUnderrunsSoFar(), epoch_ns)},
+	    {"machine", MachineToJson(machine)},
+	    {"process", ProcessToJson(machine)},
 	    {"flips", summary.flips},
 	    {"submissions",
 	     {{"total", summary.submissions}, {"per_flip", summary.submissions_per_flip}}},
@@ -1258,6 +1367,155 @@ int64_t NowNs() {
 	return ToNs(std::chrono::steady_clock::now());
 }
 
+namespace {
+
+constexpr uint64_t KILOBYTE = 1024;
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+// The processor's name from the brand string of cpuid, which is the same text as the registry
+// holds. Other architectures give nothing, and the report says unknown.
+std::string ProcessorName() {
+#if defined(_M_X64) || defined(_M_IX86)
+	constexpr int FIRST_BRAND_LEAF = 0x80000002;
+	constexpr int BRAND_LEAVES     = 3;
+	int           max_extended[4]  = {};
+	__cpuid(max_extended, static_cast<int>(0x80000000));
+	if (static_cast<unsigned>(max_extended[0]) < static_cast<unsigned>(FIRST_BRAND_LEAF + 2)) {
+		return {};
+	}
+	char brand[BRAND_LEAVES * 16 + 1] = {};
+	for (int leaf = 0; leaf < BRAND_LEAVES; leaf++) {
+		int registers[4] = {};
+		__cpuid(registers, FIRST_BRAND_LEAF + leaf);
+		std::memcpy(brand + leaf * 16, registers, sizeof(registers));
+	}
+	std::string name(brand);
+	// The text is padded with spaces on the left.
+	const auto first = name.find_first_not_of(' ');
+	return first == std::string::npos ? std::string() : name.substr(first);
+#else
+	return {};
+#endif
+}
+
+uint64_t InstalledMemoryBytes() {
+	MEMORYSTATUSEX status {};
+	status.dwLength = sizeof(status);
+	return GlobalMemoryStatusEx(&status) != FALSE ? status.ullTotalPhys : 0;
+}
+
+void ReadProcessPeaks(MachineInfo& info) {
+	PROCESS_MEMORY_COUNTERS counters {};
+	if (GetProcessMemoryInfo(GetCurrentProcess(), &counters, sizeof(counters)) != FALSE) {
+		info.peak_working_set_bytes = counters.PeakWorkingSetSize;
+		// The peak of the pagefile usage is the process's peak commit.
+		info.peak_commit_bytes = counters.PeakPagefileUsage;
+	}
+}
+#else
+// The text after the colon of the first line of /proc/cpuinfo that starts with one of the keys.
+std::string ProcessorName() {
+#ifdef __APPLE__
+	char   brand[256] = {};
+	size_t size       = sizeof(brand);
+	if (sysctlbyname("machdep.cpu.brand_string", brand, &size, nullptr, 0) == 0) {
+		return brand;
+	}
+	return {};
+#else
+	std::ifstream cpuinfo("/proc/cpuinfo");
+	std::string   line;
+	while (std::getline(cpuinfo, line)) {
+		for (const std::string_view key: {"model name", "Model", "Hardware", "cpu model"}) {
+			if (!line.starts_with(key)) {
+				continue;
+			}
+			const auto colon = line.find(':');
+			if (colon == std::string::npos) {
+				continue;
+			}
+			const auto first = line.find_first_not_of(" \t", colon + 1);
+			if (first != std::string::npos) {
+				return line.substr(first);
+			}
+		}
+	}
+	return {};
+#endif
+}
+
+uint64_t InstalledMemoryBytes() {
+#ifdef __APPLE__
+	uint64_t memory = 0;
+	size_t   size   = sizeof(memory);
+	return sysctlbyname("hw.memsize", &memory, &size, nullptr, 0) == 0 ? memory : 0;
+#else
+	const long pages     = sysconf(_SC_PHYS_PAGES);
+	const long page_size = sysconf(_SC_PAGE_SIZE);
+	return pages > 0 && page_size > 0
+	           ? static_cast<uint64_t>(pages) * static_cast<uint64_t>(page_size)
+	           : 0;
+#endif
+}
+
+// The value of a line of /proc/self/status such as "VmHWM:   1234 kB", in bytes.
+std::optional<uint64_t> StatusKilobytes(std::string_view key) {
+#ifdef __APPLE__
+	(void)key;
+	return std::nullopt;
+#else
+	std::ifstream status("/proc/self/status");
+	std::string   line;
+	while (std::getline(status, line)) {
+		if (!line.starts_with(key)) {
+			continue;
+		}
+		const char* begin = line.data() + key.size();
+		const char* end   = line.data() + line.size();
+		while (begin != end && (*begin == ' ' || *begin == '\t')) {
+			++begin;
+		}
+		uint64_t   kilobytes = 0;
+		const auto parsed    = std::from_chars(begin, end, kilobytes);
+		if (parsed.ec != std::errc {} || parsed.ptr == begin) {
+			return std::nullopt;
+		}
+		return kilobytes * KILOBYTE;
+	}
+	return std::nullopt;
+#endif
+}
+
+void ReadProcessPeaks(MachineInfo& info) {
+#ifdef __APPLE__
+	rusage used {};
+	if (getrusage(RUSAGE_SELF, &used) == 0) {
+		// macOS counts ru_maxrss in bytes. It has no peak commit to give.
+		info.peak_working_set_bytes = static_cast<uint64_t>(used.ru_maxrss);
+	}
+#else
+	// VmHWM is the peak resident size. Linux has no peak commit to give, since VmPeak is the peak
+	// of the address space the process mapped, which for the guest's reservation is far more than
+	// it ever committed. So the peak commit is left out, as it is on macOS.
+	info.peak_working_set_bytes = StatusKilobytes("VmHWM:");
+#endif
+}
+#endif
+
+} // namespace
+
+MachineInfo ReadMachineInfo() {
+	MachineInfo info;
+	if (auto name = ProcessorName(); !name.empty()) {
+		info.cpu_model = std::move(name);
+	}
+	info.logical_cores = std::thread::hardware_concurrency();
+	info.ram_bytes     = InstalledMemoryBytes();
+	info.warm_workers  = Detail::g_warm_workers.load(std::memory_order_relaxed);
+	ReadProcessPeaks(info);
+	return info;
+}
+
 uint64_t NextSubmissionId() {
 	return Enabled() ? g_last_submission.fetch_add(1, std::memory_order_relaxed) + 1
 	                 : NO_SUBMISSION;
@@ -1367,12 +1625,14 @@ CompileScope::CompileScope(Kind kind, uint64_t id, uint64_t id_ps, bool on_gpu_t
 	if (m_active) {
 		m_start    = std::chrono::steady_clock::now();
 		m_start_ns = ToNs(m_start);
+		m_context  = {.warm_running = WarmBuildsRunning(), .child_alive = GeneratorChildAlive()};
 	}
 }
 
 CompileScope::~CompileScope() {
 	if (m_active) {
-		Global().AddCompile(m_kind, m_id, m_id_ps, ElapsedMs(m_start), m_thread, m_start_ns);
+		Global().AddCompile(m_kind, m_id, m_id_ps, ElapsedMs(m_start), m_thread, m_start_ns,
+		                    m_context);
 	}
 }
 

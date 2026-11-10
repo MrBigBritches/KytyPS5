@@ -1213,13 +1213,19 @@ void TestFinishedMsOnlyAfterTheEnd() {
 	Collected       collected;
 	auto            config = MakeConfig(directory, "sleep_silent", collected);
 	StoreSupervisor supervisor(std::move(config));
+	// The report's rows of worker compiles say whether the worker was alive, which is the
+	// supervisor's to say. It is not before the start, is while the worker runs, and is not after
+	// the end.
+	Common::FirstRunReport::SetGeneratorChildAlive(false);
 	supervisor.Start();
 	std::this_thread::sleep_for(300ms);
+	CHECK(Common::FirstRunReport::GeneratorChildAlive());
 	const auto running = supervisor.Stats();
 	CHECK(running.outcome == SupervisorOutcome::Running);
 	CHECK(running.finished_ms == 0.0 && running.ended_ms == 0.0 &&
 	      !running.child_open_ms.has_value());
 	supervisor.Stop();
+	CHECK(!Common::FirstRunReport::GeneratorChildAlive());
 	const auto stopped = supervisor.Stats();
 	CHECK(stopped.outcome == SupervisorOutcome::Stopped);
 	// The stop came after the 300 ms above, so the end cannot be earlier than that. The run did not
@@ -1227,8 +1233,10 @@ void TestFinishedMsOnlyAfterTheEnd() {
 	CHECK(stopped.ended_ms >= 250.0);
 	CHECK(stopped.finished_ms == 0.0);
 	// A run that ends for good has an end and no finish.
+	Common::FirstRunReport::SetGeneratorChildAlive(true);
 	const auto fatal = Run("exit:3");
 	CHECK(fatal.stats.outcome == SupervisorOutcome::Fatal);
+	CHECK(!Common::FirstRunReport::GeneratorChildAlive());
 	CHECK(fatal.stats.ended_ms > 0.0 && fatal.stats.finished_ms == 0.0);
 }
 

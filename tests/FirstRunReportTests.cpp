@@ -1046,7 +1046,12 @@ void TestGenerationBlockFlagOffAndInactive() {
 	Check(refused_json[GENERATION_KEY] == expected, "the inactive block is not just the reason");
 	auto without_block = refused_json;
 	without_block.erase(GENERATION_KEY);
-	Check(without_block == off_json, "the block changed another part of the report");
+	// The process peaks are read when each report is written, so two reports differ in them
+	// whatever the flag is. They are left out of the comparison, which is of everything else.
+	auto off_without_peaks = off_json;
+	off_without_peaks.erase("process");
+	without_block.erase("process");
+	Check(without_block == off_without_peaks, "the block changed another part of the report");
 
 	// Reset, which tests use between cases, takes the generation state away again.
 	refused.Reset();
@@ -1300,6 +1305,204 @@ void TestGenerationRowsJson() {
 	      "a take of a module generation did not make shows a generated time");
 }
 
+// ---- Guest audio underruns, the machine, and what a worker compile met. ----
+
+// The underruns of a report: each one is stored with its time on the NowNs clock, between the clock
+// before the call and after it. An empty report has the key with nothing in it, so every report
+// shows it. The baseline of the count is the empty report.
+void TestAudioUnderrunsAreStamped() {
+	Report     report;
+	const auto empty = nlohmann::json::parse(report.ToJson({}, 0, 1.0, 0.0))["audio_underruns"];
+	Check(empty["count"] == 0 && empty["overflow"] == 0 && empty["at_ms"].is_array() &&
+	          empty["at_ms"].empty(),
+	      "an empty report lacks the underruns key or has an underrun");
+
+	const int64_t before = Common::FirstRunReport::NowNs();
+	report.AddAudioUnderrun();
+	report.AddAudioUnderrun();
+	const int64_t after = Common::FirstRunReport::NowNs();
+	const auto    taken = report.AudioUnderrunsSoFar();
+	Check(taken.at_ns.size() == 2 && taken.overflow == 0, "the underruns were not both stored");
+	for (const auto at_ns: taken.at_ns) {
+		Check(at_ns >= before && at_ns <= after, "an underrun is not stamped with the NowNs clock");
+	}
+	Check(taken.at_ns.size() == 2 && taken.at_ns[0] <= taken.at_ns[1],
+	      "the underruns are not in the order they happened");
+	// The same clock as the epoch, so the time in the file is counted from the run start. The epoch
+	// is 250 ms before the first underrun, so the first time is exactly that, which a time on the
+	// raw clock could not be.
+	constexpr int64_t epoch_lead_ns = 250 * 1000000;
+	report.SetEpoch(taken.at_ns[0] - epoch_lead_ns);
+	const auto json = nlohmann::json::parse(report.ToJson({}, 0, 1.0, 0.0))["audio_underruns"];
+	Check(json["count"] == 2 && json["at_ms"].size() == 2 && json["at_ms"][0] == 250.0 &&
+	          json["at_ms"][1] >= 250.0,
+	      "the underruns are not counted from the run start in the file");
+	// Reset empties the report and starts its slots again, so the whole capacity is free. A report
+	// that kept its index would count the last of them as overflow.
+	report.Reset();
+	Check(report.AudioUnderrunsSoFar().at_ns.empty(), "Reset kept the underruns");
+	for (size_t index = 0; index < Common::FirstRunReport::AUDIO_UNDERRUN_CAPACITY; index++) {
+		report.AddAudioUnderrun();
+	}
+	const auto refilled = report.AudioUnderrunsSoFar();
+	Check(refilled.at_ns.size() == Common::FirstRunReport::AUDIO_UNDERRUN_CAPACITY &&
+	          refilled.overflow == 0,
+	      "Reset did not free the slots of the underruns");
+}
+
+// The report is the only gate: with it off the free function stores nothing, and with it on the
+// same call does. The baseline is the call with the report on.
+void TestAudioUnderrunsRespectTheFlag() {
+	auto& global = Common::FirstRunReport::Global();
+	global.Reset();
+	Common::FirstRunReport::Configure(false, false);
+	Common::FirstRunReport::AddAudioUnderrun();
+	Check(global.AudioUnderrunsSoFar().at_ns.empty() && global.AudioUnderrunsSoFar().overflow == 0,
+	      "an underrun was stored while the report was off");
+	Common::FirstRunReport::Configure(true, false);
+	Common::FirstRunReport::AddAudioUnderrun();
+	Check(global.AudioUnderrunsSoFar().at_ns.size() == 1,
+	      "an underrun was not stored with the report on");
+	Common::FirstRunReport::Configure(false, false);
+	global.Reset();
+}
+
+// Past the capacity an underrun is only counted, and the stored ones are not overwritten. The
+// baseline is exactly the capacity, which counts no overflow. Threads share the last slots, so the
+// total must still be exact.
+void TestAudioUnderrunsOverflow() {
+	constexpr size_t capacity = Common::FirstRunReport::AUDIO_UNDERRUN_CAPACITY;
+	Report           exact;
+	for (size_t index = 0; index < capacity; index++) {
+		exact.AddAudioUnderrun();
+	}
+	Check(exact.AudioUnderrunsSoFar().at_ns.size() == capacity &&
+	          exact.AudioUnderrunsSoFar().overflow == 0,
+	      "the capacity itself was counted as an overflow");
+
+	Report over;
+	for (size_t index = 0; index < capacity + 5; index++) {
+		over.AddAudioUnderrun();
+	}
+	const auto taken = over.AudioUnderrunsSoFar();
+	Check(taken.at_ns.size() == capacity && taken.overflow == 5,
+	      "underruns past the capacity were lost or wrapped");
+	const auto json = nlohmann::json::parse(over.ToJson({}, 0, 1.0, 0.0))["audio_underruns"];
+	Check(json["count"] == capacity + 5 && json["overflow"] == 5 &&
+	          json["at_ms"].size() == capacity,
+	      "the count in the file does not include the overflow");
+
+	constexpr size_t         threads    = 4;
+	constexpr size_t         per_thread = 3000;
+	Report                   racing;
+	std::vector<std::thread> callers;
+	for (size_t caller = 0; caller < threads; caller++) {
+		callers.emplace_back([&] {
+			for (size_t index = 0; index < per_thread; index++) {
+				racing.AddAudioUnderrun();
+			}
+		});
+	}
+	for (auto& caller: callers) {
+		caller.join();
+	}
+	const auto raced = racing.AudioUnderrunsSoFar();
+	Check(raced.at_ns.size() + raced.overflow == threads * per_thread &&
+	          raced.at_ns.size() == capacity,
+	      "racing underruns were lost or stored past the capacity");
+}
+
+// The machine and process blocks are in every report. The processor is named, there is at least one
+// core, the memory is the installed memory, and the warm worker count is what was set. The process
+// peaks are there on the platforms that give them, and the working set is no more than the memory.
+void TestMachineBlock() {
+	Common::FirstRunReport::SetWarmWorkerCount(7);
+	Report     report;
+	const auto json    = nlohmann::json::parse(report.ToJson({}, 0, 1.0, 0.0));
+	const auto machine = json["machine"];
+	Check(machine["cpu_model"].is_string() && !machine["cpu_model"].get<std::string>().empty(),
+	      "the machine has no processor name");
+	// The platforms that can name their processor do, so a name that is still "unknown" is a reader
+	// that failed. Others may have none to give.
+#if defined(_M_X64) || defined(__x86_64__) || defined(__APPLE__)
+	Check(machine["cpu_model"] != "unknown", "the processor was not read");
+#endif
+	Check(machine["logical_cores"].get<uint32_t>() >= 1, "the machine has no cores");
+	constexpr uint64_t smallest_memory = 64ull * 1024 * 1024;
+	Check(machine["ram_bytes"].get<uint64_t>() > smallest_memory, "the machine has no memory");
+	Check(machine["warm_workers"] == 7, "the warm worker count is not the one set");
+	Common::FirstRunReport::SetWarmWorkerCount(0);
+	Check(nlohmann::json::parse(report.ToJson({}, 0, 1.0, 0.0))["machine"]["warm_workers"] == 0,
+	      "the warm worker count did not follow the setting");
+	const auto         process       = json["process"];
+	constexpr uint64_t smallest_peak = 1024 * 1024;
+	Check(process.contains("peak_working_set_bytes") &&
+	          process["peak_working_set_bytes"].get<uint64_t>() > smallest_peak &&
+	          process["peak_working_set_bytes"].get<uint64_t>() <=
+	              machine["ram_bytes"].get<uint64_t>(),
+	      "the process has no sane peak working set");
+#ifdef _WIN32
+	Check(process.contains("peak_commit_bytes") &&
+	          process["peak_commit_bytes"].get<uint64_t>() > smallest_peak,
+	      "the process has no peak commit");
+#else
+	// Only Windows has a peak commit. Linux's VmPeak is the address space, which is not commit.
+	Check(!process.contains("peak_commit_bytes"), "a platform with no peak commit gave one");
+#endif
+}
+
+// The row of a worker compile shows when it began and what it met: warm builds running, and whether
+// the generator's worker was alive. The baseline is the same compile with none running. A
+// GPU-thread row has none of the three keys, so it is as it was. With the report off a warm build
+// is not counted.
+void TestWorkerCompileContext() {
+	using Common::FirstRunReport::CompileScope;
+	using Common::FirstRunReport::WarmBuildScope;
+	auto& global = Common::FirstRunReport::Global();
+	global.Reset();
+	Common::FirstRunReport::Configure(false, false);
+	{
+		const WarmBuildScope off;
+		Check(Common::FirstRunReport::WarmBuildsRunning() == 0,
+		      "a warm build was counted while the report was off");
+	}
+	Common::FirstRunReport::Configure(true, false);
+	{
+		CompileScope baseline(Kind::Graphics, 1, 2, false);
+	}
+	{
+		const WarmBuildScope first;
+		const WarmBuildScope second;
+		Common::FirstRunReport::SetGeneratorChildAlive(true);
+		Check(Common::FirstRunReport::WarmBuildsRunning() == 2, "the warm builds were not counted");
+		{
+			CompileScope busy(Kind::Graphics, 3, 4, false);
+		}
+		{
+			CompileScope on_gpu(Kind::Compute, 5, 0, true);
+		}
+	}
+	Common::FirstRunReport::SetGeneratorChildAlive(false);
+	Check(Common::FirstRunReport::WarmBuildsRunning() == 0,
+	      "a finished warm build is still counted");
+	const auto rows = nlohmann::json::parse(global.ToJson({}, 0, 1.0, 0.0))["compiles"];
+	Check(rows.size() == 3, "the compile rows were lost");
+	if (rows.size() == 3) {
+		Check(rows[0]["thread"] == "worker" && rows[0].contains("at_ms") &&
+		          rows[0]["at_ms"].is_number() && rows[0]["warm_running"] == 0 &&
+		          rows[0]["child_alive"] == false,
+		      "the baseline worker row lacks its context or has one it did not meet");
+		Check(rows[1]["thread"] == "worker" && rows[1]["warm_running"] == 2 &&
+		          rows[1]["child_alive"] == true,
+		      "the worker row did not carry the warm builds and the generator it met");
+		Check(rows[2]["thread"] == "gpu" && !rows[2].contains("at_ms") &&
+		          !rows[2].contains("warm_running") && !rows[2].contains("child_alive"),
+		      "a GPU-thread row got the context of a worker row");
+	}
+	Common::FirstRunReport::Configure(false, false);
+	global.Reset();
+}
+
 // With a source, the writer asks it each time. A final figure replaces it at once and the source is
 // never called again, so the owner may destroy what the source reads. The baseline is the same
 // report before the final figure.
@@ -1410,6 +1613,11 @@ int main() {
   TestGenerationBlockFlagOffAndInactive();
   TestGenerationBlockFields();
   TestGenerationRowsJson();
+  TestAudioUnderrunsAreStamped();
+  TestAudioUnderrunsRespectTheFlag();
+  TestAudioUnderrunsOverflow();
+  TestMachineBlock();
+  TestWorkerCompileContext();
   TestGenerationSourceThenFinal();
   TestGenerationWriterNeverTouchesADestroyedSource();
   TestGenerationFinalWaitsForAWriterInTheSource();

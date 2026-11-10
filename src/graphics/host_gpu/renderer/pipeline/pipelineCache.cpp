@@ -1592,7 +1592,9 @@ void PipelineCache::StartWarmCompute(const ShaderModule& module, StoreGen::GenRo
 	// first. A refusal leaves the module to build on first use, as it would without the warm-up.
 	// The row is in the generation state, which outlasts the queue for the same reason.
 	(void)m_warm_compute->Start(module.id, [this, &module, row](Pipeline& pipeline) {
-		const auto build_start = std::chrono::steady_clock::now();
+		// The rows of worker compiles show how many warm builds were running when they began.
+		const Common::FirstRunReport::WarmBuildScope running;
+		const auto                                   build_start = std::chrono::steady_clock::now();
 		CreatePipelineInternal(m_graphics, pipeline, module, m_driver_cache);
 		if (row != nullptr) {
 			const auto build_end = std::chrono::steady_clock::now();

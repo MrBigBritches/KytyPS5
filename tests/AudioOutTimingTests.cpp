@@ -1,4 +1,5 @@
 // Exercise production output scheduling with a deterministic clock and consuming SDL queues.
+#include "common/firstRunReport.h"
 #include "common/threads.h"
 #include "libs/dualSenseHaptics.h"
 
@@ -691,6 +692,73 @@ void TestUnderrunCountedWithoutHold() {
 	Common::DebugCounters::SetEnabled(false);
 	Check(after == before + 1, "a drained queue with no hold did not count an underrun");
 }
+
+// The first-run report keeps the time of each underrun, between the clock before the output that
+// caused it and after. With the report off the same gap stores nothing, which is the baseline.
+void TestUnderrunReachesReport() {
+	constexpr uint32_t gap_us = 1000000;
+	auto&              report = Common::FirstRunReport::Global();
+	for (const bool report_on: {false, true}) {
+		report.Reset();
+		Common::FirstRunReport::Configure(report_on, false);
+		Fixture    f;
+		const auto port = f.Open();
+		f.Prime(port);
+		now += gap_us;
+		const auto before = Common::FirstRunReport::NowNs();
+		f.Output(port);
+		const auto after  = Common::FirstRunReport::NowNs();
+		const auto stored = report.AudioUnderrunsSoFar();
+		if (report_on) {
+			Check(stored.at_ns.size() == 1 && stored.overflow == 0,
+			      "a drained queue did not reach the report");
+			Check(!stored.at_ns.empty() && stored.at_ns[0] >= before && stored.at_ns[0] <= after,
+			      "the report's underrun is not stamped when it happened");
+		} else {
+			Check(stored.at_ns.empty() && stored.overflow == 0,
+			      "an underrun was stored while the report was off");
+		}
+	}
+	Common::FirstRunReport::Configure(false, false);
+	report.Reset();
+}
+
+// The report skips what the overlay's counter skips: the first submit after a hold is not an
+// underrun, and a real one after it is, so the report holds that one only.
+void TestHoldIsNotAnUnderrunInReport() {
+	constexpr uint32_t gap_us        = 1000000;
+	constexpr int      prime_outputs = 8; // Enough to fill the 40 ms cushion again.
+	auto&              report        = Common::FirstRunReport::Global();
+	report.Reset();
+	Common::FirstRunReport::Configure(true, false);
+	Fixture    f;
+	const auto port = f.Open();
+	f.Prime(port);
+	size_t      after_hold = 0;
+	size_t      after_real = 0;
+	GpuCompile  compile(&f.audio, true);
+	GuestSubmit submit([&]() {
+		const auto output = [&]() {
+			return Libs::Audio::AudioOut::AudioOutOutput(port.ToInt(), f.pcm.data());
+		};
+		const int result = output();
+		after_hold       = report.AudioUnderrunsSoFar().at_ns.size();
+		for (int i = 0; i < prime_outputs; i++) {
+			output();
+		}
+		now += gap_us; // A real gap with no compile behind it.
+		output();
+		after_real = report.AudioUnderrunsSoFar().at_ns.size();
+		return result;
+	});
+	submit.CheckHeld();
+	now += gap_us; // The game is frozen for the whole compile.
+	compile.Finish();
+	Common::FirstRunReport::Configure(false, false);
+	report.Reset();
+	Check(after_hold == 0, "the first output after a hold reached the report as an underrun");
+	Check(after_real == 1, "a real underrun after a hold did not reach the report");
+}
 } // namespace
 
 int main() {
@@ -712,6 +780,8 @@ int main() {
 	TestNoHoldWhenDisabled();
 	TestHoldIsNotAnUnderrun();
 	TestUnderrunCountedWithoutHold();
+	TestUnderrunReachesReport();
+	TestHoldIsNotAnUnderrunInReport();
 	Check(streams.empty(), "output stream leaked");
 	std::puts("AudioOutTimingTests: all cases passed");
 }

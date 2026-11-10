@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
+#include "common/firstRunReport.h"
 #include "common/gpuStall.h"
 #include "common/logging/log.h"
 #include "common/threads.h"
@@ -409,6 +410,10 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking, float 
 			// submit after it re-primes without counting an underrun.
 			if (port->queue_primed && !Common::GpuStall::ResumedFromHold()) {
 				Common::DebugCounters::Add(Common::DebugCounters::Counter::AudioUnderruns);
+				// The report keeps the time of each, which the overlay's counter cannot. It runs on
+				// this guest thread, so it takes no lock and logs nothing. It misses the underruns
+				// of Audio3d and of non-blocking submits, which do not reach this branch.
+				Common::FirstRunReport::AddAudioUnderrun();
 			}
 			port->queue_primed = false;
 		}

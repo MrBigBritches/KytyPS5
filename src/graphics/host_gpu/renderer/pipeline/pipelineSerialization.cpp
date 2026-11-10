@@ -118,6 +118,8 @@ void PipelineCache::AddComputeWarmUp(const ModuleMap&                           
 		                             : WarmUpWorkerCount(std::thread::hardware_concurrency());
 		m_warm_compute         = std::make_unique<WarmBuildSet<uint64_t, Pipeline>>(
             workers, PipelineBuildQueueOptions {.low_priority = true});
+		// The machine block of the report shows how many workers the warm-up runs.
+		Common::FirstRunReport::SetWarmWorkerCount(workers);
 		// The queue runs jobs in the order they are posted. A store is appended in the order the
 		// title first used each shader, and an offline generator writes the likely ones first, so
 		// the record order puts the builds the game needs soonest at the front. A module with

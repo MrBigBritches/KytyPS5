@@ -2,6 +2,7 @@
 
 #include "common/childProcess.h"
 #include "common/file.h"
+#include "common/firstRunReport.h"
 #include "graphics/shader/recompiler/ir/Serialize.h"
 #include "graphics/shader/storegen/frameTailer.h"
 #include "graphics/shader/storegen/progressLog.h"
@@ -228,6 +229,7 @@ StoreSupervisor::Impl::Impl(SupervisorConfig supplied)
 }
 
 void StoreSupervisor::Impl::End(SupervisorOutcome outcome, const std::string& reason) {
+	Common::FirstRunReport::SetGeneratorChildAlive(false);
 	{
 		std::scoped_lock lock(mutex);
 		if (stats.outcome != SupervisorOutcome::Running) {
@@ -335,6 +337,8 @@ bool StoreSupervisor::Impl::Spawn() {
 		s.last_pid = child->Pid();
 		s.requests.push_back(request);
 	});
+	// The rows of worker compiles in the report show whether this process was running.
+	Common::FirstRunReport::SetGeneratorChildAlive(true);
 	return true;
 }
 

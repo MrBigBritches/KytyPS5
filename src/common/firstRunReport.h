@@ -87,6 +87,15 @@ struct TranslateEntry {
 	double      ms   = 0.0;
 };
 
+/// What a pipeline creation met when it began, for the rows of worker compiles. warm_running is how
+/// many background warm-up builds were running, and child_alive whether the shader store
+/// generator's worker process was, so a row can be compared across runs with the generator on and
+/// off.
+struct CompileContext {
+	uint32_t warm_running = 0;
+	bool     child_alive  = false;
+};
+
 /// One pipeline creation. create_ms is the whole creation function, which includes layouts and
 /// helper modules as well as the driver call. For graphics id is the vertex stage id and id_ps the
 /// pixel stage id, which is 0 when there is none. For compute id is the module id.
@@ -110,6 +119,11 @@ struct CompileEntry {
 	double   visible_ms = 0.0;
 	double   picked_ms  = 0.0;
 	int64_t  start_ns   = NO_TIME_NS;
+	/// When a worker compile began, on the NowNs clock, and what it met. Only the rows of worker
+	/// compiles have them. start_ns stays for the rows that join a submission.
+	int64_t  at_ns        = NO_TIME_NS;
+	uint32_t warm_running = 0;
+	bool     child_alive  = false;
 };
 
 /// One background pipeline build the GPU thread took. ready_ms runs from the request to the end of
@@ -292,6 +306,27 @@ struct GenerationSlowTake {
 
 /// A take that stopped the dispatch for at least this long is listed in the generation block.
 inline constexpr double SLOW_TAKE_MS = 250.0;
+
+/// The most audio underruns the report keeps a time for. Past it they are only counted.
+inline constexpr size_t AUDIO_UNDERRUN_CAPACITY = 8192;
+
+/// The guest audio underruns of the run: how many were stored, how many came past the capacity, and
+/// when each stored one happened on the NowNs clock, in the order they were stored.
+struct AudioUnderruns {
+	uint64_t             overflow = 0;
+	std::vector<int64_t> at_ns;
+};
+
+/// What the report says about the machine and the emulator's own process. A figure the system did
+/// not give is missing, or "unknown" for the processor.
+struct MachineInfo {
+	std::string             cpu_model     = "unknown";
+	uint32_t                logical_cores = 0;
+	uint64_t                ram_bytes     = 0;
+	uint32_t                warm_workers  = 0;
+	std::optional<uint64_t> peak_working_set_bytes;
+	std::optional<uint64_t> peak_commit_bytes;
+};
 
 /// What the GPU thread's drain of generated modules counted.
 struct GenerationDrain {
@@ -553,7 +588,15 @@ public:
 	/// when the compile began, on the NowNs clock, and links GPU-thread rows to the submission.
 	/// Without it the row is left unlinked.
 	void AddCompile(Kind kind, uint64_t id, uint64_t id_ps, double create_ms, Thread thread,
-	                int64_t start_ns = NO_TIME_NS);
+	                int64_t start_ns = NO_TIME_NS, CompileContext context = {});
+	/// Records one guest audio underrun at the time now, which is the NowNs clock. It takes no
+	/// lock, allocates nothing and never logs, since it is called from the guest's audio submit. A
+	/// slot is reserved with one relaxed increment, and an underrun past AUDIO_UNDERRUN_CAPACITY
+	/// only adds to the overflow count, so the index cannot wrap.
+	void AddAudioUnderrun() noexcept;
+	/// The underruns recorded so far. Slots that a racing call reserved and has not written yet are
+	/// left out.
+	[[nodiscard]] AudioUnderruns AudioUnderrunsSoFar() const;
 	/// Notes the submission the GPU thread is processing. count is true when it should join the
 	/// submission totals, which the caller does once per command list.
 	void BeginSubmission(const SubmissionStamp& stamp, bool count);
@@ -595,7 +638,8 @@ public:
 	[[nodiscard]] double BlockedMs(Kind kind) const;
 	/// Records a module that --cold-pipelines could not stamp, so it compiled unstamped.
 	void AddStampFailure();
-	/// Forgets everything recorded. For tests, which share the process-wide report.
+	/// Forgets everything recorded. For tests, which share the process-wide report. It must not run
+	/// at the same time as AddAudioUnderrun, which writes the underrun slots without a lock.
 	void Reset();
 	/// What the boot warm-up stored.
 	[[nodiscard]] BootInfo Boot() const;
@@ -691,6 +735,12 @@ private:
 	double                                        m_warm_waited_ms = 0.0;
 	uint32_t                                      m_warm_waited_over = 0;
 	std::vector<WarmTake>                         m_warm_takes;
+
+	// The audio underruns, written without a lock from the audio submit. A slot holds 0 until its
+	// time is stored, and a time is never 0 on the steady clock.
+	std::array<std::atomic<int64_t>, AUDIO_UNDERRUN_CAPACITY> m_underrun_ns {};
+	std::atomic<size_t>                                       m_underrun_next {0};
+	std::atomic<uint64_t>                                     m_underrun_overflow {0};
 };
 
 /// The report of this process.
@@ -732,6 +782,66 @@ public:
 private:
 	bool m_active;
 };
+
+/// Records one guest audio underrun, when the report is on. With it off the cost is the one relaxed
+/// load of Enabled.
+inline void AddAudioUnderrun() noexcept {
+	if (Enabled()) {
+		Global().AddAudioUnderrun();
+	}
+}
+
+namespace Detail {
+inline std::atomic<int32_t>  g_warm_running {0};
+inline std::atomic<bool>     g_child_alive {false};
+inline std::atomic<uint32_t> g_warm_workers {0};
+} // namespace Detail
+
+/// How many background warm-up builds are running now.
+[[nodiscard]] inline uint32_t WarmBuildsRunning() noexcept {
+	const auto running = Detail::g_warm_running.load(std::memory_order_relaxed);
+	return running > 0 ? static_cast<uint32_t>(running) : 0;
+}
+
+/// Counts one warm-up build as running for as long as it lives, when the report is on. A worker
+/// makes it around the build, and the rows of worker compiles read the count when they begin.
+class WarmBuildScope {
+public:
+	WarmBuildScope() noexcept: m_active(Enabled()) {
+		if (m_active) {
+			Detail::g_warm_running.fetch_add(1, std::memory_order_relaxed);
+		}
+	}
+	~WarmBuildScope() {
+		if (m_active) {
+			Detail::g_warm_running.fetch_sub(1, std::memory_order_relaxed);
+		}
+	}
+	WarmBuildScope(const WarmBuildScope&)            = delete;
+	WarmBuildScope& operator=(const WarmBuildScope&) = delete;
+
+private:
+	bool m_active;
+};
+
+/// Says whether the shader store generator is running a worker. The supervisor sets it when a
+/// worker starts and when the run ends, so it also holds in the short gap between a worker that
+/// ended and the restart that follows. A row of a worker compile reads it.
+inline void SetGeneratorChildAlive(bool alive) noexcept {
+	Detail::g_child_alive.store(alive, std::memory_order_relaxed);
+}
+[[nodiscard]] inline bool GeneratorChildAlive() noexcept {
+	return Detail::g_child_alive.load(std::memory_order_relaxed);
+}
+
+/// Says how many workers the background warm-up runs, which the machine block shows.
+inline void SetWarmWorkerCount(uint32_t workers) noexcept {
+	Detail::g_warm_workers.store(workers, std::memory_order_relaxed);
+}
+
+/// Reads the machine and the emulator's own process now: the processor, the core count, the
+/// installed memory, the warm-up worker count and the process's peak working set and commit.
+[[nodiscard]] MachineInfo ReadMachineInfo();
 
 /// Notes that the guest reached a new flip.
 inline void OnFlip(int64_t flip) {
@@ -964,6 +1074,7 @@ private:
 	uint64_t                              m_id_ps;
 	std::chrono::steady_clock::time_point m_start;
 	int64_t                               m_start_ns = NO_TIME_NS;
+	CompileContext                        m_context;
 };
 
 /// Returns a copy of a SPIR-V module with an OpSourceExtension carrying nonce placed first in the

@@ -62206,6 +62206,39 @@ void CheckGeneratedRowsSurviveStop(VulkanHarness &vulkan, GuestGpu &gpu,
   std::printf("[gpu]     %-32s ok\n", name);
 }
 
+// A warm build counts as running while it is inside the driver, which is what the rows of worker
+// compiles read as warm_running. The baseline is the count before it began and after it ended, which
+// is none.
+void CheckWarmBuildCountsAsRunning(VulkanHarness &vulkan, GuestGpu &gpu,
+                                   const std::vector<DecodedModuleRecord> &records) {
+  constexpr const char *name = "WarmBuildCountsAsRunning";
+  ComputeCreateHook hook;
+  PipelineCache cache(vulkan.RuntimeContext(), nullptr);
+  PipelineCacheTestAccess::EnableWarmCompute(cache);
+  PipelineCacheTestAccess::EnableGeneration(cache);
+  Require(name, "none before", Common::FirstRunReport::WarmBuildsRunning() == 0,
+          "a warm build was counted before one began");
+  cache.PostGeneratedModule(DecodedModuleRecord(records[0]));
+  const int entered_before = ComputeCreateHook::entered.load();
+  ComputeCreateHook::release = false;
+  ComputeCreateHook::block   = true;
+  ShaderComputeInputInfo input{};
+  gpu.SendCommandSync([&] { GeneratedLookup(cache, GENERATED_STRIDE_A, input); });
+  const auto limit = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+  while (ComputeCreateHook::entered.load() == entered_before &&
+         std::chrono::steady_clock::now() < limit)
+    std::this_thread::yield();
+  Require(name, "one while it builds", Common::FirstRunReport::WarmBuildsRunning() == 1,
+          "the warm build that was inside the driver was not counted as running");
+  ComputeCreateHook::release = true;
+  PipelineCacheTestAccess::DrainWarmQueue(cache);
+  ComputeCreateHook::block = false;
+  Require(name, "none after", Common::FirstRunReport::WarmBuildsRunning() == 0,
+          "a finished warm build is still counted as running");
+  cache.StopBuilds();
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
 // The report's writer copies the rows from its own thread while the GPU thread takes modules in and
 // another thread pushes misses. The counts it sees never go down, and at the end they are exactly
 // what was pushed, which a copy of a deque that grows meanwhile would not give.
@@ -62387,6 +62420,7 @@ void CheckGeneratedModules(VulkanHarness &vulkan) {
       CheckGeneratedRowsRefused(vulkan, gpu, records);
       CheckGeneratedRowsPausedTake(vulkan, gpu, records);
       CheckGeneratedRowsSurviveStop(vulkan, gpu, records);
+      CheckWarmBuildCountsAsRunning(vulkan, gpu, records);
       CheckGeneratedRowsWriterAgainstPushes(vulkan, gpu, records);
       CheckGeneratedRowsTightWriter(vulkan);
       CheckGeneratedRowsTakeTheLock(vulkan);
@@ -62579,7 +62613,12 @@ void CheckStoreGenerationRows(VulkanHarness &vulkan, GuestGpu &gpu) {
                    fmt::format("kyty_store_generation_rows_{}",
                                std::chrono::steady_clock::now().time_since_epoch().count());
   Common::FirstRunReport::Global().Reset();
+  Common::FirstRunReport::SetWarmWorkerCount(0);
   auto cache = BootGeneratingCache(vulkan, dir, eboot, true, true);
+  // The machine block shows how many warm workers the boot made, which is the one the test asked for.
+  Require(name, "the warm worker count reaches the report",
+          Common::FirstRunReport::ReadMachineInfo().warm_workers == 1,
+          "the warm-up did not say how many workers it made");
   Require(name, "the generator finished",
           PipelineCacheTestAccess::HasSupervisor(*cache) &&
               PipelineCacheTestAccess::WaitSupervisorEnd(*cache, GENERATION_WAIT),
