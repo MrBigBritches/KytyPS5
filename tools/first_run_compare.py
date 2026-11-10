@@ -59,6 +59,12 @@ COLUMNS = [
 ]
 
 
+# Marks an arm name gets beyond its flags, for a run without --cold-pipelines and for a GPL run on a
+# device that could not link libraries.
+WARM_MARK = " (warm)"
+GPL_INACTIVE_MARK = " (gpl inactive)"
+
+
 def arm_name(report, common=frozenset(), with_store=True):
     """Names an arm by the flags that were on in it and not in every report, which keeps the label
     short when the launcher adds many base flags to all runs. A report with none of those is the
@@ -76,8 +82,8 @@ def arm_name(report, common=frozenset(), with_store=True):
     # not be merged with real GPL runs.
     library = report.get("graphics_pipeline_library", {})
     if report.get("flags", {}).get("--graphics-pipeline-library") and not library.get("active"):
-        label += " (gpl inactive)"
-    return label if report.get("cold") else label + " (warm)"
+        label += GPL_INACTIVE_MARK
+    return label if report.get("cold") else label + WARM_MARK
 
 
 def common_flags(reports):
@@ -713,7 +719,7 @@ def gate_runs(records, common, gpl_label):
         is_gen = bool(report.get("flags", {}).get(GENERATE_FLAG)) and not is_gpl
         # A second boot is told by the seeded store count in the report. A first run that was
         # seeded by hand (for example with -SeedFolder) has a count too, so it reads as a second boot.
-        if name == gpl_label + " (warm)" and metrics["second_boot"]:
+        if name == gpl_label + WARM_MARK and metrics["second_boot"]:
             groups["gpl2_warm"].append(metrics)
         if not (is_gpl or is_gen):
             continue
@@ -878,6 +884,19 @@ def memory_lines(groups):
     return lines
 
 
+def gen_arm_labels(records, common, gpl_label):
+    """The names of the arms among the generation runs, the first runs and second boots of one arm
+    sharing a name. More than one means the reports mix gen arms, such as gen and gen-wide. The
+    marks for a warm run or an inactive library are left off, since they do not make a run another
+    arm, so only a difference in flags counts."""
+    labels = set()
+    for report, _ in records:
+        name = arm_name(report, common, with_store=False)
+        if report.get("flags", {}).get(GENERATE_FLAG) and name != gpl_label:
+            labels.add(name.removesuffix(WARM_MARK).removesuffix(GPL_INACTIVE_MARK))
+    return sorted(labels)
+
+
 def gate(records, common, gpl_wanted):
     """Prints the pass criteria for the gen arm against the named gpl arm. Returns 1 when an arm
     can't be found."""
@@ -885,6 +904,14 @@ def gate(records, common, gpl_wanted):
     gpl_label = resolve_gpl_arm(names, gpl_wanted)
     if gpl_label is None:
         print(f"gate: no single gpl arm matches '{gpl_wanted}'", file=sys.stderr)
+        return 1
+    gen_labels = gen_arm_labels(records, common, gpl_label)
+    if len(gen_labels) > 1:
+        # gate_runs puts every generation run in one group, so two gen arms given together would
+        # be judged as one blend of both. Refuse, so each arm is gated on its own.
+        print("gate: the reports hold more than one gen arm, so pass one at a time:", file=sys.stderr)
+        for label in gen_labels:
+            print(f"  {label}", file=sys.stderr)
         return 1
     groups = gate_runs(records, common, gpl_label)
     if not groups["gen1"] or not groups["gpl1"]:

@@ -142,6 +142,46 @@ class ArmNames(unittest.TestCase):
         self.assertNotEqual(SCRIPT.arm_name(with_flag, common), SCRIPT.arm_name(without, common))
 
 
+class GateOneGenArm(unittest.TestCase):
+    """The gate refuses reports that hold two gen arms, since it would judge them as one blend."""
+
+    @staticmethod
+    def gate_with(extra_report):
+        """Gates the four fixtures plus one more gen first run, and returns the code and stderr."""
+        with tempfile.TemporaryDirectory() as folder:
+            paths = []
+            reports = [(name, read_fixture(name)) for name in NEW_FILES] + [("extra.json", extra_report)]
+            for name, report in reports:
+                path = os.path.join(folder, name)
+                with open(path, "w", encoding="utf-8") as handle:
+                    json.dump(report, handle)
+                paths.append(path)
+            code, _, err = run_script(paths, GPL_ARM)
+        return code, err
+
+    def test_a_second_gen_arm_is_refused(self):
+        wide = read_fixture("new_gen_first.json")
+        wide["flags"]["--warm-wide-tail-last"] = True
+        code, err = self.gate_with(wide)
+        self.assertEqual(code, 1)
+        self.assertIn("more than one gen arm", err)
+        self.assertIn(GEN_ARM + " --warm-wide-tail-last", err)
+
+    def test_another_run_of_the_same_gen_arm_is_gated(self):
+        # The same extra run without the flag is a second run of the one gen arm, so the only
+        # difference from the refused case is the flag.
+        code, err = self.gate_with(read_fixture("new_gen_first.json"))
+        self.assertEqual(code, 0, err)
+
+    def test_a_warm_run_of_the_same_gen_arm_is_gated(self):
+        # A warm copy of the gen second boot is named with a warm mark, but it is the same arm, so
+        # it must not count as a second one.
+        warm = read_fixture("new_gen_second.json")
+        warm["cold"] = False
+        code, err = self.gate_with(warm)
+        self.assertEqual(code, 0, err)
+
+
 class OldReports(unittest.TestCase):
     """Reports from before the new fields print exactly as the old script printed them."""
 
