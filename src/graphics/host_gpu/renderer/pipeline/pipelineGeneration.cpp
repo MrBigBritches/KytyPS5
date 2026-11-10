@@ -1,5 +1,4 @@
 #include "common/childProcess.h"
-#include "common/emulatorConfig.h"
 #include "common/firstRunReport.h"
 #include "common/logging/log.h"
 #include "graphics/host_gpu/renderer/pipeline/generationState.h"
@@ -249,8 +248,7 @@ void PipelineCache::AdoptGenerated(GeneratedModule&& item) {
 			// A deque, so the address that the queued build holds stays valid.
 			program->modules.push_back(std::move(item.module));
 			// The wide tail goes to the back lane, so it never delays the other builds.
-			StartWarmCompute(program->modules.back(), row,
-			                 WarmLaneOf(Config::WarmWideTailLastEnabled(), item.order));
+			StartWarmCompute(program->modules.back(), row, WarmLaneOf(item.order));
 			return;
 		}
 		case StoreGen::DrainVerdict::DropFailedInstall:

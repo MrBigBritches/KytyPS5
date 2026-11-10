@@ -89,12 +89,9 @@ static void PrintUsage() {
 	         "                                       making boot wait for them (experimental).\n");
 	::printf("  --generate-shader-store              Predict a Motor title's compute shaders from its eboot\n"
 	         "                                       and translate them in a low priority helper process,\n"
-	         "                                       so the background warm-up finds them ready. Needs\n"
-	         "                                       --shader-cache and --background-warm-up (experimental).\n");
-	::printf("  --warm-wide-tail-last                Build the extra variants of programs with\n"
-	         "                                       many variants after the other generated\n"
-	         "                                       modules. Needs --generate-shader-store\n"
-	         "                                       (experimental).\n");
+	         "                                       so the warm-up finds them ready. Extra variants of\n"
+	         "                                       programs with many variants are built last.\n"
+	         "                                       Needs --shader-cache and --background-warm-up (experimental).\n");
 	::printf("  --deferred-pipeline-draws            Let a draw that misses its graphics pipeline carry\n"
 	         "                                       on while it builds, and record the draw later\n"
 	         "                                       (experimental). Does not itself enable draw skips.\n");
@@ -260,7 +257,6 @@ static constexpr Flag FLAGS[] = {
     {"--async-pipelines-depth-only", &ConfigOptions::async_pipelines_depth_only_enabled},
     {"--background-warm-up", &ConfigOptions::background_warm_up_enabled},
     {"--generate-shader-store", &ConfigOptions::generate_shader_store_enabled},
-    {"--warm-wide-tail-last", &ConfigOptions::warm_wide_tail_last_enabled},
     {"--deferred-pipeline-draws", &ConfigOptions::deferred_pipeline_draws_enabled},
     {"--pause-warm-up-for-draws", &ConfigOptions::pause_warm_up_for_draws_enabled},
     {"--deferred-non-push-draws", &ConfigOptions::deferred_non_push_draws_enabled},

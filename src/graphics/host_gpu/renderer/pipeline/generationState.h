@@ -35,7 +35,7 @@ struct PipelineCache::GeneratedModule {
 	// When the generator's thread posted it, for the report's drain lag.
 	std::chrono::steady_clock::time_point posted;
 	// The tier and candidate count the supervisor gave the record. They fill the report's row, and
-	// the wide flag picks the lane of the warm build.
+	// the wide flag puts the warm build on the back lane.
 	StoreGen::GeneratedOrder order;
 };
 

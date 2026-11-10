@@ -1078,25 +1078,24 @@ void TestInlineClaimOfBackJobRunsOnce() {
 	CHECK(back.runs == 1);
 }
 
-// A generated module's build goes on the back lane only when the flag is on and the module is wide
-// tail. The four rows are every combination, so each one differs from its neighbours in one input
-// and a rule that ignores either input gives a wrong lane in at least one row.
+// A generated module's build goes on the back lane exactly when the module is wide tail. The rows
+// differ only in the wide flag, so a rule that ignores it gives a wrong lane in one of them. An
+// unknown candidate count is never wide, so it stays in front.
 void TestWarmLaneOf() {
 	struct Row {
-		bool wide_tail_last;
-		bool wide_tail;
-		Lane expected;
+		bool                    wide_tail;
+		std::optional<uint64_t> candidates;
+		Lane                    expected;
 	};
 	const Row rows[] = {
-	    {true, true, Lane::Back},
-	    {true, false, Lane::Front},
-	    {false, true, Lane::Front},
-	    {false, false, Lane::Front},
+	    {true, 3, Lane::Back},
+	    {false, 3, Lane::Front},
+	    {false, std::nullopt, Lane::Front},
 	};
 	for (const auto& row: rows) {
 		const StoreGen::GeneratedOrder order {
-		    .tier = 1, .candidates = 3, .wide_tail = row.wide_tail};
-		CHECK(WarmLaneOf(row.wide_tail_last, order) == row.expected);
+		    .tier = 1, .candidates = row.candidates, .wide_tail = row.wide_tail};
+		CHECK(WarmLaneOf(order) == row.expected);
 	}
 }
 

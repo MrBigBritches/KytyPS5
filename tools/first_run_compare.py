@@ -36,7 +36,7 @@ MEASUREMENT_FLAGS = {"--first-run-report", "--cold-pipelines"}
 # labelled baseline. Add each new strategy's flag here.
 STRATEGY_FLAGS = {"--async-pipelines", "--async-pipelines-depth-only", "--background-warm-up",
                   "--deferred-pipeline-draws", "--pause-warm-up-for-draws", "--deferred-non-push-draws",
-                  "--graphics-pipeline-library", "--generate-shader-store", "--warm-wide-tail-last"}
+                  "--graphics-pipeline-library", "--generate-shader-store"}
 # Histogram buckets whose lower bound is at least one second.
 LONG_PAUSE_BUCKETS = ("1000", "2500", "5000", "10000")
 MS_PER_SECOND = 1000.0
@@ -886,9 +886,9 @@ def memory_lines(groups):
 
 def gen_arm_labels(records, common, gpl_label):
     """The names of the arms among the generation runs, the first runs and second boots of one arm
-    sharing a name. More than one means the reports mix gen arms, such as gen and gen-wide. The
-    marks for a warm run or an inactive library are left off, since they do not make a run another
-    arm, so only a difference in flags counts."""
+    sharing a name. More than one means the reports mix gen arms, such as the gen flags with and
+    without another strategy flag. The marks for a warm run or an inactive library are left off,
+    since they do not make a run another arm, so only a difference in flags counts."""
     labels = set()
     for report, _ in records:
         name = arm_name(report, common, with_store=False)

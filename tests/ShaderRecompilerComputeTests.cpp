@@ -62433,12 +62433,10 @@ uint64_t StoredModuleHandle(PipelineCache &cache, const std::vector<u32> &code) 
 // created.
 std::vector<size_t> GeneratedBuildOrder(VulkanHarness &vulkan, GuestGpu &gpu,
                                         const std::vector<DecodedModuleRecord> &records,
-                                        bool wide_tail_last,
                                         std::optional<uint64_t> first_candidates) {
   constexpr const char *name = "GeneratedWideTailLast";
   constexpr uint32_t first_tier = 1;
-  Config::Load({.printf_direction = Config::LogDirection::Silent,
-                .warm_wide_tail_last_enabled = wide_tail_last});
+  Config::Load({.printf_direction = Config::LogDirection::Silent});
   ComputeCreateHook hook;
   PipelineCache cache(vulkan.RuntimeContext(), nullptr);
   PipelineCacheTestAccess::EnableWarmCompute(cache);
@@ -62470,11 +62468,10 @@ std::vector<size_t> GeneratedBuildOrder(VulkanHarness &vulkan, GuestGpu &gpu,
   return order;
 }
 
-// With --warm-wide-tail-last the wide tail is built after the other generated modules. The worker
-// is held while record 0 (tier 1, 3 candidates, wide) and then record 1 (tier 0) are taken in, so
-// the order they build in is the queue's. Each baseline changes one thing. Without the flag the
-// same posts build in the order they came, and with 2 candidates record 0 is not wide, so only the
-// flag and the width can have moved record 1 ahead.
+// The wide tail is built after the other generated modules. The worker is held while record 0
+// (tier 1, 3 candidates, wide) and then record 1 (tier 0) are taken in, so the order they build in
+// is the queue's. The baselines change one thing. With 2 candidates, or an unknown count, record 0
+// is posted the same way but is not wide, so only the width can have moved record 1 ahead.
 void CheckGeneratedWideTailLast(VulkanHarness &vulkan, GuestGpu &gpu,
                                 const std::vector<DecodedModuleRecord> &records) {
   constexpr const char *name = "GeneratedWideTailLast";
@@ -62482,23 +62479,20 @@ void CheckGeneratedWideTailLast(VulkanHarness &vulkan, GuestGpu &gpu,
   constexpr uint64_t narrow_candidates = 2;
   const std::vector<size_t> in_post_order = {0, 1};
   const std::vector<size_t> wide_last = {1, 0};
-  Require(name, "the flag moves the wide tail last",
-          GeneratedBuildOrder(vulkan, gpu, records, true, wide_candidates) == wide_last,
+  Require(name, "the wide tail builds last",
+          GeneratedBuildOrder(vulkan, gpu, records, wide_candidates) == wide_last,
           "a wide record was not built after the one that was posted behind it");
-  Require(name, "without the flag the posts build in order",
-          GeneratedBuildOrder(vulkan, gpu, records, false, wide_candidates) == in_post_order,
-          "the order changed with the flag off");
   Require(name, "a program of 2 candidates is not wide",
-          GeneratedBuildOrder(vulkan, gpu, records, true, narrow_candidates) == in_post_order,
+          GeneratedBuildOrder(vulkan, gpu, records, narrow_candidates) == in_post_order,
           "a record that is not wide was moved to the back");
   Require(name, "an unknown count is not wide",
-          GeneratedBuildOrder(vulkan, gpu, records, true, std::nullopt) == in_post_order,
+          GeneratedBuildOrder(vulkan, gpu, records, std::nullopt) == in_post_order,
           "a record with no candidate count was moved to the back");
   std::printf("[gpu]     %-32s ok\n", name);
 }
 
 // The warm-up of the main store stays on the front lane, so it builds before a generated module
-// that is taken in later, which is what the flag must not change. The first build is held in the
+// that is taken in later, since only the generator's wide tail is left to the back. The first build is held in the
 // driver while the generated module is taken in, so the second store module and the generated one
 // are queued together. A warm-up posted on the back lane would build after the generated module.
 void CheckWarmUpStaysFront(VulkanHarness &vulkan, GuestGpu &gpu,
@@ -62523,8 +62517,7 @@ void CheckWarmUpStaysFront(VulkanHarness &vulkan, GuestGpu &gpu,
   const auto store = dir / "TEST00001.shaders";
   (void)RunWarmBoot(vulkan, store, codes, false);
   Config::Load({.printf_direction = Config::LogDirection::Silent,
-                .background_warm_up_enabled = true,
-                .warm_wide_tail_last_enabled = true});
+                .background_warm_up_enabled = true});
   ComputeCreateHook hook;
   PipelineCache cache(vulkan.RuntimeContext(), nullptr);
   PipelineCacheTestAccess::SetWarmWorkerCount(cache, 1);
@@ -62640,8 +62633,7 @@ bool RigProcessAlive(uint32_t pid) {
 std::unique_ptr<PipelineCache>
 BootGeneratingCache(VulkanHarness &vulkan, const std::filesystem::path &dir,
                     const std::vector<uint8_t> &eboot, bool generate, bool background,
-                    std::function<void(StoreGen::SupervisorConfig &)> tweak = {},
-                    bool wide_tail_last = false) {
+                    std::function<void(StoreGen::SupervisorConfig &)> tweak = {}) {
   std::filesystem::create_directories(dir);
   {
     std::ofstream out(dir / "game.eboot", std::ios::binary | std::ios::trunc);
@@ -62651,8 +62643,7 @@ BootGeneratingCache(VulkanHarness &vulkan, const std::filesystem::path &dir,
   StoreGen::SetEbootPath(dir / "game.eboot");
   Config::Load({.printf_direction = Config::LogDirection::Silent,
                 .background_warm_up_enabled = background,
-                .generate_shader_store_enabled = generate,
-                .warm_wide_tail_last_enabled = wide_tail_last});
+                .generate_shader_store_enabled = generate});
   // Config::Load turns the counters off again, and the checks read them.
   Common::DebugCounters::SetEnabled(true);
   auto cache = std::make_unique<PipelineCache>(vulkan.RuntimeContext(), nullptr);
@@ -62704,10 +62695,10 @@ constexpr auto GENERATION_WAIT = std::chrono::seconds(180);
 // own, so the modules are there with no compile on any thread of the game. A cache without the flag
 // has no generator and no files, and its lookup compiles, which is the baseline.
 //
-// With `wide_tail_last` the same run has --warm-wide-tail-last on, and the wide tail of the modules
-// builds on the back lane. Every build must still be done once the drain helper returns.
-void CheckStoreGenerationNormal(VulkanHarness &vulkan, GuestGpu &gpu, bool wide_tail_last = false) {
-  const char *name = wide_tail_last ? "StoreGenerationWideTailLast" : "StoreGenerationNormal";
+// The wide tail of the modules builds on the back lane, and every build must still be done once
+// the drain helper returns.
+void CheckStoreGenerationNormal(VulkanHarness &vulkan, GuestGpu &gpu) {
+  constexpr const char *name = "StoreGenerationNormal";
   constexpr size_t candidates = StoreGenFixtures::MAIN_CANDIDATES;
   const auto eboot = StoreGenFixtures::BuildEboot(StoreGenFixtures::MainPrograms());
   const auto dir = std::filesystem::temp_directory_path() /
@@ -62748,7 +62739,7 @@ void CheckStoreGenerationNormal(VulkanHarness &vulkan, GuestGpu &gpu, bool wide_
     Common::FirstRunReport::Global().Reset();
   }
   {
-    auto cache = BootGeneratingCache(vulkan, dir / "on", eboot, true, true, {}, wide_tail_last);
+    auto cache = BootGeneratingCache(vulkan, dir / "on", eboot, true, true);
     Require(name, "the generator started", PipelineCacheTestAccess::HasSupervisor(*cache),
             "the flag did not start a generator");
     Require(name, "the generator finished",
@@ -63157,7 +63148,6 @@ void CheckStoreGeneration(VulkanHarness &vulkan) {
   Config::Load({.printf_direction = Config::LogDirection::Silent});
   vulkan.WithGpuLane([&](GuestGpu &gpu) {
     CheckStoreGenerationNormal(vulkan, gpu);
-    CheckStoreGenerationNormal(vulkan, gpu, true);
     CheckStoreGenerationSecondBoot(vulkan, gpu);
     CheckStoreGenerationRows(vulkan, gpu);
     CheckStoreGenerationTiers(vulkan, gpu);
