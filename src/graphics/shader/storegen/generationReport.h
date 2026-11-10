@@ -287,7 +287,10 @@ inline void FillModuleRows(Common::FirstRunReport::ShaderStoreGenerationReport& 
 		                                                .adopted_ns = module.adopted_ns,
 		                                                .ready_ns   = module.ready_ns,
 		                                                .build_ms   = module.build_ms,
-		                                                .how        = "unused"};
+		                                                .how        = "unused",
+		                                                .tier       = module.tier,
+		                                                .wide_tail  = module.wide_tail,
+		                                                .candidates = module.candidates};
 		if (const auto take = first_use.find(module.id); take != first_use.end()) {
 			row.how = WarmTakeHowName(take->second->how);
 			if (take->second->at_ns != Common::FirstRunReport::NO_TIME_NS) {

@@ -267,7 +267,11 @@ StoreGen::GenRow* PipelineCache::NoteAdopted(const GeneratedModule& item) {
 	const int64_t    posted  = ToNanoseconds(item.posted);
 	const int64_t    adopted = Common::FirstRunReport::NowNs();
 	std::scoped_lock lock(state.mutex);
-	return &state.generated_rows.emplace_back(item.module.id, item.key.hash, posted, adopted);
+	auto& row = state.generated_rows.emplace_back(item.module.id, item.key.hash, posted, adopted);
+	row.tier  = item.order.tier;
+	row.wide_tail  = item.order.wide_tail;
+	row.candidates = item.order.candidates;
+	return &row;
 }
 
 // Adds the row of a module that the drain refused. Only the drain's refusals are rows. A module

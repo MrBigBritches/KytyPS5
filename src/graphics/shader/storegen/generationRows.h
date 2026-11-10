@@ -31,16 +31,24 @@ struct GenRow {
 	std::atomic<int64_t> ready_ns {NO_ROW_TIME_NS};
 	/// How long that build took, or a negative number while none has finished.
 	std::atomic<double> build_ms {-1.0};
+	/// Where the module stood among its program's variants when the supervisor delivered it. They
+	/// are written once at adoption, before any worker can see the row, so they need no atomics.
+	uint32_t                tier      = 0;
+	bool                    wide_tail = false;
+	std::optional<uint64_t> candidates;
 };
 
 /// A copy of a GenRow that can be handed to another thread.
 struct GenRowSnapshot {
-	uint64_t               id         = 0;
-	uint64_t               code_hash  = 0;
-	int64_t                posted_ns  = NO_ROW_TIME_NS;
-	int64_t                adopted_ns = NO_ROW_TIME_NS;
-	std::optional<int64_t> ready_ns;
-	std::optional<double>  build_ms;
+	uint64_t                id         = 0;
+	uint64_t                code_hash  = 0;
+	int64_t                 posted_ns  = NO_ROW_TIME_NS;
+	int64_t                 adopted_ns = NO_ROW_TIME_NS;
+	std::optional<int64_t>  ready_ns;
+	std::optional<double>   build_ms;
+	uint32_t                tier      = 0;
+	bool                    wide_tail = false;
+	std::optional<uint64_t> candidates;
 };
 
 /// Copies a row. The two atomics are read separately, so a build that finishes meanwhile may show
@@ -49,7 +57,10 @@ struct GenRowSnapshot {
 	GenRowSnapshot copy {.id         = row.id,
 	                     .code_hash  = row.code_hash,
 	                     .posted_ns  = row.posted_ns,
-	                     .adopted_ns = row.adopted_ns};
+	                     .adopted_ns = row.adopted_ns,
+	                     .tier       = row.tier,
+	                     .wide_tail  = row.wide_tail,
+	                     .candidates = row.candidates};
 	if (const auto ready = row.ready_ns.load(std::memory_order_acquire); ready != NO_ROW_TIME_NS) {
 		copy.ready_ns = ready;
 	}

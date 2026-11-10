@@ -258,17 +258,22 @@ struct GenerationPrediction {
 /// One generated module the drain took in. Times are on the NowNs clock, and a time that did not
 /// happen is missing. lead_ms is first_use minus ready, so a negative number means the dispatch got
 /// there before a worker had finished the build. how is done, waited or inline, from the first use
-/// of the module, and unused when no dispatch took it.
+/// of the module, and unused when no dispatch took it. tier is how many records of the same program
+/// came before it, wide_tail says the warm queue may leave it to the end, and candidates is the
+/// program's predicted variant count, missing when no prediction line was read.
 struct GeneratedModuleRow {
-	uint64_t               id         = 0;
-	uint64_t               code_hash  = 0;
-	int64_t                posted_ns  = NO_TIME_NS;
-	int64_t                adopted_ns = NO_TIME_NS;
-	std::optional<int64_t> ready_ns;
-	std::optional<int64_t> first_use_ns;
-	std::optional<double>  build_ms;
-	std::optional<double>  lead_ms;
-	std::string            how;
+	uint64_t                id         = 0;
+	uint64_t                code_hash  = 0;
+	int64_t                 posted_ns  = NO_TIME_NS;
+	int64_t                 adopted_ns = NO_TIME_NS;
+	std::optional<int64_t>  ready_ns;
+	std::optional<int64_t>  first_use_ns;
+	std::optional<double>   build_ms;
+	std::optional<double>   lead_ms;
+	std::string             how;
+	uint32_t                tier      = 0;
+	bool                    wide_tail = false;
+	std::optional<uint64_t> candidates;
 };
 
 /// The misses of one class.

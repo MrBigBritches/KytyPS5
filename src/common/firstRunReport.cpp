@@ -953,7 +953,13 @@ nlohmann::json GeneratedModuleToJson(const GeneratedModuleRow& module, int64_t e
 	                      {"code_hash", Hex(module.code_hash)},
 	                      {"posted_ms", RunMs(module.posted_ns, epoch_ns)},
 	                      {"adopted_ms", RunMs(module.adopted_ns, epoch_ns)},
-	                      {"how", module.how}};
+	                      {"how", module.how},
+	                      {"tier", module.tier},
+	                      {"wide_tail", module.wide_tail}};
+	// Left out when unknown, like the block's other optional figures, so a count of 0 stays apart.
+	if (module.candidates) {
+		row["candidates"] = *module.candidates;
+	}
 	SetRunMs(row, "ready_ms", module.ready_ns, epoch_ns);
 	SetRunMs(row, "first_use_ms", module.first_use_ns, epoch_ns);
 	SetOptional(row, "build_ms", module.build_ms);

@@ -62804,6 +62804,69 @@ void CheckStoreGenerationRows(VulkanHarness &vulkan, GuestGpu &gpu) {
   std::printf("[gpu]     %-32s ok\n", name);
 }
 
+// The tier, wide flag and candidate count of the module rows come from a real worker. Big has four
+// candidates, so its tiers 1 to 3 are wide and its tier 0 is not. Middle has two, so its tier 1 is
+// not wide, which is the one change from Big's tier 1. Small has one and only a tier 0.
+void CheckStoreGenerationTiers(VulkanHarness &vulkan, GuestGpu &gpu) {
+  constexpr const char *name = "StoreGenerationTiers";
+  constexpr uint64_t big_candidates = 4;
+  constexpr uint64_t middle_candidates = 2;
+  constexpr uint64_t small_candidates = 1;
+  const auto eboot = StoreGenFixtures::BuildEboot(StoreGenFixtures::MainPrograms());
+  const auto dir = std::filesystem::temp_directory_path() /
+                   fmt::format("kyty_store_generation_tiers_{}",
+                               std::chrono::steady_clock::now().time_since_epoch().count());
+  auto cache = BootGeneratingCache(vulkan, dir, eboot, true, true);
+  Require(name, "the generator finished",
+          PipelineCacheTestAccess::HasSupervisor(*cache) &&
+              PipelineCacheTestAccess::WaitSupervisorEnd(*cache, GENERATION_WAIT),
+          "the worker did not finish in time");
+  LookupUntilDrained(*cache, gpu);
+  PipelineCacheTestAccess::DrainWarmQueue(*cache);
+  const auto block = PipelineCacheTestAccess::GenerationBlock(*cache);
+
+  // Each program's rows by tier, found through the candidate count its rows carry.
+  std::map<uint64_t, std::map<uint32_t, const Common::FirstRunReport::GeneratedModuleRow *>> by_count;
+  size_t unknown_rows = 0;
+  for (const auto &row : block.generated_modules) {
+    if (!row.candidates) {
+      unknown_rows++;
+      continue;
+    }
+    by_count[*row.candidates][row.tier] = &row;
+  }
+  Require(name, "every row knows its count", unknown_rows == 0 && block.generated_modules.size() ==
+              big_candidates + middle_candidates + small_candidates,
+          "a row of a cold run has no candidate count");
+  const auto tier_of = [&](uint64_t count, uint32_t tier) {
+    const auto program = by_count.find(count);
+    if (program == by_count.end()) return static_cast<const Common::FirstRunReport::GeneratedModuleRow *>(nullptr);
+    const auto row = program->second.find(tier);
+    return row == program->second.end() ? nullptr : row->second;
+  };
+  bool big_right = by_count[big_candidates].size() == big_candidates;
+  for (uint32_t tier = 0; tier < big_candidates; tier++) {
+    const auto *row = tier_of(big_candidates, tier);
+    big_right = big_right && row != nullptr && row->wide_tail == (tier >= 1);
+  }
+  Require(name, "Big is wide from tier 1", big_right,
+          "Big's tier 0 was wide or one of its tiers 1 to 3 was not");
+  const auto *middle_first = tier_of(middle_candidates, 0);
+  const auto *middle_second = tier_of(middle_candidates, 1);
+  Require(name, "Middle tier 1 is not wide, with its own count",
+          middle_first != nullptr && middle_second != nullptr && !middle_first->wide_tail &&
+              !middle_second->wide_tail && by_count[middle_candidates].size() == middle_candidates,
+          "a program of two candidates had a wide tail");
+  const auto *lone_row = tier_of(small_candidates, 0);
+  Require(name, "Small is tier 0 with one candidate",
+          lone_row != nullptr && !lone_row->wide_tail && by_count[small_candidates].size() == 1,
+          "the one-candidate program was not a lone tier 0");
+  cache->StopBuilds();
+  cache.reset();
+  std::filesystem::remove_all(dir);
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
 // A program that crashes the recompiler while it is predicted is skipped by the restart, so the
 // other programs' records still arrive. One restart, with the crashed program in the skip list and
 // nothing in the failed list, is the answer. Without the skip the restart would crash again.
@@ -62925,6 +62988,7 @@ void CheckStoreGeneration(VulkanHarness &vulkan) {
     CheckStoreGenerationNormal(vulkan, gpu);
     CheckStoreGenerationSecondBoot(vulkan, gpu);
     CheckStoreGenerationRows(vulkan, gpu);
+    CheckStoreGenerationTiers(vulkan, gpu);
     CheckStoreGenerationPredictCrash(vulkan, gpu);
   });
   CheckStoreGenerationHang(vulkan);

@@ -381,6 +381,34 @@ void TestModuleRows() {
 	      modules[0].adopted_ns == 2 * MS && modules[0].build_ms && *modules[0].build_ms == 4.0);
 }
 
+// A module's tier, wide flag and candidate count reach its report row, and an unknown count stays
+// unknown instead of turning into 0. The rows differ from each other in every field, so a copy that
+// swaps or drops one fails, and the first row is the baseline of the second.
+void TestModuleOrderFields() {
+	GenRowSnapshot first_row  = Module(1, 1, 2, std::nullopt, std::nullopt);
+	first_row.tier            = 0;
+	first_row.wide_tail       = false;
+	first_row.candidates      = 3;
+	GenRowSnapshot second_row = Module(2, 1, 2, std::nullopt, std::nullopt);
+	second_row.tier           = 2;
+	second_row.wide_tail      = true;
+	second_row.candidates     = 4;
+	GenRowSnapshot unknown    = Module(3, 1, 2, std::nullopt, std::nullopt);
+	unknown.tier              = 1;
+	GenerationRowInputs rows;
+	rows.generated = {first_row, second_row, unknown};
+	SupervisorStats stats;
+	auto            block = MakeSupervisorReport(stats);
+	FillModuleRows(block, rows);
+	CHECK(block.generated_modules.size() == 3);
+	if (block.generated_modules.size() == 3) {
+		const auto& modules = block.generated_modules;
+		CHECK(modules[0].tier == 0 && !modules[0].wide_tail && modules[0].candidates == 3);
+		CHECK(modules[1].tier == 2 && modules[1].wide_tail && modules[1].candidates == 4);
+		CHECK(modules[2].tier == 1 && !modules[2].wide_tail && !modules[2].candidates.has_value());
+	}
+}
+
 // A first use that stopped a dispatch for more than 250 ms and that was not a finished build gets a
 // row. The rows that do not are at 250 exactly, below it, and done.
 void TestSlowTakes() {
@@ -531,6 +559,7 @@ int main() {
 	TestSummary();
 	TestContextFromStats();
 	TestModuleRows();
+	TestModuleOrderFields();
 	TestSlowTakes();
 	TestBlockShape();
 	if (g_failures == 0) {

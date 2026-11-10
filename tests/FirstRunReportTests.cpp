@@ -1308,8 +1308,18 @@ void TestGenerationRowsJson() {
 	     .first_use_ns = 3250 * MS,
 	     .build_ms     = 12.5,
 	     .lead_ms      = -4.5,
-	     .how          = "done"},
-	    {.id = 0x12, .posted_ns = 1250 * MS, .adopted_ns = 1500 * MS, .how = "unused"}};
+	     .how          = "done",
+	     .tier         = 0,
+	     .wide_tail    = false,
+	     .candidates   = 3},
+	    {.id         = 0x12,
+	     .posted_ns  = 1250 * MS,
+	     .adopted_ns = 1500 * MS,
+	     .how        = "unused",
+	     .tier       = 2,
+	     .wide_tail  = true,
+	     .candidates = 0},
+	    {.id = 0x13, .posted_ns = 1250 * MS, .adopted_ns = 1500 * MS, .how = "unused", .tier = 1}};
 	figures.unused_build_ms                = 7.5;
 	figures.misses.total                   = 3;
 	figures.misses.create_ms               = 4.25;
@@ -1333,7 +1343,7 @@ void TestGenerationRowsJson() {
 	          predictions[1]["outcome"] == "calls" && predictions[1]["candidates"] == 0,
 	      "a prediction row lacks a figure");
 	const auto& modules = block["generated_modules"];
-	Check(modules.size() == 2 && modules[0]["id"] == "0000000000000011" &&
+	Check(modules.size() == 3 && modules[0]["id"] == "0000000000000011" &&
 	          modules[0]["code_hash"] == "00000000000000ab" && modules[0]["posted_ms"] == 1000.0 &&
 	          modules[0]["adopted_ms"] == 1250.0 && modules[0]["ready_ms"] == 2000.0 &&
 	          modules[0]["first_use_ms"] == 3000.0 && modules[0]["build_ms"] == 12.5 &&
@@ -1343,6 +1353,15 @@ void TestGenerationRowsJson() {
 	          !modules[1].contains("first_use_ms") && !modules[1].contains("build_ms") &&
 	          !modules[1].contains("lead_ms"),
 	      "a module that was never built shows a time it did not have");
+	// Two rows with different values, so a writer of constants fails. A known count of 0 is a
+	// number and an unknown count is absent, so the two cannot be mistaken for each other.
+	Check(modules[0]["tier"] == 0 && modules[0]["wide_tail"] == false &&
+	          modules[0]["candidates"] == 3 && modules[1]["tier"] == 2 &&
+	          modules[1]["wide_tail"] == true && modules[1]["candidates"] == 0,
+	      "a module row lacks its tier, wide flag or candidates, or they are not the row's own");
+	Check(modules[2]["tier"] == 1 && modules[2]["wide_tail"] == false &&
+	          !modules[2].contains("candidates"),
+	      "a module with an unknown candidate count shows one");
 	Check(block["unused_build_ms"] == 7.5, "unused_build_ms is not the figure");
 	const auto& misses = block["runtime_misses"];
 	Check(misses["total"] == 3 && misses["create_ms"] == 4.25 &&
