@@ -43,6 +43,7 @@
 #include "graphics/shader/shaderStoreRecord.h"
 #include "graphics/shader/storegen/ebootShaderScan.h"
 #include "graphics/shader/storegen/ebootSource.h"
+#include "graphics/shader/storegen/generationReport.h"
 #include "graphics/shader/storegen/storeSupervisor.h"
 #include "graphics/shader/storegen/workerProcess.h"
 #include "ShaderStoreEbootFixtures.h"
@@ -1252,6 +1253,45 @@ struct PipelineCacheTestAccess {
   // to change a figure after the stop and see whether the report still follows the cache.
   static void NoteBadPlan(PipelineCache &cache) { cache.m_generation->bad_plans++; }
 
+  // The generation block the report would write now, which holds the rows of the cache.
+  static Common::FirstRunReport::ShaderStoreGenerationReport GenerationBlock(const PipelineCache &cache) {
+    return cache.BuildGenerationReport(false);
+  }
+  // Records a runtime miss as GetProgram does.
+  static void NoteMiss(PipelineCache &cache, uint64_t hash, uint64_t id, bool has_calls,
+                       bool skip_dispatch) {
+    cache.NoteGeneratedMiss(hash, id, has_calls, skip_dispatch);
+  }
+  // The rows as the writer copies them, and a push of a row of a taken-in module, with the module's
+  // id and hash chosen by the caller.
+  static StoreGen::GenerationRowInputs SnapshotRows(const PipelineCache &cache) {
+    return cache.SnapshotGenerationRows();
+  }
+  static void NoteAdoptedRow(PipelineCache &cache, uint64_t id, uint64_t hash, int64_t posted_ns) {
+    PipelineCache::GeneratedModule item;
+    item.module.id = id;
+    item.key.hash = hash;
+    item.posted = std::chrono::steady_clock::time_point(std::chrono::nanoseconds(posted_ns));
+    (void)cache.NoteAdopted(item);
+  }
+  // The mutex that guards the rows, which a test holds to see which calls wait for it, and a push of
+  // the row of a refused module.
+  static std::mutex &StateMutex(PipelineCache &cache) { return cache.m_generation->mutex; }
+  static void NoteRefusedRow(PipelineCache &cache, uint64_t id) {
+    PipelineCache::GeneratedModule item;
+    item.module.id = id;
+    cache.NoteRefused(item, StoreGen::DrainVerdict::DropDuplicate);
+  }
+  // Copies of the cache's rows of refused modules and of misses, taken under the state's lock.
+  static std::vector<StoreGen::DropRow> RefusedRows(const PipelineCache &cache) {
+    std::scoped_lock lock(cache.m_generation->mutex);
+    return {cache.m_generation->refused_rows.begin(), cache.m_generation->refused_rows.end()};
+  }
+  static std::vector<StoreGen::MissRow> MissRows(const PipelineCache &cache) {
+    std::scoped_lock lock(cache.m_generation->mutex);
+    return {cache.m_generation->miss_rows.begin(), cache.m_generation->miss_rows.end()};
+  }
+
   // Posts a record the way the generator's thread does, with the changes a test may make to the
   // module on its way: its plan hash changed, which stands for a plan that is not the program's, or
   // its plan left out, which stands for a first record whose plan could not be decoded.
@@ -1308,6 +1348,11 @@ struct PipelineCacheTestAccess {
   // Makes the warm queue of the next WarmUp run one job at a time, in the order they were posted.
   static void SetWarmWorkerCount(PipelineCache &cache, uint32_t count) {
     cache.m_warm_worker_count_override = count;
+  }
+
+  // Holds the warm queue back for a while, as a pause for draws does.
+  static void PauseWarm(PipelineCache &cache) {
+    cache.m_warm_compute->Pause(PipelineBuildQueue::Clock::now() + std::chrono::seconds(30));
   }
 
   // Whether the warm queue, or the queue the deferred draws build on, is held back by a pause.
@@ -20578,6 +20623,8 @@ public:
 
     RenderContext context(m_runtime_context);
     context.InitializeGpu(nullptr);
+    // Generation is on, so that every runtime translation leaves a miss row to look at at the end.
+    PipelineCacheTestAccess::EnableGeneration(context.GetPipelineCache());
     LibKernel::Memory::InstallGpuResources(&context);
     context.GetGpu().SendCommandSync([&] {
       CommandProcessor processor(context, 0);
@@ -20774,6 +20821,32 @@ public:
           }
         }
       }
+      // The report's classes need to tell a miss on a program with GPU-selected calls from one the
+      // worker could have made. Every runtime translation above was of a program with calls, and
+      // the program below has none, so the two kinds of rows differ in has_calls alone.
+      const auto call_misses = PipelineCacheTestAccess::MissRows(context.GetPipelineCache());
+      Require(name, "misses on programs with calls", !call_misses.empty() &&
+              std::ranges::all_of(call_misses, [](const StoreGen::MissRow &row) {
+                return row.has_calls && !row.skip_dispatch && row.id != 0;
+              }), "a runtime miss on a program with calls did not set has_calls");
+      std::vector<u32> plain;
+      AppendVMovU32(&plain, 1, 0x71u);
+      plain.insert(plain.end(), {EncodeMubuf0(0x1c), EncodeMubuf1(1, 0, 0)});
+      AppendEnd(&plain);
+      ShaderMapUserData(reinterpret_cast<uint64_t>(plain.data()),
+          {.type = Prospero::ShaderBinaryType::kCs,
+           .code_size_bytes = static_cast<u32>(plain.size() * sizeof(u32))});
+      shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(plain.data()),
+                           .num_thread_x = 1, .num_thread_y = 1, .num_thread_z = 1,
+                           .wave_size = 32, .user_sgpr = 4});
+      for (u32 i = 0; i < 4; ++i) shaders.SetCsUserSgpr(i, out.fields[i]);
+      ShaderComputeInputInfo plain_input{};
+      (void)context.GetPipelineCache().GetComputeProgram(shaders.GetCs(), plain_input);
+      const auto all_misses = PipelineCacheTestAccess::MissRows(context.GetPipelineCache());
+      Require(name, "a miss on a program without calls", all_misses.size() == call_misses.size() + 1 &&
+              !all_misses.back().has_calls && !all_misses.back().skip_dispatch &&
+              all_misses.back().id != 0,
+              "a runtime miss on a program without calls was marked as having calls");
       context.UnmapMemory(base, size);
       context.GetCommandScheduler().Finish();
     });
@@ -61933,6 +62006,352 @@ void CheckGeneratedStop(VulkanHarness &vulkan, GuestGpu &gpu,
   std::printf("[gpu]     %-32s ok\n", name);
 }
 
+// The one generated module row of a block, which the checks below look at, or null.
+const Common::FirstRunReport::GeneratedModuleRow *
+OnlyModuleRow(const Common::FirstRunReport::ShaderStoreGenerationReport &block) {
+  return block.generated_modules.size() == 1 ? &block.generated_modules[0] : nullptr;
+}
+
+// The count of a class of misses in a block.
+uint64_t MissClassCount(const Common::FirstRunReport::ShaderStoreGenerationReport &block,
+                        const std::string &name) {
+  for (const auto &miss_class : block.misses.classes)
+    if (miss_class.name == name) return miss_class.count;
+  return ~0ull;
+}
+
+// A module the drain took in has a row, the warm build stamps it, and the first use joins it. The
+// baseline is the same lookup of a module nobody posted, which adds a miss and no row.
+void CheckGeneratedRowsHit(VulkanHarness &vulkan, GuestGpu &gpu,
+                           const std::vector<DecodedModuleRecord> &records) {
+  constexpr const char *name = "GeneratedRowsHit";
+  ComputeCreateHook hook;
+  PipelineCache cache(vulkan.RuntimeContext(), nullptr);
+  PipelineCacheTestAccess::EnableWarmCompute(cache);
+  PipelineCacheTestAccess::EnableGeneration(cache);
+  cache.PostGeneratedModule(DecodedModuleRecord(records[0]));
+  ShaderComputeInputInfo input{};
+  gpu.SendCommandSync([&] { GeneratedLookup(cache, GENERATED_STRIDE_A, input); });
+  auto block = PipelineCacheTestAccess::GenerationBlock(cache);
+  const auto *row = OnlyModuleRow(block);
+  Require(name, "one row for the module taken in",
+          row != nullptr && row->id == records[0].id && row->code_hash == records[0].hash &&
+              row->posted_ns <= row->adopted_ns,
+          "the drain left no row, or one with the wrong module");
+  Require(name, "a hit is no miss", block.misses.total == 0 &&
+              PipelineCacheTestAccess::MissRows(cache).empty(),
+          "a lookup that found its module was counted as a miss");
+  // The build is let finish before the dispatch asks, so the module was ready ahead of its use.
+  PipelineCacheTestAccess::DrainWarmQueue(cache);
+  (void)cache.GetComputePipeline(input);
+  block = PipelineCacheTestAccess::GenerationBlock(cache);
+  row = OnlyModuleRow(block);
+  Require(name, "the build stamped its row",
+          row != nullptr && row->ready_ns.has_value() && row->build_ms.has_value() &&
+              *row->build_ms > 0.0,
+          "the warm build did not stamp the time it finished and how long it took");
+  Require(name, "the first use joined it",
+          row != nullptr && row->how == "done" && row->first_use_ns.has_value() &&
+              row->lead_ms.has_value() && *row->lead_ms >= 0.0 && block.unused_build_ms == 0.0,
+          "the first use was not joined to the module's row");
+
+  // The baseline: a module nobody posted is a miss with no row, and with no generator behind the
+  // cache the miss is before any prediction.
+  gpu.SendCommandSync([&] { GeneratedLookup(cache, GENERATED_STRIDE_B, input); });
+  block = PipelineCacheTestAccess::GenerationBlock(cache);
+  const auto misses = PipelineCacheTestAccess::MissRows(cache);
+  Require(name, "a lookup that compiles is a miss",
+          block.generated_modules.size() == 1 && misses.size() == 1 &&
+              misses[0].code_hash == records[1].hash && misses[0].id == records[1].id &&
+              !misses[0].has_calls && !misses[0].skip_dispatch,
+          "the lookup that compiled its module left no miss row, or the wrong one");
+  Require(name, "no generator, so before the prediction",
+          block.misses.total == 1 && MissClassCount(block, "before_prediction") == 1,
+          "a miss with no prediction behind it was not before_prediction");
+  cache.StopBuilds();
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
+// A first use that stops the dispatch records whether the warm queue was held back at that moment,
+// which the report lists for the slow ones. The baseline is the same first use with the queue
+// running, which records it was not.
+void CheckGeneratedRowsPausedTake(VulkanHarness &vulkan, GuestGpu &gpu,
+                                  const std::vector<DecodedModuleRecord> &records) {
+  constexpr const char *name = "GeneratedRowsPausedTake";
+  for (const bool paused : {false, true}) {
+    Common::FirstRunReport::Global().Reset();
+    PipelineCache cache(vulkan.RuntimeContext(), nullptr);
+    PipelineCacheTestAccess::EnableWarmCompute(cache);
+    PipelineCacheTestAccess::EnableGeneration(cache);
+    if (paused) PipelineCacheTestAccess::PauseWarm(cache);
+    cache.PostGeneratedModule(DecodedModuleRecord(records[0]));
+    ShaderComputeInputInfo input{};
+    gpu.SendCommandSync([&] { GeneratedLookup(cache, GENERATED_STRIDE_A, input); });
+    // With the queue running the build is let finish first, and then the use is a finished build and
+    // is not a take that stopped anything. A held queue has not started it, so the dispatch runs it.
+    if (!paused) PipelineCacheTestAccess::DrainWarmQueue(cache);
+    (void)cache.GetComputePipeline(input);
+    const auto takes = Common::FirstRunReport::Global().WarmTakes();
+    Require(name, paused ? "a take with the queue held" : "a take with the queue running",
+            takes.size() == 1 && takes[0].id == records[0].id && takes[0].paused == paused &&
+                (takes[0].how == Common::FirstRunReport::WarmTakeHow::Inline) == paused,
+            "the take did not record whether the warm queue was held back");
+    cache.StopBuilds();
+  }
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
+// The drain leaves a row for every module it refuses, with the id and the verdict. A duplicate is a
+// module the runtime had compiled already, a changed plan hash is a plan mismatch and a left-out plan
+// of a new program is a failed install. The baseline of each is the module taken in, which has a
+// generated row and no refusal.
+void CheckGeneratedRowsRefused(VulkanHarness &vulkan, GuestGpu &gpu,
+                               const std::vector<DecodedModuleRecord> &records) {
+  constexpr const char *name = "GeneratedRowsRefused";
+  using StoreGen::DropVerdict;
+  {
+    PipelineCache cache(vulkan.RuntimeContext(), nullptr);
+    PipelineCacheTestAccess::EnableWarmCompute(cache);
+    PipelineCacheTestAccess::EnableGeneration(cache);
+    // Off the GPU thread the runtime compiles the module first, and the posted copy is then a
+    // duplicate.
+    ShaderComputeInputInfo input{};
+    GeneratedLookup(cache, GENERATED_STRIDE_A, input);
+    cache.PostGeneratedModule(DecodedModuleRecord(records[0]));
+    gpu.SendCommandSync([&] { GeneratedLookup(cache, GENERATED_STRIDE_A, input); });
+    const auto refused = PipelineCacheTestAccess::RefusedRows(cache);
+    Require(name, "a duplicate is refused with its id",
+            refused.size() == 1 && refused[0].id == records[0].id &&
+                refused[0].verdict == DropVerdict::Duplicate,
+            "the duplicate left no refusal row, or the wrong one");
+    Require(name, "and has no generated row",
+            PipelineCacheTestAccess::GenerationBlock(cache).generated_modules.empty(),
+            "a refused module got a generated row");
+    cache.StopBuilds();
+  }
+  {
+    // A program that is new with a plan that does not match is not the case, since the first module
+    // installs it. The second module of the program carries a plan that differs.
+    PipelineCache cache(vulkan.RuntimeContext(), nullptr);
+    PipelineCacheTestAccess::EnableWarmCompute(cache);
+    PipelineCacheTestAccess::EnableGeneration(cache);
+    PipelineCacheTestAccess::PostChanged(cache, DecodedModuleRecord(records[0]), false, false);
+    PipelineCacheTestAccess::PostChanged(cache, DecodedModuleRecord(records[1]), true, false);
+    ShaderComputeInputInfo input{};
+    gpu.SendCommandSync([&] { GeneratedLookup(cache, GENERATED_STRIDE_A, input); });
+    const auto refused = PipelineCacheTestAccess::RefusedRows(cache);
+    const auto block   = PipelineCacheTestAccess::GenerationBlock(cache);
+    Require(name, "a plan mismatch is refused with its id",
+            refused.size() == 1 && refused[0].id == records[1].id &&
+                refused[0].verdict == DropVerdict::PlanMismatch,
+            "the plan mismatch left no refusal row, or the wrong one");
+    Require(name, "the first module has its row",
+            block.generated_modules.size() == 1 && block.generated_modules[0].id == records[0].id,
+            "the module that was taken in has no row beside the refused one");
+    cache.StopBuilds();
+  }
+  {
+    PipelineCache cache(vulkan.RuntimeContext(), nullptr);
+    PipelineCacheTestAccess::EnableWarmCompute(cache);
+    PipelineCacheTestAccess::EnableGeneration(cache);
+    PipelineCacheTestAccess::PostChanged(cache, DecodedModuleRecord(records[0]), false, true);
+    ShaderComputeInputInfo input{};
+    gpu.SendCommandSync([&] { GeneratedLookup(cache, GENERATED_STRIDE_A, input); });
+    const auto refused = PipelineCacheTestAccess::RefusedRows(cache);
+    Require(name, "a failed install is refused with its id",
+            refused.size() == 1 && refused[0].id == records[0].id &&
+                refused[0].verdict == DropVerdict::FailedInstall,
+            "the failed install left no refusal row, or the wrong one");
+    cache.StopBuilds();
+  }
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
+// A row outlives StopStoreGeneration, and a build that was still running when the stop came stamps
+// its row afterwards. The baseline is the row before the build finished, which has no stamp.
+void CheckGeneratedRowsSurviveStop(VulkanHarness &vulkan, GuestGpu &gpu,
+                                   const std::vector<DecodedModuleRecord> &records) {
+  constexpr const char *name = "GeneratedRowsSurviveStop";
+  ComputeCreateHook hook;
+  PipelineCache cache(vulkan.RuntimeContext(), nullptr);
+  PipelineCacheTestAccess::EnableWarmCompute(cache);
+  PipelineCacheTestAccess::EnableGeneration(cache);
+  cache.PostGeneratedModule(DecodedModuleRecord(records[0]));
+  const int entered_before = ComputeCreateHook::entered.load();
+  // The build stops inside the driver call until the test lets it go, however long that takes.
+  ComputeCreateHook::release = false;
+  ComputeCreateHook::block   = true;
+  ShaderComputeInputInfo input{};
+  gpu.SendCommandSync([&] { GeneratedLookup(cache, GENERATED_STRIDE_A, input); });
+  const auto limit = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+  while (ComputeCreateHook::entered.load() == entered_before && std::chrono::steady_clock::now() < limit)
+    std::this_thread::yield();
+  Require(name, "a worker is inside the build", ComputeCreateHook::entered.load() > entered_before,
+          "no warm build began");
+  cache.StopStoreGeneration();
+  auto block      = PipelineCacheTestAccess::GenerationBlock(cache);
+  const auto *row = OnlyModuleRow(block);
+  Require(name, "the row survives the stop and has no stamp yet",
+          row != nullptr && row->id == records[0].id && !row->ready_ns && !row->build_ms,
+          "the stop cleared the row, or stamped a build that had not finished");
+  ComputeCreateHook::release = true;
+  PipelineCacheTestAccess::DrainWarmQueue(cache);
+  ComputeCreateHook::block = false;
+  block = PipelineCacheTestAccess::GenerationBlock(cache);
+  row   = OnlyModuleRow(block);
+  Require(name, "the build stamps its row after the stop",
+          row != nullptr && row->ready_ns.has_value() && row->build_ms.has_value() && *row->build_ms > 0.0,
+          "a build that ended after the stop did not stamp its row");
+  cache.StopBuilds();
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
+// The report's writer copies the rows from its own thread while the GPU thread takes modules in and
+// another thread pushes misses. The counts it sees never go down, and at the end they are exactly
+// what was pushed, which a copy of a deque that grows meanwhile would not give.
+void CheckGeneratedRowsWriterAgainstPushes(VulkanHarness &vulkan, GuestGpu &gpu,
+                                           const std::vector<DecodedModuleRecord> &records) {
+  constexpr const char *name = "GeneratedRowsWriter";
+  constexpr uint64_t miss_count = 4000;
+  constexpr size_t module_count = 24;
+  PipelineCache cache(vulkan.RuntimeContext(), nullptr);
+  PipelineCacheTestAccess::EnableWarmCompute(cache);
+  PipelineCacheTestAccess::EnableGeneration(cache);
+  std::atomic<bool> done{false};
+  std::atomic<bool> went_back{false};
+  std::atomic<bool> torn{false};
+  std::thread writer([&] {
+    uint64_t seen_misses = 0;
+    size_t seen_modules = 0;
+    while (!done) {
+      const auto block = PipelineCacheTestAccess::GenerationBlock(cache);
+      if (block.misses.total < seen_misses || block.generated_modules.size() < seen_modules)
+        went_back = true;
+      seen_misses = block.misses.total;
+      seen_modules = block.generated_modules.size();
+      // A row of a module is a whole row: its time of taking in is never before its posting.
+      for (const auto &module : block.generated_modules)
+        if (module.adopted_ns < module.posted_ns || module.id == 0) torn = true;
+    }
+  });
+  std::thread pusher([&] {
+    for (uint64_t index = 0; index < miss_count; index++)
+      PipelineCacheTestAccess::NoteMiss(cache, records[0].hash, 1 + index, false, false);
+  });
+  ShaderComputeInputInfo input{};
+  for (size_t index = 0; index < module_count; index++) {
+    auto record = DecodedModuleRecord(records[0]);
+    record.id += 5000 + index;
+    cache.PostGeneratedModule(std::move(record));
+    gpu.SendCommandSync([&] { GeneratedLookup(cache, GENERATED_STRIDE_A, input); });
+  }
+  pusher.join();
+  done = true;
+  writer.join();
+  const auto block = PipelineCacheTestAccess::GenerationBlock(cache);
+  Require(name, "the counts never went back and no row is torn", !went_back && !torn,
+          "the writer saw a count go down or a row that was not whole");
+  Require(name, "at the end, exactly what was pushed",
+          block.misses.total == miss_count && block.generated_modules.size() == module_count,
+          "the rows at the end are not the rows that were pushed");
+  cache.StopBuilds();
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
+// Whether a call waits for the state's mutex. The test holds the mutex, starts the call on another
+// thread, and looks a while later at whether it has finished. A call that takes the mutex cannot
+// finish before it is let go, so it is never wrongly blamed, and one that does not take it finishes
+// at once. After the mutex is released the call must finish, so a call that never returns fails too.
+template <typename Call> bool WaitsForStateMutex(PipelineCache &cache, Call &&call) {
+  constexpr auto look_after = std::chrono::milliseconds(250);
+  std::unique_lock lock(PipelineCacheTestAccess::StateMutex(cache));
+  std::atomic<bool> finished{false};
+  std::thread caller([&] {
+    call();
+    finished = true;
+  });
+  std::this_thread::sleep_for(look_after);
+  const bool waited = !finished;
+  lock.unlock();
+  caller.join();
+  return waited && finished;
+}
+
+// Every push of a row, and the copy that the writer makes, takes the state's mutex. A push that did
+// not would race with the copy, which no run of threads can be relied on to show.
+void CheckGeneratedRowsTakeTheLock(VulkanHarness &vulkan) {
+  constexpr const char *name = "GeneratedRowsLock";
+  PipelineCache cache(vulkan.RuntimeContext(), nullptr);
+  PipelineCacheTestAccess::EnableGeneration(cache);
+  Require(name, "a miss is pushed under the mutex",
+          WaitsForStateMutex(cache, [&] { PipelineCacheTestAccess::NoteMiss(cache, 1, 2, false, false); }),
+          "the push of a miss row did not wait for the state's mutex");
+  Require(name, "a module taken in is pushed under the mutex",
+          WaitsForStateMutex(cache, [&] { PipelineCacheTestAccess::NoteAdoptedRow(cache, 3, 4, 5); }),
+          "the push of a generated row did not wait for the state's mutex");
+  Require(name, "a refusal is pushed under the mutex",
+          WaitsForStateMutex(cache, [&] { PipelineCacheTestAccess::NoteRefusedRow(cache, 6); }),
+          "the push of a refusal row did not wait for the state's mutex");
+  Require(name, "the writer's copy is made under the mutex",
+          WaitsForStateMutex(cache, [&] { (void)PipelineCacheTestAccess::SnapshotRows(cache); }),
+          "the writer's copy of the rows did not wait for the state's mutex");
+  const auto rows = PipelineCacheTestAccess::SnapshotRows(cache);
+  Require(name, "and each push left its row",
+          rows.misses.size() == 1 && rows.generated.size() == 1 && rows.refused.size() == 1,
+          "a push that waited for the mutex left no row");
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
+// One thread copies the rows in a tight loop while two others push them, which leaves a gap for a
+// copy of a deque that grows meanwhile to be torn. Row n is made of n alone, so every copy must hold
+// rows 1 to some count in order, each whole. The baseline is the end of the run, when the copy has
+// every row that was pushed.
+void CheckGeneratedRowsTightWriter(VulkanHarness &vulkan) {
+  constexpr const char *name = "GeneratedRowsTightWriter";
+  constexpr uint64_t push_count = 60000;
+  constexpr uint64_t hash_factor = 3;
+  PipelineCache cache(vulkan.RuntimeContext(), nullptr);
+  PipelineCacheTestAccess::EnableGeneration(cache);
+  std::atomic<bool> done{false};
+  std::atomic<bool> bad{false};
+  std::atomic<uint64_t> copies{0};
+  std::thread writer([&] {
+    while (!done) {
+      const auto rows = PipelineCacheTestAccess::SnapshotRows(cache);
+      for (size_t index = 0; index < rows.misses.size(); index++) {
+        const auto &miss = rows.misses[index];
+        if (miss.id != index + 1 || miss.code_hash != miss.id * hash_factor) bad = true;
+      }
+      for (size_t index = 0; index < rows.generated.size(); index++) {
+        const auto &row = rows.generated[index];
+        if (row.id != index + 1 || row.code_hash != row.id * hash_factor ||
+            row.adopted_ns < row.posted_ns || row.posted_ns != static_cast<int64_t>(row.id))
+          bad = true;
+      }
+      copies++;
+    }
+  });
+  std::thread miss_pusher([&] {
+    for (uint64_t id = 1; id <= push_count; id++)
+      PipelineCacheTestAccess::NoteMiss(cache, id * hash_factor, id, false, false);
+  });
+  std::thread row_pusher([&] {
+    for (uint64_t id = 1; id <= push_count; id++)
+      PipelineCacheTestAccess::NoteAdoptedRow(cache, id, id * hash_factor, static_cast<int64_t>(id));
+  });
+  miss_pusher.join();
+  row_pusher.join();
+  done = true;
+  writer.join();
+  const auto rows = PipelineCacheTestAccess::SnapshotRows(cache);
+  Require(name, "every copy was whole and in order", !bad && copies > 0,
+          "a copy of the rows was torn, out of order or held a row that was not whole");
+  Require(name, "at the end, every row that was pushed",
+          rows.misses.size() == push_count && rows.generated.size() == push_count,
+          "the copy at the end is not the rows that were pushed");
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
 // Captures two module records of one program by compiling it with two strides into a store, and runs
 // the checks of the generated modules over them.
 void CheckGeneratedModules(VulkanHarness &vulkan) {
@@ -61962,6 +62381,17 @@ void CheckGeneratedModules(VulkanHarness &vulkan) {
       CheckGeneratedDrainBudget(vulkan, gpu, records);
       CheckGeneratedReport(vulkan, gpu, records);
       CheckGeneratedStop(vulkan, gpu, records);
+      Common::FirstRunReport::Configure(true, false);
+      Common::FirstRunReport::Global().Reset();
+      CheckGeneratedRowsHit(vulkan, gpu, records);
+      CheckGeneratedRowsRefused(vulkan, gpu, records);
+      CheckGeneratedRowsPausedTake(vulkan, gpu, records);
+      CheckGeneratedRowsSurviveStop(vulkan, gpu, records);
+      CheckGeneratedRowsWriterAgainstPushes(vulkan, gpu, records);
+      CheckGeneratedRowsTightWriter(vulkan);
+      CheckGeneratedRowsTakeTheLock(vulkan);
+      Common::FirstRunReport::Global().Reset();
+      Common::FirstRunReport::Configure(false, false);
     });
   }
   std::filesystem::remove_all(dir);
@@ -62135,6 +62565,92 @@ void CheckStoreGenerationNormal(VulkanHarness &vulkan, GuestGpu &gpu) {
   std::printf("[gpu]     %-32s ok\n", name);
 }
 
+// A real worker's run shows in the rows of the block: what it said of every program, a row for
+// every module taken in, none of them used and all of them built, and the one lookup of a program
+// the worker never scanned as a miss of the unscanned class, with the time the GPU thread spent
+// creating its module once a pipeline was made. The same miss in a cache with no generator behind it
+// is before_prediction (CheckGeneratedRowsHit), so the class comes from the worker's own times.
+void CheckStoreGenerationRows(VulkanHarness &vulkan, GuestGpu &gpu) {
+  constexpr const char *name = "StoreGenerationRows";
+  constexpr size_t candidates = StoreGenFixtures::MAIN_CANDIDATES;
+  const auto eboot = StoreGenFixtures::BuildEboot(StoreGenFixtures::MainPrograms());
+  const auto scan = StoreGen::ScanEbootShaders(eboot);
+  const auto dir = std::filesystem::temp_directory_path() /
+                   fmt::format("kyty_store_generation_rows_{}",
+                               std::chrono::steady_clock::now().time_since_epoch().count());
+  Common::FirstRunReport::Global().Reset();
+  auto cache = BootGeneratingCache(vulkan, dir, eboot, true, true);
+  Require(name, "the generator finished",
+          PipelineCacheTestAccess::HasSupervisor(*cache) &&
+              PipelineCacheTestAccess::WaitSupervisorEnd(*cache, GENERATION_WAIT),
+          "the worker did not finish in time");
+  // Turned on after the boot, which loads the configuration and so sets the flag from it.
+  Common::FirstRunReport::Configure(true, false);
+  const auto supervised = PipelineCacheTestAccess::SupervisorStatsOf(*cache);
+  Require(name, "the supervisor timed the run",
+          supervised.first_predict_ns.has_value() && supervised.finished_ns.has_value() &&
+              *supervised.first_predict_ns < *supervised.finished_ns,
+          "the supervisor did not give the times of the first predict line and of the finish");
+  LookupUntilDrained(*cache, gpu);
+  PipelineCacheTestAccess::DrainWarmQueue(*cache);
+  auto block = PipelineCacheTestAccess::GenerationBlock(*cache);
+
+  Require(name, "a prediction row for each program",
+          block.predictions.size() == scan.programs.size(),
+          "the block does not hold a prediction row for each scanned program");
+  uint64_t predicted_candidates = 0;
+  bool all_predicted = true;
+  for (const auto &row : block.predictions) {
+    all_predicted = all_predicted && row.outcome == "predicted";
+    predicted_candidates += row.candidates;
+  }
+  Require(name, "predicted, and the candidates are the ordering's",
+          all_predicted && predicted_candidates == candidates,
+          "the prediction rows are not the worker's");
+
+  Require(name, "a row for each module taken in", block.generated_modules.size() == candidates,
+          "the block does not hold a row for each module the drain took in");
+  double built_ms = 0.0;
+  bool all_unused = true;
+  bool all_stamped = true;
+  for (const auto &row : block.generated_modules) {
+    all_unused = all_unused && row.how == "unused";
+    all_stamped = all_stamped && row.ready_ns && row.build_ms && row.code_hash != 0 &&
+                  row.posted_ns <= row.adopted_ns;
+    built_ms += row.build_ms.value_or(0.0);
+  }
+  Require(name, "built, and none used", all_unused && all_stamped,
+          "a module row was used, or a warm build did not stamp its row");
+  Require(name, "unused_build_ms is what was built", built_ms > 0.0 && block.unused_build_ms == built_ms,
+          "unused_build_ms does not add the builds of the modules nobody used");
+
+  Require(name, "one miss, of the unscanned class",
+          block.misses.total == 1 && MissClassCount(block, "unscanned") == 1 &&
+              MissClassCount(block, "before_prediction") == 0 &&
+              MissClassCount(block, "generation_incomplete") == 0,
+          "the lookup of a program the worker never scanned was not an unscanned miss");
+  Require(name, "no pipeline yet, so no create time", block.misses.create_ms == 0.0,
+          "a miss that made no pipeline has a create time");
+
+  // The pipeline of that module is made on the GPU thread, which is the compile that the miss owns.
+  ShaderComputeInputInfo input{};
+  gpu.SendCommandSync([&] {
+    GeneratedLookup(*cache, GENERATED_STRIDE_A, input);
+    (void)cache->GetComputePipeline(input);
+  });
+  block = PipelineCacheTestAccess::GenerationBlock(*cache);
+  Require(name, "the create time of the miss's module is joined",
+          block.misses.total == 1 && block.misses.create_ms > 0.0 &&
+              block.misses.classes.size() > 0,
+          "the compile of the miss's module was not joined to the miss");
+  cache->StopBuilds();
+  cache.reset();
+  Common::FirstRunReport::Configure(false, false);
+  Common::FirstRunReport::Global().Reset();
+  std::filesystem::remove_all(dir);
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
 // A program that crashes the recompiler while it is predicted is skipped by the restart, so the
 // other programs' records still arrive. One restart, with the crashed program in the skip list and
 // nothing in the failed list, is the answer. Without the skip the restart would crash again.
@@ -62254,6 +62770,7 @@ void CheckStoreGeneration(VulkanHarness &vulkan) {
   Config::Load({.printf_direction = Config::LogDirection::Silent});
   vulkan.WithGpuLane([&](GuestGpu &gpu) {
     CheckStoreGenerationNormal(vulkan, gpu);
+    CheckStoreGenerationRows(vulkan, gpu);
     CheckStoreGenerationPredictCrash(vulkan, gpu);
   });
   CheckStoreGenerationHang(vulkan);

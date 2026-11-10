@@ -3,6 +3,7 @@
 
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/shader/storegen/generatedDrainPlanner.h"
+#include "graphics/shader/storegen/generationRows.h"
 #include "graphics/shader/storegen/storeSupervisor.h"
 
 #include <atomic>
@@ -56,6 +57,15 @@ struct PipelineCache::GenerationState {
 	// writer can read it from another thread. The planner's own counters belong to the GPU thread.
 	StoreGen::GeneratedDrainCounters published_drain;
 	uint64_t                         published_backlog = 0;
+
+	// The rows of the report, all guarded by the mutex above. They live until the cache is
+	// destroyed, which is after the warm queue has stopped, and StopStoreGeneration never clears
+	// them, so a build that is still running may stamp its row after the stop. A deque keeps the
+	// address of a row that a queued build holds. A push may allocate a chunk, which is short and
+	// rare, and the lock is never held across anything else.
+	std::deque<StoreGen::GenRow>  generated_rows;
+	std::deque<StoreGen::DropRow> refused_rows;
+	std::deque<StoreGen::MissRow> miss_rows;
 	// Whether the report was given a source, which StopStoreGeneration must then replace.
 	bool report_registered = false;
 

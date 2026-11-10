@@ -750,6 +750,14 @@ add_executable(generated_drain_planner_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(generated_drain_planner_tests PRIVATE ${inc_headers})
 
+# The classifier that says why a runtime translation was not served by generation, and the rows of
+# the first-run report made from the pipeline cache's rows. Both are pure and need no device.
+add_executable(generation_miss_classifier_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/GenerationMissClassifierTests.cpp"
+)
+target_link_libraries(generation_miss_classifier_tests common fmt::fmt)
+target_include_directories(generation_miss_classifier_tests PRIVATE ${inc_headers})
+
 # Where the generator reads the title's eboot from, including a title in a .zar made by the writer of
 # the archive tests. It needs no graphics device.
 add_executable(shader_store_eboot_source_tests EXCLUDE_FROM_ALL
@@ -998,6 +1006,7 @@ if(BUILD_TESTING)
 	add_test(NAME shader_store_progress_log COMMAND $<TARGET_FILE:shader_store_progress_log_tests>)
 	add_test(NAME shader_store_supervisor COMMAND $<TARGET_FILE:shader_store_supervisor_tests>)
 	add_test(NAME generated_drain_planner COMMAND $<TARGET_FILE:generated_drain_planner_tests>)
+	add_test(NAME generation_miss_classifier COMMAND $<TARGET_FILE:generation_miss_classifier_tests>)
 	add_test(NAME shader_store_eboot_source COMMAND $<TARGET_FILE:shader_store_eboot_source_tests>)
 	set_tests_properties(shader_store_supervisor PROPERTIES TIMEOUT 300)
 	add_test(NAME shader_store_worker COMMAND $<TARGET_FILE:shader_store_worker_tests>)
@@ -1144,6 +1153,7 @@ if(BUILD_TESTING)
 		shader_store_progress_log_tests
 		shader_store_supervisor_tests
 		generated_drain_planner_tests
+		generation_miss_classifier_tests
 		shader_store_eboot_source_tests
 		shader_store_worker_tests
 		shader_store_dispatch_tests

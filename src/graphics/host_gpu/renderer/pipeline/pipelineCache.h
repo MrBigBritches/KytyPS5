@@ -58,6 +58,9 @@ class ImageHeapSource;
 namespace StoreGen {
 struct SupervisorConfig;
 class StoreSupervisor;
+struct GenRow;
+enum class DrainVerdict : uint8_t;
+struct GenerationRowInputs;
 } // namespace StoreGen
 
 namespace ShaderRecompiler::Spirv {
@@ -600,8 +603,10 @@ private:
 	// in the order their records appear in the shader store.
 	void AddComputeWarmUp(const ModuleMap& modules, std::vector<Common::UniqueFunction<void>>& jobs);
 	// Starts the warm-up build of a compute module on the warm queue. It never stores a record,
-	// since the warm-up only builds what the store already holds.
-	void StartWarmCompute(const ShaderModule& module);
+	// since the warm-up only builds what the store already holds. A module that generation made
+	// passes its row, which the build stamps with the time it finished and how long it took. The
+	// row outlives the build, since the generation state lives as long as the cache.
+	void StartWarmCompute(const ShaderModule& module, StoreGen::GenRow* row = nullptr);
 	// Moves the module's warm-up pipeline into m_compute_pipelines, waiting for it or building it
 	// here if it is not done. Null when no warm-up build is pending for the module.
 	[[nodiscard]] Pipeline* TakeWarmCompute(const ShaderComputeInputInfo& input_info);
@@ -638,8 +643,19 @@ private:
 	// and holds no lock across anything else.
 	[[nodiscard]] Common::FirstRunReport::ShaderStoreGenerationReport
 	BuildGenerationReport(bool final_figures) const;
-	// Takes one module in, or drops it as the planner says.
+	// The rows of generated modules, refused modules and misses, copied under the state's mutex.
+	// The report's own rows are not in it.
+	[[nodiscard]] StoreGen::GenerationRowInputs SnapshotGenerationRows() const;
+	// Takes one module in, or drops it as the planner says. Either way it leaves a row for the
+	// report.
 	void AdoptGenerated(GeneratedModule&& item);
+	// Records that the runtime had to translate a compute program with generation on, for the
+	// report's classes. id is 0 for a program that the runtime skips. Any thread.
+	void NoteGeneratedMiss(uint64_t code_hash, uint64_t id, bool has_calls, bool skip_dispatch);
+	// The row of a module that was taken in, which its warm build stamps. And the row of one
+	// refused.
+	StoreGen::GenRow* NoteAdopted(const GeneratedModule& item);
+	void              NoteRefused(const GeneratedModule& item, StoreGen::DrainVerdict verdict);
 	// Destroys the Vulkan handles of a module that was never taken in.
 	void DestroyGeneratedHandles(GeneratedModule& item);
 	// The runtime translated a program that generation made, so its plan is compared with the plan

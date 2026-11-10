@@ -38,6 +38,12 @@ uint64_t ProgramNumber(const void* program) {
 	return reinterpret_cast<uintptr_t>(program);
 }
 
+// A time of the steady clock on the clock of the first-run report, which counts nanoseconds from
+// its epoch.
+int64_t ToNanoseconds(Clock::time_point time) {
+	return std::chrono::duration_cast<std::chrono::nanoseconds>(time.time_since_epoch()).count();
+}
+
 } // namespace
 
 void PipelineCache::EnableStoreGeneration() {
@@ -229,11 +235,13 @@ void PipelineCache::AdoptGenerated(GeneratedModule&& item) {
 		return HashPlanBytes(ShaderRecompiler::IR::SaveResourcePlan(program->resource_plan));
 	});
 	switch (verdict) {
-		case StoreGen::DrainVerdict::Adopt:
+		case StoreGen::DrainVerdict::Adopt: {
+			StoreGen::GenRow* row = NoteAdopted(item);
 			// A deque, so the address that the queued build holds stays valid.
 			program->modules.push_back(std::move(item.module));
-			StartWarmCompute(program->modules.back());
+			StartWarmCompute(program->modules.back(), row);
 			return;
+		}
 		case StoreGen::DrainVerdict::DropFailedInstall:
 			// The program was made for this module and has no plan, so it goes again, as a store
 			// record whose plan cannot be loaded does.
@@ -241,7 +249,48 @@ void PipelineCache::AdoptGenerated(GeneratedModule&& item) {
 			break;
 		default: break;
 	}
+	NoteRefused(item, verdict);
 	DestroyGeneratedHandles(item);
+}
+
+// Adds the row of a module that was taken in, and returns it for the warm build to stamp. The row
+// is pushed under the state's mutex, which the report's writer also takes to copy the rows.
+StoreGen::GenRow* PipelineCache::NoteAdopted(const GeneratedModule& item) {
+	auto&            state   = *m_generation;
+	const int64_t    posted  = ToNanoseconds(item.posted);
+	const int64_t    adopted = Common::FirstRunReport::NowNs();
+	std::scoped_lock lock(state.mutex);
+	return &state.generated_rows.emplace_back(item.module.id, item.key.hash, posted, adopted);
+}
+
+// Adds the row of a module that the drain refused. Only the drain's refusals are rows. A module
+// that never reached the drain because the generator was stopped is counted as undrained instead.
+void PipelineCache::NoteRefused(const GeneratedModule& item, StoreGen::DrainVerdict verdict) {
+	using StoreGen::DrainVerdict;
+	using StoreGen::DropVerdict;
+	const DropVerdict named =
+	    verdict == DrainVerdict::DropDuplicate       ? DropVerdict::Duplicate
+	    : verdict == DrainVerdict::DropPlanMismatch  ? DropVerdict::PlanMismatch
+	    : verdict == DrainVerdict::DropFailedInstall ? DropVerdict::FailedInstall
+	                                                 : DropVerdict::DroppedStopped;
+	auto&            state = *m_generation;
+	std::scoped_lock lock(state.mutex);
+	state.refused_rows.push_back({item.module.id, named});
+}
+
+void PipelineCache::NoteGeneratedMiss(uint64_t code_hash, uint64_t id, bool has_calls,
+                                      bool skip_dispatch) {
+	if (m_generation == nullptr) {
+		return;
+	}
+	// The time is taken before the lock, so a wait for it is not counted as part of the miss.
+	const StoreGen::MissRow row {.code_hash     = code_hash,
+	                             .id            = id,
+	                             .at_ns         = Common::FirstRunReport::NowNs(),
+	                             .has_calls     = has_calls,
+	                             .skip_dispatch = skip_dispatch};
+	std::scoped_lock        lock(m_generation->mutex);
+	m_generation->miss_rows.push_back(row);
 }
 
 // A program that generation made was translated again by the runtime, which happens for a module
@@ -296,6 +345,19 @@ void PipelineCache::StopStoreGeneration() {
 	}
 }
 
+// Copies the cache's rows under the state's mutex, which is the only place the writer reads them.
+StoreGen::GenerationRowInputs PipelineCache::SnapshotGenerationRows() const {
+	auto&                         state = *m_generation;
+	StoreGen::GenerationRowInputs rows;
+	std::scoped_lock              lock(state.mutex);
+	for (const auto& row: state.generated_rows) {
+		rows.generated.push_back(StoreGen::SnapshotOf(row));
+	}
+	rows.refused.assign(state.refused_rows.begin(), state.refused_rows.end());
+	rows.misses.assign(state.miss_rows.begin(), state.miss_rows.end());
+	return rows;
+}
+
 Common::FirstRunReport::ShaderStoreGenerationReport
 PipelineCache::BuildGenerationReport(bool final_figures) const {
 	auto&                            state = *m_generation;
@@ -316,7 +378,12 @@ PipelineCache::BuildGenerationReport(bool final_figures) const {
 	if (state.supervisor) {
 		stats = state.supervisor->Stats();
 	}
-	return StoreGen::MakeGenerationReport(stats, drain, counts);
+	auto rows = SnapshotGenerationRows();
+	// The report's own rows are copied after the state's lock is released, so the two are never
+	// held together.
+	rows.compiles = Common::FirstRunReport::Global().Compiles();
+	rows.takes    = Common::FirstRunReport::Global().WarmTakes();
+	return StoreGen::MakeGenerationReport(stats, drain, counts, rows);
 }
 
 std::optional<StoreGenerationStats> PipelineCache::GenerationStats() const {

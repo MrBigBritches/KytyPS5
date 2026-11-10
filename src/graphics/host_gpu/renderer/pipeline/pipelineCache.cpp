@@ -26,6 +26,7 @@
 #include "graphics/shader/recompiler/Tessellation.h"
 #include "graphics/shader/recompiler/ir/Serialize.h"
 #include "graphics/shader/shaderCompiler.h"
+#include "graphics/shader/storegen/generationRows.h"
 #include "kernel/memory.h"
 #include "loader/systemContent.h"
 
@@ -514,6 +515,9 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 			                 "reason=unsupported GPU-selected callable target; rendering is incomplete",
 			                 params.hash, source.unsupported_call_pc);
 			m_program_cache.emplace(m_lookup_key, Program {.skip_dispatch = true});
+			if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+				NoteGeneratedMiss(params.hash, 0, false, true);
+			}
 			return nullptr;
 		}
 	}
@@ -552,8 +556,12 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		// GPU thread's, so no other thread makes the check.
 		CheckGeneratedPlan(entry->second, translated);
 	}
-	return bind(CompileModule(entry->second, entry->first, options, std::move(translated),
-	                          push_data_cursor));
+	auto& compiled = CompileModule(entry->second, entry->first, options, std::move(translated),
+	                               push_data_cursor);
+	if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+		NoteGeneratedMiss(params.hash, compiled.id, entry->second.call_source != nullptr, false);
+	}
+	return bind(compiled);
 }
 
 // Opens the driver cache and, with --async-pipelines or --deferred-pipeline-draws on, starts the
@@ -1579,11 +1587,24 @@ void PipelineCache::DrainPublishedBuilds() {
 	}
 }
 
-void PipelineCache::StartWarmCompute(const ShaderModule& module) {
-	// The module lives in the program cache, which outlasts the queue because StopBuilds runs first.
-	// A refusal leaves the module to build on first use, as it would without the warm-up.
-	(void)m_warm_compute->Start(module.id, [this, &module](Pipeline& pipeline) {
+void PipelineCache::StartWarmCompute(const ShaderModule& module, StoreGen::GenRow* row) {
+	// The module lives in the program cache, which outlasts the queue because StopBuilds runs
+	// first. A refusal leaves the module to build on first use, as it would without the warm-up.
+	// The row is in the generation state, which outlasts the queue for the same reason.
+	(void)m_warm_compute->Start(module.id, [this, &module, row](Pipeline& pipeline) {
+		const auto build_start = std::chrono::steady_clock::now();
 		CreatePipelineInternal(m_graphics, pipeline, module, m_driver_cache);
+		if (row != nullptr) {
+			const auto build_end = std::chrono::steady_clock::now();
+			// The build time goes first, so a reader that sees the time of the finish sees both.
+			row->build_ms.store(
+			    std::chrono::duration<double, std::milli>(build_end - build_start).count(),
+			    std::memory_order_release);
+			row->ready_ns.store(
+			    std::chrono::duration_cast<std::chrono::nanoseconds>(build_end.time_since_epoch())
+			        .count(),
+			    std::memory_order_release);
+		}
 		// Marked here because this build adds to the driver cache without a checkpoint of its own.
 		m_driver_cache_dirty.store(true, std::memory_order_relaxed);
 	});
@@ -1593,15 +1614,15 @@ namespace {
 
 /// Records a dispatch's first use of a warm-up module for the report. The report lives in common,
 /// which cannot see the queue, so it has its own names for how the build was handed over.
-void RecordWarmTake(uint64_t id, PipelineBuildQueue::Acquired how, double stopped_ms,
-                    int64_t at_ns) {
+void RecordWarmTake(uint64_t id, PipelineBuildQueue::Acquired how, double stopped_ms, int64_t at_ns,
+                    bool paused = false) {
 	using Common::FirstRunReport::WarmTakeHow;
 	using Acquired               = PipelineBuildQueue::Acquired;
 	const WarmTakeHow report_how = how == Acquired::AlreadyDone ? WarmTakeHow::Done
 	                               : how == Acquired::Waited    ? WarmTakeHow::Waited
 	                                                            : WarmTakeHow::Inline;
 	Common::FirstRunReport::AddWarmTake(
-	    {.id = id, .how = report_how, .stopped_ms = stopped_ms, .at_ns = at_ns});
+	    {.id = id, .how = report_how, .stopped_ms = stopped_ms, .at_ns = at_ns, .paused = paused});
 }
 
 } // namespace
@@ -1657,7 +1678,7 @@ PipelineCache::TakeUnfinishedWarmCompute(uint64_t id) {
 	// stopped_ms come from the same reading.
 	const int64_t start_ns =
 	    std::chrono::duration_cast<std::chrono::nanoseconds>(start.time_since_epoch()).count();
-	RecordWarmTake(id, taken->how, stopped_ms, start_ns);
+	RecordWarmTake(id, taken->how, stopped_ms, start_ns, paused);
 	return taken;
 }
 

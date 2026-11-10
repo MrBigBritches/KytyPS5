@@ -863,8 +863,93 @@ nlohmann::json GenerationSupervisorToJson(const ShaderStoreGenerationReport& blo
 	return supervisor;
 }
 
+// A time on the NowNs clock as milliseconds from the run start, as a compile's start_ms is.
+double RunMs(int64_t time_ns, int64_t epoch_ns) {
+	const int64_t base = epoch_ns == NO_TIME_NS ? 0 : epoch_ns;
+	return Round3(static_cast<double>(time_ns - base) / NS_PER_MS);
+}
+
+// Sets a key to a time from the run start, only when the time is there.
+void SetRunMs(nlohmann::json& object, const char* key, const std::optional<int64_t>& time_ns,
+              int64_t epoch_ns) {
+	if (time_ns) {
+		object[key] = RunMs(*time_ns, epoch_ns);
+	}
+}
+
+nlohmann::json GeneratedModuleToJson(const GeneratedModuleRow& module, int64_t epoch_ns) {
+	nlohmann::json row = {{"id", Hex(module.id)},
+	                      {"code_hash", Hex(module.code_hash)},
+	                      {"posted_ms", RunMs(module.posted_ns, epoch_ns)},
+	                      {"adopted_ms", RunMs(module.adopted_ns, epoch_ns)},
+	                      {"how", module.how}};
+	SetRunMs(row, "ready_ms", module.ready_ns, epoch_ns);
+	SetRunMs(row, "first_use_ms", module.first_use_ns, epoch_ns);
+	SetOptional(row, "build_ms", module.build_ms);
+	SetOptional(row, "lead_ms", module.lead_ms);
+	return row;
+}
+
+nlohmann::json GenerationSlowTakeToJson(const GenerationSlowTake& take, int64_t epoch_ns) {
+	nlohmann::json row = {{"id", Hex(take.id)},
+	                      {"generated", take.generated},
+	                      {"how", take.how},
+	                      {"stopped_ms", Round3(take.stopped_ms)},
+	                      {"paused", take.paused}};
+	if (take.at_ns != NO_TIME_NS) {
+		row["at_ms"] = RunMs(take.at_ns, epoch_ns);
+	}
+	SetRunMs(row, "posted_ms", take.posted_ns, epoch_ns);
+	SetRunMs(row, "adopted_ms", take.adopted_ns, epoch_ns);
+	SetRunMs(row, "ready_ms", take.ready_ns, epoch_ns);
+	return row;
+}
+
+nlohmann::json GenerationMissesToJson(const GenerationMisses& misses) {
+	nlohmann::json classes = nlohmann::json::object();
+	for (const auto& miss_class: misses.classes) {
+		classes[miss_class.name] = {{"count", miss_class.count},
+		                            {"create_ms", Round3(miss_class.create_ms)}};
+	}
+	nlohmann::json refused = nlohmann::json::object();
+	for (const auto& [verdict, count]: misses.refused) {
+		refused[verdict] = count;
+	}
+	return {{"total", misses.total},
+	        {"create_ms", Round3(misses.create_ms)},
+	        {"classes", classes},
+	        {"refused", refused},
+	        {"wrong_spec_programs", misses.wrong_spec_programs},
+	        {"wrong_spec_max_variants", misses.wrong_spec_max_variants}};
+}
+
+// The rows of the block: what the worker said of each program, each module taken in, the misses and
+// the slow first uses.
+void GenerationRowsToJson(nlohmann::json& json, const ShaderStoreGenerationReport& block,
+                          int64_t epoch_ns) {
+	nlohmann::json predictions = nlohmann::json::array();
+	for (const auto& prediction: block.predictions) {
+		predictions.push_back({{"hash", Hex(prediction.hash)},
+		                       {"outcome", prediction.outcome},
+		                       {"candidates", prediction.candidates}});
+	}
+	json["predictions"]    = std::move(predictions);
+	nlohmann::json modules = nlohmann::json::array();
+	for (const auto& module: block.generated_modules) {
+		modules.push_back(GeneratedModuleToJson(module, epoch_ns));
+	}
+	json["generated_modules"] = std::move(modules);
+	json["unused_build_ms"]   = Round3(block.unused_build_ms);
+	json["runtime_misses"]    = GenerationMissesToJson(block.misses);
+	nlohmann::json slow       = nlohmann::json::array();
+	for (const auto& take: block.slow_takes) {
+		slow.push_back(GenerationSlowTakeToJson(take, epoch_ns));
+	}
+	json["slow_takes"] = std::move(slow);
+}
+
 // The whole block of an active generation.
-nlohmann::json GenerationToJson(const ShaderStoreGenerationReport& block) {
+nlohmann::json GenerationToJson(const ShaderStoreGenerationReport& block, int64_t epoch_ns) {
 	nlohmann::json json = {{"active", block.active}};
 	if (!block.inactive_reason.empty()) {
 		json["inactive_reason"] = block.inactive_reason;
@@ -876,6 +961,7 @@ nlohmann::json GenerationToJson(const ShaderStoreGenerationReport& block) {
 	}
 	json["worker"] = worker;
 	json["drain"]  = GenerationDrainToJson(block.drain);
+	GenerationRowsToJson(json, block, epoch_ns);
 	return json;
 }
 
@@ -1000,9 +1086,9 @@ std::string Report::ToJson(const Metadata& metadata, uint64_t audio_holds, doubl
 	{
 		std::lock_guard lock(m_generation_mutex);
 		if (m_generation_source) {
-			generation = GenerationToJson(m_generation_source());
+			generation = GenerationToJson(m_generation_source(), epoch_ns);
 		} else if (m_generation_final) {
-			generation = GenerationToJson(*m_generation_final);
+			generation = GenerationToJson(*m_generation_final, epoch_ns);
 		} else if (m_generation_inactive) {
 			generation =
 			    nlohmann::json {{"active", false}, {"inactive_reason", *m_generation_inactive}};

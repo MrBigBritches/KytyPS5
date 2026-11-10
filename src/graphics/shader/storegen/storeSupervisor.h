@@ -134,6 +134,12 @@ struct SupervisorStats {
 	/// exact to about a poll interval. Missing until a `predict` line arrives. It covers starting
 	/// the process, opening the eboot and the scan.
 	std::optional<double> child_open_ms;
+	/// The same two moments on the steady clock, as nanoseconds since its epoch, which is the clock
+	/// the first-run report's NowNs reads. first_predict_ns is when the first `predict` line was
+	/// found, so it is exact to about a poll interval. finished_ns is set only for a run that
+	/// finished, which is the moment from which every record the worker wrote has been posted.
+	std::optional<int64_t> first_predict_ns;
+	std::optional<int64_t> finished_ns;
 	/// From the start of the thread to the first and the last record given to the sink.
 	std::optional<double> first_record_ms;
 	std::optional<double> last_record_ms;

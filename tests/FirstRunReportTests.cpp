@@ -1213,6 +1213,93 @@ void TestGenerationBlockFields() {
 	      "a usage row lacks a figure, or a missing peak is shown as zero");
 }
 
+// The rows of the generation block put each time on the run's clock and leave out a time that did
+// not happen. The empty block has the shape of the full one, so a reader finds every key. The
+// baseline is the empty block, and a row with a missing time is the baseline of the row with it.
+void TestGenerationRowsJson() {
+	constexpr int64_t MS       = 1'000'000;
+	const auto        block_of = [](const ShaderStoreGenerationReport& figures) {
+        Report report;
+        report.SetEpoch(250 * MS);
+        report.SetGenerationFinal(figures);
+        return GenerationBlock(report);
+	};
+	const auto empty = block_of({});
+	Check(empty["predictions"].is_array() && empty["predictions"].empty() &&
+	          empty["generated_modules"].is_array() && empty["generated_modules"].empty() &&
+	          empty["slow_takes"].is_array() && empty["slow_takes"].empty() &&
+	          empty["unused_build_ms"] == 0.0 && empty["runtime_misses"]["total"] == 0 &&
+	          empty["runtime_misses"]["classes"].is_object(),
+	      "the empty block lacks the keys of the rows");
+
+	ShaderStoreGenerationReport figures;
+	figures.predictions       = {{.hash = 0xab, .outcome = "predicted", .candidates = 3},
+	                             {.hash = 0xcd, .outcome = "calls", .candidates = 0}};
+	figures.generated_modules = {
+	    {.id           = 0x11,
+	     .code_hash    = 0xab,
+	     .posted_ns    = 1250 * MS,
+	     .adopted_ns   = 1500 * MS,
+	     .ready_ns     = 2250 * MS,
+	     .first_use_ns = 3250 * MS,
+	     .build_ms     = 12.5,
+	     .lead_ms      = -4.5,
+	     .how          = "done"},
+	    {.id = 0x12, .posted_ns = 1250 * MS, .adopted_ns = 1500 * MS, .how = "unused"}};
+	figures.unused_build_ms                = 7.5;
+	figures.misses.total                   = 3;
+	figures.misses.create_ms               = 4.25;
+	figures.misses.classes                 = {{"wrong_spec", 2, 3.0}, {"unscanned", 1, 1.25}};
+	figures.misses.refused                 = {{"duplicate", 1}};
+	figures.misses.wrong_spec_programs     = 1;
+	figures.misses.wrong_spec_max_variants = 2;
+	figures.slow_takes                     = {{.id         = 0x11,
+	                                           .generated  = true,
+	                                           .how        = "waited",
+	                                           .stopped_ms = 300.5,
+	                                           .at_ns      = 3250 * MS,
+	                                           .paused     = true,
+	                                           .posted_ns  = 1250 * MS,
+	                                           .ready_ns   = 2250 * MS},
+	                                          {.id = 0x99, .how = "inline", .stopped_ms = 260.0}};
+	const auto  block                      = block_of(figures);
+	const auto& predictions                = block["predictions"];
+	Check(predictions.size() == 2 && predictions[0]["hash"] == "00000000000000ab" &&
+	          predictions[0]["outcome"] == "predicted" && predictions[0]["candidates"] == 3 &&
+	          predictions[1]["outcome"] == "calls" && predictions[1]["candidates"] == 0,
+	      "a prediction row lacks a figure");
+	const auto& modules = block["generated_modules"];
+	Check(modules.size() == 2 && modules[0]["id"] == "0000000000000011" &&
+	          modules[0]["code_hash"] == "00000000000000ab" && modules[0]["posted_ms"] == 1000.0 &&
+	          modules[0]["adopted_ms"] == 1250.0 && modules[0]["ready_ms"] == 2000.0 &&
+	          modules[0]["first_use_ms"] == 3000.0 && modules[0]["build_ms"] == 12.5 &&
+	          modules[0]["lead_ms"] == -4.5 && modules[0]["how"] == "done",
+	      "a module row lacks a figure, or its times are not from the run start");
+	Check(modules[1]["how"] == "unused" && !modules[1].contains("ready_ms") &&
+	          !modules[1].contains("first_use_ms") && !modules[1].contains("build_ms") &&
+	          !modules[1].contains("lead_ms"),
+	      "a module that was never built shows a time it did not have");
+	Check(block["unused_build_ms"] == 7.5, "unused_build_ms is not the figure");
+	const auto& misses = block["runtime_misses"];
+	Check(misses["total"] == 3 && misses["create_ms"] == 4.25 &&
+	          misses["classes"]["wrong_spec"]["count"] == 2 &&
+	          misses["classes"]["wrong_spec"]["create_ms"] == 3.0 &&
+	          misses["classes"]["unscanned"]["count"] == 1 && misses["refused"]["duplicate"] == 1 &&
+	          misses["wrong_spec_programs"] == 1 && misses["wrong_spec_max_variants"] == 2,
+	      "the misses lack a figure");
+	const auto& slow = block["slow_takes"];
+	Check(slow.size() == 2 && slow[0]["id"] == "0000000000000011" && slow[0]["generated"] == true &&
+	          slow[0]["how"] == "waited" && slow[0]["stopped_ms"] == 300.5 &&
+	          slow[0]["paused"] == true && slow[0]["at_ms"] == 3000.0 &&
+	          slow[0]["posted_ms"] == 1000.0 && slow[0]["ready_ms"] == 2000.0 &&
+	          !slow[0].contains("adopted_ms"),
+	      "a slow take row lacks a figure");
+	Check(slow[1]["generated"] == false && slow[1]["paused"] == false &&
+	          !slow[1].contains("at_ms") && !slow[1].contains("posted_ms") &&
+	          !slow[1].contains("ready_ms"),
+	      "a take of a module generation did not make shows a generated time");
+}
+
 // With a source, the writer asks it each time. A final figure replaces it at once and the source is
 // never called again, so the owner may destroy what the source reads. The baseline is the same
 // report before the final figure.
@@ -1322,6 +1409,7 @@ int main() {
   TestWriteReportOnce();
   TestGenerationBlockFlagOffAndInactive();
   TestGenerationBlockFields();
+  TestGenerationRowsJson();
   TestGenerationSourceThenFinal();
   TestGenerationWriterNeverTouchesADestroyedSource();
   TestGenerationFinalWaitsForAWriterInTheSource();

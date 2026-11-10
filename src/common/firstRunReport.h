@@ -197,6 +197,9 @@ struct WarmTake {
 	double      stopped_ms = 0.0;
 	int64_t     at_ns      = NO_TIME_NS;
 	int64_t     flip       = 0;
+	/// Whether the warm queue was held back by a pause when the dispatch asked. Only a take that
+	/// stopped the dispatch reads it, and it is not written to the warm_takes rows.
+	bool paused = false;
 };
 
 /// One run of the shader store worker that ended badly, as the report lists it.
@@ -229,6 +232,66 @@ struct GenerationDrop {
 	uint64_t    rank = 0;
 	std::string reason;
 };
+
+/// What a worker's `prediction` line said about a program.
+struct GenerationPrediction {
+	uint64_t hash = 0;
+	/// predicted, calls, unclassified, unreadable or problems.
+	std::string outcome;
+	uint64_t    candidates = 0;
+};
+
+/// One generated module the drain took in. Times are on the NowNs clock, and a time that did not
+/// happen is missing. lead_ms is first_use minus ready, so a negative number means the dispatch got
+/// there before a worker had finished the build. how is done, waited or inline, from the first use
+/// of the module, and unused when no dispatch took it.
+struct GeneratedModuleRow {
+	uint64_t               id         = 0;
+	uint64_t               code_hash  = 0;
+	int64_t                posted_ns  = NO_TIME_NS;
+	int64_t                adopted_ns = NO_TIME_NS;
+	std::optional<int64_t> ready_ns;
+	std::optional<int64_t> first_use_ns;
+	std::optional<double>  build_ms;
+	std::optional<double>  lead_ms;
+	std::string            how;
+};
+
+/// The misses of one class.
+struct GenerationMissClass {
+	std::string name;
+	uint64_t    count     = 0;
+	double      create_ms = 0.0;
+};
+
+/// The compute translations that the runtime did with generation on, by the reason generation did
+/// not serve them.
+struct GenerationMisses {
+	uint64_t                         total     = 0;
+	double                           create_ms = 0.0;
+	std::vector<GenerationMissClass> classes;
+	/// How the drain refused the modules of the dropped_at_drain class, by verdict name.
+	std::vector<std::pair<std::string, uint64_t>> refused;
+	uint64_t                                      wrong_spec_programs     = 0;
+	uint64_t                                      wrong_spec_max_variants = 0;
+};
+
+/// A first use that stopped the dispatch for long, with what is known of the module's life. The
+/// generated times are missing for a module that generation did not make.
+struct GenerationSlowTake {
+	uint64_t               id        = 0;
+	bool                   generated = false;
+	std::string            how;
+	double                 stopped_ms = 0.0;
+	int64_t                at_ns      = NO_TIME_NS;
+	bool                   paused     = false;
+	std::optional<int64_t> posted_ns;
+	std::optional<int64_t> adopted_ns;
+	std::optional<int64_t> ready_ns;
+};
+
+/// A take that stopped the dispatch for at least this long is listed in the generation block.
+inline constexpr double SLOW_TAKE_MS = 250.0;
 
 /// What the GPU thread's drain of generated modules counted.
 struct GenerationDrain {
@@ -291,6 +354,13 @@ struct ShaderStoreGenerationReport {
 	/// The fields of the worker's summary line, in the order it wrote them. Empty when none came.
 	std::vector<std::pair<std::string, std::string>> worker;
 	GenerationDrain                                  drain;
+	/// The latest `prediction` line of each program, in the order the programs were first seen.
+	std::vector<GenerationPrediction> predictions;
+	/// One row for each module taken in, and the build time of those that no dispatch took.
+	std::vector<GeneratedModuleRow> generated_modules;
+	double                          unused_build_ms = 0.0;
+	GenerationMisses                misses;
+	std::vector<GenerationSlowTake> slow_takes;
 };
 
 /// The GPU thread's blocking within one guest flip, merged into a single pause.
@@ -568,8 +638,10 @@ private:
 	// Pauses including the one still being merged. Caller holds the lock.
 	[[nodiscard]] std::vector<Pause> AllPausesLocked() const;
 
-	// Guards the three generation members only, and is never held together with m_mutex. The
-	// writer holds it while it calls the source.
+	// Guards the three generation members. The writer holds it while it calls the source, and the
+	// source reads this report's rows through Compiles() and WarmTakes(), which take m_mutex. So the
+	// order is this mutex first, then m_mutex or the owner's own mutex, and never the reverse.
+	// Nothing that holds m_mutex calls into the generation members, so it cannot deadlock.
 	mutable std::mutex                           m_generation_mutex;
 	std::optional<std::string>                   m_generation_inactive;
 	std::function<ShaderStoreGenerationReport()> m_generation_source;

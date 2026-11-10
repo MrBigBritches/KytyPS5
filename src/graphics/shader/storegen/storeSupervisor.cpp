@@ -94,6 +94,11 @@ double MillisecondsBetween(Clock::time_point from, Clock::time_point to) {
 	return std::chrono::duration<double, std::milli>(to - from).count();
 }
 
+// A time of the steady clock as nanoseconds since its epoch, as the first-run report's NowNs reads.
+int64_t NanosecondsOf(Clock::time_point time) {
+	return std::chrono::duration_cast<std::chrono::nanoseconds>(time.time_since_epoch()).count();
+}
+
 // Adds a hash to a list that holds each once.
 void AddUnique(std::vector<uint64_t>& list, uint64_t hash) {
 	if (std::ranges::find(list, hash) == list.end()) {
@@ -230,9 +235,11 @@ void StoreSupervisor::Impl::End(SupervisorOutcome outcome, const std::string& re
 		}
 		stats.outcome         = outcome;
 		stats.inactive_reason = reason;
-		stats.ended_ms        = MillisecondsBetween(thread_start, Clock::now());
+		const auto now        = Clock::now();
+		stats.ended_ms        = MillisecondsBetween(thread_start, now);
 		if (outcome == SupervisorOutcome::Finished) {
 			stats.finished_ms = stats.ended_ms;
+			stats.finished_ns = NanosecondsOf(now);
 		}
 	}
 	end_changed.notify_all();
@@ -567,7 +574,8 @@ void StoreSupervisor::Impl::NoteProgress() {
 			}
 		}
 		if (first && !s.child_open_ms) {
-			s.child_open_ms = MillisecondsBetween(first_spawn_time, *first);
+			s.child_open_ms    = MillisecondsBetween(first_spawn_time, *first);
+			s.first_predict_ns = NanosecondsOf(*first);
 		}
 	});
 	predicted_published   = predicted.size();
