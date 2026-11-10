@@ -58,6 +58,10 @@ $ArmTable = [ordered]@{
     "deferred-pause" = @{ Flags = @("--deferred-pipeline-draws", "--background-warm-up", "--pause-warm-up-for-draws");   Ready = $true }
     "deferred-non-push" = @{ Flags = @("--deferred-pipeline-draws", "--background-warm-up", "--pause-warm-up-for-draws", "--deferred-non-push-draws"); Ready = $true }
     "gpl"            = @{ Flags = @("--deferred-pipeline-draws", "--background-warm-up", "--pause-warm-up-for-draws", "--deferred-non-push-draws", "--graphics-pipeline-library"); Ready = $true }
+    # The gpl arm plus compute shaders generated from the eboot by a helper process. It needs
+    # --shader-cache, which the base args give. The helper's files match the title's cache names,
+    # so they move into the hold folder with the rest.
+    "gen"            = @{ Flags = @("--deferred-pipeline-draws", "--background-warm-up", "--pause-warm-up-for-draws", "--deferred-non-push-draws", "--graphics-pipeline-library", "--generate-shader-store"); Ready = $true }
     "lookahead"      = @{ Flags = @("--shader-lookahead");                                                                 Ready = $false }
 }
 
