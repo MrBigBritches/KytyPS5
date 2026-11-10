@@ -1,0 +1,22 @@
+{
+  "title_id": "PPSA00001",
+  "cold": true,
+  "partial": false,
+  "flags": {"--first-run-report": true, "--cold-pipelines": true, "--background-warm-up": true,
+            "--graphics-pipeline-library": true, "--deferred-pipeline-draws": true},
+  "boot": {"modules": 0, "pipelines": 0, "programs": 0, "warm_up_ms": 650.0},
+  "graphics_pipeline_library": {"active": true},
+  "play": {"blocked_ms": {"graphics": 8000.0, "compute": 2500.0, "total": 10500.0},
+           "translate_ms": 7000.0, "translate_gpu_graphics_ms": 3000.0, "worst_translate": []},
+  "pauses": {"count": 2, "longest_pause_ms": 1200.0,
+             "pause_histogram": {"under_100": 12, "100": 4, "1000": 2}},
+  "skips": {"draw": 3, "dispatch": 0, "by_target_class": {"depth_only": 2, "depth_and_color": 1},
+            "sampled_after_skip_by_target_class": {"color": 1},
+            "refused": {"has_calls": {"draws": 4, "blocked_ms": 1500.0}}},
+  "audio_held_ms": 6000.0,
+  "audio_holds": 8,
+  "warm_takes": [{"id": "00000000000000bb", "how": "waited", "flip": 7, "stopped_ms": 400.0}],
+  "compiles": [{"kind": "graphics", "vs": "0000000000000003", "ps": "0000000000000004", "create_ms": 30.0,
+                "phase": "play", "thread": "worker", "flip": 2}],
+  "deferred_draws": {"resolves": [{"flip": 1, "window_held_ms": 120.0, "window_hold_count_change": 1}]}
+}

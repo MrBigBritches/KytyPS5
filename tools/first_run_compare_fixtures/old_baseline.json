@@ -1,0 +1,18 @@
+{
+  "title_id": "PPSA00001",
+  "cold": true,
+  "partial": false,
+  "flags": {"--first-run-report": true, "--cold-pipelines": true, "--background-warm-up": true},
+  "boot": {"modules": 0, "pipelines": 0, "programs": 0, "warm_up_ms": 700.0},
+  "play": {"blocked_ms": {"graphics": 12000.0, "compute": 3000.0, "total": 15000.0},
+           "translate_ms": 9000.0, "translate_gpu_graphics_ms": 4000.0, "worst_translate": []},
+  "pauses": {"count": 3, "longest_pause_ms": 2600.0,
+             "pause_histogram": {"under_100": 10, "100": 5, "1000": 2, "2500": 1}},
+  "skips": {"draw": 0, "dispatch": 0, "by_target_class": {}, "sampled_after_skip_by_target_class": {}, "refused": {}},
+  "audio_held_ms": 9000.0,
+  "audio_holds": 12,
+  "warm_takes": [{"id": "00000000000000aa", "how": "done", "flip": 5, "stopped_ms": 0.0}],
+  "compiles": [{"kind": "graphics", "vs": "0000000000000001", "ps": "0000000000000002", "create_ms": 40.0,
+                "phase": "play", "thread": "gpu", "flip": 1}],
+  "deferred_draws": {"resolves": []}
+}

@@ -1,0 +1,37 @@
+{
+  "title_id": "PPSA00002",
+  "cold": true,
+  "partial": false,
+  "run_seconds": 100.0,
+  "flags": {"--first-run-report": true, "--cold-pipelines": true,
+            "--graphics-pipeline-library": true, "--deferred-pipeline-draws": true},
+  "boot": {"modules": 0, "pipelines": 0, "programs": 0, "warm_up_ms": 500.0},
+  "graphics_pipeline_library": {"active": true},
+  "play": {"blocked_ms": {"graphics": 10000.0, "compute": 1000.0, "total": 11000.0},
+           "translate_ms": 8000.0, "translate_gpu_graphics_ms": 3000.0, "worst_translate": []},
+  "pauses": {"count": 1, "longest_pause_ms": 900.0, "pause_histogram": {"under_100": 5}},
+  "skips": {"draw": 0, "dispatch": 0, "by_target_class": {}, "sampled_after_skip_by_target_class": {}, "refused": {}},
+  "audio_held_ms": 20000.0,
+  "audio_holds": 30,
+  "audio_underruns": {"count": 4, "overflow": 0, "at_ms": [1000.0, 2000.0, 30000.0, 40000.0]},
+  "machine": {"cpu_model": "Test CPU", "logical_cores": 16, "warm_workers": 4, "ram_bytes": 34359738368},
+  "process": {"peak_working_set_bytes": 2147483648},
+  "warm_takes": [
+    {"id": "00000000000000aa", "how": "waited", "flip": 5, "stopped_ms": 300.0, "at_ms": 5000.0},
+    {"id": "00000000000000bb", "how": "done", "flip": 6, "stopped_ms": 0.0, "at_ms": 6000.0}],
+  "compiles": [
+    {"kind": "graphics", "vs": "0000000000000001", "ps": "0000000000000002", "create_ms": 100.0, "phase": "play",
+     "thread": "worker", "flip": 1, "at_ms": 1000.0, "warm_running": 0, "child_alive": false},
+    {"kind": "graphics", "vs": "0000000000000003", "ps": "0000000000000004", "create_ms": 200.0, "phase": "play",
+     "thread": "worker", "flip": 2, "at_ms": 2000.0, "warm_running": 1, "child_alive": false},
+    {"kind": "graphics", "vs": "0000000000000005", "ps": "0000000000000006", "create_ms": 300.0, "phase": "play",
+     "thread": "worker", "flip": 3, "at_ms": 3000.0, "warm_running": 3, "child_alive": false},
+    {"kind": "compute", "id": "00000000000000cc", "create_ms": 5000.0, "phase": "play",
+     "thread": "worker", "flip": 3, "at_ms": 3500.0, "warm_running": 1, "child_alive": false}],
+  "deferred_draws": {"resolves": [
+    {"flip": 1, "window_held_ms": 100.0, "window_hold_count_change": 1},
+    {"flip": 2, "window_held_ms": 200.0, "window_hold_count_change": 2},
+    {"flip": 3, "window_held_ms": 300.0, "window_hold_count_change": 3},
+    {"flip": 4, "window_held_ms": 400.0, "window_hold_count_change": 4},
+    {"flip": 5, "window_held_ms": 500.0, "window_hold_count_change": 5}]}
+}

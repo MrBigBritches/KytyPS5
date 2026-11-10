@@ -1,0 +1,22 @@
+{
+  "title_id": "PPSA00002",
+  "cold": true,
+  "partial": false,
+  "run_seconds": 100.0,
+  "flags": {"--first-run-report": true, "--cold-pipelines": true,
+            "--graphics-pipeline-library": true, "--deferred-pipeline-draws": true},
+  "boot": {"modules": 150, "pipelines": 0, "programs": 0, "warm_up_ms": 500.0},
+  "graphics_pipeline_library": {"active": true},
+  "play": {"blocked_ms": {"graphics": 2000.0, "compute": 100.0, "total": 2100.0},
+           "translate_ms": 1000.0, "translate_gpu_graphics_ms": 500.0, "worst_translate": []},
+  "pauses": {"count": 0, "longest_pause_ms": 100.0, "pause_histogram": {"under_100": 5}},
+  "skips": {"draw": 0, "dispatch": 0, "by_target_class": {}, "sampled_after_skip_by_target_class": {}, "refused": {}},
+  "audio_held_ms": 5000.0,
+  "audio_holds": 6,
+  "audio_underruns": {"count": 0, "overflow": 0, "at_ms": []},
+  "warm_takes": [],
+  "compiles": [],
+  "deferred_draws": {"resolves": [
+    {"flip": 1, "window_held_ms": 100.0, "window_hold_count_change": 1},
+    {"flip": 2, "window_held_ms": 150.0, "window_hold_count_change": 1}]}
+}

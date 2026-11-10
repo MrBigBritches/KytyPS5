@@ -1,0 +1,8 @@
+arm                                                                         runs  gfx blocked s  cs blocked s  translate s   boot s  total wait s  longest s  pauses>1s  skip depth  skip d+c  smp depth  smp color  heap depth  heap color
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+--background-warm-up                                                           1          12.00          3.00         9.00     0.70         15.70       2.60          3           0         0          0          0           0           0
+--background-warm-up --deferred-pipeline-draws --graphics-pipeline-library     1           8.00          2.50         7.00     0.65         11.15       1.20          2           2         1          0          1           0           0
+
+--background-warm-up --deferred-pipeline-draws --graphics-pipeline-library: draws refused a skip, by rule (median and max of draws, blocked s)
+  has_calls                             4        4       1.50       1.50
+  GPU-thread graphics translate, also blocked: 3.00 s
