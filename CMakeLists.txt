@@ -750,6 +750,16 @@ add_executable(generated_drain_planner_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(generated_drain_planner_tests PRIVATE ${inc_headers})
 
+# Where the generator reads the title's eboot from, including a title in a .zar made by the writer of
+# the archive tests. It needs no graphics device.
+add_executable(shader_store_eboot_source_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ShaderStoreEbootSourceTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/storegen/ebootSource.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/storegen/storeGenerationGate.cpp"
+)
+target_link_libraries(shader_store_eboot_source_tests common ZArchive::zarchive)
+target_include_directories(shader_store_eboot_source_tests PRIVATE ${inc_headers})
+
 # The reader of a store worker's progress log. It reads text lines through Common::File and needs no
 # graphics device.
 add_executable(shader_store_progress_log_tests EXCLUDE_FROM_ALL
@@ -988,6 +998,7 @@ if(BUILD_TESTING)
 	add_test(NAME shader_store_progress_log COMMAND $<TARGET_FILE:shader_store_progress_log_tests>)
 	add_test(NAME shader_store_supervisor COMMAND $<TARGET_FILE:shader_store_supervisor_tests>)
 	add_test(NAME generated_drain_planner COMMAND $<TARGET_FILE:generated_drain_planner_tests>)
+	add_test(NAME shader_store_eboot_source COMMAND $<TARGET_FILE:shader_store_eboot_source_tests>)
 	set_tests_properties(shader_store_supervisor PROPERTIES TIMEOUT 300)
 	add_test(NAME shader_store_worker COMMAND $<TARGET_FILE:shader_store_worker_tests>)
 	add_test(NAME shader_store_dispatch COMMAND $<TARGET_FILE:shader_store_dispatch_tests>)
@@ -1133,6 +1144,7 @@ if(BUILD_TESTING)
 		shader_store_progress_log_tests
 		shader_store_supervisor_tests
 		generated_drain_planner_tests
+		shader_store_eboot_source_tests
 		shader_store_worker_tests
 		shader_store_dispatch_tests
 		virtual_memory_allocation_tests

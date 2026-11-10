@@ -195,6 +195,16 @@ void Run(const RunOptions& options) {
 
 	const auto         param_json = options.app0_dir / "sce_sys" / "param.json";
 	Common::Subsystems subsystems(true);
+	// Only for --generate-shader-store, so a run without it does nothing more here. It has to come
+	// before Init, which starts the graphics subsystem, whose pipeline cache reads the path in WarmUp.
+	// The /app0 mount does not exist yet, so the path is built from the directory it will be mounted
+	// to, which is what the mount would resolve it to. For an archive that is a member of it, and the
+	// worker reads it without a mount.
+	if (options.config.generate_shader_store_enabled &&
+	    !Libs::Graphics::StoreGen::SetEbootPath(
+	        Libs::Graphics::StoreGen::EbootPathFor(options.app0_dir, options.elf))) {
+		::printf("WARNING: the shader store generator was asked for the eboot after it was needed\n");
+	}
 	Init(options.config, param_json, subsystems);
 
 	PrintSystemInfo();
@@ -221,13 +231,6 @@ void Run(const RunOptions& options) {
 
 	Libs::LibKernel::FileSystem::Mount(options.app0_dir, "/app0");
 	Libs::LibKernel::FileSystem::Mount(options.app0_dir, "/hostapp");
-	// Only for --generate-shader-store, so a run without it does nothing more here. The worker reads
-	// the eboot by this path, which for an archive is a member of it, and it needs no mount.
-	if (options.config.generate_shader_store_enabled) {
-		Libs::Graphics::StoreGen::SetEbootPath(Libs::LibKernel::FileSystem::GetRealFilename(
-		    Common::PathToGenericString(options.elf)));
-	}
-
 	MountSandboxDirs();
 
 	Loader::AddContentLoad(options.addcont_dir, options.addcont, title_id);
