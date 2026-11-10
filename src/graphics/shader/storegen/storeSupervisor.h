@@ -4,6 +4,7 @@
 #include "common/childProcess.h"
 #include "common/threadPriority.h"
 #include "graphics/shader/shaderStoreRecord.h"
+#include "graphics/shader/storegen/generatedOrder.h"
 #include "graphics/shader/storegen/progressLog.h"
 #include "graphics/shader/storegen/storeWorkerFormat.h"
 
@@ -308,9 +309,9 @@ struct SupervisorConfig {
 	std::chrono::milliseconds candidate_timeout = GENERATION_CANDIDATE_TIMEOUT;
 	uint32_t                  max_restarts      = GENERATION_MAX_RESTARTS;
 	/// Receives each new module record, on the supervisor's thread, after its id was checked
-	/// against the ones already given. It must not stop the supervisor that calls it, since Stop
-	/// joins the very thread the sink runs on.
-	std::function<void(DecodedModuleRecord&&)> sink;
+	/// against the ones already given, with its tier and candidate count. It must not stop the
+	/// supervisor that calls it, since Stop joins the very thread the sink runs on.
+	std::function<void(DecodedModuleRecord&&, const GeneratedOrder&)> sink;
 	/// Receives the lines to log, such as a refused priority change or a slow stop.
 	std::function<void(std::string_view)> log;
 	/// How the supervisor lowers its own thread. A test replaces it to make the system refuse.

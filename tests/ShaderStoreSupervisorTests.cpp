@@ -591,6 +591,59 @@ bool FileBeginsWith(const fs::path& path, const Bytes& prefix) {
 	return in && static_cast<size_t>(in.gcount()) == prefix.size() && head == prefix;
 }
 
+// The programs of the order modes. A and B are predicted, with counts that sit on either side of
+// the wide tail limit, and C has no prediction line at all.
+constexpr size_t   ORDER_A          = 0;
+constexpr size_t   ORDER_B          = 1;
+constexpr size_t   ORDER_C          = 2;
+constexpr uint64_t ORDER_A_COUNT    = WIDE_TAIL_CANDIDATES_ABOVE + 1;
+constexpr uint64_t ORDER_B_COUNT    = WIDE_TAIL_CANDIDATES_ABOVE;
+constexpr int      FIRST_FAKE_SPAWN = 0;
+
+// The records that an order mode writes, as program and index pairs.
+std::vector<FakeCandidate> FakeOrderSequence(const FakeRun& run) {
+	const auto variant = [](size_t program, size_t index) {
+		return FakeCandidate {program, index, ProgramHash(program), ModuleIdOf(program, index)};
+	};
+	if (run.Is("wide_order_fresh")) {
+		// The first spawn stops after two records. The fresh run then writes them again and a
+		// third.
+		if (run.spawn == FIRST_FAKE_SPAWN) {
+			return {variant(ORDER_A, 0), variant(ORDER_A, 1)};
+		}
+		return {variant(ORDER_A, 0), variant(ORDER_A, 1), variant(ORDER_A, 2)};
+	}
+	return {variant(ORDER_A, 0), variant(ORDER_B, 0), variant(ORDER_C, 0), variant(ORDER_A, 1),
+	        variant(ORDER_B, 1), variant(ORDER_A, 2), variant(ORDER_C, 1)};
+}
+
+// The `wide_order` and `wide_order_fresh` modes, which write their records in an order where
+// programs are interleaved. The prediction lines come first, as the worker writes them.
+int FakeWideOrder(FakeRun& run) {
+	const auto sequence = FakeOrderSequence(run);
+	const auto predict  = [&run](size_t program, uint64_t count) {
+        run.files.Line("predict " + FakeFiles::Hex(ProgramHash(program)));
+        run.files.Line("prediction " + FakeFiles::Hex(ProgramHash(program)) + " predicted " +
+		                std::to_string(count));
+	};
+	predict(ORDER_A, ORDER_A_COUNT);
+	if (run.Is("wide_order")) {
+		predict(ORDER_B, ORDER_B_COUNT);
+	}
+	run.files.Line("order " + std::to_string(sequence.size()) + " " +
+	               FakeFiles::Hex(OrderHashOf(sequence)));
+	run.files.OpenOutput(GeneratedHeaderBytes(run.request));
+	for (size_t rank = 0; rank < sequence.size(); rank++) {
+		run.files.Line("start " + std::to_string(rank) + " " + FakeFiles::Hex(sequence[rank].hash));
+		run.files.Frame(ModuleRecord(sequence[rank].id, sequence[rank].hash));
+	}
+	if (run.Is("wide_order_fresh") && run.spawn == FIRST_FAKE_SPAWN) {
+		return WORKER_EXIT_ORDER_MISMATCH;
+	}
+	run.files.Line("summary exit=0 candidates=" + std::to_string(sequence.size()));
+	return 0;
+}
+
 // The whole fake. A mode such as `exit:3` ends before it does anything else.
 int RunFakeWorker(const std::string& mode_text, const fs::path& request_file) {
 	const auto request = ReadWorkerRequestFile(request_file);
@@ -623,6 +676,9 @@ int RunFakeWorker(const std::string& mode_text, const fs::path& request_file) {
 	if (request->mode == WorkerMode::Verify &&
 	    FileBeginsWith(PathFromUtf8(request->generated_path), GeneratedHeaderBytes(*request))) {
 		return WORKER_EXIT_UP_TO_DATE;
+	}
+	if (run.Is("wide_order") || run.Is("wide_order_fresh")) {
+		return FakeWideOrder(run);
 	}
 	// This mode has left a damaged file behind before it crashes at a predict line.
 	if (run.Is("crash_damaged_predict") && run.spawn == 0) {
@@ -698,17 +754,20 @@ constexpr auto STOP_LIMIT = 3s;
 
 // What a run of the supervisor over the fake gave.
 struct Outcome {
-	SupervisorStats          stats;
-	std::vector<uint64_t>    ids;
-	std::vector<std::string> log;
-	bool                     ended = false;
+	SupervisorStats       stats;
+	std::vector<uint64_t> ids;
+	// The order the sink was given with each id, in the same sequence.
+	std::vector<GeneratedOrder> orders;
+	std::vector<std::string>    log;
+	bool                        ended = false;
 };
 
 // The sink and the log of one run, shared with the supervisor's thread.
 struct Collected {
-	std::mutex               mutex;
-	std::vector<uint64_t>    ids;
-	std::vector<std::string> log;
+	std::mutex                  mutex;
+	std::vector<uint64_t>       ids;
+	std::vector<GeneratedOrder> orders;
+	std::vector<std::string>    log;
 };
 
 SupervisorConfig MakeConfig(const TempDirectory& directory, const std::string& mode,
@@ -726,12 +785,13 @@ SupervisorConfig MakeConfig(const TempDirectory& directory, const std::string& m
 	config.startup_timeout            = 20s;
 	config.candidate_timeout          = 20s;
 	const auto marker                 = fs::absolute(config.output_path).concat(TWO_RECORDS_MARKER);
-	config.sink                       = [&collected, marker](DecodedModuleRecord&& record) {
-        std::scoped_lock lock(collected.mutex);
-        collected.ids.push_back(record.id);
-        if (collected.ids.size() == 2) {
-            std::ofstream(marker) << "two";
-        }
+	config.sink = [&collected, marker](DecodedModuleRecord&& record, const GeneratedOrder& order) {
+		std::scoped_lock lock(collected.mutex);
+		collected.ids.push_back(record.id);
+		collected.orders.push_back(order);
+		if (collected.ids.size() == 2) {
+			std::ofstream(marker) << "two";
+		}
 	};
 	config.log = [&collected](std::string_view text) {
 		std::scoped_lock lock(collected.mutex);
@@ -757,8 +817,9 @@ Outcome Run(const std::string& mode, const std::function<void(SupervisorConfig&)
 		outcome.stats = supervisor.Stats();
 	}
 	std::scoped_lock lock(collected.mutex);
-	outcome.ids = collected.ids;
-	outcome.log = collected.log;
+	outcome.ids    = collected.ids;
+	outcome.orders = collected.orders;
+	outcome.log    = collected.log;
 	return outcome;
 }
 
@@ -1286,7 +1347,7 @@ void TestDecodeMsMax() {
 	const auto fast = Run("normal");
 	CHECK(fast.stats.decode_ms_max < SLOW_SINK_MIN_MS);
 	const auto slow = Run("normal", [](SupervisorConfig& config) {
-		config.sink = [](DecodedModuleRecord&& record) {
+		config.sink = [](DecodedModuleRecord&& record, const GeneratedOrder&) {
 			if (record.id == ModuleIdOf(1, 0)) {
 				std::this_thread::sleep_for(SLOW_SINK_DELAY);
 			}
@@ -2043,13 +2104,14 @@ struct BootOptions {
 
 // What a boot left, taken before the folder is gone.
 struct BootRun {
-	SupervisorStats           stats;
-	bool                      ended = false;
-	std::vector<uint64_t>     ids;
-	std::optional<Bytes>      generated;
-	std::optional<Bytes>      temporary;
-	std::vector<std::string>  log;
-	std::chrono::milliseconds stop_took {0};
+	SupervisorStats             stats;
+	bool                        ended = false;
+	std::vector<uint64_t>       ids;
+	std::vector<GeneratedOrder> orders;
+	std::optional<Bytes>        generated;
+	std::optional<Bytes>        temporary;
+	std::vector<std::string>    log;
+	std::chrono::milliseconds   stop_took {0};
 };
 
 // Runs the supervisor over the fake with an earlier file in place, and reads the files at the end.
@@ -2058,10 +2120,12 @@ BootRun RunBoot(const BootOptions& options = {}) {
 	Collected     collected;
 	auto          config = MakeConfig(directory, options.mode, collected);
 	if (options.sink_delay > 0ms) {
-		config.sink = [&collected, delay = options.sink_delay](DecodedModuleRecord&& record) {
+		config.sink = [&collected, delay = options.sink_delay](DecodedModuleRecord&& record,
+		                                                       const GeneratedOrder& order) {
 			std::this_thread::sleep_for(delay);
 			std::scoped_lock lock(collected.mutex);
 			collected.ids.push_back(record.id);
+			collected.orders.push_back(order);
 		};
 	}
 	if (options.tweak) {
@@ -2090,8 +2154,9 @@ BootRun RunBoot(const BootOptions& options = {}) {
 	result.generated = ReadBytes(directory / "title.generated");
 	result.temporary = ReadBytes(directory / "title.generated.1.tmp");
 	std::scoped_lock lock(collected.mutex);
-	result.ids = collected.ids;
-	result.log = collected.log;
+	result.ids    = collected.ids;
+	result.orders = collected.orders;
+	result.log    = collected.log;
 	return result;
 }
 
@@ -2320,7 +2385,8 @@ void TestFinishEndsTheLoaderBeforeTheRename() {
 	const auto          run            = RunBoot(
         {.earlier = EarlierFileBytes(LoadedIds(LONG_LOAD_RECORDS), {.identity = STALE_IDENTITY}),
 	                         .tweak = [&](SupervisorConfig& config, Collected& collected) {
-             config.sink = [&, &c = collected](DecodedModuleRecord&& record) {
+             config.sink = [&, &c = collected](DecodedModuleRecord&& record,
+                                               const GeneratedOrder&) {
                  std::this_thread::sleep_for(RECORD_SINK_DELAY);
                  std::scoped_lock lock(c.mutex);
                  c.ids.push_back(record.id);
@@ -2730,18 +2796,18 @@ void TestStaleCleanupAtStart() {
 	std::atomic<bool> stale_seen_at_first_record {true};
 	std::atomic<bool> got_record {false};
 	const auto        loaded = RunInFolder(
-        "normal",
-        {.setup = [&](const fs::path& folder) { Touch(folder / STALE_PROBE_NAME); },
-	            .process_running = OnlyLivePidRuns,
-	            .earlier         = EarlierFileBytes(LoadedIds(LOADED_RECORDS)),
-	            .tweak =
-	                [&](SupervisorConfig& config, const fs::path& folder) {
-                 config.sink = [&, probe = folder / STALE_PROBE_NAME](DecodedModuleRecord&&) {
-                     if (!got_record.exchange(true)) {
-                         stale_seen_at_first_record = fs::exists(probe);
-                     }
-                 };
-             }});
+        "normal", {.setup = [&](const fs::path& folder) { Touch(folder / STALE_PROBE_NAME); },
+	                      .process_running = OnlyLivePidRuns,
+	                      .earlier         = EarlierFileBytes(LoadedIds(LOADED_RECORDS)),
+	                      .tweak =
+	                          [&](SupervisorConfig& config, const fs::path& folder) {
+                           config.sink = [&, probe = folder / STALE_PROBE_NAME](
+                                             DecodedModuleRecord&&, const GeneratedOrder&) {
+                               if (!got_record.exchange(true)) {
+                                   stale_seen_at_first_record = fs::exists(probe);
+                               }
+                           };
+                       }});
 	CHECK(loaded.stats.source == GenerationSource::Loaded && got_record);
 	CHECK(!stale_seen_at_first_record);
 }
@@ -2832,6 +2898,103 @@ void TestHelperRemovalFailureIsLogged() {
 	CHECK(baseline.stats.remove_failures == 0);
 }
 
+// ---- The order of generated modules: their tier and whether they are wide tail. ----
+
+// The table of IsWideTail. Each row differs from a neighbour in one input. (1,2) against (1,3) is
+// the count at the limit, (0,3) against (1,3) is the tier, and an unknown count against any count
+// is not wide whatever the tier.
+void TestIsWideTailTable() {
+	struct Row {
+		uint32_t                tier;
+		std::optional<uint64_t> candidates;
+		bool                    wide;
+	};
+	const Row rows[] = {{0, 3, false},
+	                    {1, 2, false},
+	                    {1, 3, true},
+	                    {5, 8, true},
+	                    {1, std::nullopt, false},
+	                    {0, std::nullopt, false},
+	                    {1, 0, false}};
+	for (const auto& row: rows) {
+		CHECK(IsWideTail(row.tier, row.candidates) == row.wide);
+	}
+}
+
+// The tiers and wide flags that wide_order gives, in the order its records arrive: A0 B0 C0 A1 B1
+// A2 C1. A has 3 candidates and B has 2, and C has no prediction line. A1 and B1 are both tier 1
+// and differ only in the count, so the flag comes from the count. C1 is tier 1 with no count,
+// which is the fallback. A0 has a count and tier 0, so it is not wide for its tier.
+void CheckWideOrderRun(const Outcome& run) {
+	CHECK(run.ended && run.stats.outcome == SupervisorOutcome::Finished);
+	const std::vector<uint32_t> tiers {0, 0, 0, 1, 1, 2, 1};
+	const std::vector<bool>     wide {false, false, false, true, false, true, false};
+	CHECK(run.orders.size() == tiers.size());
+	for (size_t i = 0; i < run.orders.size() && i < tiers.size(); i++) {
+		CHECK(run.orders[i].tier == tiers[i]);
+		CHECK(run.orders[i].wide_tail == wide[i]);
+	}
+	if (run.orders.size() == tiers.size()) {
+		CHECK(run.orders[0].candidates == std::optional<uint64_t> {ORDER_A_COUNT});
+		CHECK(run.orders[1].candidates == std::optional<uint64_t> {ORDER_B_COUNT});
+		CHECK(!run.orders[2].candidates.has_value());
+		CHECK(run.orders[3].candidates == std::optional<uint64_t> {ORDER_A_COUNT});
+		CHECK(run.orders[4].candidates == std::optional<uint64_t> {ORDER_B_COUNT});
+		CHECK(run.orders[6].candidates == std::nullopt);
+	}
+}
+
+void TestWideOrderTiers() {
+	CheckWideOrderRun(Run("wide_order"));
+}
+
+// The same run with a slow poll, so that the first records and the prediction lines are read in one
+// poll. Every record still has its count then. This pins that the log's rows are in place for a
+// record that arrives with them. It cannot tell which of the two files is read first, since the
+// worker writes a program's prediction line before its records.
+void TestWideOrderWithOnePoll() {
+	CheckWideOrderRun(
+	    Run("wide_order", [](SupervisorConfig& config) { config.poll_interval = SLOW_POLL; }));
+}
+
+// A fresh restart writes the first two records again, and the supervisor drops them. Its counter
+// is not reset, so the third record is tier 2 and wide. A counter that the fresh start reset would
+// give it tier 0, and one that counted the repeats would give it tier 4.
+void TestWideOrderSurvivesAFreshRestart() {
+	const auto run = Run("wide_order_fresh");
+	CHECK(run.ended && run.stats.outcome == SupervisorOutcome::Finished);
+	CHECK(run.stats.spawns == 2 && run.stats.duplicates == 2);
+	CHECK(run.ids == (std::vector<uint64_t> {ModuleIdOf(ORDER_A, 0), ModuleIdOf(ORDER_A, 1),
+	                                         ModuleIdOf(ORDER_A, 2)}));
+	CHECK(run.orders.size() == 3);
+	if (run.orders.size() == 3) {
+		CHECK(run.orders[0].tier == 0 && run.orders[1].tier == 1 && run.orders[2].tier == 2);
+		CHECK(!run.orders[0].wide_tail && run.orders[1].wide_tail && run.orders[2].wide_tail);
+	}
+}
+
+// The records of an earlier file have no count and are never wide, whatever their tier. The file
+// holds three records of program A. The baseline is a live run, whose A1 and A2 are the same tiers
+// of the same program and are wide, so only the source differs.
+void TestLoadedOrderIsNeverWide() {
+	Bytes file = EncodeGeneratedHeader(StoreHeader(), GENERATOR_VERSION, CURRENT_IDENTITY);
+	for (size_t index = 0; index < 3; index++) {
+		const auto frame =
+		    FrameStoreRecord(ModuleRecord(LOADED_ID_BASE + index, ProgramHash(ORDER_A)));
+		file.insert(file.end(), frame.begin(), frame.end());
+	}
+	const auto loaded = RunBoot({.earlier = file});
+	CHECK(loaded.ended && loaded.stats.source == GenerationSource::Loaded);
+	CHECK(loaded.orders.size() == 3);
+	for (size_t index = 0; index < loaded.orders.size(); index++) {
+		CHECK(loaded.orders[index].tier == index);
+		CHECK(!loaded.orders[index].candidates.has_value());
+		CHECK(!loaded.orders[index].wide_tail);
+	}
+	const auto live = Run("wide_order");
+	CHECK(live.orders.size() == 7 && live.orders[3].wide_tail && live.orders[5].wide_tail);
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -2906,6 +3069,11 @@ int main(int argc, char** argv) {
 	TestFailedRunKeepsItsFiles();
 	TestLoadedFinishRemovesTheOutFile();
 	TestHelperRemovalFailureIsLogged();
+	TestIsWideTailTable();
+	TestWideOrderTiers();
+	TestWideOrderWithOnePoll();
+	TestWideOrderSurvivesAFreshRestart();
+	TestLoadedOrderIsNeverWide();
 	if (g_failures == 0) {
 		std::puts("Shader store supervisor tests passed");
 	}

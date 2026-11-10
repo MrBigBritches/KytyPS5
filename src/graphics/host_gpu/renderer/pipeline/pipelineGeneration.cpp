@@ -74,7 +74,9 @@ void PipelineCache::StartStoreGeneration(const std::filesystem::path& store_path
 	const auto pid        = std::to_string(Common::CurrentProcessId());
 	config.output_path    = store_path.parent_path() / (stem + ".generated." + pid + ".tmp");
 	config.generated_path = store_path.parent_path() / (stem + ".generated");
-	config.sink = [this](DecodedModuleRecord&& record) { PostGeneratedModule(std::move(record)); };
+	config.sink = [this](DecodedModuleRecord&& record, const StoreGen::GeneratedOrder& order) {
+		PostGeneratedModule(std::move(record), order);
+	};
 	config.log = [](std::string_view text) { Log::WriteToConsoleAndLog(std::string(text) + "\n"); };
 	if (m_supervisor_tweak) {
 		m_supervisor_tweak(config);
@@ -88,9 +90,11 @@ void PipelineCache::StartStoreGeneration(const std::filesystem::path& store_path
 // Runs on the generator's thread. It touches no cache map, only the device, which creates shader
 // modules from any thread, and the state of the intake that only this thread uses.
 std::optional<PipelineCache::GeneratedModule>
-PipelineCache::MakeGeneratedModule(DecodedModuleRecord&& record) {
+PipelineCache::MakeGeneratedModule(DecodedModuleRecord&&           record,
+                                   const StoreGen::GeneratedOrder& order) {
 	auto&           state = *m_generation;
 	GeneratedModule item;
+	item.order     = order;
 	item.plan_hash = HashPlanBytes(record.plan);
 	FillKeyFromRecord(record, item.key);
 	// The plan is decoded for the first record of a program only. Decoding it is the costly part of
@@ -114,11 +118,14 @@ PipelineCache::MakeGeneratedModule(DecodedModuleRecord&& record) {
 	return item;
 }
 
-void PipelineCache::PostGeneratedModule(DecodedModuleRecord&& record) {
+// Makes the module of a record on the generator's thread and hands it to the GPU thread. The order
+// travels with it and nothing reads it yet.
+void PipelineCache::PostGeneratedModule(DecodedModuleRecord&&           record,
+                                        const StoreGen::GeneratedOrder& order) {
 	if (m_generation == nullptr) {
 		return;
 	}
-	if (auto item = MakeGeneratedModule(std::move(record))) {
+	if (auto item = MakeGeneratedModule(std::move(record), order)) {
 		PushGenerated(std::move(*item));
 	}
 }

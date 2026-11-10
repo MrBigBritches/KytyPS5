@@ -5,6 +5,7 @@
 #include "common/firstRunReport.h"
 #include "graphics/shader/recompiler/ir/Serialize.h"
 #include "graphics/shader/storegen/frameTailer.h"
+#include "graphics/shader/storegen/generatedOrder.h"
 #include "graphics/shader/storegen/progressLog.h"
 #include "graphics/shader/storegen/shaderStoreWorker.h"
 #include "graphics/shader/storegen/workerProcess.h"
@@ -20,6 +21,7 @@
 #include <optional>
 #include <stop_token>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -293,13 +295,16 @@ struct StoreSupervisor::Impl {
 	void               LowerPriority();
 
 	// ---- Following the child. ----
-	bool               Spawn();
-	void               Deliver(std::vector<TailedFrame>&& frames);
-	void               DeliverRecord(const TailedFrame& frame);
-	void               HandleRecord(const TailedFrame& frame);
-	void               CatchUp();
-	[[nodiscard]] bool TimedOut(ProgressClock::time_point now) const;
-	std::optional<int> TerminateChild();
+	bool Spawn();
+	void Deliver(std::vector<TailedFrame>&& frames);
+	// Whether a record came from the worker's output or from the earlier generated file.
+	enum class RecordSource : uint8_t { Worker, Loaded };
+	void                         DeliverRecord(const TailedFrame& frame, RecordSource source);
+	void                         HandleRecord(const TailedFrame& frame, RecordSource source);
+	[[nodiscard]] GeneratedOrder OrderOf(uint64_t program_hash, RecordSource source);
+	void                         CatchUp();
+	[[nodiscard]] bool           TimedOut(ProgressClock::time_point now) const;
+	std::optional<int>           TerminateChild();
 
 	// ---- Loading the generated file of an earlier run. ----
 	void               OpenLoader();
@@ -376,9 +381,12 @@ struct StoreSupervisor::Impl {
 	ProgressLogReader            progress;
 	WorkerRequest                request;
 	std::unordered_set<uint64_t> seen_ids;
-	Clock::time_point            thread_start;
-	Clock::time_point            spawn_time;
-	Clock::time_point            first_spawn_time;
+	// How many records of each program were delivered. Like seen_ids it is never cleared, so a
+	// fresh restart that sends records again does not give them a lower tier.
+	std::unordered_map<uint64_t, uint32_t> delivered_per_program;
+	Clock::time_point                      thread_start;
+	Clock::time_point                      spawn_time;
+	Clock::time_point                      first_spawn_time;
 	// What the statistics of the current spawn have taken already, so ending a spawn in two places
 	// counts it once.
 	bool   stats_collected     = false;
@@ -550,7 +558,7 @@ void StoreSupervisor::Impl::AdvanceLoader(std::chrono::milliseconds budget) {
 			loader->ReadSlice();
 		}
 		if (const auto frame = loader->TakeFrame()) {
-			DeliverRecord(*frame);
+			DeliverRecord(*frame, RecordSource::Loaded);
 		}
 	} while (LoaderLoading() && Clock::now() < deadline && !stop.stop_requested());
 }
@@ -655,6 +663,11 @@ void StoreSupervisor::Impl::Iterate() {
 	// Read before the files, since bytes written just before the exit must still be read after it.
 	const auto exited = child->Poll();
 	const auto now    = ProgressClock::now();
+	// The progress log is polled before the records, and a record's candidate count is looked up in
+	// the log when the record is delivered. The worker writes all its prediction lines before it
+	// opens the output, so a poll that reads a record almost always read its line too. A line
+	// written between the two reads is missed by the records that follow it, which then count as
+	// not wide.
 	progress.Poll(now);
 	NoteProgress();
 	Deliver(poller->Poll(exited.has_value()));
@@ -692,23 +705,37 @@ void StoreSupervisor::Impl::CatchUp() {
 
 void StoreSupervisor::Impl::Deliver(std::vector<TailedFrame>&& frames) {
 	for (const auto& frame: frames) {
-		DeliverRecord(frame);
+		DeliverRecord(frame, RecordSource::Worker);
 	}
 }
 
 // Decodes one frame, and gives its module to the sink unless an earlier record had its id. A fresh
 // restart sends the records again, so the ids are what makes them arrive once.
-void StoreSupervisor::Impl::DeliverRecord(const TailedFrame& frame) {
+void StoreSupervisor::Impl::DeliverRecord(const TailedFrame& frame, RecordSource source) {
 	const auto begin = Clock::now();
-	HandleRecord(frame);
+	HandleRecord(frame, source);
 	const auto end = Clock::now();
 	Update([&](SupervisorStats& s) {
 		s.decode_ms_max = std::max(s.decode_ms_max, MillisecondsBetween(begin, end));
 	});
 }
 
+// Where a new record stands among its program's, and how many candidates the program has. It runs
+// after the id check, so a record the restart sent again was dropped before it could count. The
+// counter is kept across fresh restarts for the same reason as the ids. A record of the earlier
+// file has no prediction line of this run, so it has no count and is never wide.
+GeneratedOrder StoreSupervisor::Impl::OrderOf(uint64_t program_hash, RecordSource source) {
+	GeneratedOrder order;
+	order.tier = delivered_per_program[program_hash]++;
+	if (source == RecordSource::Worker) {
+		order.candidates = progress.CandidatesOf(program_hash);
+	}
+	order.wide_tail = IsWideTail(order.tier, order.candidates);
+	return order;
+}
+
 // The work of DeliverRecord, which it times.
-void StoreSupervisor::Impl::HandleRecord(const TailedFrame& frame) {
+void StoreSupervisor::Impl::HandleRecord(const TailedFrame& frame, RecordSource source) {
 	using ShaderRecompiler::IR::IoAll;
 	using ShaderRecompiler::IR::Reader;
 	Update([](SupervisorStats& s) { s.frames_delivered++; });
@@ -728,8 +755,9 @@ void StoreSupervisor::Impl::HandleRecord(const TailedFrame& frame) {
 		Update([](SupervisorStats& s) { s.duplicates++; });
 		return;
 	}
+	const auto order = OrderOf(decoded.hash, source);
 	if (config.sink) {
-		config.sink(std::move(decoded));
+		config.sink(std::move(decoded), order);
 	}
 	const auto since_start = MillisecondsBetween(thread_start, Clock::now());
 	Update([&](SupervisorStats& s) {

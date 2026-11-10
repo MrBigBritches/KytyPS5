@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -532,6 +533,37 @@ void TestPredictionsKept() {
 	CHECK(fresh.Predictions() == after_fresh);
 }
 
+// CandidatesOf gives the count of a program's latest row across spawns, and keeps it through a
+// fresh run. Program B is never predicted again, so it shows that the answer for A changed because
+// of the later row and not because every count moved. A program with no row has no count, which a
+// count of 0 is not.
+void TestCandidatesOf() {
+	TempDirectory directory;
+	const auto    path = directory / "log.txt";
+	AppendText(path, "predict " + Hex(HASH_A) + "\nprediction " + Hex(HASH_A) + " predicted 3\n" +
+	                     "predict " + Hex(HASH_B) + "\nprediction " + Hex(HASH_B) +
+	                     " predicted 2\n");
+	ProgressLogReader reader(path);
+	reader.BeginSpawnAt(0, T0);
+	reader.PollToEnd(T1);
+	CHECK(reader.CandidatesOf(HASH_A) == std::optional<uint64_t> {3});
+	CHECK(reader.CandidatesOf(HASH_B) == std::optional<uint64_t> {2});
+	CHECK(!reader.CandidatesOf(HASH_C).has_value());
+
+	// The second spawn predicts A again with another count, and the latest row wins.
+	reader.BeginSpawn(T2);
+	AppendText(path, "prediction " + Hex(HASH_A) + " predicted 5\n");
+	reader.PollToEnd(T3);
+	CHECK(reader.CandidatesOf(HASH_A) == std::optional<uint64_t> {5});
+	CHECK(reader.CandidatesOf(HASH_B) == std::optional<uint64_t> {2});
+
+	// A fresh run keeps the rows, and still has no row for C.
+	reader.BeginFreshRun(T3);
+	CHECK(reader.CandidatesOf(HASH_A) == std::optional<uint64_t> {5});
+	CHECK(reader.CandidatesOf(HASH_B) == std::optional<uint64_t> {2});
+	CHECK(!reader.CandidatesOf(HASH_C).has_value());
+}
+
 // PollToEnd reads a log of more than one poll whole, where Poll stops at its bound, and says that
 // it caught up. It is what a supervisor calls before BeginSpawn, so that a dead child's last line
 // is not skipped.
@@ -643,6 +675,7 @@ int main() {
 	TestLargeLogIsReadInPolls();
 	TestFreshRunForgets();
 	TestPredictionsKept();
+	TestCandidatesOf();
 	TestPollToEndCatchesUp();
 	TestShrunkLogIsReadAgain();
 	TestPollToEndStopsWithoutProgress();

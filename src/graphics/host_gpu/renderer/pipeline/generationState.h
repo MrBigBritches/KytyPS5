@@ -3,6 +3,7 @@
 
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/shader/storegen/generatedDrainPlanner.h"
+#include "graphics/shader/storegen/generatedOrder.h"
 #include "graphics/shader/storegen/generationRows.h"
 #include "graphics/shader/storegen/storeSupervisor.h"
 
@@ -33,6 +34,8 @@ struct PipelineCache::GeneratedModule {
 	ShaderModule module;
 	// When the generator's thread posted it, for the report's drain lag.
 	std::chrono::steady_clock::time_point posted;
+	// The tier and candidate count the supervisor gave the record. Nothing reads it yet.
+	StoreGen::GeneratedOrder order;
 };
 
 struct PipelineCache::GenerationState {

@@ -18,6 +18,7 @@
 #include "graphics/shader/rectListShader.h"
 #include "graphics/shader/shader.h"
 #include "graphics/shader/storegen/generatedDrainPlanner.h"
+#include "graphics/shader/storegen/generatedOrder.h"
 
 #include <array>
 #include <atomic>
@@ -359,7 +360,8 @@ public:
 	// decoded for the first record of the program only. The GPU thread takes the module in at the top
 	// of a shader lookup. Does nothing unless generation was enabled, and after it was stopped it
 	// only destroys what it made. Never touches a cache map.
-	void PostGeneratedModule(DecodedModuleRecord&& record);
+	void PostGeneratedModule(DecodedModuleRecord&&           record,
+	                         const StoreGen::GeneratedOrder& order = {});
 	// Ends the intake of generated modules and destroys the ones no drain took. Call it before
 	// StopWarmBuilds, since a module that was taken in belongs to the warm queue. Does nothing
 	// when there is no generation, and calling it again does nothing. It touches the backlog, which
@@ -630,7 +632,8 @@ private:
 	void StartStoreGeneration(const std::filesystem::path& store_path, std::span<const uint8_t> header);
 	// Builds the module of a record on the generator's thread. Nothing when its plan cannot be
 	// decoded.
-	[[nodiscard]] std::optional<GeneratedModule> MakeGeneratedModule(DecodedModuleRecord&& record);
+	[[nodiscard]] std::optional<GeneratedModule>
+	MakeGeneratedModule(DecodedModuleRecord&& record, const StoreGen::GeneratedOrder& order = {});
 	// Puts a module in the inbox, or destroys it when the intake has stopped.
 	void PushGenerated(GeneratedModule&& item);
 	// Takes posted modules into the program cache and queues their builds. GPU thread only. It takes

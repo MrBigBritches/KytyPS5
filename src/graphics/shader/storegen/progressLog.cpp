@@ -206,6 +206,14 @@ void ProgressLogReader::BeginFreshRun(ProgressClock::time_point now) {
 	BeginSpawn(now);
 }
 
+std::optional<uint64_t> ProgressLogReader::CandidatesOf(uint64_t hash) const {
+	const auto found = m_prediction_index.find(hash);
+	if (found == m_prediction_index.end()) {
+		return std::nullopt;
+	}
+	return m_predictions[found->second].candidates;
+}
+
 void ProgressLogReader::TakeLine(std::string_view line, ProgressClock::time_point now) {
 	if (!line.empty() && line.back() == '\r') {
 		line.remove_suffix(1);

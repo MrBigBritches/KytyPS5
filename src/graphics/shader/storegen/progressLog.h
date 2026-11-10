@@ -192,6 +192,10 @@ public:
 	[[nodiscard]] const std::vector<ProgressPrediction>& Predictions() const {
 		return m_predictions;
 	}
+	/// The candidate count of a program's latest `prediction` line. It is kept across spawns and
+	/// fresh runs, like Predictions.
+	/// @return nothing when no row of the program was read.
+	[[nodiscard]] std::optional<uint64_t> CandidatesOf(uint64_t hash) const;
 	/// When the first `predict` line of the whole log was found, which is the time of the Poll that
 	/// found it and not of the line itself.
 	[[nodiscard]] const std::optional<ProgressClock::time_point>& FirstPredictTime() const {
