@@ -119,12 +119,12 @@ jobs:
             resource_materialization_tests shader_vertex_metadata_tests archive_file_tests avplayer_file_tests vdecsw_tests ^
             memory_tracker_tests page_manager_tests readback_guard_tests image_page_table_tests bit_array_tests build_flags_tests ^
             event_queue_lifetime_tests first_run_report_tests sync_on_address_tests save_data_memory_tests trophy_system_tests ^
-            audio_out_timing_tests ajm_resample_tests png_enc_tests jpeg_dec_tests jpeg_enc_tests occlusion_queries_tests pipeline_build_queue_tests pipeline_library_tests pipeline_parts_tests descriptor_set_layout_cache_tests graphics_library_cache_tests child_process_tests shader_store_scan_tests shader_store_predictor_tests shader_store_keys_tests shader_store_record_tests shader_store_worker_tests shader_store_tailer_tests thread_priority_tests shader_store_dispatch_tests shader_store_progress_log_tests shader_store_supervisor_tests generated_drain_planner_tests shader_store_eboot_source_tests ces_tests save_data_dialog_tests psml_tests --parallel
+            audio_out_timing_tests ajm_resample_tests png_enc_tests jpeg_dec_tests jpeg_enc_tests occlusion_queries_tests pipeline_build_queue_tests pipeline_library_tests pipeline_parts_tests descriptor_set_layout_cache_tests graphics_library_cache_tests child_process_tests shader_store_scan_tests shader_store_predictor_tests shader_store_keys_tests shader_store_record_tests shader_store_worker_tests shader_store_tailer_tests thread_priority_tests shader_store_dispatch_tests shader_store_progress_log_tests shader_store_supervisor_tests generated_drain_planner_tests shader_store_eboot_source_tests generation_miss_classifier_tests ces_tests save_data_dialog_tests psml_tests --parallel
 
       - name: Test
         shell: cmd
         run: |
-          ctest --test-dir _Build/windows --output-on-failure -R "^(audio_out2_port|ngs2_sampler|pad_haptics|controller_settings|host_input|ime_dialog|lru_cache|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|vdecsw|virtual_memory_allocation|memory_tracker|page_manager|readback_guard|image_page_table|bit_array|build_flags|event_queue_lifetime|first_run_report|sync_on_address|save_data_memory|trophy_system|audio_out_timing|ajm_resample|png_enc|jpeg_dec|jpeg_enc|occlusion_queries|pipeline_build_queue|pipeline_library|pipeline_parts|descriptor_set_layout_cache|graphics_library_cache|child_process|shader_store_scan|shader_store_predictor|shader_store_keys|shader_store_record|shader_store_worker|shader_store_tailer|thread_priority|shader_store_dispatch|shader_store_progress_log|shader_store_supervisor|generated_drain_planner|shader_store_eboot_source|ces|save_data_dialog|psml)$"
+          ctest --test-dir _Build/windows --output-on-failure -R "^(audio_out2_port|ngs2_sampler|pad_haptics|controller_settings|host_input|ime_dialog|lru_cache|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|vdecsw|virtual_memory_allocation|memory_tracker|page_manager|readback_guard|image_page_table|bit_array|build_flags|event_queue_lifetime|first_run_report|sync_on_address|save_data_memory|trophy_system|audio_out_timing|ajm_resample|png_enc|jpeg_dec|jpeg_enc|occlusion_queries|pipeline_build_queue|pipeline_library|pipeline_parts|descriptor_set_layout_cache|graphics_library_cache|child_process|shader_store_scan|shader_store_predictor|shader_store_keys|shader_store_record|shader_store_worker|shader_store_tailer|thread_priority|shader_store_dispatch|shader_store_progress_log|shader_store_supervisor|generated_drain_planner|shader_store_eboot_source|generation_miss_classifier|ces|save_data_dialog|psml)$"
 
       - name: Install
         shell: cmd
@@ -205,7 +205,7 @@ jobs:
         shell: bash
         run: |
           cmake --build _Build/macos \
-            --target launcher audio_out2_port_tests ngs2_sampler_tests pad_haptics_tests controller_settings_tests host_input_tests ime_dialog_tests lru_cache_tests pipeline_build_queue_tests pipeline_library_tests pipeline_parts_tests descriptor_set_layout_cache_tests graphics_library_cache_tests child_process_tests shader_store_scan_tests shader_store_predictor_tests shader_store_keys_tests shader_store_record_tests shader_store_worker_tests shader_store_tailer_tests thread_priority_tests shader_store_dispatch_tests shader_store_progress_log_tests shader_store_supervisor_tests generated_drain_planner_tests shader_store_eboot_source_tests virtual_memory_allocation_tests \
+            --target launcher audio_out2_port_tests ngs2_sampler_tests pad_haptics_tests controller_settings_tests host_input_tests ime_dialog_tests lru_cache_tests pipeline_build_queue_tests pipeline_library_tests pipeline_parts_tests descriptor_set_layout_cache_tests graphics_library_cache_tests child_process_tests shader_store_scan_tests shader_store_predictor_tests shader_store_keys_tests shader_store_record_tests shader_store_worker_tests shader_store_tailer_tests thread_priority_tests shader_store_dispatch_tests shader_store_progress_log_tests shader_store_supervisor_tests generated_drain_planner_tests shader_store_eboot_source_tests generation_miss_classifier_tests first_run_report_tests virtual_memory_allocation_tests \
               memory_tracker_tests page_manager_tests readback_guard_tests shader_recompiler_compute_tests \
               resource_tracking_tests scalar_provenance_tests \
               resource_materialization_tests shader_vertex_metadata_tests archive_file_tests avplayer_file_tests vdecsw_tests \
@@ -215,7 +215,7 @@ jobs:
         shell: bash
         run: |
           ctest --test-dir _Build/macos --output-on-failure \
-            -R '^(audio_out2_port|ngs2_sampler|pad_haptics|controller_settings|host_input|ime_dialog|lru_cache|memory_tracker|page_manager|readback_guard|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|vdecsw|virtual_memory_allocation|pipeline_build_queue|pipeline_library|pipeline_parts|descriptor_set_layout_cache|graphics_library_cache|child_process|shader_store_scan|shader_store_predictor|shader_store_keys|shader_store_record|shader_store_worker|shader_store_tailer|thread_priority|shader_store_dispatch|shader_store_progress_log|shader_store_supervisor|generated_drain_planner|shader_store_eboot_source)$'
+            -R '^(audio_out2_port|ngs2_sampler|pad_haptics|controller_settings|host_input|ime_dialog|lru_cache|memory_tracker|page_manager|readback_guard|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|vdecsw|virtual_memory_allocation|pipeline_build_queue|pipeline_library|pipeline_parts|descriptor_set_layout_cache|graphics_library_cache|child_process|shader_store_scan|shader_store_predictor|shader_store_keys|shader_store_record|shader_store_worker|shader_store_tailer|thread_priority|shader_store_dispatch|shader_store_progress_log|shader_store_supervisor|generated_drain_planner|shader_store_eboot_source|generation_miss_classifier|first_run_report)$'
 
       - name: Install
         shell: bash
@@ -391,7 +391,7 @@ jobs:
         run: |
           cmake --build _Build/linux \
             --target launcher page_manager_tests readback_guard_tests memory_tracker_tests \
-              audio_out2_port_tests ngs2_sampler_tests pad_haptics_tests controller_settings_tests host_input_tests ime_dialog_tests lru_cache_tests pipeline_build_queue_tests pipeline_library_tests pipeline_parts_tests descriptor_set_layout_cache_tests graphics_library_cache_tests child_process_tests shader_store_scan_tests shader_store_predictor_tests shader_store_keys_tests shader_store_record_tests shader_store_worker_tests shader_store_tailer_tests thread_priority_tests shader_store_dispatch_tests shader_store_progress_log_tests shader_store_supervisor_tests generated_drain_planner_tests shader_store_eboot_source_tests virtual_memory_allocation_tests \
+              audio_out2_port_tests ngs2_sampler_tests pad_haptics_tests controller_settings_tests host_input_tests ime_dialog_tests lru_cache_tests pipeline_build_queue_tests pipeline_library_tests pipeline_parts_tests descriptor_set_layout_cache_tests graphics_library_cache_tests child_process_tests shader_store_scan_tests shader_store_predictor_tests shader_store_keys_tests shader_store_record_tests shader_store_worker_tests shader_store_tailer_tests thread_priority_tests shader_store_dispatch_tests shader_store_progress_log_tests shader_store_supervisor_tests generated_drain_planner_tests shader_store_eboot_source_tests generation_miss_classifier_tests first_run_report_tests virtual_memory_allocation_tests \
               resource_tracking_tests scalar_provenance_tests \
               resource_materialization_tests shader_vertex_metadata_tests archive_file_tests avplayer_file_tests vdecsw_tests \
             --parallel
@@ -400,7 +400,12 @@ jobs:
         shell: bash
         run: |
           ctest --test-dir _Build/linux --output-on-failure \
-            -R '^(audio_out2_port|ngs2_sampler|pad_haptics|controller_settings|host_input|ime_dialog|lru_cache|memory_tracker|page_manager|readback_guard|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|vdecsw|virtual_memory_allocation|pipeline_build_queue|pipeline_library|pipeline_parts|descriptor_set_layout_cache|graphics_library_cache|child_process|shader_store_scan|shader_store_predictor|shader_store_keys|shader_store_record|shader_store_worker|shader_store_tailer|thread_priority|shader_store_dispatch|shader_store_progress_log|shader_store_supervisor|generated_drain_planner|shader_store_eboot_source)$'
+            -R '^(audio_out2_port|ngs2_sampler|pad_haptics|controller_settings|host_input|ime_dialog|lru_cache|memory_tracker|page_manager|readback_guard|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|vdecsw|virtual_memory_allocation|pipeline_build_queue|pipeline_library|pipeline_parts|descriptor_set_layout_cache|graphics_library_cache|child_process|shader_store_scan|shader_store_predictor|shader_store_keys|shader_store_record|shader_store_worker|shader_store_tailer|thread_priority|shader_store_dispatch|shader_store_progress_log|shader_store_supervisor|generated_drain_planner|shader_store_eboot_source|generation_miss_classifier|first_run_report)$'
+
+      - name: Test first-run compare script
+        shell: bash
+        run: |
+          python3 -I tools/first_run_compare_test.py
 
       - name: Install
         shell: bash
