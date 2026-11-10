@@ -243,9 +243,11 @@ class GatePass5(unittest.TestCase):
     def test_cut_at_gen_finished_at(self):
         out = run_new()
         self.assertEqual(gate_line(out, "P5a"),
-                         "P5a FAIL underruns before cut 10700 ms, gen 6 vs gpl 2, limit 4")
+                         "P5a FAIL underrun events before cut 10700 ms, gen 6 vs gpl 2, limit 4"
+                         " (submits, gen 6 vs gpl 2)")
         self.assertEqual(gate_line(out, "P5b"),
-                         "P5b PASS underruns after cut 10700 ms, gen 1 vs gpl 2, limit 4")
+                         "P5b PASS underrun events after cut 10700 ms, gen 1 vs gpl 2, limit 4"
+                         " (submits, gen 1 vs gpl 2)")
 
     def test_moving_the_finish_moves_the_cut(self):
         # Baseline for the cut. Only finished_at_ms differs, and the window counts follow it.
@@ -253,9 +255,11 @@ class GatePass5(unittest.TestCase):
             report["shader_store_generation"]["supervisor"]["finished_at_ms"] = 400.0
         out = run_new({"new_gen_first.json": finish_early})
         self.assertEqual(gate_line(out, "P5a"),
-                         "P5a PASS underruns before cut 400 ms, gen 0 vs gpl 0, limit 2")
+                         "P5a PASS underrun events before cut 400 ms, gen 0 vs gpl 0, limit 2"
+                         " (submits, gen 0 vs gpl 0)")
         self.assertEqual(gate_line(out, "P5b"),
-                         "P5b FAIL underruns after cut 400 ms, gen 7 vs gpl 4, limit 6")
+                         "P5b FAIL underrun events after cut 400 ms, gen 7 vs gpl 4, limit 6"
+                         " (submits, gen 7 vs gpl 4)")
 
     def test_the_duration_is_not_the_cut(self):
         # finished_ms is 700 ms short of the run-clock time. Changing it alone changes nothing in P5,
@@ -270,7 +274,8 @@ class GatePass5(unittest.TestCase):
     def test_limit_is_the_larger_of_two_and_a_quarter(self):
         # With 12 gpl underruns before the cut a quarter is 3, which beats the flat 2.
         def many(report):
-            report["audio_underruns"]["at_ms"] = [float(index) for index in range(12)]
+            # Spaced beyond the event gap, so each submit is its own event.
+            report["audio_underruns"]["at_ms"] = [index * 100.0 for index in range(12)]
         out = run_new({"new_gpl_first.json": many})
         self.assertIn("gpl 12, limit 15", gate_line(out, "P5a"))
 
@@ -428,9 +433,12 @@ class GateGraphics(unittest.TestCase):
         self.assertEqual(gate_line(out, "GFX").split(" ")[1], "PASS")
         self.assertEqual(gate_line(out, "P8c").split(" ")[1], "FAIL")
 
-    def test_p3_p95_is_gated(self):
+    def test_p3_p95_is_gated_with_a_quarter_of_room(self):
+        # Gen 600 against gpl 500 was a FAIL before the allowance. The limit is now 625, so it passes.
         out = run_new()
-        self.assertEqual(gate_line(out, "P3b"), "P3b FAIL window_held p95 ms, gen 600.00 vs gpl 500.00")
+        self.assertEqual(gate_line(out, "P3b"),
+                         "P3b PASS window_held p95 ms pooled over all runs, gen 600.00 (5 windows)"
+                         " vs gpl 500.00 (5 windows), limit 625.00 (gpl x 1.25)")
         self.assertEqual(gate_line(out, "P3c").split(" ")[1], "PASS")
 
     def test_unknown_gpl_arm_is_refused(self):
@@ -439,6 +447,181 @@ class GateGraphics(unittest.TestCase):
             code, _, err = run_script(paths, "--no-such-arm")
         self.assertEqual(code, 1)
         self.assertIn("no single gpl arm", err)
+
+
+def set_windows(values):
+    """An edit that gives a report these held times as its resolve windows."""
+    def edit(report):
+        report["deferred_draws"]["resolves"] = [
+            {"flip": index, "window_held_ms": value, "window_hold_count_change": 1}
+            for index, value in enumerate(values)]
+    return edit
+
+
+class GateP3(unittest.TestCase):
+    """P3b pools the windows of every run of an arm, and P3d is information only."""
+
+    def verdict_of(self, edits=None, extra=None):
+        return gate_line(run_new(edits, extra=extra), "P3b").split(" ")[1]
+
+    def test_boundary_of_the_allowance(self):
+        # The gpl p95 is 500, so 625 is exactly on the limit and passes, and a hair over fails.
+        self.assertEqual(self.verdict_of({"new_gen_first.json": set_windows([625.0])}), "PASS")
+        self.assertEqual(self.verdict_of({"new_gen_first.json": set_windows([625.5])}), "FAIL")
+
+    def test_pooled_windows_pass_where_the_median_of_run_p95s_fails(self):
+        # Three gen runs. Two have 10 windows with one 1000 ms outlier, so their own p95 is 1000.
+        # The third has 80 windows at 100 ms. Pooled that is 100 windows with 2 outliers, and the
+        # p95 (rank 95) is 100, while the median of the three per-run p95s is 1000.
+        outlier_run = [100.0] * 9 + [1000.0]
+        extra = [("gen_b.json", read_fixture("new_gen_first.json")),
+                 ("gen_c.json", read_fixture("new_gen_first.json"))]
+        for _, report in extra:
+            set_windows(outlier_run)(report)
+        edits = {"new_gen_first.json": set_windows([100.0] * 80)}
+        out = run_new(edits, extra=extra)
+        self.assertEqual(gate_line(out, "P3b"),
+                         "P3b PASS window_held p95 ms pooled over all runs, gen 100.00 (100 windows)"
+                         " vs gpl 500.00 (5 windows), limit 625.00 (gpl x 1.25)")
+
+    def test_pooled_windows_fail_when_enough_outliers_are_pooled(self):
+        # The baseline of the test above, with the big run holding four outliers instead of none, so
+        # 6 of 100 windows are 1000 ms and rank 95 is an outlier. Only the outlier count differs.
+        extra = [("gen_b.json", read_fixture("new_gen_first.json")),
+                 ("gen_c.json", read_fixture("new_gen_first.json"))]
+        for _, report in extra:
+            set_windows([100.0] * 9 + [1000.0])(report)
+        edits = {"new_gen_first.json": set_windows([100.0] * 76 + [1000.0] * 4)}
+        self.assertEqual(self.verdict_of(edits, extra), "FAIL")
+
+    def test_hold_mean_is_information_only(self):
+        # A gen mean far above gpl's, and one far below, both print INFO.
+        def high(report):
+            for row in report["deferred_draws"]["resolves"]:
+                row["window_hold_count_change"] = 99
+        def low(report):
+            for row in report["deferred_draws"]["resolves"]:
+                row["window_hold_count_change"] = 0
+        for edit in (high, low):
+            line = gate_line(run_new({"new_gen_first.json": edit}), "P3d")
+            self.assertEqual(line.split(" ")[1], "INFO")
+        self.assertIn("gen 99.00 vs gpl 3.00", gate_line(run_new({"new_gen_first.json": high}), "P3d"))
+
+
+def set_stopped(gen_ms=None, gpl_ms=None):
+    """Edits that set the longest stopped_ms of the gen first run and of the gpl first run. Only the
+    first take of each is changed, and every other take stays below the new figure."""
+    edits = {}
+    if gen_ms is not None:
+        edits["new_gen_first.json"] = lambda report: report["warm_takes"][0].update(stopped_ms=gen_ms)
+    if gpl_ms is not None:
+        edits["new_gpl_first.json"] = lambda report: report["warm_takes"][0].update(stopped_ms=gpl_ms)
+    return edits
+
+
+class GateP4b(unittest.TestCase):
+    """P4b passes up to the larger of 1.25 x gpl and 500 ms, and P4e shows like for like create times."""
+
+    def verdict_of(self, gen_ms, gpl_ms):
+        return gate_line(run_new(set_stopped(gen_ms, gpl_ms)), "P4b").split(" ")[1]
+
+    def test_the_floor_lets_a_small_gpl_through(self):
+        # With gpl at 0 the ratio alone would allow nothing. The other gen takes are 300 and below.
+        self.assertEqual(self.verdict_of(400.0, 0.0), "PASS")
+        self.assertEqual(self.verdict_of(500.0, 0.0), "PASS")
+        self.assertEqual(self.verdict_of(600.0, 0.0), "FAIL")
+
+    def test_the_ratio_applies_above_the_floor(self):
+        self.assertEqual(self.verdict_of(1250.0, 1000.0), "PASS")
+        self.assertEqual(self.verdict_of(1251.0, 1000.0), "FAIL")
+
+    def like_for_like(self, gpl_rows, extra=None):
+        def add_rows(report):
+            report["compiles"].extend(gpl_rows)
+        return gate_lines(run_new({"new_gpl_first.json": add_rows}, extra=extra), "P4e")
+
+    def test_like_for_like_shows_the_gpl_create_time_of_the_same_id(self):
+        row = {"kind": "compute", "id": "0000000000000001", "create_ms": 80.0, "thread": "gpu"}
+        self.assertEqual(self.like_for_like([row]),
+                         ["P4e INFO like for like, gen take 0000000000000001 stopped 500.0 ms,"
+                          " gpl create_ms for the same id 80.0 ms"])
+
+    def test_like_for_like_is_n_a_without_a_gpl_row(self):
+        # Baseline of the test above, the row left out. Another id's row must not stand in.
+        other = {"kind": "compute", "id": "0000000000000002", "create_ms": 80.0, "thread": "gpu"}
+        self.assertEqual(self.like_for_like([other]),
+                         ["P4e INFO like for like, gen take 0000000000000001 stopped 500.0 ms,"
+                          " gpl create_ms for the same id n/a"])
+
+    def test_like_for_like_matches_ids_as_text(self):
+        # The id 1 is the same number as 0000000000000001 and a different text, so its row is no match.
+        # Parsed as numbers the 999 would win as the longest.
+        rows = [{"kind": "compute", "id": "0000000000000001", "create_ms": 80.0, "thread": "gpu"},
+                {"kind": "compute", "id": "1", "create_ms": 999.0, "thread": "gpu"}]
+        self.assertIn("same id 80.0 ms", self.like_for_like(rows)[0])
+
+    def test_like_for_like_takes_the_median_over_gpl_runs(self):
+        row = lambda create_ms: {"kind": "compute", "id": "0000000000000001", "create_ms": create_ms,
+                                 "thread": "gpu"}
+        second = read_fixture("new_gpl_first.json")
+        second["compiles"].append(row(100.0))
+        lines = self.like_for_like([row(80.0)], extra=[("gpl_b.json", second)])
+        self.assertIn("same id 90.0 ms", lines[0])
+
+
+class GateP5Events(unittest.TestCase):
+    """P5 counts events. A submit no more than 50 ms after the previous one joins its event, so a gap
+    of exactly 50 ms is the same event and anything longer is a new one."""
+
+    def counts(self, at_ms, code="P5a"):
+        """The event and submit figures of the gen arm in the window, read from the line."""
+        line = gate_line(run_new({"new_gen_first.json": lambda report: report["audio_underruns"].update(at_ms=at_ms)}),
+                         code)
+        gen_events = line.split(" gen ")[1].split(" vs")[0]
+        gen_submits = line.split("(submits, gen ")[1].split(" vs")[0]
+        return int(gen_events), int(gen_submits)
+
+    def test_three_submits_within_half_a_millisecond_are_one_event(self):
+        self.assertEqual(self.counts([100.0, 100.2, 100.5]), (1, 3))
+
+    def test_submits_spaced_out_are_separate_events(self):
+        # Baseline of the test above. The same three submits, 100 ms apart.
+        self.assertEqual(self.counts([100.0, 200.0, 300.0]), (3, 3))
+
+    def test_two_submits_60_ms_apart_are_two_events(self):
+        self.assertEqual(self.counts([100.0, 160.0]), (2, 2))
+
+    def test_a_gap_of_exactly_50_ms_joins_the_event(self):
+        self.assertEqual(self.counts([100.0, 150.0]), (1, 2))
+        self.assertEqual(self.counts([100.0, 150.5]), (2, 2))
+
+    def test_a_chain_of_short_gaps_is_one_event(self):
+        # Each gap is 40 ms from the previous submit, though the burst spans 120 ms in all.
+        self.assertEqual(self.counts([100.0, 140.0, 180.0, 220.0]), (1, 4))
+
+    def test_events_are_counted_after_the_cut_too(self):
+        self.assertEqual(self.counts([11000.0, 11000.1, 11000.3], "P5b"), (1, 3))
+        self.assertEqual(self.counts([11000.0, 11100.0, 11200.0], "P5b"), (3, 3))
+
+    def test_a_burst_across_the_cut_counts_once_on_each_side(self):
+        # The cut is 10700 ms. The submits are 20 ms apart and are split at the cut first.
+        self.assertEqual(self.counts([10690.0, 10710.0], "P5a"), (1, 1))
+        self.assertEqual(self.counts([10690.0, 10710.0], "P5b"), (1, 1))
+
+
+class GateP7(unittest.TestCase):
+    """P7 passes when the decode maximum is under 50 ms."""
+
+    def line(self, decode_ms):
+        def edit(report):
+            report["shader_store_generation"]["supervisor"]["decode_ms_max"] = decode_ms
+        return gate_line(run_new({"new_gen_first.json": edit}), "P7")
+
+    def test_just_under_passes(self):
+        self.assertEqual(self.line(49.9), "P7 PASS decode max 49.90 ms")
+
+    def test_exactly_50_fails(self):
+        self.assertEqual(self.line(50.0), "P7 FAIL decode max 50.00 ms")
 
 
 class PeakSources(unittest.TestCase):

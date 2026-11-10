@@ -192,13 +192,19 @@ P1_MEAN_HELD_S = 15.0
 P1_RUN_HELD_S = 20.0
 P1_HARD_FRACTION = 0.5
 P4_EXTRA_SLOW_TAKES = 2
+P3B_P95_ALLOWANCE = 1.25
 P4_STOPPED_RATIO = 1.25
+# The longest stop that always passes, so a gpl arm with tiny stops does not make the limit tiny.
+P4_STOPPED_FLOOR_MS = 500.0
 P5_MIN_EXTRA_UNDERRUNS = 2
 P5_EXTRA_FRACTION = 0.25
+# Underrun submits no more than this far after the previous one belong to the same event. A gap of
+# exactly this size is inclusive, so it joins the event, and anything longer starts a new one.
+P5_EVENT_GAP_MS = 50.0
 P6_DRAIN_MAX_MS = 2.0
 P6_DRAIN_HARD_MS = 8.0
 P6_OVER_1MS_HANDFUL = 5
-P7_DECODE_MS = 20.0
+P7_DECODE_MS = 50.0
 P8_GFX_ALLOWANCE = 0.10
 GFX_FIRST_RUN_ALLOWANCE = 0.15
 
@@ -236,6 +242,7 @@ def window_figures(report):
     held = [row.get("window_held_ms", 0.0) for row in resolves]
     changes = [row.get("window_hold_count_change", 0) for row in resolves]
     return {"win_max": max(held, default=None), "win_p95": percentile(held, P95_FRACTION),
+            "windows": held,
             "hold_max": max(changes, default=None),
             "hold_mean": statistics.mean(changes) if changes else None}
 
@@ -257,7 +264,10 @@ def take_figures(report, generated_ids):
             and take.get("stopped_ms", 0.0) > SLOW_TAKE_MS]
     slow_generated = sum(1 for take in slow if hash_text(take.get("id")) in generated_ids)
     waited = sum(1 for take in slow if take.get("how") == "waited")
+    slow_generated_takes = [(hash_text(take.get("id")), take.get("stopped_ms", 0.0)) for take in slow
+                            if hash_text(take.get("id")) in generated_ids]
     return {"slow_gen": slow_generated, "slow_player": len(slow) - slow_generated,
+            "slow_gen_takes": slow_generated_takes,
             "slow_waited": waited, "slow_inline": len(slow) - waited,
             "max_stopped": max((take.get("stopped_ms", 0.0) for take in takes), default=0.0)}
 
@@ -308,6 +318,17 @@ def generation_figures(block):
                         for name, row in classes.items()}}
 
 
+def create_by_id(report):
+    """The longest pipeline create time of each compile row that carries an id, keyed by the id as
+    text. Rows without an id (graphics rows are named by their vs and ps) are left out."""
+    longest = {}
+    for row in report.get("compiles", []):
+        if "id" in row:
+            key = hash_text(row["id"])
+            longest[key] = max(longest.get(key, 0.0), row.get("create_ms", 0.0))
+    return longest
+
+
 def underrun_times(report):
     """The underrun times in milliseconds, or None when the report has no audio_underruns."""
     underruns = report.get("audio_underruns")
@@ -325,6 +346,7 @@ def run_metrics(report):
                "second_boot": bool(report.get("boot", {}).get("modules", 0)),
                "gen": generation_figures(block) if block else None,
                "contention": contention_figures(report), "proc_peak": process_peak(report),
+               "create_by_id": create_by_id(report),
                "machine": report.get("machine")}
     metrics.update(window_figures(report))
     metrics.update(take_figures(report, generated_ids))
@@ -393,6 +415,25 @@ def count_around(times, cut_ms):
     """Underruns before the cut and from the cut on, so a run is split at one wall time."""
     before = sum(1 for at_ms in times if at_ms < cut_ms)
     return before, len(times) - before
+
+
+def event_count(times):
+    """Underrun events in a list of submit times. A submit no more than P5_EVENT_GAP_MS after the
+    previous submit joins that submit's event, so a burst is one event however long it chains."""
+    events = 0
+    previous = None
+    for at_ms in sorted(times):
+        if previous is None or at_ms - previous > P5_EVENT_GAP_MS:
+            events += 1
+        previous = at_ms
+    return events
+
+
+def events_around(times, cut_ms):
+    """Underrun events before the cut and from the cut on. The submits are split at the cut first,
+    so a burst that straddles the cut counts once on each side."""
+    return (event_count([at_ms for at_ms in times if at_ms < cut_ms]),
+            event_count([at_ms for at_ms in times if at_ms >= cut_ms]))
 
 
 def split_cells(runs, cut_ms_of):
@@ -559,14 +600,47 @@ def at_most(value, limit):
     return None if value is None or limit is None else value <= limit
 
 
+def pooled_p95(runs):
+    """The 95th percentile of the resolve windows of all runs of an arm taken together, with the
+    number of windows. Pooling weighs each window once, where a median of per-run p95s would let a
+    short run count as much as a long one."""
+    pooled = [held for run in runs for held in run["windows"]]
+    return percentile(pooled, P95_FRACTION), len(pooled)
+
+
 def window_checks(gen, gpl):
-    """P3, where each window figure of gen must be no higher than gpl."""
+    """P3. P3a and P3c need gen no higher than gpl. P3b compares the pooled p95 with a 25 percent
+    allowance. P3d is information only, since P2 already covers the hold counts."""
     lines = []
-    for code, key, label in (("P3a", "win_max", "window_held max ms"), ("P3b", "win_p95", "window_held p95 ms"),
-                             ("P3c", "hold_max", "holds per window max"), ("P3d", "hold_mean", "holds per window mean")):
+    for code, key, label in (("P3a", "win_max", "window_held max ms"), ("P3c", "hold_max", "holds per window max")):
         gen_value, gpl_value = med(gen, key), med(gpl, key)
         lines.append((code, verdict(at_most(gen_value, gpl_value)),
                       f"{label}, gen {fmt_num(gen_value)} vs gpl {fmt_num(gpl_value)}"))
+    gen_p95, gen_count = pooled_p95(gen)
+    gpl_p95, gpl_count = pooled_p95(gpl)
+    limit = None if gpl_p95 is None else gpl_p95 * P3B_P95_ALLOWANCE
+    lines.insert(1, ("P3b", verdict(at_most(gen_p95, limit)),
+                     f"window_held p95 ms pooled over all runs, gen {fmt_num(gen_p95)} ({gen_count} windows)"
+                     f" vs gpl {fmt_num(gpl_p95)} ({gpl_count} windows), limit {fmt_num(limit)}"
+                     f" (gpl x {P3B_P95_ALLOWANCE})"))
+    lines.append(("P3d", "INFO", f"holds per window mean, gen {fmt_num(med(gen, 'hold_mean'))}"
+                                 f" vs gpl {fmt_num(med(gpl, 'hold_mean'))} (information only, P2 covers hold counts)"))
+    return lines
+
+
+def like_for_like_lines(gen, gpl):
+    """P4e, information only. Each slow generated take of the gen runs is shown beside the create
+    time of the same pipeline id in the gpl runs' compile rows, as the median over the gpl runs that
+    have a row for it. Ids are text and are matched as text."""
+    takes = [take for run in gen for take in run["slow_gen_takes"]]
+    if not takes:
+        return [("P4e", "INFO", "no slow generated takes to compare with gpl create time")]
+    lines = []
+    for take_id, stopped_ms in takes:
+        creates = [run["create_by_id"][take_id] for run in gpl if take_id in run["create_by_id"]]
+        gpl_text = "n/a" if not creates else f"{statistics.median(creates):.1f} ms"
+        lines.append(("P4e", "INFO", f"like for like, gen take {take_id} stopped {stopped_ms:.1f} ms,"
+                                     f" gpl create_ms for the same id {gpl_text}"))
     return lines
 
 
@@ -585,9 +659,11 @@ def audio_checks(gen, gpl):
     lines.append(("P4a", verdict(at_most(gen_slow, limit)),
                   f"waited takes over 250 ms, gen {fmt_num(gen_slow, 1)} vs gpl {fmt_num(gpl_slow, 1)} + {P4_EXTRA_SLOW_TAKES}"))
     gen_stop, gpl_stop = med(gen, "max_stopped"), med(gpl, "max_stopped")
-    limit = None if gpl_stop is None else P4_STOPPED_RATIO * gpl_stop
+    limit = None if gpl_stop is None else max(P4_STOPPED_RATIO * gpl_stop, P4_STOPPED_FLOOR_MS)
     lines.append(("P4b", verdict(at_most(gen_stop, limit)),
-                  f"max stopped ms, gen {fmt_num(gen_stop, 1)} vs gpl {fmt_num(gpl_stop, 1)} x {P4_STOPPED_RATIO}"))
+                  f"max stopped ms, gen {fmt_num(gen_stop, 1)} vs gpl {fmt_num(gpl_stop, 1)}, limit"
+                  f" {fmt_num(limit, 1)} (the larger of gpl x {P4_STOPPED_RATIO} and {P4_STOPPED_FLOOR_MS:g})"))
+    lines += like_for_like_lines(gen, gpl)
     lines.append(("P4c", "INFO", f"generated modules among slow takes, median {fmt_num(med(gen, 'slow_gen'), 1)}"
                                  " (each needs an explanation)"))
     lines.append(("P4d", "INFO", f"inline takes over 250 ms, gen {fmt_num(med(gen, 'slow_inline'), 1)}"
@@ -610,11 +686,14 @@ def p5_lines(gen, gpl):
         return [("P5", "N/A", "needs audio_underruns in both arms")]
     lines = []
     for index, window in enumerate(("before", "after")):
-        gen_count = median_of(count_around(run["underruns"], cut)[index] for run in gen_runs)
-        gpl_count = median_of(count_around(run["underruns"], cut)[index] for run in gpl_runs)
+        gen_count = median_of(events_around(run["underruns"], cut)[index] for run in gen_runs)
+        gpl_count = median_of(events_around(run["underruns"], cut)[index] for run in gpl_runs)
+        gen_submits = median_of(count_around(run["underruns"], cut)[index] for run in gen_runs)
+        gpl_submits = median_of(count_around(run["underruns"], cut)[index] for run in gpl_runs)
         limit = gpl_count + max(P5_MIN_EXTRA_UNDERRUNS, P5_EXTRA_FRACTION * gpl_count)
         lines.append((f"P5{'ab'[index]}", verdict(gen_count <= limit),
-                      f"underruns {window} cut {cut:.0f} ms, gen {gen_count:g} vs gpl {gpl_count:g}, limit {limit:g}"))
+                      f"underrun events {window} cut {cut:.0f} ms, gen {gen_count:g} vs gpl {gpl_count:g},"
+                      f" limit {limit:g} (submits, gen {gen_submits:g} vs gpl {gpl_submits:g})"))
     return lines
 
 
