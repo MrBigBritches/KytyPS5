@@ -16,6 +16,7 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/rectListShader.h"
 #include "graphics/shader/shader.h"
+#include "graphics/shader/storegen/generatedDrainPlanner.h"
 
 #include <array>
 #include <atomic>
@@ -26,6 +27,7 @@
 #include <filesystem>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <queue>
 #include <string>
 #include <span>
@@ -185,6 +187,23 @@ private:
 	std::jthread m_thread;
 };
 
+// What the intake of generated modules did, for the report. The drain counters belong to the GPU
+// thread, so read them from it or after StopStoreGeneration.
+struct StoreGenerationStats {
+	StoreGen::GeneratedDrainCounters drain;
+	// Modules the generator's thread posted, and the shader module handles it made and the cache
+	// destroyed, which are equal once nothing is waiting.
+	uint64_t posted            = 0;
+	uint64_t handles_created   = 0;
+	uint64_t handles_destroyed = 0;
+	// Records whose first-of-program plan could not be decoded, so they were never posted.
+	uint64_t bad_plans = 0;
+	// Posted modules that the stop destroyed before any drain took them.
+	uint64_t undrained_at_stop = 0;
+	// Posted modules that are waiting for a drain.
+	uint64_t pending = 0;
+};
+
 // The longest the warm-up queue is held while deferred draws wait for their pipelines. A resolve
 // waits for the parallel builds of one submission, and the measured wait of the worst frame was
 // 3.8 to 7.5 s (4 to 6 workers, 1.0 to 1.34 times contention, design section 7). Ten seconds is
@@ -325,6 +344,23 @@ public:
 	// taken. Later requests build on the calling thread. The owner calls it while the objects the
 	// builds read, such as the image heap's layout, still exist. Calling it again does nothing.
 	void StopBuilds();
+	// Posts a module that the shader store generator made, from the generator's thread. The record is
+	// decoded off the GPU thread: its shader module is created here, and the plan of a program is
+	// decoded for the first record of the program only. The GPU thread takes the module in at the top
+	// of a shader lookup. Does nothing unless generation was enabled, and after it was stopped it
+	// only destroys what it made. Never touches a cache map.
+	void PostGeneratedModule(DecodedModuleRecord&& record);
+	// Ends the intake of generated modules and destroys the ones no drain took. Call it before
+	// StopWarmBuilds, since a module that was taken in belongs to the warm queue. Does nothing
+	// when there is no generation, and calling it again does nothing. It touches the backlog, which
+	// belongs to the GPU thread, so it must not run while that thread can still drain: the destructor
+	// and a StopBuilds that follows the GPU's shutdown meet that. The generator's thread has to be
+	// stopped and joined first by whoever owns it, since it posts into the state this ends.
+	void StopStoreGeneration();
+	// What the intake did so far, or nothing without generation. The drain counters and the backlog
+	// belong to the GPU thread, so call it from that thread, or after StopStoreGeneration. The pending
+	// count is exact only then.
+	[[nodiscard]] std::optional<StoreGenerationStats> GenerationStats() const;
 	// Holds the warm-up queue from new builds, from the first hole of a submission until its resolve
 	// ends, so the compiles the resolve waits for do not compete with it for cores. Only with
 	// --background-warm-up, --deferred-pipeline-draws and --pause-warm-up-for-draws, and never the queue of the deferred draws
@@ -464,6 +500,13 @@ private:
 	// Zero sizes the warm queue from the hardware threads. A test sets one to make the queue run
 	// jobs strictly in order.
 	uint32_t                                                                     m_warm_worker_count_override = 0;
+	// Generated modules (--generate-shader-store). Null unless generation is enabled, so a cache
+	// without it has one pointer and one flag for it and nothing else. The inbox is filled by the
+	// generator's thread and drained by the GPU thread, like the published builds.
+	struct GeneratedModule;
+	struct GenerationState;
+	std::unique_ptr<GenerationState> m_generation;
+	std::atomic<bool>                m_has_generated {false};
 
 	template <typename InputInfo>
 	const ShaderModule* GetProgram(const ShaderParams& params, InputInfo& input_info,
@@ -562,6 +605,24 @@ private:
 	void NoteWarmComputeStop(PipelineBuildQueue::Acquired how, double stopped_ms, bool queue_held);
 	// Stops the warm queue and destroys the pipelines it built that nobody took.
 	void StopWarmBuilds();
+
+	// Makes the state of the generated modules intake. Called once, before the generator starts.
+	void EnableStoreGeneration();
+	// Builds the module of a record on the generator's thread. Nothing when its plan cannot be
+	// decoded.
+	[[nodiscard]] std::optional<GeneratedModule> MakeGeneratedModule(DecodedModuleRecord&& record);
+	// Puts a module in the inbox, or destroys it when the intake has stopped.
+	void PushGenerated(GeneratedModule&& item);
+	// Takes posted modules into the program cache and queues their builds. GPU thread only. It takes
+	// a bounded number, and stops after a bounded time, so a drain is always short.
+	void DrainGenerated();
+	// Takes one module in, or drops it as the planner says.
+	void AdoptGenerated(GeneratedModule&& item);
+	// Destroys the Vulkan handles of a module that was never taken in.
+	void DestroyGeneratedHandles(GeneratedModule& item);
+	// The runtime translated a program that generation made, so its plan is compared with the plan
+	// the program was made with.
+	void CheckGeneratedPlan(Program& program, const ShaderRecompiler::TranslateResult& translated);
 
 	// pipelineSerialization.cpp
 	bool LoadRecord(std::span<const uint8_t>& records);

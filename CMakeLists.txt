@@ -742,6 +742,14 @@ add_executable(shader_store_supervisor_tests EXCLUDE_FROM_ALL
 target_link_libraries(shader_store_supervisor_tests common fmt::fmt xbyak::xbyak xxhash libzstd_static)
 target_include_directories(shader_store_supervisor_tests PRIVATE ${inc_headers})
 
+# The decisions of the drain that takes generated modules into the pipeline cache. They need no
+# graphics device, so this target links only the planner.
+add_executable(generated_drain_planner_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/GeneratedDrainPlannerTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/storegen/generatedDrainPlanner.cpp"
+)
+target_include_directories(generated_drain_planner_tests PRIVATE ${inc_headers})
+
 # The reader of a store worker's progress log. It reads text lines through Common::File and needs no
 # graphics device.
 add_executable(shader_store_progress_log_tests EXCLUDE_FROM_ALL
@@ -971,10 +979,13 @@ if(BUILD_TESTING)
 	add_test(NAME shader_store_tailer COMMAND $<TARGET_FILE:shader_store_tailer_tests>)
 	add_test(NAME shader_store_progress_log COMMAND $<TARGET_FILE:shader_store_progress_log_tests>)
 	add_test(NAME shader_store_supervisor COMMAND $<TARGET_FILE:shader_store_supervisor_tests>)
+	add_test(NAME generated_drain_planner COMMAND $<TARGET_FILE:generated_drain_planner_tests>)
 	set_tests_properties(shader_store_supervisor PROPERTIES TIMEOUT 300)
 	add_test(NAME shader_store_worker COMMAND $<TARGET_FILE:shader_store_worker_tests>)
 	add_test(NAME shader_store_dispatch COMMAND $<TARGET_FILE:shader_store_dispatch_tests>)
 	set_tests_properties(shader_store_dispatch PROPERTIES TIMEOUT 300)
+	add_test(NAME shader_recompiler_generated_modules
+	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --generated-modules-only)
 	add_test(NAME shader_recompiler_submit_cadence
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --submit-cadence-only)
 	add_test(NAME shader_recompiler_submit_cadence_gpu
@@ -1110,6 +1121,7 @@ if(BUILD_TESTING)
 		shader_store_tailer_tests
 		shader_store_progress_log_tests
 		shader_store_supervisor_tests
+		generated_drain_planner_tests
 		shader_store_worker_tests
 		shader_store_dispatch_tests
 		virtual_memory_allocation_tests

@@ -16,6 +16,7 @@
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
+#include "graphics/host_gpu/renderer/pipeline/generationState.h"
 #include "graphics/host_gpu/renderer/pipeline/graphicsLibraryCache.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -427,6 +428,14 @@ ShaderModule& PipelineCache::CompileModule(Program& program, const ProgramKey& k
 template <typename InputInfo>
 const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputInfo& input_info,
                                               uint32_t& push_data_cursor) {
+	// Modules that the shader store generator made are taken in first, so a lookup finds what is
+	// there. Without generation the first test fails. With it and nothing posted the second does,
+	// so the cost of an empty inbox is one relaxed load. The GPU thread test is last, since it is
+	// the dearest, and it keeps any other thread that reaches a lookup from draining.
+	if (m_generation && m_has_generated.load(std::memory_order_relaxed) &&
+	    GuestGpu::IsGpuThread()) {
+		DrainGenerated();
+	}
 	const auto user_data = std::span(params.user_data).first(params.user_data_count);
 	ShaderRecompiler::IR::SrtRuntime runtime {
 	    .user_data                  = user_data,
@@ -533,6 +542,11 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		if (const auto* module = entry->second.FindModule<true>(runtime, push_data_cursor)) {
 			return bind(*module);
 		}
+	} else if (m_generation != nullptr && GuestGpu::IsGpuThread()) {
+		// The runtime translated a program that already exists and no module of it fits, so a
+		// program that generation made is checked against the runtime's own plan. The planner is the
+		// GPU thread's, so no other thread makes the check.
+		CheckGeneratedPlan(entry->second, translated);
 	}
 	return bind(CompileModule(entry->second, entry->first, options, std::move(translated),
 	                          push_data_cursor));
@@ -560,6 +574,8 @@ PipelineCache::PipelineCache(GraphicContext&                         graphics,
 
 // Stops the builds, saves the driver cache and destroys every pipeline, layout and module.
 PipelineCache::~PipelineCache() {
+	// Generated modules that no drain took still own Vulkan handles, which go before the device does.
+	StopStoreGeneration();
 	// For a cache made without a render context, which has no one to stop the builds earlier.
 	StopBuilds();
 	Save();

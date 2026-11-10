@@ -37,6 +37,9 @@
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
+#include "graphics/host_gpu/renderer/pipeline/generationState.h"
+#include "graphics/shader/recompiler/ir/Serialize.h"
+#include "graphics/shader/shaderStoreRecord.h"
 #include "graphics/host_gpu/renderer/pipeline/graphicsLibraryCache.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineParts.h"
@@ -1231,6 +1234,31 @@ struct PipelineCacheTestAccess {
     cache.m_warm_compute = std::make_unique<WarmBuildSet<uint64_t, PipelineCache::Pipeline>>(
         1, PipelineBuildQueueOptions{.low_priority = true});
   }
+
+  // Gives the cache the intake of generated modules without a generator, which is the stand-in the
+  // tests use for what StartStoreGeneration will make. It owns the inbox and the counters, and no
+  // thread.
+  static void EnableGeneration(PipelineCache &cache) { cache.EnableStoreGeneration(); }
+
+  // Posts a record the way the generator's thread does, with the changes a test may make to the
+  // module on its way: its plan hash changed, which stands for a plan that is not the program's, or
+  // its plan left out, which stands for a first record whose plan could not be decoded.
+  static void PostChanged(PipelineCache &cache, DecodedModuleRecord &&record, bool change_hash,
+                          bool drop_plan) {
+    auto item = cache.MakeGeneratedModule(std::move(record));
+    EXIT_IF(!item);
+    if (change_hash) item->plan_hash ^= 1u;
+    if (drop_plan) item->plan.reset();
+    cache.PushGenerated(std::move(*item));
+  }
+
+  // How many modules the program cache holds, and how many programs.
+  static size_t ModuleCount(const PipelineCache &cache) {
+    size_t count = 0;
+    for (const auto &program : cache.m_program_cache) count += program.second.modules.size();
+    return count;
+  }
+  static size_t ProgramCount(const PipelineCache &cache) { return cache.m_program_cache.size(); }
 
   // Queues the warm-up build of a compute module, as WarmUp does.
   static void StartWarmCompute(PipelineCache &cache, const ShaderModule &module) {
@@ -32765,6 +32793,7 @@ public:
 #include "GraphicsCreateInfoTests.inc"
 #include "SplitLayoutTests.inc"
 #include "GraphicsLibraryTests.inc"
+#include "GeneratedModuleGpuLane.inc"
 
 private:
   bool m_rasterization_supported = true;
@@ -61406,6 +61435,407 @@ void CheckBackgroundWarmUp(VulkanHarness &vulkan) {
   std::printf("[gpu]     %-32s ok\n", name);
 }
 
+// ---- Generated modules (--generate-shader-store). ----
+
+// Reads the module records of a shader store file. The header is not read: the records start at the
+// first offset from which every frame to the end of the file unframes, which the checksums make
+// certain.
+std::vector<DecodedModuleRecord> ReadStoredModuleRecords(const std::filesystem::path &path) {
+  std::vector<uint8_t> bytes;
+  if (Common::File file; Common::File::IsFileExisting(path) && file.Open(path, Common::File::Mode::Read)) {
+    bytes.resize(file.Size());
+    uint32_t read = 0;
+    file.Read(bytes.data(), static_cast<uint32_t>(bytes.size()), &read);
+    bytes.resize(read);
+  }
+  constexpr size_t longest_header = 512;
+  for (size_t start = 0; start < std::min(bytes.size(), longest_header); start++) {
+    std::vector<DecodedModuleRecord> records;
+    size_t at = start;
+    bool whole = true;
+    while (at < bytes.size()) {
+      const auto frame = UnframeStoreRecord(std::span<const uint8_t>(bytes).subspan(at));
+      if (!frame) {
+        whole = false;
+        break;
+      }
+      ShaderRecompiler::IR::Reader reader{frame->raw};
+      auto type = StoreRecord::Module;
+      ShaderRecompiler::IR::IoAll(reader, type);
+      DecodedModuleRecord record;
+      if (type == StoreRecord::Module) DecodeModuleRecord(reader, record);
+      if (type != StoreRecord::Module || !reader.ok || !reader.bytes.empty()) {
+        whole = false;
+        break;
+      }
+      records.push_back(std::move(record));
+      at += frame->frame_bytes;
+    }
+    if (whole && !records.empty()) return records;
+  }
+  return {};
+}
+
+// The one compute program of the generated module checks.
+const std::vector<u32> &GeneratedCheckCode() {
+  static const std::vector<u32> code = [] {
+    std::vector<u32> shader;
+    AppendVMovU32(&shader, 1, 0x71u);
+    shader.insert(shader.end(), {EncodeMubuf0(0x1c), EncodeMubuf1(1, 0, 0)});
+    AppendEnd(&shader);
+    ShaderMapUserData(reinterpret_cast<uint64_t>(shader.data()),
+                      {.type = Prospero::ShaderBinaryType::kCs,
+                       .code_size_bytes = static_cast<u32>(shader.size() * sizeof(u32))});
+    return shader;
+  }();
+  return code;
+}
+
+// Looks the program up with a buffer of the given stride. The stride is part of the module's
+// specialization, so two strides give two modules of the one program.
+void GeneratedLookup(PipelineCache &cache, u32 stride, ShaderComputeInputInfo &input) {
+  const auto &code = GeneratedCheckCode();
+  HW::ComputeShaderInfo regs{};
+  regs.cs_regs.data_addr = reinterpret_cast<uint64_t>(code.data());
+  regs.cs_regs.num_thread_x = 1;
+  regs.cs_regs.num_thread_y = 1;
+  regs.cs_regs.num_thread_z = 1;
+  regs.cs_regs.wave_size = 32;
+  regs.cs_regs.user_sgpr = 4;
+  const ShaderBufferResource buffer{{0x10000u, stride << 16u, 64,
+      DstSel(4, 5, 6, 7) | (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u)}};
+  std::copy_n(buffer.fields, 4, regs.cs_user_sgpr.value);
+  input = ShaderComputeInputInfo{};
+  (void)cache.GetComputeProgram(regs, input);
+}
+
+constexpr u32 GENERATED_STRIDE_A = 4;
+constexpr u32 GENERATED_STRIDE_B = 16;
+constexpr u32 GENERATED_STRIDE_C = 32;
+
+// How many shader modules the runtime compiled so far, which a lookup that finds a posted module
+// leaves alone and a lookup that does not compiles one of.
+uint64_t ShadersCompiledSoFar() {
+  return Common::DebugCounters::Get(Common::DebugCounters::Counter::ShadersCompiled);
+}
+
+// A module that generation posted is taken in by a lookup on the GPU thread, and the lookup then
+// finds it, so the runtime compiles nothing and the warm build is the module's pipeline. The
+// baselines differ in one thing each: a cache without generation compiles the same lookup, and a
+// lookup on another thread than the GPU thread leaves the module in the inbox and compiles.
+void CheckGeneratedDrain(VulkanHarness &vulkan, GuestGpu &gpu,
+                         const std::vector<DecodedModuleRecord> &records) {
+  constexpr const char *name = "GeneratedDrain";
+  const auto caller = std::this_thread::get_id();
+  Common::DebugCounters::SetEnabled(true);
+  const auto record = [&](size_t index) {
+    return DecodedModuleRecord(records[index]);
+  };
+  {
+    // The baseline: without generation the lookup compiles.
+    PipelineCache cache(vulkan.RuntimeContext(), nullptr);
+    PipelineCacheTestAccess::EnableWarmCompute(cache);
+    Require(name, "no generation, no stats", !cache.GenerationStats().has_value(),
+            "a cache that was never given generation reported its intake");
+    cache.PostGeneratedModule(record(0));
+    ShaderComputeInputInfo input{};
+    const auto before = ShadersCompiledSoFar();
+    gpu.SendCommandSync([&] { GeneratedLookup(cache, GENERATED_STRIDE_A, input); });
+    Require(name, "baseline compiles the lookup", ShadersCompiledSoFar() == before + 1,
+            "a lookup without generation did not compile its module");
+    Require(name, "baseline has no pending build", PipelineCacheTestAccess::WarmPending(cache) == 0,
+            "a cache without generation had a warm build");
+  }
+  {
+    ComputeCreateHook hook;
+    PipelineCache cache(vulkan.RuntimeContext(), nullptr);
+    PipelineCacheTestAccess::EnableWarmCompute(cache);
+    PipelineCacheTestAccess::EnableGeneration(cache);
+    cache.PostGeneratedModule(record(0));
+    ShaderComputeInputInfo input{};
+    const auto before = ShadersCompiledSoFar();
+    gpu.SendCommandSync([&] { GeneratedLookup(cache, GENERATED_STRIDE_A, input); });
+    Require(name, "the lookup compiles nothing", ShadersCompiledSoFar() == before,
+            "a lookup compiled a module that generation had posted");
+    Require(name, "the module is found", input.stage.module != nullptr,
+            "the lookup did not find the posted module");
+    const auto stats = cache.GenerationStats();
+    Require(name, "one module taken in",
+            stats && stats->drain.adopted == 1 && stats->pending == 0 && stats->drain.drain_calls == 1,
+            "the drain did not take the posted module in");
+    Require(name, "its build was queued", PipelineCacheTestAccess::WarmPending(cache) == 1,
+            "the taken module did not start a warm build");
+    // The worker is let finish first, or the lookup would run a build the worker had not started.
+    PipelineCacheTestAccess::DrainWarmQueue(cache);
+    (void)cache.GetComputePipeline(input);
+    Require(name, "the pipeline came from a worker",
+            ComputeCreateHook::Created() == 1 && ComputeCreateHook::CreatedOn(0) != caller,
+            "the pipeline was not the one a worker built");
+    cache.StopBuilds();
+  }
+  {
+    // On another thread than the GPU thread the module stays in the inbox, and the lookup compiles.
+    PipelineCache cache(vulkan.RuntimeContext(), nullptr);
+    PipelineCacheTestAccess::EnableWarmCompute(cache);
+    PipelineCacheTestAccess::EnableGeneration(cache);
+    cache.PostGeneratedModule(record(0));
+    ShaderComputeInputInfo input{};
+    const auto before = ShadersCompiledSoFar();
+    GeneratedLookup(cache, GENERATED_STRIDE_A, input);
+    Require(name, "off the GPU thread nothing is taken", ShadersCompiledSoFar() == before + 1,
+            "a lookup off the GPU thread drained the inbox");
+    auto stats = cache.GenerationStats();
+    Require(name, "the module waits", stats && stats->pending == 1 && stats->drain.drain_calls == 0,
+            "a lookup off the GPU thread took a module in");
+    // The GPU thread's next lookup takes it in. The module has the id of the one the runtime
+    // compiled, so it is a duplicate and is dropped.
+    gpu.SendCommandSync([&] { GeneratedLookup(cache, GENERATED_STRIDE_A, input); });
+    stats = cache.GenerationStats();
+    Require(name, "a duplicate is dropped",
+            stats && stats->drain.duplicates == 1 && stats->drain.adopted == 0 &&
+                PipelineCacheTestAccess::ModuleCount(cache) == 1,
+            "a module the program already held was taken in a second time");
+    Require(name, "its handles were destroyed", stats && stats->handles_created == stats->handles_destroyed,
+            "a dropped module kept its shader module");
+    cache.StopBuilds();
+  }
+  Common::DebugCounters::SetEnabled(false);
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
+// A module whose plan is not its program's is dropped and counted, and the same module with the plan
+// is taken in, so only the plan decides. The program is one the runtime made, and the module is
+// another module of it.
+void CheckGeneratedPlanTripwire(VulkanHarness &vulkan, GuestGpu &gpu,
+                                const std::vector<DecodedModuleRecord> &records) {
+  constexpr const char *name = "GeneratedPlanTripwire";
+  for (const bool changed : {false, true}) {
+    PipelineCache cache(vulkan.RuntimeContext(), nullptr);
+    PipelineCacheTestAccess::EnableWarmCompute(cache);
+    PipelineCacheTestAccess::EnableGeneration(cache);
+    ShaderComputeInputInfo input{};
+    GeneratedLookup(cache, GENERATED_STRIDE_A, input);
+    PipelineCacheTestAccess::PostChanged(cache, DecodedModuleRecord(records[1]), changed, false);
+    gpu.SendCommandSync([&] { GeneratedLookup(cache, GENERATED_STRIDE_A, input); });
+    const auto stats = cache.GenerationStats();
+    Require(name, changed ? "a changed plan is dropped" : "the right plan is taken",
+            stats && stats->drain.plan_mismatch == (changed ? 1u : 0u) &&
+                stats->drain.adopted == (changed ? 0u : 1u) &&
+                PipelineCacheTestAccess::ModuleCount(cache) == (changed ? 1u : 2u) &&
+                PipelineCacheTestAccess::WarmPending(cache) == (changed ? 0u : 1u),
+            "the plan check did not decide what became of the module");
+    Require(name, "handles are balanced after a drop",
+            changed ? stats->handles_created == stats->handles_destroyed : true,
+            "a module dropped for its plan kept its shader module");
+    cache.StopBuilds();
+  }
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
+// The plan of a program is decoded for the first record of the program only. A later record of the
+// same program whose plan bytes could not be decoded is still posted, since it carries only the
+// hash, and what becomes of it is for the drain's check. The first record of a program whose plan
+// cannot be decoded is not posted at all, and is counted.
+void CheckGeneratedPlanDecodedOnce(VulkanHarness &vulkan, const std::vector<DecodedModuleRecord> &records) {
+  constexpr const char *name = "GeneratedPlanDecodedOnce";
+  PipelineCache cache(vulkan.RuntimeContext(), nullptr);
+  PipelineCacheTestAccess::EnableWarmCompute(cache);
+  PipelineCacheTestAccess::EnableGeneration(cache);
+  auto broken_first = DecodedModuleRecord(records[0]);
+  broken_first.plan = {1, 2, 3};
+  cache.PostGeneratedModule(std::move(broken_first));
+  auto stats = cache.GenerationStats();
+  Require(name, "an undecodable first plan is not posted",
+          stats && stats->posted == 0 && stats->bad_plans == 1 && stats->pending == 0,
+          "a first record of a program with a plan that cannot be decoded was posted");
+  cache.PostGeneratedModule(DecodedModuleRecord(records[0]));
+  auto later = DecodedModuleRecord(records[1]);
+  later.plan = {1, 2, 3};
+  cache.PostGeneratedModule(std::move(later));
+  stats = cache.GenerationStats();
+  Require(name, "a later record is not decoded",
+          stats && stats->posted == 2 && stats->bad_plans == 1 && stats->pending == 2,
+          "the plan of a later record of the program was decoded again");
+  cache.StopBuilds();
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
+// The check in the other direction: a program that generation made is translated by the runtime
+// for a module the generator did not predict, and its plan is compared with the generated one. A
+// plan that differs is counted, and nothing else changes. The same run with the right plan counts
+// nothing.
+void CheckGeneratedReverseTripwire(VulkanHarness &vulkan, GuestGpu &gpu,
+                                   const std::vector<DecodedModuleRecord> &records) {
+  constexpr const char *name = "GeneratedReverseTripwire";
+  for (const bool changed : {false, true}) {
+    PipelineCache cache(vulkan.RuntimeContext(), nullptr);
+    PipelineCacheTestAccess::EnableWarmCompute(cache);
+    PipelineCacheTestAccess::EnableGeneration(cache);
+    PipelineCacheTestAccess::PostChanged(cache, DecodedModuleRecord(records[0]), changed, false);
+    ShaderComputeInputInfo input{};
+    // The first lookup takes in the module of stride A, which makes the program. The lookup is for
+    // stride B, which no module fits, so the runtime translates the program itself.
+    gpu.SendCommandSync([&] { GeneratedLookup(cache, GENERATED_STRIDE_B, input); });
+    const auto stats = cache.GenerationStats();
+    Require(name, changed ? "a changed plan is counted" : "the same plan is not",
+            stats && stats->drain.adopted == 1 &&
+                stats->drain.plan_mismatch_reverse == (changed ? 1u : 0u),
+            "the runtime's plan was not compared with the generated one");
+    cache.StopBuilds();
+  }
+  {
+    // The check uses the GPU thread's planner, so a lookup on another thread does not make it, and
+    // does not use it up: the next lookup on the GPU thread that translates the program does.
+    PipelineCache cache(vulkan.RuntimeContext(), nullptr);
+    PipelineCacheTestAccess::EnableWarmCompute(cache);
+    PipelineCacheTestAccess::EnableGeneration(cache);
+    PipelineCacheTestAccess::PostChanged(cache, DecodedModuleRecord(records[0]), true, false);
+    ShaderComputeInputInfo input{};
+    gpu.SendCommandSync([&] { GeneratedLookup(cache, GENERATED_STRIDE_A, input); });
+    GeneratedLookup(cache, GENERATED_STRIDE_B, input);
+    auto stats = cache.GenerationStats();
+    Require(name, "off the GPU thread there is no check",
+            stats && stats->drain.adopted == 1 && stats->drain.plan_mismatch_reverse == 0,
+            "a lookup off the GPU thread made the check on the GPU thread's planner");
+    gpu.SendCommandSync([&] { GeneratedLookup(cache, GENERATED_STRIDE_C, input); });
+    stats = cache.GenerationStats();
+    Require(name, "the check is still due", stats && stats->drain.plan_mismatch_reverse == 1,
+            "the lookup off the GPU thread used up the check");
+    cache.StopBuilds();
+  }
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
+// A drain takes at most the budget in one lookup and the next lookup goes on, so no lookup is held
+// for long. The cost per taken module is printed.
+void CheckGeneratedDrainBudget(VulkanHarness &vulkan, GuestGpu &gpu,
+                               const std::vector<DecodedModuleRecord> &records) {
+  constexpr const char *name = "GeneratedDrainBudget";
+  constexpr size_t module_count = 20;
+  PipelineCache cache(vulkan.RuntimeContext(), nullptr);
+  PipelineCacheTestAccess::EnableWarmCompute(cache);
+  PipelineCacheTestAccess::EnableGeneration(cache);
+  for (size_t index = 0; index < module_count; index++) {
+    auto record = DecodedModuleRecord(records[0]);
+    record.id += 1000 + index;
+    cache.PostGeneratedModule(std::move(record));
+  }
+  ShaderComputeInputInfo input{};
+  gpu.SendCommandSync([&] { GeneratedLookup(cache, GENERATED_STRIDE_A, input); });
+  auto stats = cache.GenerationStats();
+  Require(name, "one lookup takes a bounded number",
+          stats && stats->drain.adopted >= 1 && stats->drain.adopted <= StoreGen::GENERATION_DRAIN_BUDGET &&
+              stats->pending == module_count - stats->drain.adopted,
+          "a drain took more than its budget, or lost a module");
+  for (int lookups = 0; lookups < 10 && cache.GenerationStats()->pending != 0; lookups++) {
+    gpu.SendCommandSync([&] { GeneratedLookup(cache, GENERATED_STRIDE_A, input); });
+  }
+  stats = cache.GenerationStats();
+  Require(name, "the rest follows", stats && stats->pending == 0 && stats->drain.adopted == module_count,
+          "the lookups after the first did not take the rest in");
+  // The longest module is timed, and it fits in the longest drain it was part of.
+  Require(name, "the longest module is timed",
+          stats && stats->drain.item_max_ms > 0.0 && stats->drain.item_max_ms <= stats->drain.drain_max_ms,
+          "the time of the longest module was not kept");
+  if (stats && stats->drain.adopted != 0) {
+    std::printf("[gpu]     GeneratedDrainBudget: %llu drains, %.3f ms in all, %.3f ms the longest, "
+                "%.4f ms per module taken\n",
+                static_cast<unsigned long long>(stats->drain.drain_calls), stats->drain.drain_total_ms,
+                stats->drain.drain_max_ms,
+                stats->drain.drain_total_ms / static_cast<double>(stats->drain.adopted));
+  }
+  cache.StopBuilds();
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
+// The stop destroys the modules no drain took, and a module posted after it is destroyed at once, so
+// the shader modules that were made are all destroyed. A module whose plan was left out for a program
+// that is new is not kept either, and its program goes.
+void CheckGeneratedStop(VulkanHarness &vulkan, GuestGpu &gpu,
+                        const std::vector<DecodedModuleRecord> &records) {
+  constexpr const char *name = "GeneratedStop";
+  {
+    PipelineCache cache(vulkan.RuntimeContext(), nullptr);
+    PipelineCacheTestAccess::EnableWarmCompute(cache);
+    PipelineCacheTestAccess::EnableGeneration(cache);
+    for (size_t index = 0; index < 3; index++) {
+      auto record = DecodedModuleRecord(records[0]);
+      record.id += 100 + index;
+      cache.PostGeneratedModule(std::move(record));
+    }
+    auto before = cache.GenerationStats();
+    Require(name, "made and waiting", before && before->handles_created >= 3 && before->handles_destroyed == 0 &&
+                                          before->pending == 3,
+            "the modules were not waiting before the stop");
+    cache.StopStoreGeneration();
+    auto stats = cache.GenerationStats();
+    Require(name, "undrained modules are destroyed",
+            stats && stats->undrained_at_stop == 3 && stats->pending == 0 &&
+                stats->handles_created == stats->handles_destroyed,
+            "the stop left shader modules that no drain took");
+    cache.PostGeneratedModule(DecodedModuleRecord(records[1]));
+    stats = cache.GenerationStats();
+    Require(name, "a module after the stop is destroyed",
+            stats && stats->pending == 0 && stats->handles_created == stats->handles_destroyed,
+            "a module posted after the stop was kept");
+    cache.StopStoreGeneration();
+    cache.StopBuilds();
+  }
+  {
+    // A new program whose plan is missing is not taken in, and the program that was made for it goes.
+    PipelineCache cache(vulkan.RuntimeContext(), nullptr);
+    PipelineCacheTestAccess::EnableWarmCompute(cache);
+    PipelineCacheTestAccess::EnableGeneration(cache);
+    PipelineCacheTestAccess::PostChanged(cache, DecodedModuleRecord(records[0]), false, true);
+    ShaderComputeInputInfo input{};
+    const auto programs_before = PipelineCacheTestAccess::ProgramCount(cache);
+    gpu.SendCommandSync([&] { GeneratedLookup(cache, GENERATED_STRIDE_A, input); });
+    const auto stats = cache.GenerationStats();
+    Require(name, "a missing plan is a failed install",
+            stats && stats->drain.failed_installs == 1 && stats->drain.adopted == 0 &&
+                stats->handles_created == stats->handles_destroyed,
+            "a record without its plan was taken in");
+    // The lookup compiled the program itself afterwards, so one program stands, made by the runtime.
+    Require(name, "the empty program went", PipelineCacheTestAccess::ProgramCount(cache) == programs_before + 1,
+            "the program made for a failed module was kept beside the runtime's");
+    cache.StopBuilds();
+  }
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
+// Captures two module records of one program by compiling it with two strides into a store, and runs
+// the checks of the generated modules over them.
+void CheckGeneratedModules(VulkanHarness &vulkan) {
+  Config::Load({.printf_direction = Config::LogDirection::Silent});
+  const auto dir = std::filesystem::temp_directory_path() /
+                   fmt::format("kyty_generated_modules_{}",
+                               std::chrono::steady_clock::now().time_since_epoch().count());
+  const auto store = dir / "TEST00001.shaders";
+  {
+    PipelineCache writer(vulkan.RuntimeContext(), nullptr);
+    writer.WarmUp(store);
+    ShaderComputeInputInfo input{};
+    GeneratedLookup(writer, GENERATED_STRIDE_A, input);
+    GeneratedLookup(writer, GENERATED_STRIDE_B, input);
+    writer.StopBuilds();
+  }
+  const auto records = ReadStoredModuleRecords(store);
+  Require("GeneratedModules", "two records of one program",
+          records.size() == 2 && records[0].id != records[1].id && records[0].hash == records[1].hash,
+          "the store did not hold the two modules of the program");
+  if (records.size() == 2) {
+    vulkan.WithGpuLane([&](GuestGpu &gpu) {
+      CheckGeneratedDrain(vulkan, gpu, records);
+      CheckGeneratedPlanTripwire(vulkan, gpu, records);
+      CheckGeneratedPlanDecodedOnce(vulkan, records);
+      CheckGeneratedReverseTripwire(vulkan, gpu, records);
+      CheckGeneratedDrainBudget(vulkan, gpu, records);
+      CheckGeneratedStop(vulkan, gpu, records);
+    });
+  }
+  std::filesystem::remove_all(dir);
+}
+
 // Boots the store with the flag on and one warm worker, waits for that worker to finish, and
 // returns which of `codes` each driver pipeline build was for, in the order the builds ran.
 std::vector<size_t> WarmBuildOrder(VulkanHarness &vulkan, const std::filesystem::path &store,
@@ -68630,6 +69060,11 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--deferred-draws-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckDeferredDraws();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--generated-modules-only") == 0) {
+    VulkanHarness vulkan;
+    CheckGeneratedModules(vulkan);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--warm-pause-only") == 0) {
