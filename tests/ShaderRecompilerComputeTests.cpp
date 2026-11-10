@@ -62118,12 +62118,19 @@ void CheckGeneratedRowsRefused(VulkanHarness &vulkan, GuestGpu &gpu,
     ShaderComputeInputInfo input{};
     GeneratedLookup(cache, GENERATED_STRIDE_A, input);
     cache.PostGeneratedModule(DecodedModuleRecord(records[0]));
+    const int64_t before_refusal = Common::FirstRunReport::NowNs();
     gpu.SendCommandSync([&] { GeneratedLookup(cache, GENERATED_STRIDE_A, input); });
+    const int64_t after_refusal = Common::FirstRunReport::NowNs();
     const auto refused = PipelineCacheTestAccess::RefusedRows(cache);
     Require(name, "a duplicate is refused with its id",
             refused.size() == 1 && refused[0].id == records[0].id &&
                 refused[0].verdict == DropVerdict::Duplicate,
             "the duplicate left no refusal row, or the wrong one");
+    // The classifier compares this time with a miss's, so a missing or stale stamp would misclass.
+    Require(name, "and the time of the refusal",
+            refused.size() == 1 && refused[0].at_ns >= before_refusal &&
+                refused[0].at_ns <= after_refusal,
+            "the refusal row has no time, or one outside the drain");
     Require(name, "and has no generated row",
             PipelineCacheTestAccess::GenerationBlock(cache).generated_modules.empty(),
             "a refused module got a generated row");

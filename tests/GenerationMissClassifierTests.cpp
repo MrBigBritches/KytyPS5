@@ -473,9 +473,59 @@ void TestContextFromStats() {
 	CHECK(of(0xC4) == MissClass::Unscanned);
 }
 
+// A Duplicate refusal that came after the miss means the runtime built the module first, so it is
+// not_yet_generated. The baseline is the same refusal before the miss, which is a real drop, and
+// a refusal with no time stays a drop. Nothing else in the rows could give not_yet_generated here,
+// since there is no generated row. The time must also survive the trip through MakeMissContext.
+void TestRefusalTime() {
+	auto miss                        = Miss();
+	auto context                     = Context();
+	context.refused_by_id[MODULE_ID] = DropVerdict::Duplicate;
+
+	context.refused_ns_by_id[MODULE_ID] = MISS_AT + 1;
+	CHECK(Of(miss, context) == MissClass::NotYetGenerated);
+	context.refused_ns_by_id[MODULE_ID] = MISS_AT - 1;
+	CHECK(Of(miss, context) == MissClass::DroppedAtDrain);
+	// Equal times are not after the miss.
+	context.refused_ns_by_id[MODULE_ID] = MISS_AT;
+	CHECK(Of(miss, context) == MissClass::DroppedAtDrain);
+	context.refused_ns_by_id.clear();
+	CHECK(Of(miss, context) == MissClass::DroppedAtDrain);
+
+	// The same refusal time with another verdict is a real disagreement and stays a drop. The
+	// baseline is the Duplicate case above, which moves.
+	for (const auto verdict:
+	     {DropVerdict::PlanMismatch, DropVerdict::FailedInstall, DropVerdict::DroppedStopped}) {
+		context.refused_by_id[MODULE_ID]    = verdict;
+		context.refused_ns_by_id[MODULE_ID] = MISS_AT + 1;
+		CHECK(Of(miss, context) == MissClass::DroppedAtDrain);
+	}
+	context.refused_by_id[MODULE_ID] = DropVerdict::Duplicate;
+	CHECK(Of(miss, context) == MissClass::NotYetGenerated);
+
+	// Through the rows of the report, and only the refusals before the miss count as drops.
+	SupervisorStats stats;
+	stats.first_predict_ns = FIRST_PREDICT;
+	stats.finished_ns      = FINISHED;
+	GenerationRowInputs rows;
+	rows.refused      = {{.id = MODULE_ID, .verdict = DropVerdict::Duplicate, .at_ns = MISS_AT + 1},
+	                     {.id = MODULE_ID + 1, .verdict = DropVerdict::Duplicate, .at_ns = MISS_AT - 1},
+	                     {.id = MODULE_ID + 2, .verdict = DropVerdict::Duplicate}};
+	rows.misses       = {Miss(), Miss(), Miss()};
+	rows.misses[1].id = MODULE_ID + 1;
+	rows.misses[2].id = MODULE_ID + 2;
+	const auto summary = SummarizeMisses(rows.misses, MakeMissContext(stats, rows), {});
+	const auto late    = static_cast<size_t>(MissClass::NotYetGenerated);
+	const auto dropped = static_cast<size_t>(MissClass::DroppedAtDrain);
+	CHECK(summary.classes[late].count == 1);
+	CHECK(summary.classes[dropped].count == 2);
+	CHECK(summary.refused_by_verdict[static_cast<size_t>(DropVerdict::Duplicate)] == 2);
+}
+
 } // namespace
 
 int main() {
+	TestRefusalTime();
 	TestEveryClassAgainstItsBaseline();
 	TestPrecedence();
 	TestSummary();

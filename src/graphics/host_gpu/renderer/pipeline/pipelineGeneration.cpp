@@ -273,9 +273,11 @@ void PipelineCache::NoteRefused(const GeneratedModule& item, StoreGen::DrainVerd
 	    : verdict == DrainVerdict::DropPlanMismatch  ? DropVerdict::PlanMismatch
 	    : verdict == DrainVerdict::DropFailedInstall ? DropVerdict::FailedInstall
 	                                                 : DropVerdict::DroppedStopped;
-	auto&            state = *m_generation;
+	// The time is taken before the lock, as a miss's is, so both are on the same footing.
+	const int64_t    refused_at = Common::FirstRunReport::NowNs();
+	auto&            state      = *m_generation;
 	std::scoped_lock lock(state.mutex);
-	state.refused_rows.push_back({item.module.id, named});
+	state.refused_rows.push_back({item.module.id, named, refused_at});
 }
 
 void PipelineCache::NoteGeneratedMiss(uint64_t code_hash, uint64_t id, bool has_calls,

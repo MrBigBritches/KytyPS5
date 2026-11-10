@@ -78,10 +78,13 @@ enum class DropVerdict : uint8_t {
 	return "";
 }
 
-/// A module the drain refused. It was never adopted, so it has no GenRow.
+/// A module the drain refused. It was never adopted, so it has no GenRow. at_ns is when the drain
+/// refused it, on the clock of MissRow::at_ns, so the classifier can tell a refusal that came after
+/// the miss (the runtime built the module first) from one that came before it (a real loss).
 struct DropRow {
 	uint64_t    id      = 0;
 	DropVerdict verdict = DropVerdict::Duplicate;
+	int64_t     at_ns   = NO_ROW_TIME_NS;
 };
 
 /// One compute translation that the runtime had to do after generation was on, which means the

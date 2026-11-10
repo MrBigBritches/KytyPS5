@@ -230,6 +230,9 @@ struct GenerationRowInputs {
 	}
 	for (const auto& row: rows.refused) {
 		context.refused_by_id.emplace(row.id, row.verdict);
+		if (row.at_ns != NO_ROW_TIME_NS) {
+			context.refused_ns_by_id.emplace(row.id, row.at_ns);
+		}
 	}
 	for (const auto& row: stats.predictions) {
 		context.prediction_by_hash[row.hash] = {row.outcome, row.candidates};

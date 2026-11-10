@@ -23,14 +23,18 @@ enum class MissClass : uint8_t {
 	/// The miss came before the worker had written its first `predict` line, so it is a matter of
 	/// how long the worker took to start, and no prediction could have served it.
 	BeforePrediction,
-	/// The module exists in the generator's output, but it was posted after the miss.
+	/// The module exists in the generator's output, but it was posted after the miss. It is also
+	/// the class of a module the drain refused as a Duplicate after the miss, since the runtime
+	/// built it first and the generator's copy then arrived late.
 	NotYetGenerated,
 	/// It was posted before the miss and was taken in after it, so it waited in the inbox or the
 	/// backlog.
 	InInbox,
 	/// It was taken in before the miss, which contradicts the id contract and should not happen.
 	AdoptedUnmatched,
-	/// The generator made it and the drain refused it.
+	/// The generator made it and the drain refused it. A Duplicate refusal after the miss is
+	/// NotYetGenerated instead. Every other verdict stays here whatever the time, since it is not
+	/// about lateness, as does a Duplicate before the miss or with no time recorded.
 	DroppedAtDrain,
 	/// The runtime skips the program, which the worker leaves out by design.
 	SkipDispatch,
@@ -99,6 +103,9 @@ struct MissContext {
 	std::optional<int64_t>                       finished_ns;
 	std::unordered_map<uint64_t, GenRowSnapshot> generated_by_id;
 	std::unordered_map<uint64_t, DropVerdict>    refused_by_id;
+	/// When the drain refused each id, for the ids that have a time. An id in refused_by_id with no
+	/// entry here has no refusal time.
+	std::unordered_map<uint64_t, int64_t>        refused_ns_by_id;
 	std::unordered_map<uint64_t, PredictionFact> prediction_by_hash;
 	std::unordered_set<uint64_t>                 dropped_hashes;
 	/// Programs that a worker crashed or hung on, whether in prediction (skipped) or in a build
@@ -120,6 +127,14 @@ struct MissContext {
 		                                           : MissClass::AdoptedUnmatched;
 	}
 	if (miss.id != 0 && context.refused_by_id.contains(miss.id)) {
+		// A Duplicate after the miss means the runtime had built the module before the drain saw
+		// the generator's copy, so the module was generated too late. Other verdicts are not about
+		// lateness, and a refusal before the miss or with no time is a module the drain lost.
+		const auto refused_at = context.refused_ns_by_id.find(miss.id);
+		if (context.refused_by_id.at(miss.id) == DropVerdict::Duplicate &&
+		    refused_at != context.refused_ns_by_id.end() && refused_at->second > miss.at_ns) {
+			return MissClass::NotYetGenerated;
+		}
 		return MissClass::DroppedAtDrain;
 	}
 	if (miss.skip_dispatch) {
@@ -164,7 +179,9 @@ struct MissSummary {
 	std::array<MissClassTotals, MISS_CLASS_COUNT> classes;
 	uint64_t                                      total     = 0;
 	double                                        create_ms = 0.0;
-	/// How the misses of DroppedAtDrain were refused, by verdict in DropVerdict order.
+	/// How the misses of DroppedAtDrain were refused, by verdict in DropVerdict order. Refusals
+	/// that were a Duplicate after their miss are classed NotYetGenerated, so Duplicate counts
+	/// only those before the miss or untimed, and the other verdicts count in full.
 	std::array<uint64_t, 4> refused_by_verdict {};
 	/// Distinct programs among the WrongSpec misses, and the most modules of one of them. A few
 	/// programs with many variants point at a specification rule, and many programs at a general
