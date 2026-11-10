@@ -206,6 +206,11 @@ public:
 	/// The number of file bytes read so far.
 	[[nodiscard]] uint64_t BytesRead() const { return m_offset; }
 
+	/// How many times a poll found a held bad item and went back to GoodOffset to read it again. A
+	/// reader of a file with a small max_poll_bytes uses it to see an item that no window can
+	/// judge.
+	[[nodiscard]] uint32_t Rewinds() const { return m_rewinds; }
+
 private:
 	bool ReadNewBytes();
 
@@ -213,6 +218,7 @@ private:
 	FrameTailer&          m_tailer;
 	uint64_t              m_max_poll_bytes = MAX_POLL_READ_BYTES;
 	uint64_t              m_offset         = 0;
+	uint32_t              m_rewinds        = 0;
 };
 
 } // namespace Libs::Graphics::StoreGen

@@ -47,6 +47,17 @@ struct GenerationCounts {
 		case GeneratedPersistence::NotFinished: return "not_finished";
 		case GeneratedPersistence::Renamed: return "renamed";
 		case GeneratedPersistence::RenameFailed: return "rename_failed";
+		case GeneratedPersistence::Existing: return "existing";
+	}
+	return "";
+}
+
+/// The name of where a run's modules came from in the report.
+[[nodiscard]] inline const char* SourceName(GenerationSource source) {
+	switch (source) {
+		case GenerationSource::Generated: return "generated";
+		case GenerationSource::Loaded: return "loaded";
+		case GenerationSource::LoadedRegenerated: return "loaded_regenerated";
 	}
 	return "";
 }
@@ -104,17 +115,22 @@ MakeSupervisorReport(const SupervisorStats& stats) {
 	Common::FirstRunReport::ShaderStoreGenerationReport block;
 	const bool stopped_for_good = stats.outcome == SupervisorOutcome::Fatal ||
 	                              stats.outcome == SupervisorOutcome::RestartsCapped;
-	block.active          = !stopped_for_good;
-	block.inactive_reason = stopped_for_good ? stats.inactive_reason : std::string();
-	block.outcome         = OutcomeName(stats.outcome);
-	block.persisted       = PersistedName(stats.persisted);
-	block.persist_error   = stats.persist_error;
-	block.spawns          = stats.spawns;
-	block.restarts        = stats.restarts;
-	block.spawn_ms        = stats.spawn_ms;
-	block.child_open_ms   = stats.child_open_ms;
-	block.first_record_ms = stats.first_record_ms;
-	block.last_record_ms  = stats.last_record_ms;
+	block.active                   = !stopped_for_good;
+	block.inactive_reason          = stopped_for_good ? stats.inactive_reason : std::string();
+	block.outcome                  = OutcomeName(stats.outcome);
+	block.persisted                = PersistedName(stats.persisted);
+	block.persist_error            = stats.persist_error;
+	block.source                   = SourceName(stats.source);
+	block.verify_ms                = stats.verify_ms;
+	block.loader_abandoned         = stats.loader_abandoned;
+	block.regenerated_after_damage = stats.regenerated_after_damage;
+	block.file_bytes               = stats.file_bytes;
+	block.spawns                   = stats.spawns;
+	block.restarts                 = stats.restarts;
+	block.spawn_ms                 = stats.spawn_ms;
+	block.child_open_ms            = stats.child_open_ms;
+	block.first_record_ms          = stats.first_record_ms;
+	block.last_record_ms           = stats.last_record_ms;
 	if (stats.outcome == SupervisorOutcome::Finished) {
 		block.finished_ms = stats.finished_ms;
 		block.finished_ns = stats.finished_ns;

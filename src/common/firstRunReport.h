@@ -359,11 +359,23 @@ struct ShaderStoreGenerationReport {
 	/// restarts_capped), and then inactive_reason says why.
 	bool        active = true;
 	std::string inactive_reason;
-	/// What became of the finished file: renamed, rename_failed or not_finished. It is the field to
+	/// What became of the finished file: renamed, rename_failed, existing (an earlier file was
+	/// current and was left) or not_finished. It is the field to
 	/// trust for what is on disk, since a run reported as stopped can still have renamed its file.
 	std::string persisted = "not_finished";
 	/// Why the rename failed. Empty for any other value of persisted.
 	std::string persist_error;
+	/// Where the modules came from: generated, loaded or loaded_regenerated. Loaded from the moment
+	/// an earlier file is accepted, and settled when the run finishes.
+	std::string source = "generated";
+	/// From the spawn of a Verify worker to its answer. Missing when none answered.
+	std::optional<double> verify_ms;
+	/// Whether a finish gave up on the load of the earlier file, and whether a damaged earlier file
+	/// made the supervisor start a worker again in Generate mode.
+	bool loader_abandoned         = false;
+	bool regenerated_after_damage = false;
+	/// The size of the generated file once the run finished, or zero.
+	uint64_t file_bytes = 0;
 	/// running, finished, fatal, restarts_capped or stopped.
 	std::string outcome;
 	uint32_t    spawns   = 0;

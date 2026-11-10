@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <condition_variable>
+#include <deque>
 #include <fmt/format.h>
 #include <fstream>
 #include <mutex>
@@ -37,7 +38,9 @@ constexpr int EXIT_CODE_ORDER_MISMATCH = WORKER_EXIT_ORDER_MISMATCH;
 
 // What a worker run ended in and what the supervisor does about it.
 struct Verdict {
-	enum class Action : uint8_t { Finish, Fatal, Fresh, Resume };
+	// Verified is a Verify worker's exit 10, which says the generated file is current. It is not
+	// a finish yet, since the file has to be loaded whole as well.
+	enum class Action : uint8_t { Finish, Verified, Fatal, Fresh, Resume };
 	Action      action = Action::Fatal;
 	std::string reason;
 	FailureKind kind = FailureKind::Crash;
@@ -107,6 +110,86 @@ void AddUnique(std::vector<uint64_t>& list, uint64_t hash) {
 	}
 }
 
+// Streams the generated file of an earlier run, one read at a time. The file is complete, since
+// only a finished run renames its output to it, so nothing writes to it and a bad item in it is
+// final. It is opened for each read and closed again, so nothing holds it when a finish replaces
+// it.
+class GeneratedFileLoader {
+public:
+	enum class Phase : uint8_t {
+		Loading,  // More frames are queued or still to be read.
+		Complete, // Every frame was handed over and the file ended after one.
+		Damaged,  // The file is bad from some point on. What came before it was handed over.
+	};
+
+	GeneratedFileLoader(std::vector<uint8_t> store_header, uint32_t generator_version,
+	                    const fs::path& path, uint64_t read_bytes)
+	    : m_tailer(std::move(store_header), generator_version, std::nullopt),
+	      m_poller(path, m_tailer, read_bytes) {}
+	GeneratedFileLoader(const GeneratedFileLoader&)            = delete;
+	GeneratedFileLoader& operator=(const GeneratedFileLoader&) = delete;
+
+	// Whether the file's header is the expected one, by the stamp and the generator version. The
+	// eboot identity is not asked, since the worker's Verify answers that.
+	[[nodiscard]] bool HeaderAccepted() const { return m_tailer.Identity().has_value(); }
+
+	[[nodiscard]] Phase GetPhase() const {
+		if (!m_pending.empty()) {
+			return Phase::Loading;
+		}
+		if (m_stalled) {
+			return Phase::Damaged;
+		}
+		switch (m_tailer.Status()) {
+			case TailStatus::Waiting: return Phase::Loading;
+			case TailStatus::Complete: return Phase::Complete;
+			default: return Phase::Damaged;
+		}
+	}
+
+	// Whether the next frame needs a read of the file first.
+	[[nodiscard]] bool NeedsRead() const {
+		return m_pending.empty() && GetPhase() == Phase::Loading;
+	}
+
+	// Reads the next part of the file and queues the frames that became complete. A bad item is
+	// held once and read again, which judges it. One that is read again from the same good frame
+	// twice is larger than a read, which no read can judge, so the file is given up as damaged.
+	void ReadSlice() {
+		const auto rewinds_before = m_poller.Rewinds();
+		for (auto& frame: m_poller.Poll(true)) {
+			m_pending.push_back(std::move(frame));
+		}
+		if (m_poller.Rewinds() == rewinds_before) {
+			return;
+		}
+		const auto good      = m_tailer.GoodOffset();
+		m_rewinds_at_good    = good == m_rewind_good_offset ? m_rewinds_at_good + 1 : 1;
+		m_rewind_good_offset = good;
+		if (m_rewinds_at_good >= GENERATION_LOADER_REWIND_LIMIT) {
+			m_stalled = true;
+		}
+	}
+
+	// The next queued frame, or nothing.
+	std::optional<TailedFrame> TakeFrame() {
+		if (m_pending.empty()) {
+			return std::nullopt;
+		}
+		auto frame = std::move(m_pending.front());
+		m_pending.pop_front();
+		return frame;
+	}
+
+private:
+	FrameTailer             m_tailer;
+	FileTailPoller          m_poller;
+	std::deque<TailedFrame> m_pending;
+	uint64_t                m_rewind_good_offset = 0;
+	uint32_t                m_rewinds_at_good    = 0;
+	bool                    m_stalled            = false;
+};
+
 } // namespace
 
 bool PeakReplaces(const Common::PeakMemory& held, const Common::PeakMemory& candidate) {
@@ -146,11 +229,20 @@ struct StoreSupervisor::Impl {
 	[[nodiscard]] bool TimedOut(ProgressClock::time_point now) const;
 	std::optional<int> TerminateChild();
 
+	// ---- Loading the generated file of an earlier run. ----
+	void               OpenLoader();
+	void               AdvanceLoader(std::chrono::milliseconds budget);
+	[[nodiscard]] bool LoaderLoading() const;
+	void               SettleVerified();
+	void               RespawnAfterDamage();
+
 	// ---- Deciding. ----
 	void                  Conclude(int exit_code, bool killed);
-	void                  Finish();
+	void                  Finish(bool verified_current);
 	void                  EndLoader();
 	void                  Persist();
+	void                  NoteExistingFile();
+	void                  NoteSource(bool verified_current);
 	[[nodiscard]] Verdict Judge(int exit_code, bool killed) const;
 	void                  Restart(const Verdict& verdict);
 	void                  BlameLastLine();
@@ -194,12 +286,25 @@ struct StoreSupervisor::Impl {
 	std::unique_ptr<Common::ChildProcess> child;
 	std::unique_ptr<FrameTailer>          tailer;
 	std::unique_ptr<FileTailPoller>       poller;
-	ProgressLogReader                     progress;
-	WorkerRequest                         request;
-	std::unordered_set<uint64_t>          seen_ids;
-	Clock::time_point                     thread_start;
-	Clock::time_point                     spawn_time;
-	Clock::time_point                     first_spawn_time;
+	// The earlier generated file being loaded. Empty when there is none, when its header was not
+	// the expected one, and after a finish gave up on it.
+	std::unique_ptr<GeneratedFileLoader> loader;
+	// Whether the header of the earlier file was the expected one. It stays set when the loader is
+	// gone, since the source of the run depends on it.
+	bool header_accepted = false;
+	// Whether a Verify worker said the file is current and the supervisor waits for it to load.
+	bool verified = false;
+	// Set before a worker is started for a damaged file, and checked first, so it happens once. It
+	// cannot be reached today, since RespawnAfterDamage and Restart both set Generate, nothing sets
+	// Verify again, and Judge gives Verified only in Verify mode. It stays as a backstop against a
+	// respawn loop if a later change lets a restart verify again.
+	bool                         regenerated_after_damage = false;
+	ProgressLogReader            progress;
+	WorkerRequest                request;
+	std::unordered_set<uint64_t> seen_ids;
+	Clock::time_point            thread_start;
+	Clock::time_point            spawn_time;
+	Clock::time_point            first_spawn_time;
 	// What the statistics of the current spawn have taken already, so ending a spawn in two places
 	// counts it once.
 	bool   stats_collected     = false;
@@ -317,7 +422,90 @@ bool StoreSupervisor::Impl::Begin() {
 	tailer = std::make_unique<FrameTailer>(request.store_header, request.generator_version,
 	                                       std::nullopt);
 	poller = std::make_unique<FileTailPoller>(config.output_path, *tailer);
+	OpenLoader();
 	return Spawn();
+}
+
+// Starts loading the generated file of an earlier run, when there is one. The first reads go on
+// until the header is judged, since that decides what the first worker is asked to do. A header
+// that is not the expected one, by the stamp or the version, makes the file ignored: the worker
+// then generates, as it does when there is no file. Otherwise the worker runs in Verify mode while
+// the records load.
+void StoreSupervisor::Impl::OpenLoader() {
+	std::error_code error;
+	if (config.generated_path.empty() || !fs::is_regular_file(config.generated_path, error)) {
+		return;
+	}
+	loader = std::make_unique<GeneratedFileLoader>(request.store_header, request.generator_version,
+	                                               config.generated_path, config.loader_read_bytes);
+	while (!loader->HeaderAccepted() && loader->GetPhase() == GeneratedFileLoader::Phase::Loading) {
+		loader->ReadSlice();
+	}
+	if (!loader->HeaderAccepted()) {
+		Log("Shader store generation: the generated file of an earlier run is not for this build, "
+		    "so it is ignored");
+		loader.reset();
+		return;
+	}
+	header_accepted = true;
+	request.mode    = WorkerMode::Verify;
+	// Provisional, so a run that is stopped during or after the load still says it loaded. The
+	// finish refines it to loaded_regenerated when the worker writes a new file.
+	Update([](SupervisorStats& s) { s.source = GenerationSource::Loaded; });
+}
+
+bool StoreSupervisor::Impl::LoaderLoading() const {
+	return loader && loader->GetPhase() == GeneratedFileLoader::Phase::Loading;
+}
+
+// Gives the load of the earlier file about one slice of work: it reads when no frame is queued and
+// hands frames on, through the same decode, id check and sink as the worker's records, and stops
+// at the first record that ends the slice. At least one record goes on each call, so a slice that
+// is shorter than a record still makes progress.
+void StoreSupervisor::Impl::AdvanceLoader(std::chrono::milliseconds budget) {
+	if (!loader) {
+		return;
+	}
+	const auto deadline = Clock::now() + budget;
+	do {
+		if (loader->NeedsRead()) {
+			loader->ReadSlice();
+		}
+		if (const auto frame = loader->TakeFrame()) {
+			DeliverRecord(*frame);
+		}
+	} while (LoaderLoading() && Clock::now() < deadline && !stop.stop_requested());
+}
+
+// What follows a Verify worker's exit 10 once the earlier file has loaded as far as it can. The
+// worker has said that the file is current, which is only worth anything if it loaded whole.
+void StoreSupervisor::Impl::SettleVerified() {
+	AdvanceLoader(config.loader_slice);
+	if (LoaderLoading()) {
+		return;
+	}
+	const bool whole = loader && loader->GetPhase() == GeneratedFileLoader::Phase::Complete;
+	switch (DecideAfterVerify(whole ? LoaderEnd::Complete : LoaderEnd::Damaged,
+	                          regenerated_after_damage)) {
+		case VerifiedAction::Finish: Finish(true); break;
+		case VerifiedAction::Respawn: RespawnAfterDamage(); break;
+		case VerifiedAction::Fatal: End(SupervisorOutcome::Fatal, "bad_output"); break;
+	}
+}
+
+// The file the worker called current is damaged, so it is not trusted. A worker is started again in
+// Generate mode, which writes a new file. It is not a restart, since nothing failed. The flag is
+// set first, so that nothing can bring the supervisor here twice.
+void StoreSupervisor::Impl::RespawnAfterDamage() {
+	regenerated_after_damage = true;
+	Update([](SupervisorStats& s) { s.regenerated_after_damage = true; });
+	Log("Shader store generation: the generated file of an earlier run is damaged, so it is "
+	    "generated again");
+	verified     = false;
+	request.mode = WorkerMode::Generate;
+	if (PrepareFresh()) {
+		Spawn();
+	}
 }
 
 // Writes the request and starts the worker. The progress log's spawn offset is taken before the
@@ -380,6 +568,12 @@ std::optional<int> StoreSupervisor::Impl::TerminateChild() {
 
 // One look at the child and its files, and the decision that follows from it.
 void StoreSupervisor::Impl::Iterate() {
+	// A worker that said the file is current has exited, and only the load is left to wait for.
+	if (verified) {
+		SettleVerified();
+		return;
+	}
+	AdvanceLoader(config.loader_slice);
 	// Read before the files, since bytes written just before the exit must still be read after it.
 	const auto exited = child->Poll();
 	const auto now    = ProgressClock::now();
@@ -485,8 +679,13 @@ Verdict StoreSupervisor::Impl::Judge(int exit_code, bool killed) const {
 			return {Action::Fresh, "", FailureKind::BadOutput};
 		}
 	}
-	// Verify mode is not asked for yet, so exit 10 is no answer to anything. The others mean the
-	// request, the eboot or the disk is wrong, which another run would meet again.
+	// Exit 10 is Verify mode's answer, and only for a worker that was asked to verify a file whose
+	// header was accepted. From a Generate worker it means something is wrong, like the other
+	// codes below, which say the request, the eboot or the disk is wrong. Another run would meet
+	// that again.
+	if (!killed && exit_code == WORKER_EXIT_UP_TO_DATE && request.mode == WorkerMode::Verify) {
+		return {Action::Verified, "", FailureKind::Crash};
+	}
 	if (!killed &&
 	    (exit_code == WORKER_EXIT_UP_TO_DATE ||
 	     (exit_code >= WORKER_EXIT_BAD_REQUEST && exit_code <= WORKER_EXIT_OUTPUT_FAILED))) {
@@ -514,11 +713,19 @@ Verdict StoreSupervisor::Impl::Judge(int exit_code, bool killed) const {
 }
 
 void StoreSupervisor::Impl::Conclude(int exit_code, bool killed) {
+	const auto concluded = Clock::now();
 	CatchUp();
 	CollectSpawnStats();
 	const auto verdict = Judge(exit_code, killed);
 	if (verdict.action == Verdict::Action::Finish) {
-		Finish();
+		Finish(false);
+		return;
+	}
+	if (verdict.action == Verdict::Action::Verified) {
+		Update(
+		    [&](SupervisorStats& s) { s.verify_ms = MillisecondsBetween(spawn_time, concluded); });
+		verified = true;
+		SettleVerified();
 		return;
 	}
 	RecordFailure(verdict, exit_code);
@@ -538,21 +745,70 @@ void StoreSupervisor::Impl::Conclude(int exit_code, bool killed) {
 // old generated file safe. The loader is ended first, so nothing still reads a file the rename
 // replaces. The rename comes next, since only a worker that has exited has closed its file. The
 // outcome is set last, so a reader that sees Finished also sees what became of the file. A stop
-// that comes while the loader ends renames nothing, and the thread ends as Stopped.
-void StoreSupervisor::Impl::Finish() {
+// that comes while the loader ends renames nothing, and the thread ends as Stopped. A run whose
+// worker found the earlier file current has written no file, so there is nothing to rename and the
+// earlier file is what persists.
+void StoreSupervisor::Impl::Finish(bool verified_current) {
 	EndLoader();
 	if (stop.stop_requested()) {
 		return;
 	}
-	Persist();
+	if (verified_current) {
+		NoteExistingFile();
+	} else {
+		Persist();
+	}
+	NoteSource(verified_current);
 	End(SupervisorOutcome::Finished, "");
 }
 
-// The loader step of a finish. With no loader it does nothing.
+// The loader step of a finish. The load of the earlier file is allowed to reach its end for a
+// bounded time, since the generation that just ended took far longer, and is abandoned after that.
+// Slices follow each other with no wait between them, and a stop ends the wait at once. The
+// configured hook runs after.
 void StoreSupervisor::Impl::EndLoader() {
-	if (config.end_loader) {
-		config.end_loader(stop, GENERATION_LOADER_END_WAIT);
+	if (LoaderLoading()) {
+		const auto deadline = Clock::now() + config.loader_end_wait;
+		while (LoaderLoading() && !stop.stop_requested() && Clock::now() < deadline) {
+			AdvanceLoader(config.loader_slice);
+		}
+		if (LoaderLoading() && !stop.stop_requested()) {
+			Update([](SupervisorStats& s) { s.loader_abandoned = true; });
+			Log("Shader store generation: the load of the earlier generated file was given up, "
+			    "since it did not end in time");
+			// Nothing reads the file after this, so the rename may replace it.
+			loader.reset();
+		}
 	}
+	if (config.end_loader) {
+		config.end_loader(stop, config.loader_end_wait);
+	}
+}
+
+// The size of the generated file on disk, or zero when it cannot be read.
+static uint64_t GeneratedFileSize(const fs::path& path) {
+	std::error_code error;
+	const auto      size = fs::file_size(path, error);
+	return error ? 0 : static_cast<uint64_t>(size);
+}
+
+// Records that the worker found the earlier file current and left it as it was.
+void StoreSupervisor::Impl::NoteExistingFile() {
+	const auto bytes = GeneratedFileSize(config.generated_path);
+	Update([&](SupervisorStats& s) {
+		s.persisted  = GeneratedPersistence::Existing;
+		s.file_bytes = bytes;
+	});
+}
+
+// Says where the modules came from, which a finish knows: a worker that verified the file loaded
+// it, one that wrote a new file after the earlier file's header was accepted regenerated it, and
+// any other run generated.
+void StoreSupervisor::Impl::NoteSource(bool verified_current) {
+	const auto source = verified_current  ? GenerationSource::Loaded
+	                    : header_accepted ? GenerationSource::LoadedRegenerated
+	                                      : GenerationSource::Generated;
+	Update([&](SupervisorStats& s) { s.source = source; });
 }
 
 // Renames the finished temporary file to the generated file and records the result. A failure keeps
@@ -574,10 +830,13 @@ void StoreSupervisor::Impl::Persist() {
 		                    fs::exists(config.generated_path, ignored) ? "present" : "absent");
 		Log("Shader store generation: " + error);
 	}
+	// A failed rename leaves no new generated file, so the size is only taken after a good one.
+	const auto bytes = error.empty() ? GeneratedFileSize(config.generated_path) : 0;
 	Update([&](SupervisorStats& s) {
 		s.persisted =
 		    error.empty() ? GeneratedPersistence::Renamed : GeneratedPersistence::RenameFailed;
 		s.persist_error = std::move(error);
+		s.file_bytes    = bytes;
 	});
 }
 
@@ -751,6 +1010,9 @@ bool StoreSupervisor::Impl::PrepareFresh() {
 
 // Starts the worker again, from where it was or from nothing, unless the cap is reached.
 void StoreSupervisor::Impl::Restart(const Verdict& verdict) {
+	// Only the first spawn verifies. A worker that started again has failed once, and the file it
+	// would find current is not the question any more.
+	request.mode = WorkerMode::Generate;
 	AbsorbDrops();
 	if (verdict.action == Verdict::Action::Resume) {
 		BlameLastLine();

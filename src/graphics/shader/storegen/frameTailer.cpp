@@ -184,6 +184,7 @@ std::vector<TailedFrame> FileTailPoller::Poll(bool child_exited) {
 	// the next poll judges it for good, on bytes that were all read together.
 	if (m_tailer.WantsReread()) {
 		RestartFrom();
+		m_rewinds++;
 	}
 	return frames;
 }

@@ -576,6 +576,14 @@ void FakeOpenOutput(FakeRun& run) {
 	}
 }
 
+// Whether a file starts with these bytes. A file that is missing or shorter does not.
+bool FileBeginsWith(const fs::path& path, const Bytes& prefix) {
+	std::ifstream in(path, std::ios::binary);
+	Bytes         head(prefix.size());
+	in.read(reinterpret_cast<char*>(head.data()), static_cast<std::streamsize>(head.size()));
+	return in && static_cast<size_t>(in.gcount()) == prefix.size() && head == prefix;
+}
+
 // The whole fake. A mode such as `exit:3` ends before it does anything else.
 int RunFakeWorker(const std::string& mode_text, const fs::path& request_file) {
 	const auto request = ReadWorkerRequestFile(request_file);
@@ -591,6 +599,12 @@ int RunFakeWorker(const std::string& mode_text, const fs::path& request_file) {
 	if (run.Is("sleep_silent")) {
 		SleepSeconds(HANG_SECONDS);
 		return 0;
+	}
+	// A worker asked to verify leaves a file that begins with its own header as it is, and answers
+	// with exit 10 without a progress line, as the real one does. Any other file is generated over.
+	if (request->mode == WorkerMode::Verify &&
+	    FileBeginsWith(PathFromUtf8(request->generated_path), GeneratedHeaderBytes(*request))) {
+		return WORKER_EXIT_UP_TO_DATE;
 	}
 	// This mode has left a damaged file behind before it crashes at a predict line.
 	if (run.Is("crash_damaged_predict") && run.spawn == 0) {
@@ -1949,6 +1963,460 @@ void TestPersistedInTheReport() {
 	CHECK(std::string(PersistedName(GeneratedPersistence::RenameFailed)) == "rename_failed");
 }
 
+// ---- Loading the generated file of an earlier run, and verifying it. ----
+
+// The records of the earlier file. Their ids are far from the fake worker's, so a record that
+// reaches the sink with one of these ids came from the loader and from nothing else.
+constexpr uint64_t LOADED_ID_BASE      = 9000;
+constexpr size_t   LOADED_RECORDS      = 4;
+constexpr size_t   LONG_LOAD_RECORDS   = 60;
+constexpr uint64_t LOADED_HASH_BASE    = 0x7000;
+constexpr auto     RECORD_SINK_DELAY   = 15ms;
+constexpr auto     PROMPT_STOP_LIMIT   = 1s;
+constexpr auto     STOP_DURING_LOAD_AT = 300ms;
+constexpr auto     TINY_END_WAIT       = 50ms;
+// A read this small cannot hold one frame of the fake, which makes a bad frame larger than a read.
+constexpr uint64_t TINY_READ_BYTES = 40;
+// The version a file of another generator has.
+constexpr uint32_t OTHER_VERSION = GENERATOR_VERSION + 1;
+// The seed of a store header of another build.
+constexpr uint8_t OTHER_STAMP_SEED = 0x11;
+
+std::vector<uint64_t> LoadedIds(size_t count) {
+	std::vector<uint64_t> ids;
+	for (size_t i = 0; i < count; i++) {
+		ids.push_back(LOADED_ID_BASE + i);
+	}
+	return ids;
+}
+
+// What identifies the eboot of a file, and the same with another size, which the fake worker calls
+// out of date.
+constexpr EbootIdentity CURRENT_IDENTITY {.size = EBOOT_SIZE, .program_hash = IDENTITY_HASH};
+constexpr EbootIdentity STALE_IDENTITY {.size = EBOOT_SIZE + 1, .program_hash = IDENTITY_HASH};
+
+// The header of an earlier generated file, which the options change in the way a test needs.
+struct EarlierFile {
+	uint8_t       stamp_seed = 0xA0;
+	uint32_t      version    = GENERATOR_VERSION;
+	EbootIdentity identity   = CURRENT_IDENTITY;
+};
+
+// A generated file as an earlier run left it: the header and one frame for each id.
+Bytes EarlierFileBytes(const std::vector<uint64_t>& ids, const EarlierFile& file = {}) {
+	Bytes bytes = EncodeGeneratedHeader(StoreHeader(file.stamp_seed), file.version, file.identity);
+	for (const auto id: ids) {
+		const auto frame = FrameStoreRecord(ModuleRecord(id, LOADED_HASH_BASE + id));
+		bytes.insert(bytes.end(), frame.begin(), frame.end());
+	}
+	return bytes;
+}
+
+// What a boot over an earlier file is given.
+struct BootOptions {
+	std::string mode = "normal";
+	// The bytes that are in the generated file's place when the run starts.
+	std::optional<Bytes> earlier;
+	// How long each record takes in the sink, for a test that needs the load to be slow.
+	std::chrono::milliseconds                          sink_delay {0};
+	std::optional<std::chrono::milliseconds>           stop_after;
+	std::function<void(SupervisorConfig&, Collected&)> tweak;
+};
+
+// What a boot left, taken before the folder is gone.
+struct BootRun {
+	SupervisorStats           stats;
+	bool                      ended = false;
+	std::vector<uint64_t>     ids;
+	std::optional<Bytes>      generated;
+	std::optional<Bytes>      temporary;
+	std::vector<std::string>  log;
+	std::chrono::milliseconds stop_took {0};
+};
+
+// Runs the supervisor over the fake with an earlier file in place, and reads the files at the end.
+BootRun RunBoot(const BootOptions& options = {}) {
+	TempDirectory directory;
+	Collected     collected;
+	auto          config = MakeConfig(directory, options.mode, collected);
+	if (options.sink_delay > 0ms) {
+		config.sink = [&collected, delay = options.sink_delay](DecodedModuleRecord&& record) {
+			std::this_thread::sleep_for(delay);
+			std::scoped_lock lock(collected.mutex);
+			collected.ids.push_back(record.id);
+		};
+	}
+	if (options.tweak) {
+		options.tweak(config, collected);
+	}
+	if (options.earlier) {
+		std::ofstream(directory / "title.generated", std::ios::binary)
+		    .write(reinterpret_cast<const char*>(options.earlier->data()),
+		           static_cast<std::streamsize>(options.earlier->size()));
+	}
+	BootRun result;
+	{
+		StoreSupervisor supervisor(std::move(config));
+		supervisor.Start();
+		if (options.stop_after) {
+			std::this_thread::sleep_for(*options.stop_after);
+		} else {
+			result.ended = supervisor.WaitForEnd(END_LIMIT);
+		}
+		const auto begin = std::chrono::steady_clock::now();
+		supervisor.Stop();
+		result.stop_took = std::chrono::duration_cast<std::chrono::milliseconds>(
+		    std::chrono::steady_clock::now() - begin);
+		result.stats = supervisor.Stats();
+	}
+	result.generated = ReadBytes(directory / "title.generated");
+	result.temporary = ReadBytes(directory / "title.generated.1.tmp");
+	std::scoped_lock lock(collected.mutex);
+	result.ids = collected.ids;
+	result.log = collected.log;
+	return result;
+}
+
+// The ids a boot should have given, each once, from several lists.
+std::vector<uint64_t> UnionOf(std::vector<uint64_t> first, const std::vector<uint64_t>& second) {
+	first.insert(first.end(), second.begin(), second.end());
+	std::ranges::sort(first);
+	first.erase(std::unique(first.begin(), first.end()), first.end());
+	return first;
+}
+
+// A boot over a current earlier file loads its records, and the worker that is started in Verify
+// mode answers exit 10 and writes nothing. One spawn, no failure, nothing renamed, and the file is
+// the earlier one byte for byte. The ids are the file's own, which the fake worker never writes.
+// Without an earlier file the same boot generates, which is the baseline for every field.
+void TestSecondBootLoadsTheFile() {
+	const auto file = EarlierFileBytes(LoadedIds(LOADED_RECORDS));
+	const auto run  = RunBoot({.earlier = file});
+	CHECK(run.ended && run.stats.outcome == SupervisorOutcome::Finished);
+	CHECK(run.ids == LoadedIds(LOADED_RECORDS));
+	CHECK(run.stats.spawns == 1 && run.stats.restarts == 0 && run.stats.failures.empty());
+	CHECK(run.stats.requests.size() == 1 && run.stats.requests[0].mode == WorkerMode::Verify);
+	CHECK(run.stats.source == GenerationSource::Loaded);
+	CHECK(run.stats.persisted == GeneratedPersistence::Existing && run.stats.persist_error.empty());
+	CHECK(run.stats.file_bytes == file.size());
+	CHECK(run.stats.verify_ms.has_value() && *run.stats.verify_ms > 0.0);
+	CHECK(!run.stats.loader_abandoned && !run.stats.regenerated_after_damage);
+	CHECK(run.stats.posted == LOADED_RECORDS && run.stats.duplicates == 0);
+	CHECK(run.generated == file && !run.temporary.has_value());
+
+	const auto baseline = RunBoot();
+	CHECK(baseline.stats.outcome == SupervisorOutcome::Finished);
+	CHECK(baseline.ids == IdsOf({0, 1, 2}));
+	CHECK(baseline.stats.requests.size() == 1 &&
+	      baseline.stats.requests[0].mode == WorkerMode::Generate);
+	CHECK(baseline.stats.source == GenerationSource::Generated);
+	CHECK(baseline.stats.persisted == GeneratedPersistence::Renamed);
+	CHECK(!baseline.stats.verify_ms.has_value());
+	CHECK(baseline.generated == ExpectedOutput());
+}
+
+// A Verify worker's exit 10 is not the end while records of the file are still to load. The sink
+// takes a while for each record, so the worker answers long before the load is done. A run that
+// ended at the exit would have fewer than all of them.
+void TestExit10WaitsForTheLoad() {
+	const auto run = RunBoot({.earlier    = EarlierFileBytes(LoadedIds(LONG_LOAD_RECORDS)),
+	                          .sink_delay = RECORD_SINK_DELAY});
+	CHECK(run.ended && run.stats.outcome == SupervisorOutcome::Finished);
+	CHECK(run.ids == LoadedIds(LONG_LOAD_RECORDS));
+	CHECK(run.stats.source == GenerationSource::Loaded && run.stats.spawns == 1);
+	// The answer came while the load was far from done, which is what the wait is for.
+	CHECK(run.stats.verify_ms.has_value() && run.stats.last_record_ms.has_value() &&
+	      *run.stats.last_record_ms > *run.stats.verify_ms);
+}
+
+// A file that is not for this build is ignored, by the stamp or by the version: the worker is asked
+// to generate, no record of the file reaches the sink, and the file is replaced. Each differs from
+// the current file of the test above only in that header field.
+void TestHeaderMismatchIsIgnored() {
+	const std::vector<EarlierFile> others = {{.stamp_seed = OTHER_STAMP_SEED},
+	                                         {.version = OTHER_VERSION}};
+	for (const auto& other: others) {
+		const auto run = RunBoot({.earlier = EarlierFileBytes(LoadedIds(LOADED_RECORDS), other)});
+		CHECK(run.ended && run.stats.outcome == SupervisorOutcome::Finished);
+		CHECK(run.ids == IdsOf({0, 1, 2}));
+		CHECK(run.stats.spawns == 1 && run.stats.requests[0].mode == WorkerMode::Generate);
+		CHECK(run.stats.source == GenerationSource::Generated);
+		CHECK(run.stats.persisted == GeneratedPersistence::Renamed);
+		CHECK(run.generated == ExpectedOutput());
+		CHECK(!run.stats.verify_ms.has_value());
+	}
+	// A file too short for a header, and an empty one, are ignored too.
+	for (const size_t bytes: {size_t {3}, size_t {0}}) {
+		Bytes cut = EarlierFileBytes(LoadedIds(LOADED_RECORDS));
+		cut.resize(bytes);
+		const auto run = RunBoot({.earlier = cut});
+		CHECK(run.stats.outcome == SupervisorOutcome::Finished && run.ids == IdsOf({0, 1, 2}));
+		CHECK(run.stats.source == GenerationSource::Generated);
+	}
+}
+
+// An earlier file of another eboot has a good header, so its records load, and the worker finds its
+// identity out of date and generates a new file. The records the two have in common reach the sink
+// once, the file is replaced, and the source says both happened. The records are not lost to the
+// replacement, and the loader is not what the child's output is compared with.
+void TestStaleIdentityRegenerates() {
+	auto ids = LoadedIds(LOADED_RECORDS);
+	// One record that the worker writes again.
+	ids.push_back(ModuleIdOf(0, 0));
+	const auto run = RunBoot({.earlier = EarlierFileBytes(ids, {.identity = STALE_IDENTITY})});
+	CHECK(run.ended && run.stats.outcome == SupervisorOutcome::Finished);
+	CHECK(run.stats.spawns == 1 && run.stats.restarts == 0 && run.stats.failures.empty());
+	CHECK(run.stats.requests[0].mode == WorkerMode::Verify);
+	CHECK(run.stats.source == GenerationSource::LoadedRegenerated);
+	CHECK(run.stats.persisted == GeneratedPersistence::Renamed);
+	CHECK(run.generated == ExpectedOutput() && !run.temporary.has_value());
+	CHECK(!run.stats.verify_ms.has_value());
+	// Every id once. The id that both wrote is the one duplicate.
+	const auto expected = UnionOf(IdsOf({0, 1, 2}), LoadedIds(LOADED_RECORDS));
+	CHECK(SortedIds(run.ids) == expected && run.ids.size() == expected.size());
+	CHECK(run.stats.duplicates == 1);
+	CHECK(run.stats.file_bytes == ExpectedOutput().size());
+}
+
+// A damaged file that a worker calls current is not trusted. The worker is started once more, in
+// Generate mode, and that is not a restart. The frames before the damage were loaded and the ones
+// after it were not. A file cut off in the middle of a frame is the same, and the undamaged file of
+// the first test is the baseline.
+void TestDamagedFileWithExit10Regenerates() {
+	const auto good = EarlierFileBytes(LoadedIds(LOADED_RECORDS));
+	const auto header_bytes =
+	    EncodeGeneratedHeader(StoreHeader(), GENERATOR_VERSION, CURRENT_IDENTITY).size();
+	const auto frame_bytes =
+	    FrameStoreRecord(ModuleRecord(LOADED_ID_BASE, LOADED_HASH_BASE + LOADED_ID_BASE)).size();
+	// The second frame is broken and bytes follow it, so one record is good. The other file lacks
+	// the end of the last frame, so three are.
+	struct DamagedCase {
+		Bytes  file;
+		size_t good_records;
+	};
+	Bytes mid_damage = good;
+	mid_damage[header_bytes + frame_bytes + sizeof(StoreFrame) + 2] ^= 0xFF;
+	Bytes cut_tail = good;
+	cut_tail.resize(good.size() - 3);
+	for (const auto& damaged: {DamagedCase {mid_damage, 1}, DamagedCase {cut_tail, 3}}) {
+		const auto run = RunBoot({.earlier = damaged.file});
+		CHECK(run.ended && run.stats.outcome == SupervisorOutcome::Finished);
+		CHECK(run.stats.spawns == 2 && run.stats.restarts == 0 && run.stats.failures.empty());
+		CHECK(run.stats.requests.size() == 2 && run.stats.requests[0].mode == WorkerMode::Verify &&
+		      run.stats.requests[1].mode == WorkerMode::Generate);
+		CHECK(run.stats.regenerated_after_damage);
+		CHECK(run.stats.source == GenerationSource::LoadedRegenerated);
+		CHECK(run.stats.persisted == GeneratedPersistence::Renamed);
+		CHECK(run.generated == ExpectedOutput());
+		// The frames before the damage were loaded, the ones after it were not, and the new
+		// generation follows. The worker of the first spawn answered at once and wrote nothing.
+		auto expected = LoadedIds(damaged.good_records);
+		for (const auto id: IdsOf({0, 1, 2})) {
+			expected.push_back(id);
+		}
+		CHECK(run.ids == expected);
+	}
+}
+
+// The respawn for a damaged file happens once. A worker that answers exit 10 whatever it is asked
+// is the case that could repeat it: its second answer comes in Generate mode, where it is fatal, so
+// there are two spawns and no third. The decision itself has the flag first, so a damaged file that
+// meets it a second time is fatal, and a whole file never is.
+void TestDamagedRespawnHappensOnce() {
+	auto damaged = EarlierFileBytes(LoadedIds(LOADED_RECORDS));
+	damaged.resize(damaged.size() - 3);
+	const auto run = RunBoot({.mode = "exit:10", .earlier = damaged});
+	CHECK(run.ended && run.stats.outcome == SupervisorOutcome::Fatal);
+	CHECK(run.stats.inactive_reason == "worker_exit_10");
+	CHECK(run.stats.spawns == 2 && run.stats.restarts == 0 && run.stats.regenerated_after_damage);
+	CHECK(run.stats.requests.size() == 2 && run.stats.requests[1].mode == WorkerMode::Generate);
+
+	CHECK(DecideAfterVerify(LoaderEnd::Complete, false) == VerifiedAction::Finish);
+	CHECK(DecideAfterVerify(LoaderEnd::Damaged, false) == VerifiedAction::Respawn);
+	CHECK(DecideAfterVerify(LoaderEnd::Damaged, true) == VerifiedAction::Fatal);
+	CHECK(DecideAfterVerify(LoaderEnd::Complete, true) == VerifiedAction::Finish);
+}
+
+// Exit 10 is fatal when the worker was not asked to verify, and a whole earlier file does not
+// change that. The same answer to a Verify request is the done case of the first test.
+void TestExit10IsFatalInGenerateMode() {
+	const auto run = RunBoot({.mode = "exit:10"});
+	CHECK(run.ended && run.stats.outcome == SupervisorOutcome::Fatal);
+	CHECK(run.stats.inactive_reason == "worker_exit_10" && run.stats.spawns == 1);
+	const auto ignored = RunBoot(
+	    {.mode    = "exit:10",
+	     .earlier = EarlierFileBytes(LoadedIds(LOADED_RECORDS), {.stamp_seed = OTHER_STAMP_SEED})});
+	CHECK(ignored.stats.outcome == SupervisorOutcome::Fatal &&
+	      ignored.stats.inactive_reason == "worker_exit_10");
+	const auto verified = RunBoot({.mode = "exit:10", .earlier = EarlierFileBytes(LoadedIds(1))});
+	CHECK(verified.stats.outcome == SupervisorOutcome::Finished);
+}
+
+// A worker that fails after a Verify spawn is started again in Generate mode, since the question of
+// whether the file is current is over. The baseline has no file, and both its spawns generate.
+void TestFirstRestartSwitchesToGenerate() {
+	const auto run = RunBoot(
+	    {.mode    = "crash_start:2",
+	     .earlier = EarlierFileBytes(LoadedIds(LOADED_RECORDS), {.identity = STALE_IDENTITY})});
+	CHECK(run.ended && run.stats.outcome == SupervisorOutcome::Finished);
+	CHECK(run.stats.requests.size() == 2);
+	if (run.stats.requests.size() == 2) {
+		CHECK(run.stats.requests[0].mode == WorkerMode::Verify);
+		CHECK(run.stats.requests[1].mode == WorkerMode::Generate);
+	}
+	CHECK(run.stats.restarts == 1 && !run.stats.regenerated_after_damage);
+	const auto baseline = RunBoot({.mode = "crash_start:2"});
+	CHECK(baseline.stats.requests.size() == 2 &&
+	      baseline.stats.requests[0].mode == WorkerMode::Generate &&
+	      baseline.stats.requests[1].mode == WorkerMode::Generate);
+}
+
+// A stop during the load returns promptly. The sink takes 15 ms for a record, so the whole load
+// takes far longer than the limit, and a load that did not give way at the stop would show in the
+// time. The load had started and was not done, and the file is as it was.
+void TestStopDuringTheLoad() {
+	const auto file = EarlierFileBytes(LoadedIds(LONG_LOAD_RECORDS));
+	const auto run  = RunBoot({.mode       = "sleep_silent",
+	                           .earlier    = file,
+	                           .sink_delay = RECORD_SINK_DELAY,
+	                           .stop_after = STOP_DURING_LOAD_AT});
+	CHECK(run.stop_took < PROMPT_STOP_LIMIT);
+	CHECK(run.stats.outcome == SupervisorOutcome::Stopped);
+	CHECK(!run.ids.empty() && run.ids.size() < LONG_LOAD_RECORDS);
+	CHECK(run.stats.persisted == GeneratedPersistence::NotFinished);
+	CHECK(run.generated == file);
+	// The same run left to itself loads every record, so the stop is what cut it short.
+	const auto whole =
+	    RunBoot({.mode = "normal", .earlier = file, .sink_delay = RECORD_SINK_DELAY});
+	CHECK(whole.ids == LoadedIds(LONG_LOAD_RECORDS));
+}
+
+// The finish lets a load that is behind reach its end before it renames. The earlier file is of an
+// out of date eboot and is long, so the child finishes while records are still to load, which the
+// sink notes when the child's last record arrives. At the rename every record of the file has
+// arrived. A rename taken before the loader ended would see fewer.
+void TestFinishEndsTheLoaderBeforeTheRename() {
+	std::atomic<size_t> loaded_at_last_generated {0};
+	std::atomic<size_t> loaded_at_rename {0};
+	const auto          last_generated = ModuleIdOf(PROGRAMS - 1, CANDIDATES_EACH - 1);
+	const auto          run            = RunBoot(
+        {.earlier = EarlierFileBytes(LoadedIds(LONG_LOAD_RECORDS), {.identity = STALE_IDENTITY}),
+	                         .tweak = [&](SupervisorConfig& config, Collected& collected) {
+             config.sink = [&, &c = collected](DecodedModuleRecord&& record) {
+                 std::this_thread::sleep_for(RECORD_SINK_DELAY);
+                 std::scoped_lock lock(c.mutex);
+                 c.ids.push_back(record.id);
+                 if (record.id == last_generated) {
+                     loaded_at_last_generated = static_cast<size_t>(std::ranges::count_if(
+                         c.ids, [](uint64_t id) { return id >= LOADED_ID_BASE; }));
+                 }
+             };
+             config.rename_file = [&, &c = collected](const fs::path& from, const fs::path& to) {
+                 {
+                     std::scoped_lock lock(c.mutex);
+                     loaded_at_rename = static_cast<size_t>(std::ranges::count_if(
+                         c.ids, [](uint64_t id) { return id >= LOADED_ID_BASE; }));
+                 }
+                 return Common::File::RenameFile(from, to);
+             };
+         }});
+	CHECK(run.ended && run.stats.outcome == SupervisorOutcome::Finished);
+	CHECK(run.stats.persisted == GeneratedPersistence::Renamed && !run.stats.loader_abandoned);
+	// The premise: the child's last record came while the load was far from done.
+	CHECK(loaded_at_last_generated.load() < LONG_LOAD_RECORDS);
+	CHECK(loaded_at_rename.load() == LONG_LOAD_RECORDS);
+	CHECK(run.generated == ExpectedOutput());
+}
+
+// A load that cannot end within the wait is abandoned, counted, and the rename goes on. persisted
+// stays renamed, since it is the new file that is on disk. The run of the test above, with the
+// wait long enough, is the baseline: it abandons nothing.
+void TestAbandonedLoader() {
+	const auto earlier =
+	    EarlierFileBytes(LoadedIds(LONG_LOAD_RECORDS), {.identity = STALE_IDENTITY});
+	const auto run = RunBoot({.earlier    = earlier,
+	                          .sink_delay = RECORD_SINK_DELAY * 3,
+	                          .tweak      = [](SupervisorConfig& config, Collected&) {
+                                  config.loader_end_wait = TINY_END_WAIT;
+	                          }});
+	CHECK(run.ended && run.stats.outcome == SupervisorOutcome::Finished);
+	CHECK(run.stats.loader_abandoned);
+	CHECK(run.stats.persisted == GeneratedPersistence::Renamed);
+	CHECK(run.generated == ExpectedOutput() && !run.temporary.has_value());
+	CHECK(run.stats.source == GenerationSource::LoadedRegenerated);
+	CHECK(std::ranges::count_if(run.ids, [](uint64_t id) { return id >= LOADED_ID_BASE; }) <
+	      static_cast<std::ptrdiff_t>(LONG_LOAD_RECORDS));
+	const auto patient = RunBoot({.earlier = earlier, .sink_delay = RECORD_SINK_DELAY});
+	CHECK(patient.stats.outcome == SupervisorOutcome::Finished && !patient.stats.loader_abandoned);
+}
+
+// A bad frame that is larger than one read of the file can never be judged by a read, so the loader
+// gives the file up as damaged and does not read it again for ever. A worker that calls the file
+// current then regenerates it. With the default read size the same file is judged by the first
+// reads, which is the baseline: it is damaged in the same way and no stall is involved.
+void TestBadFrameLargerThanAReadIsDamaged() {
+	auto       file = EarlierFileBytes(LoadedIds(LOADED_RECORDS));
+	const auto header_bytes =
+	    EncodeGeneratedHeader(StoreHeader(), GENERATOR_VERSION, CURRENT_IDENTITY).size();
+	file[header_bytes + sizeof(StoreFrame) + 2] ^= 0xFF;
+	const auto run = RunBoot({.earlier = file, .tweak = [](SupervisorConfig& config, Collected&) {
+		                          config.loader_read_bytes = TINY_READ_BYTES;
+	                          }});
+	CHECK(run.ended && run.stats.outcome == SupervisorOutcome::Finished);
+	CHECK(run.stats.regenerated_after_damage && run.stats.spawns == 2);
+	CHECK(run.generated == ExpectedOutput());
+	const auto baseline = RunBoot({.earlier = file});
+	CHECK(baseline.stats.regenerated_after_damage && baseline.stats.spawns == 2);
+	// The small reads still load a good file, one frame at a time, so the tiny window is not what
+	// breaks the loader.
+	const auto good = RunBoot({.earlier = EarlierFileBytes(LoadedIds(LOADED_RECORDS)),
+	                           .tweak   = [](SupervisorConfig& config, Collected&) {
+                                   config.loader_read_bytes = TINY_READ_BYTES;
+	                           }});
+	CHECK(good.ids == LoadedIds(LOADED_RECORDS) && good.stats.source == GenerationSource::Loaded);
+}
+
+// A run that is stopped after an earlier file was accepted says it loaded, since the game may end
+// before the run does. The child sleeps so the run cannot finish. The same stop with no file is the
+// baseline, which generated nothing and says generated.
+void TestStoppedRunReportsLoaded() {
+	const auto loaded = RunBoot({.mode       = "sleep_silent",
+	                             .earlier    = EarlierFileBytes(LoadedIds(LOADED_RECORDS)),
+	                             .stop_after = STOP_DURING_LOAD_AT});
+	CHECK(loaded.stats.outcome == SupervisorOutcome::Stopped);
+	CHECK(loaded.stats.source == GenerationSource::Loaded);
+	CHECK(loaded.ids == LoadedIds(LOADED_RECORDS));
+	const auto baseline = RunBoot({.mode = "sleep_silent", .stop_after = STOP_DURING_LOAD_AT});
+	CHECK(baseline.stats.outcome == SupervisorOutcome::Stopped);
+	CHECK(baseline.stats.source == GenerationSource::Generated);
+	// A file that is not accepted is no load.
+	const auto ignored = RunBoot(
+	    {.mode    = "sleep_silent",
+	     .earlier = EarlierFileBytes(LoadedIds(LOADED_RECORDS), {.stamp_seed = OTHER_STAMP_SEED}),
+	     .stop_after = STOP_DURING_LOAD_AT});
+	CHECK(ignored.stats.source == GenerationSource::Generated);
+}
+
+// The report carries the new figures by name, and an existing file is said to be existing.
+void TestLoadFiguresInTheReport() {
+	CHECK(std::string(PersistedName(GeneratedPersistence::Existing)) == "existing");
+	CHECK(std::string(SourceName(GenerationSource::Generated)) == "generated");
+	CHECK(std::string(SourceName(GenerationSource::Loaded)) == "loaded");
+	CHECK(std::string(SourceName(GenerationSource::LoadedRegenerated)) == "loaded_regenerated");
+	const auto run   = RunBoot({.earlier = EarlierFileBytes(LoadedIds(LOADED_RECORDS))});
+	const auto block = MakeSupervisorReport(run.stats);
+	CHECK(block.source == "loaded" && block.persisted == "existing");
+	CHECK(block.verify_ms == run.stats.verify_ms && block.verify_ms.has_value());
+	CHECK(block.file_bytes == run.stats.file_bytes && block.file_bytes > 0);
+	CHECK(!block.loader_abandoned && !block.regenerated_after_damage);
+	SupervisorStats stats;
+	stats.loader_abandoned         = true;
+	stats.regenerated_after_damage = true;
+	const auto flagged             = MakeSupervisorReport(stats);
+	CHECK(flagged.loader_abandoned && flagged.regenerated_after_damage);
+	CHECK(flagged.source == "generated" && !flagged.verify_ms.has_value());
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -2002,6 +2470,20 @@ int main(int argc, char** argv) {
 	TestRenameFailureKeepsTheTemporary();
 	TestStopDuringTheLoaderStep();
 	TestPersistedInTheReport();
+	TestSecondBootLoadsTheFile();
+	TestExit10WaitsForTheLoad();
+	TestHeaderMismatchIsIgnored();
+	TestStaleIdentityRegenerates();
+	TestDamagedFileWithExit10Regenerates();
+	TestDamagedRespawnHappensOnce();
+	TestExit10IsFatalInGenerateMode();
+	TestFirstRestartSwitchesToGenerate();
+	TestStopDuringTheLoad();
+	TestFinishEndsTheLoaderBeforeTheRename();
+	TestAbandonedLoader();
+	TestBadFrameLargerThanAReadIsDamaged();
+	TestStoppedRunReportsLoaded();
+	TestLoadFiguresInTheReport();
 	if (g_failures == 0) {
 		std::puts("Shader store supervisor tests passed");
 	}

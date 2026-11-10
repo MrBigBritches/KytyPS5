@@ -46,6 +46,18 @@ constexpr size_t GENERATION_OUT_TAIL_BYTES = 2048;
 /// generation took minutes, so the old file's few seconds of loading are worth the wait, and a
 /// loader that is slower than this is abandoned.
 constexpr std::chrono::seconds GENERATION_LOADER_END_WAIT {5};
+/// How much work one turn of the loop gives to loading the generated file of an earlier run. A turn
+/// ends after the record that crosses this, so the loader costs the supervisor's thread a fraction
+/// of each poll and a stop is seen within a turn.
+constexpr std::chrono::milliseconds GENERATION_LOADER_SLICE {10};
+/// How many bytes of the generated file one read takes. It bounds the frames that are unframed at
+/// once, since the frames of a read are all decoded before the first is handed on. A real frame is
+/// about a third of a megabyte and the largest allowed is 16 MiB.
+constexpr uint64_t GENERATION_LOADER_READ_BYTES = 1ull << 20;
+/// How many times a read of the generated file may start over from the same good frame before the
+/// loader gives the file up as damaged. A bad frame that is larger than a read can never be judged
+/// by one, and would be read again for ever.
+constexpr uint32_t GENERATION_LOADER_REWIND_LIMIT = 2;
 
 /// How the supervisor ended.
 enum class SupervisorOutcome : uint8_t {
@@ -85,7 +97,40 @@ enum class GeneratedPersistence : uint8_t {
 	NotFinished,  ///< Nothing was renamed, because the run did not finish or has not yet.
 	Renamed,      ///< The temporary file is now the generated file.
 	RenameFailed, ///< The rename failed and the temporary file is kept. See persist_error.
+	Existing,     ///< The worker found the generated file of an earlier run current, so nothing was
+	              ///< written and nothing was renamed.
 };
+
+/// Where the modules of a run came from. Loaded once an earlier file's header is accepted.
+enum class GenerationSource : uint8_t {
+	Generated, ///< The worker made them, since no generated file was usable.
+	Loaded,    ///< The generated file of an earlier run was loaded and the worker said it is
+	           ///< current.
+	LoadedRegenerated, ///< The earlier file was loaded, and the worker made a new one anyway, since
+	                   ///< the file was out of date or damaged.
+};
+
+/// What the supervisor does once a Verify worker has said the generated file is current, from how
+/// the load of that file ended.
+enum class VerifiedAction : uint8_t {
+	Finish,  ///< The file loaded whole, so the run is done.
+	Respawn, ///< The file is damaged, so a worker generates it again, once.
+	Fatal,   ///< The file is damaged for the second time.
+};
+
+/// How the load of the generated file ended.
+enum class LoaderEnd : uint8_t { Complete, Damaged };
+
+/// What follows a Verify worker's exit 10, given how the load ended and whether a worker was
+/// already started again for a damaged file. A damaged file gets one respawn in Generate mode,
+/// which is not a restart, and the flag is what keeps it from happening twice.
+[[nodiscard]] constexpr VerifiedAction DecideAfterVerify(LoaderEnd end,
+                                                         bool      regenerated_after_damage) {
+	if (end == LoaderEnd::Complete) {
+		return VerifiedAction::Finish;
+	}
+	return regenerated_after_damage ? VerifiedAction::Fatal : VerifiedAction::Respawn;
+}
 
 /// A program that a `drop` line gave up on.
 struct SupervisorDrop {
@@ -186,6 +231,21 @@ struct SupervisorStats {
 	/// Why the rename failed, when persisted is RenameFailed: what the rename was asked and which
 	/// of the two files existed afterwards. Empty otherwise.
 	std::string persist_error;
+	/// Where the modules came from. Loaded as soon as the earlier file's header is accepted, and
+	/// settled before the outcome becomes Finished, with persisted.
+	GenerationSource source = GenerationSource::Generated;
+	/// From the spawn of a Verify worker to the moment its exit 10 was seen, so exact to about a
+	/// poll interval. It is what the eager load costs beside the child's own check. Missing when no
+	/// worker answered Verify.
+	std::optional<double> verify_ms;
+	/// Whether the loader was still reading the old file when the finish gave up waiting for it.
+	bool loader_abandoned = false;
+	/// Whether a worker was started again in Generate mode because the loaded file was damaged. It
+	/// is set before that worker starts, and the respawn is not counted in restarts.
+	bool regenerated_after_damage = false;
+	/// The size of the generated file once the run finished, which is the new file after a rename
+	/// and the loaded one after a Verify. Zero for a run that did not finish.
+	uint64_t file_bytes = 0;
 };
 
 /// Whether a measured peak replaces the held one. Sources rank WorkingSet, then WorkingSetSampled,
@@ -204,7 +264,8 @@ struct SupervisorConfig {
 	/// The output file of the worker, which is the temporary of the generated file. The progress
 	/// log, the request file and the worker's text file are next to it, and are named from it.
 	std::filesystem::path output_path;
-	/// The finished generated file, which only Verify mode reads.
+	/// The finished generated file of an earlier run. The supervisor loads it when it is there, and
+	/// the worker in Verify mode checks it. The run's own file is renamed to this path.
 	std::filesystem::path generated_path;
 	/// The program to spawn. Empty means the running emulator, WorkerProgramPath().
 	std::filesystem::path program;
@@ -223,13 +284,20 @@ struct SupervisorConfig {
 	std::function<void(std::string_view)> log;
 	/// How the supervisor lowers its own thread. A test replaces it to make the system refuse.
 	Common::PriorityStep priority_step = &Common::SystemLowerStep;
-	/// The loader step of a finish, which the loader of an earlier generated file fills. Empty
-	/// means no loader, and the step does nothing. It runs once, on the supervisor's thread, after
-	/// the child has exited and every record was taken, and before the rename, so that nothing
-	/// still reads a file the rename replaces. It must return within the wait it is given, which is
-	/// GENERATION_LOADER_END_WAIT, by letting the loader reach its end or abandoning it, and it
-	/// must check the stop token while it waits, so that Stop stays prompt.
+	/// A step that follows the loader's own end in a finish. The supervisor loads an earlier
+	/// generated file itself and ends that load first, letting it reach its end for at most
+	/// GENERATION_LOADER_END_WAIT and counting it as abandoned after that. This hook then runs
+	/// once, on the supervisor's thread, after the child has exited and every record was taken, and
+	/// before the rename. A test uses it to see the order of the steps and to stall them. It must
+	/// return within the wait it is given and check the stop token while it waits, so that Stop
+	/// stays prompt. Empty means nothing more.
 	std::function<void(std::stop_token, std::chrono::milliseconds)> end_loader;
+	/// How much work a turn gives to loading the generated file, and how many bytes one read of it
+	/// takes, and how long a finish waits for the load to end. A test lowers them to make a small
+	/// file take many turns, and to make a finish give up on the load.
+	std::chrono::milliseconds loader_slice      = GENERATION_LOADER_SLICE;
+	uint64_t                  loader_read_bytes = GENERATION_LOADER_READ_BYTES;
+	std::chrono::milliseconds loader_end_wait   = GENERATION_LOADER_END_WAIT;
 	/// Renames the finished file over the generated one and tells whether it worked. Empty means
 	/// Common::File::RenameFile. A test replaces it to see when it is called and to make it fail.
 	std::function<bool(const std::filesystem::path&, const std::filesystem::path&)> rename_file;

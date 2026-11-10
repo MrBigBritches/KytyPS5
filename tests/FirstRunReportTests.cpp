@@ -1077,6 +1077,9 @@ void TestGenerationBlockFields() {
 		return GenerationBlock(report);
 	};
 	const auto base = block_of({});
+	Check(base["source"] == "generated" && base["file_bytes"] == 0 && !base.contains("verify_ms") &&
+	          base["loader_abandoned"] == false && base["regenerated_after_damage"] == false,
+	      "the empty block does not say it generated");
 	Check(base["active"] == true && base["persisted"] == "not_finished" &&
 	          !base.contains("persist_error") && base["supervisor"]["outcome"] == "" &&
 	          !base["supervisor"].contains("finished_ms") &&
@@ -1092,6 +1095,13 @@ void TestGenerationBlockFields() {
 	    {"persisted", [](auto& b) { b.persisted = "renamed"; }, "/persisted", "renamed"},
 	    {"persist_error", [](auto& b) { b.persist_error = "rename of a to b failed"; },
 	     "/persist_error", "rename of a to b failed"},
+	    {"source", [](auto& b) { b.source = "loaded_regenerated"; }, "/source",
+	     "loaded_regenerated"},
+	    {"file_bytes", [](auto& b) { b.file_bytes = 65000000; }, "/file_bytes", 65000000},
+	    {"verify_ms", [](auto& b) { b.verify_ms = 312.5; }, "/verify_ms", 312.5},
+	    {"loader_abandoned", [](auto& b) { b.loader_abandoned = true; }, "/loader_abandoned", true},
+	    {"regenerated_after_damage", [](auto& b) { b.regenerated_after_damage = true; },
+	     "/regenerated_after_damage", true},
 	    {"outcome", [](auto& b) { b.outcome = "finished"; }, "/supervisor/outcome", "finished"},
 	    {"spawns", [](auto& b) { b.spawns = 4; }, "/supervisor/spawns", 4},
 	    {"restarts", [](auto& b) { b.restarts = 3; }, "/supervisor/restarts", 3},

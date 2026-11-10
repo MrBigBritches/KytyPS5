@@ -62599,6 +62599,96 @@ void CheckStoreGenerationNormal(VulkanHarness &vulkan, GuestGpu &gpu) {
   std::printf("[gpu]     %-32s ok\n", name);
 }
 
+// A file's bytes, or nothing when it is not there.
+std::optional<std::vector<uint8_t>> RigFileBytes(const std::filesystem::path &path) {
+  std::ifstream in(path, std::ios::binary);
+  if (!in) return std::nullopt;
+  return std::vector<uint8_t>((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+}
+
+// A second boot of a title that a real worker already generated for loads the file and the real
+// worker, asked to verify it, exits 10. Every record of the file reaches the cache through the
+// supervisor, taken in by the GPU thread, in one spawn with no restart. Nothing is written: the
+// generated file and the main store (.shaders) have the same bytes after the boot as before it, and
+// no temporary file of the generator is left. The first boot of the same title, which generates, is
+// the baseline for what the figures say.
+void CheckStoreGenerationSecondBoot(VulkanHarness &vulkan, GuestGpu &gpu) {
+  constexpr const char *name = "StoreGenerationSecondBoot";
+  constexpr size_t candidates = StoreGenFixtures::MAIN_CANDIDATES;
+  const auto eboot = StoreGenFixtures::BuildEboot(StoreGenFixtures::MainPrograms());
+  const auto dir = std::filesystem::temp_directory_path() /
+                   fmt::format("kyty_store_generation_second_{}",
+                               std::chrono::steady_clock::now().time_since_epoch().count());
+  const auto store = dir / "TEST00001.shaders";
+  const auto generated = dir / "TEST00001.generated";
+  const auto temporary =
+      dir / fmt::format("TEST00001.generated.{}.tmp", Common::CurrentProcessId());
+  Common::DebugCounters::SetEnabled(true);
+  {
+    auto cache = BootGeneratingCache(vulkan, dir, eboot, true, true);
+    Require(name, "the first boot generates",
+            PipelineCacheTestAccess::HasSupervisor(*cache) &&
+                PipelineCacheTestAccess::WaitSupervisorEnd(*cache, GENERATION_WAIT),
+            "the first worker did not finish in time");
+    const auto first = PipelineCacheTestAccess::SupervisorStatsOf(*cache);
+    Require(name, "from a worker, and renamed",
+            first.outcome == StoreGen::SupervisorOutcome::Finished &&
+                first.source == StoreGen::GenerationSource::Generated &&
+                first.persisted == StoreGen::GeneratedPersistence::Renamed && first.posted == candidates &&
+                !first.verify_ms.has_value() && first.requests.size() == 1 &&
+                first.requests[0].mode == StoreGen::WorkerMode::Generate,
+            "the first boot was not a plain generation");
+    // A lookup compiles a module of the player's own, so the main store has something to hold.
+    ShaderComputeInputInfo input{};
+    gpu.SendCommandSync([&] { GeneratedLookup(*cache, GENERATED_STRIDE_A, input); });
+    cache->StopBuilds();
+  }
+  const auto store_before = RigFileBytes(store);
+  const auto generated_before = RigFileBytes(generated);
+  Require(name, "the first boot left both files",
+          store_before.has_value() && !store_before->empty() && generated_before.has_value() &&
+              !generated_before->empty(),
+          "the first boot did not leave a main store and a generated file to compare against");
+  {
+    auto cache = BootGeneratingCache(vulkan, dir, eboot, true, true);
+    Require(name, "the second boot's generator ends",
+            PipelineCacheTestAccess::HasSupervisor(*cache) &&
+                PipelineCacheTestAccess::WaitSupervisorEnd(*cache, GENERATION_WAIT),
+            "the verifying worker did not end in time");
+    const auto second = PipelineCacheTestAccess::SupervisorStatsOf(*cache);
+    Require(name, "one spawn, which verified",
+            second.outcome == StoreGen::SupervisorOutcome::Finished && second.spawns == 1 &&
+                second.restarts == 0 && second.failures.empty() && second.requests.size() == 1 &&
+                second.requests[0].mode == StoreGen::WorkerMode::Verify &&
+                second.verify_ms.has_value(),
+            "the second boot did not end in one Verify spawn with exit 10");
+    Require(name, "the file was loaded, not generated",
+            second.source == StoreGen::GenerationSource::Loaded &&
+                second.persisted == StoreGen::GeneratedPersistence::Existing &&
+                second.posted == candidates && !second.regenerated_after_damage &&
+                !second.loader_abandoned && generated_before &&
+                second.file_bytes == generated_before->size(),
+            "the second boot did not take its records from the file");
+    LookupUntilDrained(*cache, gpu);
+    const auto stats = cache->GenerationStats();
+    Require(name, "every loaded module was taken in",
+            stats && stats->drain.adopted == candidates && stats->pending == 0 &&
+                stats->drain.plan_mismatch == 0,
+            "the GPU thread did not take in every record of the loaded file");
+    cache->StopBuilds();
+  }
+  Require(name, "the generated file is as it was", RigFileBytes(generated) == generated_before,
+          "a verified boot changed the generated file");
+  Require(name, "the main store is as it was", RigFileBytes(store) == store_before,
+          "a verified boot wrote to the main store");
+  Require(name, "no temporary file is left", !std::filesystem::exists(temporary),
+          "a verified boot left the generator's temporary file");
+  Common::FirstRunReport::Global().Reset();
+  Common::DebugCounters::SetEnabled(false);
+  std::filesystem::remove_all(dir);
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
 // A real worker's run shows in the rows of the block: what it said of every program, a row for
 // every module taken in, none of them used and all of them built, and the one lookup of a program
 // the worker never scanned as a miss of the unscanned class, with the time the GPU thread spent
@@ -62809,6 +62899,7 @@ void CheckStoreGeneration(VulkanHarness &vulkan) {
   Config::Load({.printf_direction = Config::LogDirection::Silent});
   vulkan.WithGpuLane([&](GuestGpu &gpu) {
     CheckStoreGenerationNormal(vulkan, gpu);
+    CheckStoreGenerationSecondBoot(vulkan, gpu);
     CheckStoreGenerationRows(vulkan, gpu);
     CheckStoreGenerationPredictCrash(vulkan, gpu);
   });
