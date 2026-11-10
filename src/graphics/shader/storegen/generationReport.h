@@ -264,6 +264,17 @@ inline void FillMissReport(Common::FirstRunReport::GenerationMisses& out,
 	}
 	out.wrong_spec_programs     = summary.wrong_spec_programs;
 	out.wrong_spec_max_variants = summary.wrong_spec_max_variants;
+	for (const auto& late: summary.late_modules) {
+		out.late_modules.push_back({.id           = late.id,
+		                            .code_hash    = late.code_hash,
+		                            .miss_ns      = late.miss_ns,
+		                            .delivered_ns = late.delivered_ns,
+		                            .via = late.via == LateVia::Adopted ? "adopted" : "refused",
+		                            .create_ms  = late.create_ms,
+		                            .misses     = late.misses,
+		                            .adopted_ns = late.adopted_ns});
+	}
+	out.late_overflow = summary.late_overflow;
 }
 
 /// The name of how a first use got its build.

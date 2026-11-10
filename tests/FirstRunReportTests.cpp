@@ -1320,6 +1320,23 @@ void TestGenerationRowsJson() {
 	     .wide_tail  = true,
 	     .candidates = 0},
 	    {.id = 0x13, .posted_ns = 1250 * MS, .adopted_ns = 1500 * MS, .how = "unused", .tier = 1}};
+	// Two late modules with different values, and hashes with leading zeros.
+	figures.misses.late_modules  = {{.id           = 0x0a,
+	                                 .code_hash    = 0x00ab,
+	                                 .miss_ns      = 1750 * MS,
+	                                 .delivered_ns = 2250 * MS,
+	                                 .via          = "adopted",
+	                                 .create_ms    = 6.5,
+	                                 .misses       = 3,
+	                                 .adopted_ns   = 2500 * MS},
+	                                {.id           = 0x0b,
+	                                 .code_hash    = 0x00cd,
+	                                 .miss_ns      = 1500 * MS,
+	                                 .delivered_ns = 1625 * MS,
+	                                 .via          = "refused",
+	                                 .misses       = 1}};
+	figures.misses.late_overflow = 5;
+
 	figures.unused_build_ms                = 7.5;
 	figures.misses.total                   = 3;
 	figures.misses.create_ms               = 4.25;
@@ -1370,6 +1387,22 @@ void TestGenerationRowsJson() {
 	          misses["classes"]["unscanned"]["count"] == 1 && misses["refused"]["duplicate"] == 1 &&
 	          misses["wrong_spec_programs"] == 1 && misses["wrong_spec_max_variants"] == 2,
 	      "the misses lack a figure");
+	const auto& late = misses["late_modules"];
+	Check(late.size() == 2 && late[0]["id"] == "000000000000000a" &&
+	          late[0]["code_hash"] == "00000000000000ab" && late[0]["miss_ms"] == 1500.0 &&
+	          late[0]["delivered_ms"] == 2000.0 && late[0]["via"] == "adopted" &&
+	          late[0]["create_ms"] == 6.5 && late[0]["misses"] == 3 &&
+	          late[0]["adopted_ms"] == 2250.0 && misses["late_overflow"] == 5,
+	      "a late module row lacks a figure, or its times are not from the run start");
+	Check(late[1]["id"] == "000000000000000b" && late[1]["code_hash"] == "00000000000000cd" &&
+	          late[1]["miss_ms"] == 1250.0 && late[1]["delivered_ms"] == 1375.0 &&
+	          late[1]["via"] == "refused" && late[1]["create_ms"] == 0.0 &&
+	          late[1]["misses"] == 1 && !late[1].contains("adopted_ms"),
+	      "the second late module row is not its own");
+	Check(empty["runtime_misses"]["late_modules"].is_array() &&
+	          empty["runtime_misses"]["late_modules"].empty() &&
+	          empty["runtime_misses"]["late_overflow"] == 0,
+	      "the empty block lacks the late module keys or lists one");
 	const auto& slow = block["slow_takes"];
 	Check(slow.size() == 2 && slow[0]["id"] == "0000000000000011" && slow[0]["generated"] == true &&
 	          slow[0]["how"] == "waited" && slow[0]["stopped_ms"] == 300.5 &&

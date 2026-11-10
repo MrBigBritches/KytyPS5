@@ -982,7 +982,21 @@ nlohmann::json GenerationSlowTakeToJson(const GenerationSlowTake& take, int64_t 
 	return row;
 }
 
-nlohmann::json GenerationMissesToJson(const GenerationMisses& misses) {
+// One module the runtime needed before the generator delivered it, with both times on the run's
+// clock.
+nlohmann::json GenerationLateModuleToJson(const GenerationLateModule& late, int64_t epoch_ns) {
+	nlohmann::json row = {{"id", Hex(late.id)},
+	                      {"code_hash", Hex(late.code_hash)},
+	                      {"miss_ms", RunMs(late.miss_ns, epoch_ns)},
+	                      {"delivered_ms", RunMs(late.delivered_ns, epoch_ns)},
+	                      {"via", late.via},
+	                      {"create_ms", Round3(late.create_ms)},
+	                      {"misses", late.misses}};
+	SetRunMs(row, "adopted_ms", late.adopted_ns, epoch_ns);
+	return row;
+}
+
+nlohmann::json GenerationMissesToJson(const GenerationMisses& misses, int64_t epoch_ns) {
 	nlohmann::json classes = nlohmann::json::object();
 	for (const auto& miss_class: misses.classes) {
 		classes[miss_class.name] = {{"count", miss_class.count},
@@ -992,12 +1006,18 @@ nlohmann::json GenerationMissesToJson(const GenerationMisses& misses) {
 	for (const auto& [verdict, count]: misses.refused) {
 		refused[verdict] = count;
 	}
+	nlohmann::json late_modules = nlohmann::json::array();
+	for (const auto& late: misses.late_modules) {
+		late_modules.push_back(GenerationLateModuleToJson(late, epoch_ns));
+	}
 	return {{"total", misses.total},
 	        {"create_ms", Round3(misses.create_ms)},
 	        {"classes", classes},
 	        {"refused", refused},
 	        {"wrong_spec_programs", misses.wrong_spec_programs},
-	        {"wrong_spec_max_variants", misses.wrong_spec_max_variants}};
+	        {"wrong_spec_max_variants", misses.wrong_spec_max_variants},
+	        {"late_modules", late_modules},
+	        {"late_overflow", misses.late_overflow}};
 }
 
 // The rows of the block: what the worker said of each program, each module taken in, the misses and
@@ -1017,7 +1037,7 @@ void GenerationRowsToJson(nlohmann::json& json, const ShaderStoreGenerationRepor
 	}
 	json["generated_modules"] = std::move(modules);
 	json["unused_build_ms"]   = Round3(block.unused_build_ms);
-	json["runtime_misses"]    = GenerationMissesToJson(block.misses);
+	json["runtime_misses"]    = GenerationMissesToJson(block.misses, epoch_ns);
 	nlohmann::json slow       = nlohmann::json::array();
 	for (const auto& take: block.slow_takes) {
 		slow.push_back(GenerationSlowTakeToJson(take, epoch_ns));

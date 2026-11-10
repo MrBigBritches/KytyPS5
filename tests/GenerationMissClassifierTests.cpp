@@ -550,9 +550,182 @@ void TestRefusalTime() {
 	CHECK(summary.refused_by_verdict[static_cast<size_t>(DropVerdict::Duplicate)] == 2);
 }
 
+// A miss of another module than the one under test, at the given time.
+MissRow MissOf(uint64_t id, int64_t at_ns = MISS_AT) {
+	return {.code_hash = PROGRAM, .id = id, .at_ns = at_ns};
+}
+
+// Each NotYetGenerated miss is listed with the time its module was delivered. An adopted module is
+// delivered when it was posted, which differs from when it was adopted, so a row that took the
+// wrong one fails. A refused duplicate is delivered when the drain refused it. Each baseline is the
+// same module with the one change that makes it another class, which lists nothing.
+void TestLateModules() {
+	constexpr int64_t POSTED_LATE   = MISS_AT + 10;
+	constexpr int64_t ADOPTED_LATE  = MISS_AT + 20;
+	constexpr int64_t REFUSED_LATE  = MISS_AT + 5;
+	constexpr double  CREATE_MS     = 12.5;
+	const auto        classify_late = [](const MissRow& miss, const MissContext& context) {
+        return SummarizeMisses({miss}, context, {});
+	};
+
+	// Adopted after the miss.
+	auto adopted_context                       = Context();
+	adopted_context.generated_by_id[MODULE_ID] = GenRowAt(POSTED_LATE, ADOPTED_LATE);
+	Report::CompileEntry compile;
+	compile.kind       = Report::Kind::Compute;
+	compile.thread     = Report::Thread::Gpu;
+	compile.id         = MODULE_ID;
+	compile.create_ms  = CREATE_MS;
+	const auto adopted = SummarizeMisses({Miss()}, adopted_context, {compile});
+	CHECK(adopted.late_modules.size() == 1 && adopted.late_overflow == 0);
+	CHECK(adopted.late_modules[0].id == MODULE_ID && adopted.late_modules[0].code_hash == PROGRAM);
+	CHECK(adopted.late_modules[0].miss_ns == MISS_AT);
+	CHECK(adopted.late_modules[0].via == LateVia::Adopted);
+	CHECK(adopted.late_modules[0].delivered_ns == POSTED_LATE);
+	CHECK(adopted.late_modules[0].create_ms == CREATE_MS);
+	CHECK(adopted.late_modules[0].misses == 1);
+	// The adoption time is the row's own, apart from the post time.
+	CHECK(adopted.late_modules[0].adopted_ns == ADOPTED_LATE);
+	// Baseline, posted before the miss and adopted after it, is in_inbox and lists nothing.
+	auto inbox_context                       = Context();
+	inbox_context.generated_by_id[MODULE_ID] = GenRowAt(MISS_AT - 10, ADOPTED_LATE);
+	const auto inbox                         = classify_late(Miss(), inbox_context);
+	CHECK(inbox.classes[static_cast<size_t>(MissClass::InInbox)].count == 1);
+	CHECK(inbox.late_modules.empty());
+
+	// Refused as a Duplicate after the miss, and the baselines that are not late.
+	auto refused_context                        = Context();
+	refused_context.refused_by_id[MODULE_ID]    = DropVerdict::Duplicate;
+	refused_context.refused_ns_by_id[MODULE_ID] = REFUSED_LATE;
+	const auto refused                          = classify_late(Miss(), refused_context);
+	CHECK(refused.late_modules.size() == 1 && refused.late_modules[0].via == LateVia::Refused);
+	CHECK(refused.late_modules[0].delivered_ns == REFUSED_LATE);
+	// A refused module was never adopted, so it has no adoption time. A row that took the post time
+	// of some other source would show one.
+	CHECK(refused.late_modules[0].misses == 1 && !refused.late_modules[0].adopted_ns);
+	refused_context.refused_ns_by_id[MODULE_ID] = MISS_AT - 5;
+	const auto before                           = classify_late(Miss(), refused_context);
+	CHECK(before.classes[static_cast<size_t>(MissClass::DroppedAtDrain)].count == 1);
+	CHECK(before.late_modules.empty());
+	refused_context.refused_ns_by_id[MODULE_ID] = REFUSED_LATE;
+	refused_context.refused_by_id[MODULE_ID]    = DropVerdict::PlanMismatch;
+	CHECK(classify_late(Miss(), refused_context).late_modules.empty());
+
+	// A miss the worker never named is unscanned, and lists nothing.
+	const auto unscanned = classify_late(Miss(), Context());
+	CHECK(unscanned.classes[static_cast<size_t>(MissClass::Unscanned)].count == 1);
+	CHECK(unscanned.late_modules.empty());
+
+	// Two modules with different values in miss order, so a writer of one value fails.
+	adopted_context.refused_by_id[MODULE_ID + 1]    = DropVerdict::Duplicate;
+	adopted_context.refused_ns_by_id[MODULE_ID + 1] = REFUSED_LATE + 1;
+	const auto both =
+	    SummarizeMisses({Miss(), MissOf(MODULE_ID + 1, MISS_AT + 1)}, adopted_context, {});
+	CHECK(both.late_modules.size() == 2 && both.late_modules[0].id == MODULE_ID &&
+	      both.late_modules[1].id == MODULE_ID + 1);
+	CHECK(both.late_modules[1].via == LateVia::Refused &&
+	      both.late_modules[1].miss_ns == MISS_AT + 1 &&
+	      both.late_modules[1].delivered_ns == REFUSED_LATE + 1);
+}
+
+// The list stops at LATE_MODULE_LIMIT and counts the rest, while the class count keeps all of them.
+// The baseline is exactly the limit, which has no overflow.
+void TestLateModuleCap() {
+	const auto summary_of = [](size_t count) {
+		auto                 context = Context();
+		std::vector<MissRow> misses;
+		for (size_t index = 0; index < count; index++) {
+			const uint64_t id           = 100 + index;
+			context.generated_by_id[id] = {.id         = id,
+			                               .code_hash  = PROGRAM,
+			                               .posted_ns  = MISS_AT + 1,
+			                               .adopted_ns = MISS_AT + 2};
+			misses.push_back(MissOf(id));
+		}
+		return SummarizeMisses(misses, context, {});
+	};
+	const auto late    = static_cast<size_t>(MissClass::NotYetGenerated);
+	const auto exactly = summary_of(LATE_MODULE_LIMIT);
+	CHECK(exactly.late_modules.size() == LATE_MODULE_LIMIT && exactly.late_overflow == 0);
+	const auto over = summary_of(LATE_MODULE_LIMIT + 3);
+	CHECK(over.late_modules.size() == LATE_MODULE_LIMIT && over.late_overflow == 3);
+	CHECK(over.classes[late].count == LATE_MODULE_LIMIT + 3);
+	// The rows kept are the first ones.
+	CHECK(over.late_modules.front().id == 100 &&
+	      over.late_modules.back().id == 100 + LATE_MODULE_LIMIT - 1);
+}
+
+// A module that misses more than once has one row, with the times and compile time of its first
+// miss and a count of the misses. The baseline is a single miss, which has a count of 1. A compile
+// entry is passed, so a row that lost the compile time shows 0. Repeats of an id past the cap are
+// not counted again as overflow.
+void TestLateRepeats() {
+	constexpr double CREATE_MS         = 9.25;
+	auto             context           = Context();
+	context.generated_by_id[MODULE_ID] = GenRowAt(MISS_AT + 100, MISS_AT + 200);
+	Report::CompileEntry compile;
+	compile.kind      = Report::Kind::Compute;
+	compile.thread    = Report::Thread::Gpu;
+	compile.id        = MODULE_ID;
+	compile.create_ms = CREATE_MS;
+
+	const auto single = SummarizeMisses({Miss()}, context, {compile});
+	CHECK(single.late_modules.size() == 1 && single.late_modules[0].misses == 1);
+	const auto twice =
+	    SummarizeMisses({Miss(), MissOf(MODULE_ID, MISS_AT + 50)}, context, {compile});
+	CHECK(twice.late_modules.size() == 1 && twice.late_overflow == 0);
+	CHECK(twice.late_modules[0].misses == 2);
+	CHECK(twice.late_modules[0].create_ms == CREATE_MS);
+	CHECK(twice.late_modules[0].miss_ns == MISS_AT);
+	// Both misses are still counted in the class.
+	CHECK(twice.classes[static_cast<size_t>(MissClass::NotYetGenerated)].count == 2);
+
+	// With the list full, a repeat of a listed id raises its count and a repeat of an overflowed id
+	// is one overflow.
+	auto                 full = Context();
+	std::vector<MissRow> misses;
+	for (size_t index = 0; index < LATE_MODULE_LIMIT + 1; index++) {
+		const uint64_t id        = 100 + index;
+		full.generated_by_id[id] = {
+		    .id = id, .code_hash = PROGRAM, .posted_ns = MISS_AT + 1, .adopted_ns = MISS_AT + 2};
+		misses.push_back(MissOf(id));
+	}
+	misses.push_back(MissOf(100));
+	misses.push_back(MissOf(100 + LATE_MODULE_LIMIT));
+	const auto capped = SummarizeMisses(misses, full, {});
+	CHECK(capped.late_modules.size() == LATE_MODULE_LIMIT && capped.late_overflow == 1);
+	CHECK(capped.late_modules.front().misses == 2 && capped.late_modules.back().misses == 1);
+}
+
+// The rows reach the report's block with the supervisor's times, through MakeMissContext. An
+// adopted module and a refused one, with different values, so a constant or swapped field fails.
+void TestLateModulesInBlock() {
+	SupervisorStats stats;
+	stats.first_predict_ns = FIRST_PREDICT;
+	stats.finished_ns      = FINISHED;
+	GenerationRowInputs rows;
+	rows.generated = {GenRowAt(MISS_AT + 10, MISS_AT + 20)};
+	rows.refused   = {
+        {.id = MODULE_ID + 1, .verdict = DropVerdict::Duplicate, .at_ns = MISS_AT + 31}};
+	rows.misses       = {Miss(), MissOf(MODULE_ID + 1, MISS_AT + 1)};
+	const auto  block = MakeGenerationReport(stats, {}, {}, rows);
+	const auto& late  = block.misses.late_modules;
+	CHECK(late.size() == 2 && block.misses.late_overflow == 0);
+	CHECK(late[0].id == MODULE_ID && late[0].via == "adopted" && late[0].miss_ns == MISS_AT &&
+	      late[0].delivered_ns == MISS_AT + 10 && late[0].adopted_ns == MISS_AT + 20 &&
+	      late[0].misses == 1);
+	CHECK(!late[1].adopted_ns);
+	CHECK(late[1].id == MODULE_ID + 1 && late[1].via == "refused" &&
+	      late[1].miss_ns == MISS_AT + 1 && late[1].delivered_ns == MISS_AT + 31);
+}
+
 } // namespace
 
 int main() {
+	TestLateModules();
+	TestLateModuleCap();
+	TestLateRepeats();
+	TestLateModulesInBlock();
 	TestRefusalTime();
 	TestEveryClassAgainstItsBaseline();
 	TestPrecedence();

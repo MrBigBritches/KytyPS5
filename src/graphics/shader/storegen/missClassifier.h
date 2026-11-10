@@ -11,6 +11,7 @@
 #include <optional>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 // Says why a compute translation that the runtime had to do was not served by generation. It is a
@@ -174,6 +175,63 @@ struct MissClassTotals {
 	double   create_ms = 0.0;
 };
 
+/// How many late modules a summary lists. There are few in a real run, and the cap keeps a run that
+/// has thousands from filling the report. The rest are only counted.
+constexpr size_t LATE_MODULE_LIMIT = 64;
+
+/// How the generator delivered a module that the runtime needed first.
+enum class LateVia : uint8_t {
+	/// The drain adopted it, and the time is when the generator posted it.
+	Adopted,
+	/// The drain refused it as a Duplicate, and the time is when it refused.
+	Refused,
+};
+
+/// One module that the runtime needed before the generator delivered it, with the time of its first
+/// NotYetGenerated miss. A module that missed more than once has one row, and misses counts them.
+/// The time of delivery is what tells the worker's generation order how far behind the game it was.
+struct LateModule {
+	uint64_t id           = 0;
+	uint64_t code_hash    = 0;
+	int64_t  miss_ns      = NO_ROW_TIME_NS;
+	int64_t  delivered_ns = NO_ROW_TIME_NS;
+	LateVia  via          = LateVia::Adopted;
+	/// What the GPU thread spent creating the module for its first miss. Later misses of the same
+	/// id add nothing, since the compile time goes to the first.
+	double create_ms = 0.0;
+	/// How many NotYetGenerated misses the module had.
+	uint64_t misses = 1;
+	/// When the GPU thread took an adopted module in, so the drain's lag is delivered to adopted.
+	/// Missing for a refused module, which was never adopted.
+	std::optional<int64_t> adopted_ns;
+};
+
+/// When and how the generator delivered the module of a miss that ClassifyMiss called
+/// NotYetGenerated. It follows the same lookups in the same order, so the two cannot disagree on
+/// which row applies.
+struct LateDeliveryInfo {
+	int64_t                delivered_ns = NO_ROW_TIME_NS;
+	LateVia                via          = LateVia::Adopted;
+	std::optional<int64_t> adopted_ns;
+};
+
+/// Looks up the delivery of the module of a NotYetGenerated miss.
+[[nodiscard]] inline LateDeliveryInfo LateDelivery(const MissRow&     miss,
+                                                   const MissContext& context) {
+	if (const auto row = context.generated_by_id.find(miss.id);
+	    row != context.generated_by_id.end()) {
+		return {row->second.posted_ns, LateVia::Adopted, row->second.adopted_ns};
+	}
+	return {context.refused_ns_by_id.at(miss.id), LateVia::Refused, std::nullopt};
+}
+
+/// Which late modules are listed or counted as overflow, by id, so a repeat miss of an id is not a
+/// second module.
+struct LateTracker {
+	std::unordered_map<uint64_t, size_t> listed_index;
+	std::unordered_set<uint64_t>         overflow_ids;
+};
+
 /// The misses of a run by class.
 struct MissSummary {
 	std::array<MissClassTotals, MISS_CLASS_COUNT> classes;
@@ -188,6 +246,10 @@ struct MissSummary {
 	/// miss.
 	uint64_t wrong_spec_programs     = 0;
 	uint64_t wrong_spec_max_variants = 0;
+	/// The modules of the NotYetGenerated misses, one each, in the order of their first miss, up to
+	/// LATE_MODULE_LIMIT, and how many more modules there were.
+	std::vector<LateModule> late_modules;
+	uint64_t                late_overflow = 0;
 };
 
 /// The time that the GPU thread's compute pipeline compiles took, by module id. The miss's own
@@ -204,12 +266,41 @@ GpuComputeCreateMsById(const std::vector<Common::FirstRunReport::CompileEntry>& 
 	return by_id;
 }
 
+/// Lists the module of a NotYetGenerated miss in the summary. A module already listed only has its
+/// miss count raised, so the first miss keeps the times and compile time. Once the list is full a
+/// new module is counted once as overflow, and its repeats are not counted again.
+inline void AddLateModule(MissSummary& summary, LateTracker& tracker, const MissRow& miss,
+                          const MissContext& context, double create_ms) {
+	if (const auto listed = tracker.listed_index.find(miss.id);
+	    listed != tracker.listed_index.end()) {
+		summary.late_modules[listed->second].misses++;
+		return;
+	}
+	if (summary.late_modules.size() >= LATE_MODULE_LIMIT) {
+		if (tracker.overflow_ids.insert(miss.id).second) {
+			summary.late_overflow++;
+		}
+		return;
+	}
+	const auto delivery = LateDelivery(miss, context);
+	tracker.listed_index.emplace(miss.id, summary.late_modules.size());
+	summary.late_modules.push_back({.id           = miss.id,
+	                                .code_hash    = miss.code_hash,
+	                                .miss_ns      = miss.at_ns,
+	                                .delivered_ns = delivery.delivered_ns,
+	                                .via          = delivery.via,
+	                                .create_ms    = create_ms,
+	                                .adopted_ns   = delivery.adopted_ns});
+}
+
 /// Classifies every miss and totals the classes. A module's compile time goes to the first miss
-/// with its id only, so two rows of one id do not count it twice.
+/// with its id only, so two rows of one id do not count it twice. The module of each
+/// NotYetGenerated miss is also listed once, with the time it was delivered.
 [[nodiscard]] inline MissSummary
 SummarizeMisses(const std::vector<MissRow>& misses, const MissContext& context,
                 const std::vector<Common::FirstRunReport::CompileEntry>& compiles) {
 	MissSummary summary;
+	LateTracker late_tracker;
 	auto        create_ms = GpuComputeCreateMsById(compiles);
 	std::unordered_map<uint64_t, std::unordered_set<uint64_t>> wrong_spec_ids;
 	for (const auto& miss: misses) {
@@ -217,10 +308,15 @@ SummarizeMisses(const std::vector<MissRow>& misses, const MissContext& context,
 		auto&      totals     = summary.classes[static_cast<size_t>(miss_class)];
 		totals.count++;
 		summary.total++;
+		double miss_create_ms = 0.0;
 		if (const auto found = create_ms.find(miss.id); miss.id != 0 && found != create_ms.end()) {
+			miss_create_ms = found->second;
 			totals.create_ms += found->second;
 			summary.create_ms += found->second;
 			create_ms.erase(found);
+		}
+		if (miss_class == MissClass::NotYetGenerated) {
+			AddLateModule(summary, late_tracker, miss, context, miss_create_ms);
 		}
 		if (miss_class == MissClass::DroppedAtDrain) {
 			summary.refused_by_verdict[static_cast<size_t>(context.refused_by_id.at(miss.id))]++;

@@ -283,6 +283,22 @@ struct GenerationMissClass {
 	double      create_ms = 0.0;
 };
 
+/// A module that the runtime needed before the generator delivered it, one row per module. The
+/// times are on the NowNs clock. miss_ns and create_ms are of its first miss, and misses counts all
+/// its not_yet_generated misses. via says whether the delivery was an adoption (delivered_ns is the
+/// post, and adopted_ns is when the GPU thread took it in) or a refusal as a duplicate
+/// (delivered_ns is the refusal, and there is no adopted_ns).
+struct GenerationLateModule {
+	uint64_t               id           = 0;
+	uint64_t               code_hash    = 0;
+	int64_t                miss_ns      = NO_TIME_NS;
+	int64_t                delivered_ns = NO_TIME_NS;
+	std::string            via;
+	double                 create_ms = 0.0;
+	uint64_t               misses    = 1;
+	std::optional<int64_t> adopted_ns;
+};
+
 /// The compute translations that the runtime did with generation on, by the reason generation did
 /// not serve them.
 struct GenerationMisses {
@@ -293,6 +309,10 @@ struct GenerationMisses {
 	std::vector<std::pair<std::string, uint64_t>> refused;
 	uint64_t                                      wrong_spec_programs     = 0;
 	uint64_t                                      wrong_spec_max_variants = 0;
+	/// One row for each module with a not_yet_generated miss, up to a cap, and how many modules
+	/// were left out.
+	std::vector<GenerationLateModule> late_modules;
+	uint64_t                          late_overflow = 0;
 };
 
 /// A first use that stopped the dispatch for long, with what is known of the module's life. The
