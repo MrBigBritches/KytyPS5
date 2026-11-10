@@ -196,6 +196,10 @@ P3B_P95_ALLOWANCE = 1.25
 P4_STOPPED_RATIO = 1.25
 # The longest stop that always passes, so a gpl arm with tiny stops does not make the limit tiny.
 P4_STOPPED_FLOOR_MS = 500.0
+# The M1 pre-check. Go needs this share of used modules at tier 0, and more than this share of the
+# unused build time at tier 1+.
+M1_TIER0_USED_PERCENT = 90.0
+M1_TIER1_UNUSED_BUILD_PERCENT = 50.0
 P5_MIN_EXTRA_UNDERRUNS = 2
 P5_EXTRA_FRACTION = 0.25
 # Underrun submits no more than this far after the previous one belong to the same event. A gap of
@@ -294,6 +298,42 @@ def contention_figures(report):
     return figures_by_name
 
 
+def tier_order_key(module):
+    """The order variants of one program are ranked in. Posted time comes first, then adopted time
+    for a tie, then the id as text for a tie in both. A missing time counts as 0."""
+    return (module.get("posted_ms", 0.0), module.get("adopted_ms", 0.0), hash_text(module.get("id")))
+
+
+def variant_tiers(modules):
+    """The tier of each module, in the order of the list. The tier is the module's rank among the
+    modules with the same code_hash in this one run, in posted order, so the first posted variant of
+    each program is tier 0. A program with a single variant is tier 0. Ranks never carry over from
+    another run, so pass the modules of one run only."""
+    by_hash = {}
+    for index, module in enumerate(modules):
+        by_hash.setdefault(hash_text(module.get("code_hash")), []).append(index)
+    tiers = [0] * len(modules)
+    for indexes in by_hash.values():
+        for rank, index in enumerate(sorted(indexes, key=lambda i: tier_order_key(modules[i]))):
+            tiers[index] = rank
+    return tiers
+
+
+def tier_rows(block):
+    """One row per generated module with its tier. Start delay is ready_ms - build_ms - adopted_ms,
+    which is how long the module waited in the warm queue before a worker began to build it. A row
+    without ready_ms, build_ms or adopted_ms was never built, has no delay and counts as not built."""
+    modules = block.get("generated_modules", [])
+    rows = []
+    for module, tier in zip(modules, variant_tiers(modules)):
+        ready, build, adopted = module.get("ready_ms"), module.get("build_ms"), module.get("adopted_ms")
+        built = ready is not None and build is not None and adopted is not None
+        rows.append({"tier": tier, "hash": hash_text(module.get("code_hash")), "used": module.get("how") != "unused",
+                     "built": built, "build_ms": build or 0.0,
+                     "delay_ms": ready - build - adopted if built else None})
+    return rows
+
+
 def generation_figures(block):
     """Reduces a generation block to the numbers of the Generation table."""
     supervisor = block["supervisor"]
@@ -313,7 +353,7 @@ def generation_figures(block):
             "plan_mismatch": drain.get("plan_mismatch"),
             "done": how.count("done"), "waited": how.count("waited"), "inline": how.count("inline"),
             "unused": how.count("unused"), "unused_build_ms": block.get("unused_build_ms"),
-            "order": block.get("worker", {}).get("order"),
+            "order": block.get("worker", {}).get("order"), "tier_rows": tier_rows(block),
             "classes": {name: (row.get("count", 0), row.get("create_ms", 0.0))
                         for name, row in classes.items()}}
 
@@ -553,6 +593,98 @@ def generation_table(arms):
         runs = [run for run in arms[name] if run["gen"] is not None]
         if runs:
             generation_extras(name, runs)
+
+
+def tier_group_stats(rows):
+    """The figures of one tier group of one run."""
+    delays = [row["delay_ms"] for row in rows if row["delay_ms"] is not None]
+    return {"modules": len(rows), "used": sum(1 for row in rows if row["used"]),
+            "unused": sum(1 for row in rows if not row["used"]),
+            "not_built": sum(1 for row in rows if not row["built"]),
+            "unused_build_ms": sum(row["build_ms"] for row in rows if not row["used"]),
+            "delay_ms": statistics.median(delays) if delays else None}
+
+
+def share_percent(part, whole):
+    """Part as a percentage of the whole, or None when the whole is zero."""
+    return None if not whole else 100.0 * part / whole
+
+
+def tier_run_figures(rows):
+    """Tier 0 and tier 1+ figures of one run, with the two shares the M1 pre-check reads."""
+    tier0 = tier_group_stats([row for row in rows if row["tier"] == 0])
+    later = tier_group_stats([row for row in rows if row["tier"] > 0])
+    return {"t0": tier0, "t1": later,
+            "used_at_0": share_percent(tier0["used"], tier0["used"] + later["used"]),
+            "unused_build_at_1": share_percent(later["unused_build_ms"],
+                                               tier0["unused_build_ms"] + later["unused_build_ms"])}
+
+
+def tier_cells(figures_list, key):
+    """The cells of one tier row, as the median over the runs of an arm."""
+    stats = [figures[key] for figures in figures_list]
+    unused_build = median_of(item["unused_build_ms"] for item in stats)
+    return [fmt_count(median_of(item[name] for item in stats))
+            for name in ("modules", "used", "unused", "not_built")] + \
+           [fmt_num(unused_build / MS_PER_SECOND), fmt_num(median_of(item["delay_ms"] for item in stats), 1)]
+
+
+def program_lines(name, runs):
+    """For each program with more than one variant, the tiers that were used. Over several runs the
+    used tiers are joined and the variant count is the largest seen. Hashes are text."""
+    programs = {}
+    for run in runs:
+        counts = {}
+        for row in run["gen"]["tier_rows"]:
+            counts[row["hash"]] = counts.get(row["hash"], 0) + 1
+            entry = programs.setdefault(row["hash"], [set(), 0])
+            if row["used"]:
+                entry[0].add(row["tier"])
+        for code_hash, count in counts.items():
+            programs[code_hash][1] = max(programs[code_hash][1], count)
+    return [f"  {name}: {code_hash}: used tiers {','.join(str(tier) for tier in sorted(tiers)) or 'none'} of {count}"
+            for code_hash, (tiers, count) in sorted(programs.items()) if count > 1]
+
+
+def m1_summary(name, runs):
+    """The two shares and the M1 go or no-go. It is information and not a gate. Go needs at least
+    90 percent of used modules at tier 0 and more than half of the unused build time at tier 1+.
+    The shares are taken over the modules of all runs of the arm pooled together, so each module
+    and each second of build counts once. Tiers are still ranked within each run."""
+    pooled = tier_run_figures([row for run in runs for row in run["gen"]["tier_rows"]])
+    used_at_0, unused_at_1 = pooled["used_at_0"], pooled["unused_build_at_1"]
+    lines = [f"  {name}: used modules at tier 0 (runs pooled): {fmt_num(used_at_0, 1)}%",
+             f"  {name}: unused build time at tier 1+ (runs pooled): {fmt_num(unused_at_1, 1)}%"]
+    if used_at_0 is None or unused_at_1 is None:
+        verdict_text = "n/a (no used modules or no unused build time)"
+    else:
+        go = used_at_0 >= M1_TIER0_USED_PERCENT and unused_at_1 > M1_TIER1_UNUSED_BUILD_PERCENT
+        verdict_text = "go" if go else "no-go"
+    lines.append(f"  {name}: M1 pre-check: {verdict_text} (INFO) with used at tier 0 {fmt_num(used_at_0, 1)}%"
+                 f" (needs {M1_TIER0_USED_PERCENT:g} or more) and unused build at tier 1+ {fmt_num(unused_at_1, 1)}%"
+                 f" (needs over {M1_TIER1_UNUSED_BUILD_PERCENT:g})")
+    return lines
+
+
+def tier_table(arms):
+    """The Generated by tier table, for arms whose reports carry the generation block with modules."""
+    columns = [("modules", 7), ("used", 4), ("unused", 6), ("not built", 9), ("unused build s", 14),
+               ("start delay ms", 14)]
+    rows, notes = [], []
+    for name in sorted(arms):
+        runs = [run for run in arms[name] if run["gen"] is not None and run["gen"]["tier_rows"]]
+        if not runs:
+            continue
+        figures_list = [tier_run_figures(run["gen"]["tier_rows"]) for run in runs]
+        rows += [(f"{name} tier 0", tier_cells(figures_list, "t0")),
+                 (f"{name} tier 1+", tier_cells(figures_list, "t1"))]
+        notes += m1_summary(name, runs) + program_lines(name, runs)
+    if not rows:
+        return
+    print_table("Generated by tier (tier = variant rank within code hash by posted time, "
+                "start delay = ready - build - adopted)", columns, rows)
+    for note in notes:
+        print(note)
 
 
 def strip_store(label):
@@ -804,6 +936,7 @@ def main(patterns, gate_arm=None):
               "  ".join(cell.rjust(width) for cell, (_, width) in zip(cells, COLUMNS)))
     print_refusals(refusals, gpu_translate)
     generation_table(new_arms)
+    tier_table(new_arms)
     audio_table(new_arms)
     contention_table(new_arms)
     return gate(records, common, gate_arm) if gate_arm else 0
