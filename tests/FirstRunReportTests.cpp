@@ -1218,6 +1218,49 @@ void TestGenerationBlockFields() {
 	      "a usage row lacks a figure, or a missing peak is shown as zero");
 }
 
+// finished_at_ms is the finish counted from the report's epoch, and finished_ms stays a duration
+// from the supervisor thread's start. The thread starts 700 ms after the epoch here, so the two
+// differ by that offset, and a finished_at_ms copied from finished_ms or left on the raw clock
+// would not show it. The baseline is the same block with no finish, which has no finished_at_ms.
+void TestGenerationFinishedAtMs() {
+	constexpr int64_t MS               = 1'000'000;
+	constexpr int64_t EPOCH_NS         = 250 * MS;
+	constexpr double  THREAD_OFFSET_MS = 700.0;
+	constexpr double  FINISHED_MS      = 9000.0;
+	const auto        block_of         = [&](const ShaderStoreGenerationReport& figures) {
+        Report report;
+        report.SetEpoch(EPOCH_NS);
+        report.SetGenerationFinal(figures);
+        return GenerationBlock(report)["supervisor"];
+	};
+	ShaderStoreGenerationReport unfinished;
+	unfinished.outcome = "stopped";
+	unfinished.ended_ms = FINISHED_MS;
+	const auto base     = block_of(unfinished);
+	Check(!base.contains("finished_at_ms") && !base.contains("finished_ms"),
+	      "a run that did not finish has a finish time");
+
+	ShaderStoreGenerationReport finished = unfinished;
+	finished.outcome                     = "finished";
+	finished.finished_ms                 = FINISHED_MS;
+	// Nine seconds from a thread that started 700 ms after the epoch is 9700 ms from the epoch.
+	finished.finished_ns = EPOCH_NS + static_cast<int64_t>((THREAD_OFFSET_MS + FINISHED_MS) * MS);
+	const auto actual    = block_of(finished);
+	Check(actual["finished_ms"] == FINISHED_MS, "finished_ms is no longer the duration");
+	Check(actual["finished_at_ms"] == THREAD_OFFSET_MS + FINISHED_MS,
+	      "finished_at_ms is not counted from the epoch");
+	Check(actual["finished_at_ms"].get<double>() - actual["finished_ms"].get<double>() ==
+	          THREAD_OFFSET_MS,
+	      "finished_at_ms and finished_ms do not differ by the thread's offset");
+
+	// A finished_ms with no finish moment, as an older source gives, writes no finished_at_ms.
+	ShaderStoreGenerationReport duration_only = finished;
+	duration_only.finished_ns.reset();
+	Check(!block_of(duration_only).contains("finished_at_ms") &&
+	          block_of(duration_only).contains("finished_ms"),
+	      "finished_at_ms was written from finished_ms");
+}
+
 // The rows of the generation block put each time on the run's clock and leave out a time that did
 // not happen. The empty block has the shape of the full one, so a reader finds every key. The
 // baseline is the empty block, and a row with a missing time is the baseline of the row with it.
@@ -1613,6 +1656,7 @@ int main() {
   TestGenerationBlockFlagOffAndInactive();
   TestGenerationBlockFields();
   TestGenerationRowsJson();
+  TestGenerationFinishedAtMs();
   TestAudioUnderrunsAreStamped();
   TestAudioUnderrunsRespectTheFlag();
   TestAudioUnderrunsOverflow();

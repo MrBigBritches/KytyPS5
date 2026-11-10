@@ -85,9 +85,10 @@ struct GenerationCounts {
 	return "";
 }
 
-/// Copies the supervisor's statistics into the report's plain figures. finished_ms is given only
-/// for a run that finished, and ended_ms for every run that is over. A supervisor that ended for a
-/// reason that stops generation makes the block inactive, with that reason.
+/// Copies the supervisor's statistics into the report's plain figures. finished_ms and finished_ns
+/// (the same moment on the report's clock) are given only for a run that finished, and ended_ms for
+/// every run that is over. A supervisor that ended for a reason that stops generation makes the
+/// block inactive, with that reason.
 [[nodiscard]] inline Common::FirstRunReport::ShaderStoreGenerationReport
 MakeSupervisorReport(const SupervisorStats& stats) {
 	Common::FirstRunReport::ShaderStoreGenerationReport block;
@@ -104,6 +105,7 @@ MakeSupervisorReport(const SupervisorStats& stats) {
 	block.last_record_ms  = stats.last_record_ms;
 	if (stats.outcome == SupervisorOutcome::Finished) {
 		block.finished_ms = stats.finished_ms;
+		block.finished_ns = stats.finished_ns;
 	}
 	if (stats.outcome != SupervisorOutcome::Running) {
 		block.ended_ms = stats.ended_ms;

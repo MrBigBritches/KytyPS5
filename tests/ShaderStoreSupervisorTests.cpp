@@ -1534,6 +1534,9 @@ void TestReportFromFinishedAndEndedRuns() {
 	CHECK(block.active && block.inactive_reason.empty() && block.outcome == "finished");
 	CHECK(block.finished_ms.has_value() && block.ended_ms.has_value() &&
 	      *block.finished_ms == *block.ended_ms && *block.finished_ms > 0.0);
+	// The finish on the report's clock is carried over as it is, and is missing when there was
+	// none.
+	CHECK(block.finished_ns.has_value() && block.finished_ns == finished.stats.finished_ns);
 	CHECK(block.spawns == 1 && block.restarts == 0 && block.failures.empty());
 	CHECK(block.posted == finished.stats.posted && block.posted == 6);
 	CHECK(block.first_record_ms.has_value() && block.last_record_ms.has_value() &&
@@ -1547,7 +1550,8 @@ void TestReportFromFinishedAndEndedRuns() {
 	const auto fatal_block = MakeSupervisorReport(fatal.stats);
 	CHECK(!fatal_block.active && fatal_block.inactive_reason == "child_silent" &&
 	      fatal_block.outcome == "fatal");
-	CHECK(!fatal_block.finished_ms.has_value() && fatal_block.ended_ms.has_value());
+	CHECK(!fatal_block.finished_ms.has_value() && fatal_block.ended_ms.has_value() &&
+	      !fatal_block.finished_ns.has_value());
 
 	// Capped: the cap is reached and what was delivered is kept.
 	const auto capped =
@@ -1570,7 +1574,8 @@ void TestReportFromFinishedAndEndedRuns() {
 	supervisor.Stop();
 	const auto stopped = MakeSupervisorReport(supervisor.Stats());
 	CHECK(stopped.active && stopped.outcome == "stopped");
-	CHECK(!stopped.finished_ms.has_value() && stopped.ended_ms.has_value());
+	CHECK(!stopped.finished_ms.has_value() && stopped.ended_ms.has_value() &&
+	      !stopped.finished_ns.has_value());
 }
 
 // The rows of a failure and of the drops, with the names the report uses.

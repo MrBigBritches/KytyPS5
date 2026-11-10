@@ -369,7 +369,12 @@ struct ShaderStoreGenerationReport {
 	std::optional<double> first_record_ms;
 	std::optional<double> last_record_ms;
 	/// Set only when the worker finished, and the end of the run for any outcome except running.
-	std::optional<double>             finished_ms;
+	std::optional<double> finished_ms;
+	/// The moment of the finish on the report's clock (NowNs), written as finished_at_ms from the
+	/// run start like an underrun's at_ms. finished_ms counts from the supervisor thread's start
+	/// instead, which is later than the run start, so only this one can cut a window of the run in
+	/// two. Set only when the worker finished.
+	std::optional<int64_t>            finished_ns;
 	std::optional<double>             ended_ms;
 	double                            decode_ms_max      = 0.0;
 	double                            terminate_wait_ms  = 0.0;
