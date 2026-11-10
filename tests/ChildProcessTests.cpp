@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <optional>
@@ -56,6 +57,31 @@ constexpr int  UNKNOWN_FAKE_MODE        = 99;
 [[maybe_unused]] constexpr int LOWEST_POSIX_RANK = -19;
 // The rank of below normal in PriorityRank on Windows.
 [[maybe_unused]] constexpr int WINDOWS_BELOW_NORMAL_RANK = 1;
+
+// How much processor time the burn child spends. Windows reads process times in
+// ticks of about 15.6 ms, so the margins below leave a few ticks of room.
+constexpr double BURN_CPU_MS = 300.0;
+// The least the burn child must be credited with, and the most the sleeping
+// baseline may show. A baseline pays for starting the process, which is a few
+// tens of milliseconds.
+constexpr double BURN_MIN_REPORTED_MS = 200.0;
+constexpr double BASELINE_MAX_CPU_MS  = 150.0;
+// How long the sleeping baseline lives, about as long as the burn takes.
+constexpr auto BASELINE_SLEEP = 300ms;
+// How long the alloc child keeps its memory before it exits. Linux samples a
+// live child, so it has to be alive across a few polls (2 ms apart).
+constexpr auto ALLOC_HOLD = 300ms;
+// How much the alloc child takes. A bare child is far below the threshold, and
+// the threshold is below the allocation so that allocator slack cannot hide it.
+constexpr uint64_t ALLOC_MEGABYTES      = 64;
+constexpr uint64_t BYTES_PER_MEGABYTE   = 1024 * 1024;
+constexpr uint64_t ALLOC_MIN_PEAK_BYTES = 48 * BYTES_PER_MEGABYTE;
+// What the test parent holds while a baseline child runs. A child that
+// inherited its parent's peak, as posix_spawn on Linux can, would report at
+// least this much.
+constexpr uint64_t                PARENT_BALLAST_MEGABYTES = 128;
+constexpr size_t                  PAGE_STRIDE_BYTES        = 4096;
+[[maybe_unused]] constexpr double MS_PER_SECOND            = 1000.0;
 
 int g_failures = 0;
 
@@ -192,6 +218,59 @@ bool WaitUntilGone(uint32_t pid, std::chrono::milliseconds deadline) {
 
 // ---- child side ----
 
+// The processor time this process has used, in milliseconds.
+double OwnCpuMs() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	FILETIME creation {};
+	FILETIME exited {};
+	FILETIME kernel {};
+	FILETIME user {};
+	GetProcessTimes(GetCurrentProcess(), &creation, &exited, &kernel, &user);
+	constexpr double TICKS_PER_MILLISECOND = 10000.0;
+	const auto       ticks                 = [](const FILETIME& time) {
+        return static_cast<double>((static_cast<uint64_t>(time.dwHighDateTime) << 32) |
+		                                                 time.dwLowDateTime);
+	};
+	return (ticks(kernel) + ticks(user)) / TICKS_PER_MILLISECOND;
+#else
+	timespec now {};
+	clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &now);
+	constexpr double NANOSECONDS_PER_MS = 1e6;
+	return (static_cast<double>(now.tv_sec) * MS_PER_SECOND) +
+	       (static_cast<double>(now.tv_nsec) / NANOSECONDS_PER_MS);
+#endif
+}
+
+// Spins until this process has used the given processor time. It reads its own
+// clock, so a loaded machine only makes it take longer in wall time.
+void BurnCpu(double milliseconds) {
+	const double       start = OwnCpuMs();
+	volatile uint64_t  sink  = 0;
+	constexpr uint64_t BATCH = 100000;
+	while (OwnCpuMs() - start < milliseconds) {
+		for (uint64_t i = 0; i < BATCH; ++i) {
+			sink = sink + i;
+		}
+	}
+}
+
+// Where a block is kept. A volatile pointer stops the compiler from dropping an
+// allocation that nothing reads.
+char* volatile g_block = nullptr;
+
+// Takes memory. With touch it writes a byte on every page, which makes the
+// pages resident. Without it the memory is committed but never made resident.
+void TakeMemory(uint64_t megabytes, bool touch) {
+	const uint64_t bytes = megabytes * BYTES_PER_MEGABYTE;
+	g_block              = static_cast<char*>(std::malloc(bytes));
+	if (g_block == nullptr || !touch) {
+		return;
+	}
+	for (uint64_t offset = 0; offset < bytes; offset += PAGE_STRIDE_BYTES) {
+		g_block[offset] = static_cast<char>(offset);
+	}
+}
+
 [[noreturn]] void HangForever() {
 	while (true) {
 		std::this_thread::sleep_for(HANG_SLEEP);
@@ -226,6 +305,22 @@ int RunFakeChild(const std::vector<std::string>& args) {
 	}
 	if (mode == "exit321") {
 		std::_Exit(EXIT_CODE_BIG);
+	}
+	// burn: spends BURN_CPU_MS of processor time. sleep: waits as long and
+	// uses none. alloc <touch 0|1>: takes ALLOC_MEGABYTES, resident only
+	// when touched, and holds them.
+	if (mode == "burn") {
+		BurnCpu(BURN_CPU_MS);
+		return 0;
+	}
+	if (mode == "sleep") {
+		std::this_thread::sleep_for(BASELINE_SLEEP);
+		return 0;
+	}
+	if (mode == "alloc" && args.size() >= 2) {
+		TakeMemory(ALLOC_MEGABYTES, args[1] == "1");
+		std::this_thread::sleep_for(ALLOC_HOLD);
+		return 0;
 	}
 	if (mode == "fake-parent" && args.size() >= 3) {
 		return RunFakeParent(args[1], args[2]);
@@ -377,6 +472,142 @@ void TestNoHandleLeak() {
 	CHECK(handle_count() <= before);
 }
 #endif
+
+// Runs a fake child to its end and returns what it used, when the system said.
+std::optional<Common::ChildUsage>
+RunForUsage(std::vector<std::string> mode_arguments,
+            Common::PeakMemorySelect select = Common::PeakMemorySelect::Auto) {
+	ChildProcess child;
+	if (!SpawnFake(child, std::move(mode_arguments)) || child.Wait(CHILD_FINISH_TIMEOUT) != 0) {
+		return std::nullopt;
+	}
+	return child.Usage(select);
+}
+
+double CpuMs(const Common::ChildUsage& usage) {
+	return usage.cpu_user_ms + usage.cpu_kernel_ms;
+}
+
+// A child that burns processor time reports clearly more than one that sleeps
+// for as long.
+void TestUsageCpu() {
+	const auto burned = RunForUsage({"burn"});
+	const auto slept  = RunForUsage({"sleep"});
+	CHECK(burned.has_value() && slept.has_value());
+	if (!burned || !slept) {
+		return;
+	}
+	CHECK(CpuMs(*burned) >= BURN_MIN_REPORTED_MS);
+	CHECK(CpuMs(*slept) < BASELINE_MAX_CPU_MS);
+	// The baseline is the same child doing nothing, so the gap is the work and
+	// not the start-up.
+	CHECK(CpuMs(*burned) > CpuMs(*slept) + BURN_MIN_REPORTED_MS - BASELINE_MAX_CPU_MS);
+}
+
+// Usage must say nothing while the child runs, and it must stay readable once
+// the child is gone.
+void TestUsageOnlyAfterExit() {
+	const auto     dir = MakeWorkDir("usage_running");
+	ChildProcess   child;
+	const fs::path ready = dir / "child.pid";
+	CHECK(SpawnFake(child, {"hang", std::to_string(Common::CurrentProcessId()), Utf8(ready)}));
+	CHECK(WaitForFile(ready, FILE_WAIT_TIMEOUT));
+	CHECK(!child.Usage().has_value());
+	child.Terminate();
+	CHECK(child.Poll().has_value());
+	CHECK(child.Usage().has_value());
+	// Asking again gives the same answer, so nothing was lost to a handle that
+	// closed.
+	CHECK(child.Usage().has_value());
+}
+
+// The peak memory of the child that touched 64 MB, from the source this
+// operating system measures resident memory with. Windows and macOS have the
+// system's own figure, and Linux samples.
+void TestUsageResidentMemory() {
+	using Common::PeakMemorySelect;
+	using Common::PeakMemorySource;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	constexpr auto SELECT   = PeakMemorySelect::WorkingSet;
+	constexpr auto EXPECTED = PeakMemorySource::WorkingSet;
+#elif defined(__APPLE__)
+	constexpr auto SELECT   = PeakMemorySelect::WorkingSet;
+	constexpr auto EXPECTED = PeakMemorySource::WorkingSet;
+#else
+	constexpr auto SELECT   = PeakMemorySelect::WorkingSetSampled;
+	constexpr auto EXPECTED = PeakMemorySource::WorkingSetSampled;
+#endif
+	// The parent holds a large touched block while the baseline runs. A child
+	// that took its parent's peak along would show it, and a bare child shows
+	// only itself.
+	const uint64_t    ballast_bytes = PARENT_BALLAST_MEGABYTES * BYTES_PER_MEGABYTE;
+	std::vector<char> ballast(ballast_bytes);
+	for (uint64_t offset = 0; offset < ballast_bytes; offset += PAGE_STRIDE_BYTES) {
+		ballast[offset] = static_cast<char>(offset | 1);
+	}
+	const auto idle    = RunForUsage({"sleep"}, SELECT);
+	const auto touched = RunForUsage({"alloc", "1"}, SELECT);
+	CHECK(idle.has_value() && touched.has_value());
+	if (!idle || !touched) {
+		return;
+	}
+	CHECK(idle->peak.has_value() && touched->peak.has_value());
+	if (!idle->peak || !touched->peak) {
+		return;
+	}
+	CHECK(idle->peak->source == EXPECTED);
+	CHECK(touched->peak->source == EXPECTED);
+	CHECK(touched->peak->bytes >= ALLOC_MIN_PEAK_BYTES);
+	CHECK(idle->peak->bytes < ALLOC_MIN_PEAK_BYTES);
+	CHECK(idle->peak->bytes > 0);
+	// Memory taken and never touched is not resident, so the figure must not show
+	// it.
+	const auto untouched = RunForUsage({"alloc", "0"}, SELECT);
+	CHECK(untouched.has_value() && untouched->peak.has_value() &&
+	      untouched->peak->bytes < ALLOC_MIN_PEAK_BYTES);
+	CHECK(ballast[0] != 0);
+	// Auto picks this same source, so a default caller gets the resident figure
+	// too.
+	const auto automatic = RunForUsage({"alloc", "1"});
+	CHECK(automatic.has_value() && automatic->peak.has_value() &&
+	      automatic->peak->source == EXPECTED);
+}
+
+// The commit figure comes from the job object, and only Windows has one. It
+// counts memory that was taken and never touched, which tells it from the
+// working set. A source that is not there is reported missing, and not replaced
+// by the working set.
+void TestUsageCommit() {
+	using Common::PeakMemorySelect;
+	using Common::PeakMemorySource;
+	const auto untouched = RunForUsage({"alloc", "0"}, PeakMemorySelect::Commit);
+	const auto idle      = RunForUsage({"sleep"}, PeakMemorySelect::Commit);
+	CHECK(untouched.has_value() && idle.has_value());
+	if (!untouched || !idle) {
+		return;
+	}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	CHECK(untouched->peak.has_value() && idle->peak.has_value());
+	if (!untouched->peak || !idle->peak) {
+		return;
+	}
+	CHECK(untouched->peak->source == PeakMemorySource::Commit);
+	CHECK(idle->peak->source == PeakMemorySource::Commit);
+	CHECK(untouched->peak->bytes >= ALLOC_MIN_PEAK_BYTES);
+	CHECK(idle->peak->bytes < ALLOC_MIN_PEAK_BYTES);
+	CHECK(idle->peak->bytes > 0);
+	// The other Windows source is asked for alone too, and must not answer with
+	// the commit.
+	const auto working = RunForUsage({"alloc", "0"}, PeakMemorySelect::WorkingSet);
+	CHECK(working.has_value() && working->peak.has_value() &&
+	      working->peak->source == PeakMemorySource::WorkingSet);
+	CHECK(working.has_value() && working->peak.has_value() &&
+	      working->peak->bytes < ALLOC_MIN_PEAK_BYTES);
+#else
+	CHECK(!untouched->peak.has_value());
+	CHECK(!idle->peak.has_value());
+#endif
+}
 
 // Ends a process by pid, for cleaning up a grandchild the test could not otherwise reach.
 void KillProcess(uint32_t pid) {
@@ -586,6 +817,10 @@ int main(int argc, char** argv) {
 #endif
 	TestChildPriorityIsLower();
 	TestParentDeathKillsChild();
+	TestUsageCpu();
+	TestUsageOnlyAfterExit();
+	TestUsageResidentMemory();
+	TestUsageCommit();
 	std::error_code error;
 	fs::remove_all(fs::temp_directory_path() / ("kyty_child_process_" + std::to_string(Common::CurrentProcessId())), error);
 	if (g_failures == 0) {

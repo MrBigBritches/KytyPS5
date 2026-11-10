@@ -5,6 +5,9 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <charconv>
+#include <fstream>
+#include <string>
 #include <system_error>
 #include <thread>
 #include <vector>
@@ -12,6 +15,7 @@
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <psapi.h>
 #else
 #include <csignal>
 #include <cstdlib>
@@ -45,6 +49,42 @@ constexpr std::chrono::milliseconds TERMINATE_GRACE {2000};
 [[maybe_unused]] std::string PathToUtf8(const std::filesystem::path& path) {
 	const auto text = path.u8string();
 	return {reinterpret_cast<const char*>(text.data()), text.size()};
+}
+
+// What the system said about a finished child, before a memory measure is chosen.
+struct CapturedUsage {
+	double                  user_ms   = 0.0;
+	double                  kernel_ms = 0.0;
+	std::optional<uint64_t> working_set;
+	std::optional<uint64_t> commit;
+	std::optional<uint64_t> sampled;
+};
+
+// Chooses the memory figure. Auto prefers the figure the system measured by itself, then the
+// commit, then the sample. A named choice returns that figure or none, never another one.
+std::optional<PeakMemory> PickMemory(const CapturedUsage& captured, PeakMemorySelect select) {
+	const auto make = [](const std::optional<uint64_t>& bytes,
+	                     PeakMemorySource               source) -> std::optional<PeakMemory> {
+		if (!bytes) {
+			return std::nullopt;
+		}
+		return PeakMemory {.bytes = *bytes, .source = source};
+	};
+	switch (select) {
+		case PeakMemorySelect::WorkingSet:
+			return make(captured.working_set, PeakMemorySource::WorkingSet);
+		case PeakMemorySelect::Commit: return make(captured.commit, PeakMemorySource::Commit);
+		case PeakMemorySelect::WorkingSetSampled:
+			return make(captured.sampled, PeakMemorySource::WorkingSetSampled);
+		case PeakMemorySelect::Auto: break;
+	}
+	if (auto best = make(captured.working_set, PeakMemorySource::WorkingSet)) {
+		return best;
+	}
+	if (auto best = make(captured.sampled, PeakMemorySource::WorkingSetSampled)) {
+		return best;
+	}
+	return make(captured.commit, PeakMemorySource::Commit);
 }
 
 } // namespace
@@ -84,6 +124,17 @@ constexpr size_t MAX_WINDOWS_PATH = 32768;
 
 // The exit code Windows reports for a child that Terminate killed.
 constexpr unsigned TERMINATED_EXIT_CODE = 1;
+
+// Windows counts processor time in ticks of 100 ns, so ten thousand of them make a millisecond.
+constexpr double TICKS_PER_MILLISECOND = 10000.0;
+
+// The processor time of a FILETIME duration, in milliseconds.
+double DurationMs(const FILETIME& time) {
+	ULARGE_INTEGER ticks;
+	ticks.LowPart  = time.dwLowDateTime;
+	ticks.HighPart = time.dwHighDateTime;
+	return static_cast<double>(ticks.QuadPart) / TICKS_PER_MILLISECOND;
+}
 
 // Converts UTF-8 to the UTF-16 the Windows API takes.
 std::wstring Widen(const std::string& utf8) {
@@ -125,6 +176,47 @@ struct ChildProcess::Impl {
 	HANDLE             job     = nullptr;
 	DWORD              pid     = 0;
 	std::optional<int> exit_code;
+	std::optional<CapturedUsage> usage;
+
+	// Reads what the finished child used. The process handle is open here, and so is the job, which
+	// keeps the totals of a member that has ended. Both memory figures are kept, so each source can
+	// be asked for alone.
+	void CaptureUsage() {
+		CapturedUsage captured;
+		bool          have_cpu = false;
+		FILETIME      creation {};
+		FILETIME      exited {};
+		FILETIME      kernel {};
+		FILETIME      user {};
+		if (GetProcessTimes(process, &creation, &exited, &kernel, &user) != FALSE) {
+			captured.user_ms   = DurationMs(user);
+			captured.kernel_ms = DurationMs(kernel);
+			have_cpu           = true;
+		}
+		PROCESS_MEMORY_COUNTERS memory {};
+		if (GetProcessMemoryInfo(process, &memory, sizeof(memory)) != FALSE) {
+			captured.working_set = memory.PeakWorkingSetSize;
+		}
+		JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits {};
+		if (job != nullptr &&
+		    QueryInformationJobObject(job, JobObjectExtendedLimitInformation, &limits,
+		                              sizeof(limits), nullptr) != FALSE) {
+			captured.commit = limits.PeakProcessMemoryUsed;
+		}
+		JOBOBJECT_BASIC_ACCOUNTING_INFORMATION accounting {};
+		if (!have_cpu && job != nullptr &&
+		    QueryInformationJobObject(job, JobObjectBasicAccountingInformation, &accounting,
+		                              sizeof(accounting), nullptr) != FALSE) {
+			captured.user_ms =
+			    static_cast<double>(accounting.TotalUserTime.QuadPart) / TICKS_PER_MILLISECOND;
+			captured.kernel_ms =
+			    static_cast<double>(accounting.TotalKernelTime.QuadPart) / TICKS_PER_MILLISECOND;
+			have_cpu = true;
+		}
+		if (have_cpu || captured.working_set || captured.commit) {
+			usage = captured;
+		}
+	}
 
 	// Closing the job handle is what kills the child when this process dies without cleanup.
 	void Release() {
@@ -213,6 +305,7 @@ std::optional<int> ChildProcess::Wait(std::chrono::milliseconds timeout) {
 	DWORD code = 0;
 	GetExitCodeProcess(m_impl->process, &code);
 	m_impl->exit_code = static_cast<int>(code);
+	m_impl->CaptureUsage();
 	return m_impl->exit_code;
 }
 
@@ -258,6 +351,51 @@ constexpr int MAX_NICE             = 19;
 
 // Shell convention for a process that died from a signal.
 constexpr int SIGNAL_EXIT_CODE_BASE = 128;
+
+#ifdef __APPLE__
+// What one unit of ru_maxrss is, in bytes. macOS counts bytes. Linux counts kilobytes, but its
+// ru_maxrss is not used (see PeakMemorySource::WorkingSetSampled), so only macOS reads it.
+constexpr uint64_t RU_MAXRSS_UNIT_BYTES = 1;
+#endif
+// The unit of the VmHWM line in /proc/<pid>/status, which is kilobytes.
+[[maybe_unused]] constexpr uint64_t PROC_STATUS_UNIT_BYTES = 1024;
+
+constexpr double MS_PER_SECOND       = 1000.0;
+constexpr double MICROSECONDS_PER_MS = 1000.0;
+
+// The processor time of a timeval, in milliseconds.
+double DurationMs(const timeval& time) {
+	return (static_cast<double>(time.tv_sec) * MS_PER_SECOND) +
+	       (static_cast<double>(time.tv_usec) / MICROSECONDS_PER_MS);
+}
+
+#ifdef __linux__
+// The high-water mark of the resident memory of a live process, from its status file, or nothing
+// when the file or the line is not there (the process ended, or the kernel does not say).
+std::optional<uint64_t> ReadPeakResidentBytes(pid_t pid) {
+	std::ifstream     status("/proc/" + std::to_string(pid) + "/status");
+	std::string       line;
+	const std::string key = "VmHWM:";
+	while (std::getline(status, line)) {
+		if (!line.starts_with(key)) {
+			continue;
+		}
+		// from_chars, because exceptions are off in the POSIX builds. It stops at " kB".
+		const char* begin = line.data() + key.size();
+		const char* end   = line.data() + line.size();
+		while (begin != end && (*begin == ' ' || *begin == '\t')) {
+			++begin;
+		}
+		uint64_t   kilobytes = 0;
+		const auto parsed    = std::from_chars(begin, end, kilobytes);
+		if (parsed.ec != std::errc {} || parsed.ptr == begin) {
+			return std::nullopt;
+		}
+		return kilobytes * PROC_STATUS_UNIT_BYTES;
+	}
+	return std::nullopt;
+}
+#endif
 
 // Ends the process once the parent is gone. Re-parenting changes getppid, which also covers a
 // parent that died before this thread started.
@@ -358,8 +496,35 @@ uint32_t CurrentProcessId() {
 }
 
 struct ChildProcess::Impl {
-	pid_t              pid = -1;
-	std::optional<int> exit_code;
+	pid_t                        pid = -1;
+	std::optional<int>           exit_code;
+	std::optional<CapturedUsage> usage;
+	// The largest sample of the child's resident peak, taken while it ran (Linux).
+	std::optional<uint64_t> sampled_peak;
+
+	// Takes one sample of the live child. A smaller value than before is ignored, since the
+	// high-water mark only grows and a smaller read would be a different process.
+	void SamplePeak() {
+#ifdef __linux__
+		if (const auto bytes = ReadPeakResidentBytes(pid)) {
+			sampled_peak = std::max(sampled_peak.value_or(0), *bytes);
+		}
+#endif
+	}
+
+	// Keeps what the kernel said the child used, from the wait4 that reaped it. The processor
+	// times are the kernel's. The memory is ru_maxrss on macOS only, and the samples on Linux.
+	void CaptureUsage(const rusage& used) {
+		CapturedUsage captured;
+		captured.user_ms   = DurationMs(used.ru_utime);
+		captured.kernel_ms = DurationMs(used.ru_stime);
+#ifdef __APPLE__
+		captured.working_set = static_cast<uint64_t>(used.ru_maxrss) * RU_MAXRSS_UNIT_BYTES;
+#else
+		captured.sampled = sampled_peak;
+#endif
+		usage = captured;
+	}
 };
 
 ChildProcess::ChildProcess(): m_impl(std::make_unique<Impl>()) {}
@@ -403,10 +568,14 @@ std::optional<int> ChildProcess::Poll() {
 	if (m_impl->exit_code || m_impl->pid <= 0) {
 		return m_impl->exit_code;
 	}
-	int   status = 0;
-	pid_t result = 0;
+	// Sampled before the wait, while the process can still be read. One that ends in between keeps
+	// the previous sample.
+	m_impl->SamplePeak();
+	int    status = 0;
+	pid_t  result = 0;
+	rusage used {};
 	do {
-		result = waitpid(m_impl->pid, &status, WNOHANG);
+		result = wait4(m_impl->pid, &status, WNOHANG, &used);
 	} while (result < 0 && errno == EINTR);
 	if (result == 0) {
 		return std::nullopt;
@@ -414,10 +583,17 @@ std::optional<int> ChildProcess::Poll() {
 	if (result < 0) {
 		// Someone else reaped it, so the real code is lost.
 		m_impl->exit_code = -1;
-	} else if (WIFEXITED(status)) {
-		m_impl->exit_code = WEXITSTATUS(status);
 	} else {
-		m_impl->exit_code = SIGNAL_EXIT_CODE_BASE + (WIFSIGNALED(status) ? WTERMSIG(status) : 0);
+		if (WIFEXITED(status)) {
+			m_impl->exit_code = WEXITSTATUS(status);
+		} else {
+			m_impl->exit_code =
+			    SIGNAL_EXIT_CODE_BASE + (WIFSIGNALED(status) ? WTERMSIG(status) : 0);
+		}
+		// The rusage belongs to this child only when wait4 returned its pid.
+		if (result == m_impl->pid) {
+			m_impl->CaptureUsage(used);
+		}
 	}
 	return m_impl->exit_code;
 }
@@ -456,5 +632,16 @@ void ChildProcess::EnterChildMode(uint32_t parent_pid, ChildGuards guards) {
 }
 
 #endif
+
+std::optional<ChildUsage> ChildProcess::Usage(PeakMemorySelect select) const {
+	if (!m_impl->usage) {
+		return std::nullopt;
+	}
+	ChildUsage usage;
+	usage.cpu_user_ms   = m_impl->usage->user_ms;
+	usage.cpu_kernel_ms = m_impl->usage->kernel_ms;
+	usage.peak          = PickMemory(*m_impl->usage, select);
+	return usage;
+}
 
 } // namespace Common

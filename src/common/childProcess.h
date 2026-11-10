@@ -38,6 +38,42 @@ struct ChildGuards {
 	bool watchdog       = true; ///< A thread that ends the process once the parent is gone.
 };
 
+/// Which measure a child's peak memory is. They are not comparable, so a report names the one it
+/// holds.
+enum class PeakMemorySource : uint8_t {
+	/// The most resident memory the child had, read by the system when the child ended. Windows
+	/// PeakWorkingSetSize and macOS ru_maxrss.
+	WorkingSet,
+	/// The most committed memory the child had, which counts memory that was never touched.
+	/// Windows only, from the job object that holds the child.
+	Commit,
+	/// The largest VmHWM seen in /proc while the child ran, sampled at each Poll. Linux only. A
+	/// child that ends between two samples can have had more than the last sample shows, and one
+	/// that ends before the first sample has no value at all. ru_maxrss is not used on Linux,
+	/// since posix_spawn there shares the parent's address space until exec, and the kernel can
+	/// fold the parent's high-water mark into the child's.
+	WorkingSetSampled,
+};
+
+/// Which memory measure Usage should return. Auto takes the best one the system gave. The others
+/// ask for exactly that one, and a measure the system did not give is reported as missing and not
+/// replaced by another. That is the seam a test uses to prove each source on its own.
+enum class PeakMemorySelect : uint8_t { Auto, WorkingSet, Commit, WorkingSetSampled };
+
+/// A peak memory figure and what it measures.
+struct PeakMemory {
+	uint64_t         bytes  = 0;
+	PeakMemorySource source = PeakMemorySource::WorkingSet;
+};
+
+/// What a finished child used. peak is empty when the system gave no memory figure, which is not
+/// the same as zero.
+struct ChildUsage {
+	double                    cpu_user_ms   = 0.0;
+	double                    cpu_kernel_ms = 0.0;
+	std::optional<PeakMemory> peak;
+};
+
 /// One spawned helper process. Not thread safe: one owner thread calls every method. On POSIX
 /// the pid can be reused by an unrelated process once Poll or Wait has returned a code, so do
 /// not signal a pid taken from Pid() after that. Program and arguments are UTF-8. The
@@ -77,6 +113,15 @@ public:
 
 	/// Kills the child if it is still running and waits briefly for the system to reap it.
 	void Terminate();
+
+	/// What the child used, once Poll, Wait or Terminate has seen it exit, and nothing before that.
+	/// On POSIX the processor time comes from the wait4 that reaped the child, and on Windows from
+	/// the process and job handles, which stay open until this object is destroyed. Nothing is
+	/// returned when the system could not say, for instance when someone else reaped the child.
+	/// The memory figure follows PeakMemorySelect and may be missing while the times are not.
+	/// Linux is the case where it is sampled, so a child that lived through no Poll has none.
+	[[nodiscard]] std::optional<ChildUsage>
+	Usage(PeakMemorySelect select = PeakMemorySelect::Auto) const;
 
 	/// Called by the child itself, first thing in its worker mode and before it creates any
 	/// thread, because Linux nice values and the death signal are per thread. Lowers its
