@@ -59,13 +59,15 @@ public:
 	KYTY_CLASS_NO_COPY(WarmBuildSet);
 
 	/// Queues the build under the key. Returns false and drops the work when the key is already
-	/// pending or the set has stopped.
-	bool Start(const Key& key, Work work) {
+	/// pending or the set has stopped. A build on the Back lane starts only when no Front build
+	/// waits.
+	bool Start(const Key& key, Work work,
+	           PipelineBuildQueue::Lane lane = PipelineBuildQueue::Lane::Front) {
 		if (m_pending.contains(key)) {
 			return false;
 		}
 		auto slot = std::make_shared<Result>();
-		auto job  = m_queue.Post([slot, work = std::move(work)] { work(*slot); });
+		auto job  = m_queue.Post([slot, work = std::move(work)] { work(*slot); }, lane);
 		if (job == nullptr) {
 			return false;
 		}

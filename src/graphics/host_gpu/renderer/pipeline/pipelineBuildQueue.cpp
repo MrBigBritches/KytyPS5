@@ -58,7 +58,8 @@ PipelineBuildQueue::~PipelineBuildQueue() {
 	Stop();
 }
 
-PipelineBuildQueue::JobPtr PipelineBuildQueue::Post(Common::UniqueFunction<void>&& work) {
+PipelineBuildQueue::JobPtr PipelineBuildQueue::Post(Common::UniqueFunction<void>&& work,
+                                                    Lane                           lane) {
 	JobPtr job;
 	{
 		std::scoped_lock lock(m_mutex);
@@ -67,7 +68,7 @@ PipelineBuildQueue::JobPtr PipelineBuildQueue::Post(Common::UniqueFunction<void>
 			return nullptr;
 		}
 		job = std::make_shared<Job>(std::move(work));
-		m_jobs.push_back(job);
+		(lane == Lane::Back ? m_back_jobs : m_jobs).push_back(job);
 	}
 	m_ready.notify_one();
 	return job;
@@ -112,9 +113,9 @@ void PipelineBuildQueue::WorkerLoop(std::stop_token stop) {
 	}
 	std::unique_lock lock(m_mutex);
 	while (!stop.stop_requested()) {
-		if (m_jobs.empty()) {
-			// Woken by a post or by the stop.
-			m_ready.wait(lock, stop, [this] { return !m_jobs.empty(); });
+		if (!HasJobsLocked()) {
+			// Woken by a post to either lane or by the stop.
+			m_ready.wait(lock, stop, [this] { return HasJobsLocked(); });
 		} else if (PausedLocked()) {
 			// A job waits and the queue is paused. Resume, the deadline and the stop all end the wait, and
 			// so does a pause that moved the deadline, since the wait runs to a copy of the old one.
@@ -123,8 +124,7 @@ void PipelineBuildQueue::WorkerLoop(std::stop_token stop) {
 				return !PausedLocked() || m_pause_deadline != deadline;
 			});
 		} else {
-			const auto job = std::move(m_jobs.front());
-			m_jobs.pop_front();
+			const auto job = PopNextLocked();
 			m_active++;
 			lock.unlock();
 			RunIfQueued(*job);
@@ -132,6 +132,21 @@ void PipelineBuildQueue::WorkerLoop(std::stop_token stop) {
 			m_active--;
 		}
 	}
+}
+
+bool PipelineBuildQueue::HasJobsLocked() const {
+	return !m_jobs.empty() || !m_back_jobs.empty();
+}
+
+PipelineBuildQueue::JobPtr PipelineBuildQueue::PopNextLocked() {
+	// The one place that decides which job runs next. A later admit check for Back jobs, and a cap
+	// on how many of them run at once, belongs here. The caller tests the pause for both lanes.
+	// Such a check must also change the workers' wait to "a job that may run now", since Back can
+	// then hold jobs that none may take, and a wait on HasJobsLocked would spin.
+	auto& lane = m_jobs.empty() ? m_back_jobs : m_jobs;
+	auto  job  = std::move(lane.front());
+	lane.pop_front();
+	return job;
 }
 
 bool PipelineBuildQueue::PausedLocked() const {
@@ -170,6 +185,7 @@ uint32_t PipelineBuildQueue::Stop() {
 			return 0;
 		}
 		m_jobs.clear();
+		m_back_jobs.clear();
 		waited_for = m_active;
 	}
 	for (auto& worker: m_workers) {

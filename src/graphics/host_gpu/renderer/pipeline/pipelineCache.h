@@ -605,8 +605,10 @@ private:
 	// Starts the warm-up build of a compute module on the warm queue. It never stores a record,
 	// since the warm-up only builds what the store already holds. A module that generation made
 	// passes its row, which the build stamps with the time it finished and how long it took. The
-	// row outlives the build, since the generation state lives as long as the cache.
-	void StartWarmCompute(const ShaderModule& module, StoreGen::GenRow* row = nullptr);
+	// row outlives the build, since the generation state lives as long as the cache. The lane says
+	// whether workers build it with the rest or only when nothing else is waiting.
+	void StartWarmCompute(const ShaderModule& module, StoreGen::GenRow* row = nullptr,
+	                      PipelineBuildQueue::Lane lane = PipelineBuildQueue::Lane::Front);
 	// Moves the module's warm-up pipeline into m_compute_pipelines, waiting for it or building it
 	// here if it is not done. Null when no warm-up build is pending for the module.
 	[[nodiscard]] Pipeline* TakeWarmCompute(const ShaderComputeInputInfo& input_info);

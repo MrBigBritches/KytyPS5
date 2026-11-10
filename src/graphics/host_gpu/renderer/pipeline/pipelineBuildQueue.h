@@ -88,9 +88,14 @@ public:
 	~PipelineBuildQueue();
 	KYTY_CLASS_NO_COPY(PipelineBuildQueue);
 
-	/// Queues work behind everything posted before it. Returns null after Stop, and then the work
-	/// has not been taken.
-	[[nodiscard]] JobPtr Post(Common::UniqueFunction<void>&& work);
+	/// Which line a job waits in, held in m_jobs for Front and m_back_jobs for Back. Workers serve
+	/// Front first and take from Back only when Front is empty, so Back suits work that should
+	/// never delay the rest. Each lane is first in, first out.
+	enum class Lane : uint8_t { Front, Back };
+
+	/// Queues work behind everything posted to the same lane before it. Returns null after Stop,
+	/// and then the work has not been taken.
+	[[nodiscard]] JobPtr Post(Common::UniqueFunction<void>&& work, Lane lane = Lane::Front);
 
 	/// How many worker threads were started.
 	[[nodiscard]] uint32_t WorkerCount() const noexcept { return static_cast<uint32_t>(m_workers.size()); }
@@ -136,10 +141,16 @@ private:
 	static void RunClaimed(Job& job);
 	/// Whether a pause is in force. The caller holds m_mutex.
 	[[nodiscard]] bool PausedLocked() const;
+	/// Whether either lane holds a job. The caller holds m_mutex.
+	[[nodiscard]] bool HasJobsLocked() const;
+	/// Removes and returns the job a worker should run next, the oldest of Front or else the oldest
+	/// of Back. At least one lane must hold a job. The caller holds m_mutex.
+	[[nodiscard]] JobPtr PopNextLocked();
 
 	mutable std::mutex          m_mutex;
 	std::condition_variable_any m_ready;
 	std::deque<JobPtr>          m_jobs;
+	std::deque<JobPtr>          m_back_jobs;
 	// Jobs a worker has taken from the queue and not finished. Guarded by m_mutex.
 	uint32_t                    m_active = 0;
 	// A pause asked for and not resumed. It is in force only until m_pause_deadline. Guarded by m_mutex.

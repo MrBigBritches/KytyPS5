@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <latch>
 #include <memory>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -880,6 +881,202 @@ void TestPausedWarmSetTakesInline() {
 	(void)set.Stop();
 }
 
+using Lane = PipelineBuildQueue::Lane;
+
+// Notes the order in which numbered jobs ran, from any thread.
+struct RunOrder {
+	std::mutex       mutex;
+	std::vector<int> ids;
+
+	Common::UniqueFunction<void> Work(int id) {
+		return [this, id] {
+			std::scoped_lock lock(mutex);
+			ids.push_back(id);
+		};
+	}
+};
+
+// One numbered job and the lane it is posted to.
+struct Posting {
+	int  id;
+	Lane lane;
+};
+
+// Posts the jobs in order behind a held worker, releases it and returns the order they ran in. The
+// only worker runs one job at a time, so the order is the order the queue chose.
+std::vector<int> RunOrderOf(const std::vector<Posting>& postings) {
+	PipelineBuildQueue queue(1);
+	Blocker            blocker;
+	auto               holding = queue.Post(blocker.Work());
+	WaitFor([&] { return blocker.started.load(); });
+	RunOrder                                order;
+	std::vector<PipelineBuildQueue::JobPtr> jobs;
+	for (const auto& posting: postings) {
+		jobs.push_back(queue.Post(order.Work(posting.id), posting.lane));
+		CHECK(jobs.back() != nullptr);
+	}
+	blocker.release = true;
+	WaitFor([&] {
+		return std::all_of(jobs.begin(), jobs.end(), [](const auto& job) {
+			return job->GetState() == PipelineBuildQueue::State::Done;
+		});
+	});
+	return order.ids;
+}
+
+// Each lane is first in, first out. The posts alternate between the lanes, so the order 1 to 6 can
+// only come from two separate lines that each keep their order and are read Front first. The same
+// posts all on Front are the baseline, which run in the order posted.
+void TestLanesAreFifoEach() {
+	const std::vector<int> expected {1, 2, 3, 4, 5, 6};
+	const auto             split = RunOrderOf({{4, Lane::Back},
+	                                           {1, Lane::Front},
+	                                           {5, Lane::Back},
+	                                           {2, Lane::Front},
+	                                           {6, Lane::Back},
+	                                           {3, Lane::Front}});
+	CHECK(split == expected);
+	const std::vector<int> posted {4, 1, 5, 2, 6, 3};
+	const auto             merged = RunOrderOf({{4, Lane::Front},
+	                                            {1, Lane::Front},
+	                                            {5, Lane::Front},
+	                                            {2, Lane::Front},
+	                                            {6, Lane::Front},
+	                                            {3, Lane::Front}});
+	CHECK(merged == posted);
+	// A lane on its own keeps the order it was posted in.
+	const std::vector<int> back_only {1, 2, 3, 4};
+	const auto             alone =
+	    RunOrderOf({{1, Lane::Back}, {2, Lane::Back}, {3, Lane::Back}, {4, Lane::Back}});
+	CHECK(alone == back_only);
+}
+
+// A Back job posted first runs after the Front jobs posted later. All on Front they run as posted.
+void TestBackRunsAfterFront() {
+	constexpr int X = 1, Y = 2, Z = 3;
+	const auto    back_first = RunOrderOf({{X, Lane::Back}, {Y, Lane::Front}, {Z, Lane::Front}});
+	const std::vector<int> expected_back_last {Y, Z, X};
+	CHECK(back_first == expected_back_last);
+	const auto all_front = RunOrderOf({{X, Lane::Front}, {Y, Lane::Front}, {Z, Lane::Front}});
+	const std::vector<int> expected_posted {X, Y, Z};
+	CHECK(all_front == expected_posted);
+}
+
+// With nothing on Front the Back jobs all run, and on idle workers with no one holding them.
+void TestBackJobsAreNotStarved() {
+	PipelineBuildQueue queue(2);
+	WarmWorker(queue);
+	constexpr size_t                        BACK_JOBS = 5;
+	std::vector<std::unique_ptr<Counted>>   counters;
+	std::vector<PipelineBuildQueue::JobPtr> jobs;
+	for (size_t index = 0; index < BACK_JOBS; index++) {
+		counters.push_back(std::make_unique<Counted>());
+		jobs.push_back(queue.Post(counters.back()->Work(), Lane::Back));
+	}
+	WaitFor([&] {
+		return std::all_of(jobs.begin(), jobs.end(), [](const auto& job) {
+			return job->GetState() == PipelineBuildQueue::State::Done;
+		});
+	});
+	for (const auto& counted: counters) {
+		CHECK(counted->runs == 1 && counted->ran_on != std::this_thread::get_id());
+	}
+}
+
+// A pause holds a job of either lane until Resume. The Front lane is the baseline, and the Back job
+// is alone in its queue, so nothing on Front could be what keeps the worker waiting.
+void TestPauseHoldsBothLanes() {
+	for (const Lane lane: {Lane::Front, Lane::Back}) {
+		PipelineBuildQueue queue(1);
+		WarmWorker(queue);
+		queue.Pause(std::chrono::steady_clock::now() + FAR_FUTURE);
+		Counted counted;
+		auto    job = queue.Post(counted.Work(), lane);
+		CHECK(StaysQueued(*job));
+		CHECK(counted.runs == 0);
+		queue.Resume();
+		WaitFor([&] { return job->GetState() == PipelineBuildQueue::State::Done; });
+		CHECK(counted.runs == 1 && counted.ran_on != std::this_thread::get_id());
+	}
+}
+
+// Stop drops the queued jobs of either lane and frees the work they captured, with the Front lane
+// as the baseline. The weak handle expires only when the queue let go of the job, so it is read
+// while the queue is still alive.
+void TestStopDropsBothLanes() {
+	for (const Lane lane: {Lane::Front, Lane::Back}) {
+		PipelineBuildQueue queue(1);
+		Blocker            blocker;
+		auto               holding = queue.Post(blocker.Work());
+		WaitFor([&] { return blocker.started.load(); });
+
+		Counted                  counted;
+		auto                     token   = std::make_shared<int>(0);
+		const std::weak_ptr<int> watch   = token;
+		auto                     dropped = queue.Post([token, &counted] { counted.runs++; }, lane);
+		token.reset();
+		CHECK(!watch.expired());
+
+		std::thread stopper([&] { (void)queue.Stop(); });
+		WaitFor([&] { return queue.Stopping(); });
+		blocker.release = true;
+		stopper.join();
+
+		CHECK(dropped->GetState() == PipelineBuildQueue::State::Queued);
+		CHECK(counted.runs == 0);
+		dropped.reset();
+		CHECK(watch.expired());
+	}
+}
+
+// The warm set passes the lane on. The Back build is started first and the Front build second, and
+// the Front one is built first. Both on Front are built in the order started.
+void TestWarmSetLaneOrder() {
+	constexpr uint32_t K1 = 1, K2 = 2;
+	for (const Lane first_lane: {Lane::Back, Lane::Front}) {
+		RunOrder   order;
+		Blocker    blocker;
+		Warm       set(1, {});
+		const auto holding = HoldWorker(set, blocker);
+		CHECK(set.Start(K1, [&order](Built&) { order.Work(1)(); }, first_lane));
+		CHECK(set.Start(K2, [&order](Built&) { order.Work(2)(); }, Lane::Front));
+		blocker.release = true;
+		WaitFor([&] { return set.IsDone(K1) && set.IsDone(K2); });
+		const std::vector<int> expected =
+		    first_lane == Lane::Back ? std::vector<int> {2, 1} : std::vector<int> {1, 2};
+		CHECK(order.ids == expected);
+		(void)set.Stop();
+	}
+}
+
+// A Back job that a caller claims while Front is not empty runs once, on the caller. The worker
+// reaches its stale entry later and skips it. A sentinel behind it on Back says the entry was
+// taken.
+void TestInlineClaimOfBackJobRunsOnce() {
+	PipelineBuildQueue queue(1);
+	Blocker            blocker;
+	auto               holding = queue.Post(blocker.Work());
+	WaitFor([&] { return blocker.started.load(); });
+
+	Counted front;
+	Counted back;
+	auto    front_job = queue.Post(front.Work(), Lane::Front);
+	auto    back_job  = queue.Post(back.Work(), Lane::Back);
+	CHECK(front_job->GetState() == PipelineBuildQueue::State::Queued);
+	CHECK(queue.Acquire(*back_job) == PipelineBuildQueue::Acquired::RanInline);
+	CHECK(back.runs == 1 && back.ran_on == std::this_thread::get_id());
+	CHECK(front.runs == 0);
+
+	blocker.release = true;
+	Counted sentinel;
+	auto    last = queue.Post(sentinel.Work(), Lane::Back);
+	WaitFor([&] { return last->GetState() == PipelineBuildQueue::State::Done; });
+	CHECK(front.runs == 1);
+	CHECK(back.runs == 1);
+	CHECK(queue.Acquire(*back_job) == PipelineBuildQueue::Acquired::AlreadyDone);
+	CHECK(back.runs == 1);
+}
+
 int main() {
 #ifdef KYTY_TEST_HAS_PRIORITY
 	TestLowPriorityWorkers();
@@ -909,5 +1106,12 @@ int main() {
 	TestStopPausedQueue();
 	TestPauseClampsFarDeadline();
 	TestPausedWarmSetTakesInline();
+	TestLanesAreFifoEach();
+	TestBackRunsAfterFront();
+	TestBackJobsAreNotStarved();
+	TestPauseHoldsBothLanes();
+	TestStopDropsBothLanes();
+	TestWarmSetLaneOrder();
+	TestInlineClaimOfBackJobRunsOnce();
 	std::puts("Pipeline build queue tests passed");
 }

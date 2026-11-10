@@ -1587,11 +1587,12 @@ void PipelineCache::DrainPublishedBuilds() {
 	}
 }
 
-void PipelineCache::StartWarmCompute(const ShaderModule& module, StoreGen::GenRow* row) {
+void PipelineCache::StartWarmCompute(const ShaderModule& module, StoreGen::GenRow* row,
+                                     PipelineBuildQueue::Lane lane) {
 	// The module lives in the program cache, which outlasts the queue because StopBuilds runs
 	// first. A refusal leaves the module to build on first use, as it would without the warm-up.
 	// The row is in the generation state, which outlasts the queue for the same reason.
-	(void)m_warm_compute->Start(module.id, [this, &module, row](Pipeline& pipeline) {
+	auto build = [this, &module, row](Pipeline& pipeline) {
 		// The rows of worker compiles show how many warm builds were running when they began.
 		const Common::FirstRunReport::WarmBuildScope running;
 		const auto                                   build_start = std::chrono::steady_clock::now();
@@ -1609,7 +1610,8 @@ void PipelineCache::StartWarmCompute(const ShaderModule& module, StoreGen::GenRo
 		}
 		// Marked here because this build adds to the driver cache without a checkpoint of its own.
 		m_driver_cache_dirty.store(true, std::memory_order_relaxed);
-	});
+	};
+	(void)m_warm_compute->Start(module.id, std::move(build), lane);
 }
 
 namespace {
