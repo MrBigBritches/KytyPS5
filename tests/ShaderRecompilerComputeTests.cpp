@@ -1383,11 +1383,24 @@ struct PipelineCacheTestAccess {
   }
 
   // Waits until every warm build started before has finished. The queue has one worker, so a job
-  // posted behind them runs only after they are done.
+  // posted behind them runs only after they are done. It goes on the back lane, which the worker
+  // serves last, so builds queued there are done as well. With nothing on that lane it is the same
+  // as a job at the end of the front one.
   static void DrainWarmQueue(PipelineCache &cache) {
     auto &queue = cache.m_warm_compute->Queue();
-    const auto job = queue.Post([] {});
+    const auto job = queue.Post([] {}, PipelineBuildQueue::Lane::Back);
     while (job->GetState() != PipelineBuildQueue::State::Done) std::this_thread::yield();
+  }
+
+  // Keeps the one warm worker busy until `release` is set, so a test can queue builds behind it and
+  // see the order the worker takes them in. `held` is set once the worker is inside the job.
+  static PipelineBuildQueue::JobPtr HoldWarmWorker(PipelineCache &cache, std::atomic<bool> &held,
+                                                   std::atomic<bool> &release) {
+    return cache.m_warm_compute->Queue().Post([&held, &release] {
+      held = true;
+      const auto limit = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+      while (!release.load() && std::chrono::steady_clock::now() < limit) std::this_thread::yield();
+    });
   }
 
   // The key the cache stores a pipeline under, found by its address.
@@ -62392,6 +62405,157 @@ void CheckGeneratedRowsTightWriter(VulkanHarness &vulkan) {
   std::printf("[gpu]     %-32s ok\n", name);
 }
 
+// The shader module of a lookup's result, as the number the driver hook records for a build.
+uint64_t ModuleHandleOf(const ShaderComputeInputInfo &input) {
+  return reinterpret_cast<uint64_t>(static_cast<VkShaderModule>(input.stage.module->module));
+}
+
+// The shader module the cache holds for a stored program of one buffer, found by looking it up.
+uint64_t StoredModuleHandle(PipelineCache &cache, const std::vector<u32> &code) {
+  HW::ComputeShaderInfo regs{};
+  regs.cs_regs.data_addr = reinterpret_cast<uint64_t>(code.data());
+  regs.cs_regs.num_thread_x = 1;
+  regs.cs_regs.num_thread_y = 1;
+  regs.cs_regs.num_thread_z = 1;
+  regs.cs_regs.wave_size = 32;
+  regs.cs_regs.user_sgpr = 4;
+  const ShaderBufferResource buffer{{0x10000u, 4u << 16u, 64,
+      DstSel(4, 5, 6, 7) | (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u)}};
+  std::copy_n(buffer.fields, 4, regs.cs_user_sgpr.value);
+  ShaderComputeInputInfo input{};
+  (void)cache.GetComputeProgram(regs, input);
+  return ModuleHandleOf(input);
+}
+
+// Takes in the two records while the one warm worker is busy, so both builds wait in the queue
+// together, then lets the worker go. The first record is posted as tier 1 with the given candidate
+// count, the second as tier 0. Returns the records' indexes in the order their pipelines were
+// created.
+std::vector<size_t> GeneratedBuildOrder(VulkanHarness &vulkan, GuestGpu &gpu,
+                                        const std::vector<DecodedModuleRecord> &records,
+                                        bool wide_tail_last,
+                                        std::optional<uint64_t> first_candidates) {
+  constexpr const char *name = "GeneratedWideTailLast";
+  constexpr uint32_t first_tier = 1;
+  Config::Load({.printf_direction = Config::LogDirection::Silent,
+                .warm_wide_tail_last_enabled = wide_tail_last});
+  ComputeCreateHook hook;
+  PipelineCache cache(vulkan.RuntimeContext(), nullptr);
+  PipelineCacheTestAccess::EnableWarmCompute(cache);
+  PipelineCacheTestAccess::EnableGeneration(cache);
+  std::atomic<bool> held{false};
+  std::atomic<bool> release{false};
+  const auto blocker = PipelineCacheTestAccess::HoldWarmWorker(cache, held, release);
+  WaitUntilTrue(name, "worker held", [&] { return held.load(); });
+  cache.PostGeneratedModule(
+      DecodedModuleRecord(records[0]),
+      {.tier = first_tier,
+       .candidates = first_candidates,
+       .wide_tail = StoreGen::IsWideTail(first_tier, first_candidates)});
+  cache.PostGeneratedModule(DecodedModuleRecord(records[1]), {});
+  ShaderComputeInputInfo first_input{};
+  ShaderComputeInputInfo second_input{};
+  gpu.SendCommandSync([&] {
+    GeneratedLookup(cache, GENERATED_STRIDE_A, first_input);
+    GeneratedLookup(cache, GENERATED_STRIDE_B, second_input);
+  });
+  const uint64_t handles[] = {ModuleHandleOf(first_input), ModuleHandleOf(second_input)};
+  release = true;
+  PipelineCacheTestAccess::DrainWarmQueue(cache);
+  std::vector<size_t> order;
+  for (const auto built : ComputeCreateHook::CreatedModules())
+    order.push_back(built == handles[0] ? 0 : 1);
+  cache.StopBuilds();
+  Config::Load({.printf_direction = Config::LogDirection::Silent});
+  return order;
+}
+
+// With --warm-wide-tail-last the wide tail is built after the other generated modules. The worker
+// is held while record 0 (tier 1, 3 candidates, wide) and then record 1 (tier 0) are taken in, so
+// the order they build in is the queue's. Each baseline changes one thing. Without the flag the
+// same posts build in the order they came, and with 2 candidates record 0 is not wide, so only the
+// flag and the width can have moved record 1 ahead.
+void CheckGeneratedWideTailLast(VulkanHarness &vulkan, GuestGpu &gpu,
+                                const std::vector<DecodedModuleRecord> &records) {
+  constexpr const char *name = "GeneratedWideTailLast";
+  constexpr uint64_t wide_candidates = 3;
+  constexpr uint64_t narrow_candidates = 2;
+  const std::vector<size_t> in_post_order = {0, 1};
+  const std::vector<size_t> wide_last = {1, 0};
+  Require(name, "the flag moves the wide tail last",
+          GeneratedBuildOrder(vulkan, gpu, records, true, wide_candidates) == wide_last,
+          "a wide record was not built after the one that was posted behind it");
+  Require(name, "without the flag the posts build in order",
+          GeneratedBuildOrder(vulkan, gpu, records, false, wide_candidates) == in_post_order,
+          "the order changed with the flag off");
+  Require(name, "a program of 2 candidates is not wide",
+          GeneratedBuildOrder(vulkan, gpu, records, true, narrow_candidates) == in_post_order,
+          "a record that is not wide was moved to the back");
+  Require(name, "an unknown count is not wide",
+          GeneratedBuildOrder(vulkan, gpu, records, true, std::nullopt) == in_post_order,
+          "a record with no candidate count was moved to the back");
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
+// The warm-up of the main store stays on the front lane, so it builds before a generated module
+// that is taken in later, which is what the flag must not change. The first build is held in the
+// driver while the generated module is taken in, so the second store module and the generated one
+// are queued together. A warm-up posted on the back lane would build after the generated module.
+void CheckWarmUpStaysFront(VulkanHarness &vulkan, GuestGpu &gpu,
+                           const std::vector<DecodedModuleRecord> &records) {
+  constexpr const char *name = "WarmUpStaysFront";
+  constexpr size_t store_programs = 2;
+  constexpr u32 first_value = 0x91u;
+  std::vector<std::vector<u32>> codes;
+  for (size_t index = 0; index < store_programs; index++) {
+    std::vector<u32> code;
+    AppendVMovU32(&code, 1, first_value + static_cast<u32>(index));
+    code.insert(code.end(), {EncodeMubuf0(0x1c), EncodeMubuf1(1, 0, 0)});
+    AppendEnd(&code);
+    ShaderMapUserData(reinterpret_cast<uint64_t>(code.data()),
+                      {.type = Prospero::ShaderBinaryType::kCs,
+                       .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
+    codes.push_back(std::move(code));
+  }
+  const auto dir = std::filesystem::temp_directory_path() /
+                   fmt::format("kyty_warm_stays_front_{}",
+                               std::chrono::steady_clock::now().time_since_epoch().count());
+  const auto store = dir / "TEST00001.shaders";
+  (void)RunWarmBoot(vulkan, store, codes, false);
+  Config::Load({.printf_direction = Config::LogDirection::Silent,
+                .background_warm_up_enabled = true,
+                .warm_wide_tail_last_enabled = true});
+  ComputeCreateHook hook;
+  PipelineCache cache(vulkan.RuntimeContext(), nullptr);
+  PipelineCacheTestAccess::SetWarmWorkerCount(cache, 1);
+  const int entered_before = ComputeCreateHook::entered.load();
+  ComputeCreateHook::release = false;
+  ComputeCreateHook::block = true;
+  cache.WarmUp(store);
+  WaitUntilTrue(name, "first store build held",
+                [&] { return ComputeCreateHook::entered.load() > entered_before; });
+  PipelineCacheTestAccess::EnableGeneration(cache);
+  cache.PostGeneratedModule(DecodedModuleRecord(records[0]), {});
+  std::vector<uint64_t> handles;
+  gpu.SendCommandSync([&] {
+    ShaderComputeInputInfo generated{};
+    GeneratedLookup(cache, GENERATED_STRIDE_A, generated);
+    for (const auto &code : codes) handles.push_back(StoredModuleHandle(cache, code));
+    handles.push_back(ModuleHandleOf(generated));
+  });
+  ComputeCreateHook::release = true;
+  PipelineCacheTestAccess::DrainWarmQueue(cache);
+  ComputeCreateHook::block = false;
+  Require(name, "the store's modules build before the generated one",
+          ComputeCreateHook::CreatedModules() == handles,
+          "a main store warm build did not come ahead of the generated module");
+  cache.StopBuilds();
+  Config::Load({.printf_direction = Config::LogDirection::Silent});
+  Common::FirstRunReport::Global().Reset();
+  std::filesystem::remove_all(dir);
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
 // Captures two module records of one program by compiling it with two strides into a store, and runs
 // the checks of the generated modules over them.
 void CheckGeneratedModules(VulkanHarness &vulkan) {
@@ -62431,6 +62595,8 @@ void CheckGeneratedModules(VulkanHarness &vulkan) {
       CheckGeneratedRowsWriterAgainstPushes(vulkan, gpu, records);
       CheckGeneratedRowsTightWriter(vulkan);
       CheckGeneratedRowsTakeTheLock(vulkan);
+      CheckGeneratedWideTailLast(vulkan, gpu, records);
+      CheckWarmUpStaysFront(vulkan, gpu, records);
       Common::FirstRunReport::Global().Reset();
       Common::FirstRunReport::Configure(false, false);
     });
@@ -62474,7 +62640,8 @@ bool RigProcessAlive(uint32_t pid) {
 std::unique_ptr<PipelineCache>
 BootGeneratingCache(VulkanHarness &vulkan, const std::filesystem::path &dir,
                     const std::vector<uint8_t> &eboot, bool generate, bool background,
-                    std::function<void(StoreGen::SupervisorConfig &)> tweak = {}) {
+                    std::function<void(StoreGen::SupervisorConfig &)> tweak = {},
+                    bool wide_tail_last = false) {
   std::filesystem::create_directories(dir);
   {
     std::ofstream out(dir / "game.eboot", std::ios::binary | std::ios::trunc);
@@ -62484,7 +62651,8 @@ BootGeneratingCache(VulkanHarness &vulkan, const std::filesystem::path &dir,
   StoreGen::SetEbootPath(dir / "game.eboot");
   Config::Load({.printf_direction = Config::LogDirection::Silent,
                 .background_warm_up_enabled = background,
-                .generate_shader_store_enabled = generate});
+                .generate_shader_store_enabled = generate,
+                .warm_wide_tail_last_enabled = wide_tail_last});
   // Config::Load turns the counters off again, and the checks read them.
   Common::DebugCounters::SetEnabled(true);
   auto cache = std::make_unique<PipelineCache>(vulkan.RuntimeContext(), nullptr);
@@ -62535,8 +62703,11 @@ constexpr auto GENERATION_WAIT = std::chrono::seconds(180);
 // reaches the cache, is taken in by the GPU thread, and has its build queued behind the player's
 // own, so the modules are there with no compile on any thread of the game. A cache without the flag
 // has no generator and no files, and its lookup compiles, which is the baseline.
-void CheckStoreGenerationNormal(VulkanHarness &vulkan, GuestGpu &gpu) {
-  constexpr const char *name = "StoreGenerationNormal";
+//
+// With `wide_tail_last` the same run has --warm-wide-tail-last on, and the wide tail of the modules
+// builds on the back lane. Every build must still be done once the drain helper returns.
+void CheckStoreGenerationNormal(VulkanHarness &vulkan, GuestGpu &gpu, bool wide_tail_last = false) {
+  const char *name = wide_tail_last ? "StoreGenerationWideTailLast" : "StoreGenerationNormal";
   constexpr size_t candidates = StoreGenFixtures::MAIN_CANDIDATES;
   const auto eboot = StoreGenFixtures::BuildEboot(StoreGenFixtures::MainPrograms());
   const auto dir = std::filesystem::temp_directory_path() /
@@ -62577,7 +62748,7 @@ void CheckStoreGenerationNormal(VulkanHarness &vulkan, GuestGpu &gpu) {
     Common::FirstRunReport::Global().Reset();
   }
   {
-    auto cache = BootGeneratingCache(vulkan, dir / "on", eboot, true, true);
+    auto cache = BootGeneratingCache(vulkan, dir / "on", eboot, true, true, {}, wide_tail_last);
     Require(name, "the generator started", PipelineCacheTestAccess::HasSupervisor(*cache),
             "the flag did not start a generator");
     Require(name, "the generator finished",
@@ -62986,6 +63157,7 @@ void CheckStoreGeneration(VulkanHarness &vulkan) {
   Config::Load({.printf_direction = Config::LogDirection::Silent});
   vulkan.WithGpuLane([&](GuestGpu &gpu) {
     CheckStoreGenerationNormal(vulkan, gpu);
+    CheckStoreGenerationNormal(vulkan, gpu, true);
     CheckStoreGenerationSecondBoot(vulkan, gpu);
     CheckStoreGenerationRows(vulkan, gpu);
     CheckStoreGenerationTiers(vulkan, gpu);

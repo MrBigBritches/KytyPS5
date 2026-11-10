@@ -117,6 +117,10 @@ struct ConfigOptions {
 	// priority helper process, so the warm-up finds them ready. Needs shader_cache_enabled and
 	// background_warm_up_enabled, and does nothing without both.
 	bool                   generate_shader_store_enabled = false;
+	// Builds the wide tail of the generated modules after the other warm builds, so a program with
+	// many variants does not hold up the rest. Orders the generator's warm builds only, and needs
+	// generate_shader_store_enabled to have any effect.
+	bool                   warm_wide_tail_last_enabled = false;
 	// Lets a draw that misses its graphics pipeline carry on while the pipeline builds, with the
 	// draw recorded afterwards. Stands alone and enables no draw skips.
 	bool                   deferred_pipeline_draws_enabled = false;
@@ -236,6 +240,9 @@ bool BackgroundWarmUpEnabled();
 /// True when --generate-shader-store asks for the shader store to be generated from the eboot. The
 /// pipeline cache decides whether it can, and says why not.
 bool GenerateShaderStoreEnabled();
+/// True when --warm-wide-tail-last builds the wide tail of the generated modules after the
+/// others. It does nothing without --generate-shader-store.
+bool WarmWideTailLastEnabled();
 /// True when --deferred-pipeline-draws lets draws wait for their pipeline out of line.
 bool DeferredPipelineDrawsEnabled();
 /// True when --pause-warm-up-for-draws holds the warm-up queue while deferred draws resolve.

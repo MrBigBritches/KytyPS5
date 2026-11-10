@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineBuildQueue.h"
 #include "graphics/host_gpu/renderer/pipeline/warmBuildSet.h"
+#include "graphics/host_gpu/renderer/pipeline/warmLane.h"
 
 #include <algorithm>
 #include <atomic>
@@ -1077,7 +1078,30 @@ void TestInlineClaimOfBackJobRunsOnce() {
 	CHECK(back.runs == 1);
 }
 
+// A generated module's build goes on the back lane only when the flag is on and the module is wide
+// tail. The four rows are every combination, so each one differs from its neighbours in one input
+// and a rule that ignores either input gives a wrong lane in at least one row.
+void TestWarmLaneOf() {
+	struct Row {
+		bool wide_tail_last;
+		bool wide_tail;
+		Lane expected;
+	};
+	const Row rows[] = {
+	    {true, true, Lane::Back},
+	    {true, false, Lane::Front},
+	    {false, true, Lane::Front},
+	    {false, false, Lane::Front},
+	};
+	for (const auto& row: rows) {
+		const StoreGen::GeneratedOrder order {
+		    .tier = 1, .candidates = 3, .wide_tail = row.wide_tail};
+		CHECK(WarmLaneOf(row.wide_tail_last, order) == row.expected);
+	}
+}
+
 int main() {
+	TestWarmLaneOf();
 #ifdef KYTY_TEST_HAS_PRIORITY
 	TestLowPriorityWorkers();
 #endif

@@ -916,6 +916,13 @@ if(BUILD_TESTING)
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --generate-shader-store)
 	set_tests_properties(emulator_generate_shader_store_help PROPERTIES
 	                     PASS_REGULAR_EXPRESSION "--generate-shader-store +Predict a Motor title")
+	add_test(NAME emulator_warm_wide_tail_last_cli
+	         COMMAND $<TARGET_FILE:kyty_emulator> --help --warm-wide-tail-last)
+	# Checked apart from the parsing, as the help of --generate-shader-store is.
+	add_test(NAME emulator_warm_wide_tail_last_help
+	         COMMAND $<TARGET_FILE:kyty_emulator> --help --warm-wide-tail-last)
+	set_tests_properties(emulator_warm_wide_tail_last_help PROPERTIES
+	                     PASS_REGULAR_EXPRESSION "--warm-wide-tail-last +Build the extra variants of programs with")
 	add_test(NAME emulator_deferred_pipeline_draws_cli
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --deferred-pipeline-draws)
 	add_test(NAME emulator_pause_warm_up_for_draws_cli

@@ -276,6 +276,10 @@ bool GenerateShaderStoreEnabled() {
 	return g_config->generate_shader_store_enabled;
 }
 
+bool WarmWideTailLastEnabled() {
+	return g_config->warm_wide_tail_last_enabled;
+}
+
 bool DeferredPipelineDrawsEnabled() {
 	return g_config->deferred_pipeline_draws_enabled;
 }

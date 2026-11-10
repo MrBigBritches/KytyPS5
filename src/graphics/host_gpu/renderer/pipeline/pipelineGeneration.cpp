@@ -1,8 +1,10 @@
 #include "common/childProcess.h"
+#include "common/emulatorConfig.h"
 #include "common/firstRunReport.h"
 #include "common/logging/log.h"
 #include "graphics/host_gpu/renderer/pipeline/generationState.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/pipeline/warmLane.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
@@ -119,7 +121,7 @@ PipelineCache::MakeGeneratedModule(DecodedModuleRecord&&           record,
 }
 
 // Makes the module of a record on the generator's thread and hands it to the GPU thread. The order
-// travels with it and nothing reads it yet.
+// travels with it, for the report's rows and for the lane of the module's warm build.
 void PipelineCache::PostGeneratedModule(DecodedModuleRecord&&           record,
                                         const StoreGen::GeneratedOrder& order) {
 	if (m_generation == nullptr) {
@@ -246,7 +248,9 @@ void PipelineCache::AdoptGenerated(GeneratedModule&& item) {
 			StoreGen::GenRow* row = NoteAdopted(item);
 			// A deque, so the address that the queued build holds stays valid.
 			program->modules.push_back(std::move(item.module));
-			StartWarmCompute(program->modules.back(), row);
+			// The wide tail goes to the back lane, so it never delays the other builds.
+			StartWarmCompute(program->modules.back(), row,
+			                 WarmLaneOf(Config::WarmWideTailLastEnabled(), item.order));
 			return;
 		}
 		case StoreGen::DrainVerdict::DropFailedInstall:
