@@ -62428,14 +62428,14 @@ uint64_t StoredModuleHandle(PipelineCache &cache, const std::vector<u32> &code) 
 }
 
 // Takes in the two records while the one warm worker is busy, so both builds wait in the queue
-// together, then lets the worker go. The first record is posted as tier 1 with the given candidate
+// together, then lets the worker go. The first record is posted with the given tier and candidate
 // count, the second as tier 0. Returns the records' indexes in the order their pipelines were
 // created.
 std::vector<size_t> GeneratedBuildOrder(VulkanHarness &vulkan, GuestGpu &gpu,
                                         const std::vector<DecodedModuleRecord> &records,
+                                        uint32_t first_tier,
                                         std::optional<uint64_t> first_candidates) {
   constexpr const char *name = "GeneratedWideTailLast";
-  constexpr uint32_t first_tier = 1;
   Config::Load({.printf_direction = Config::LogDirection::Silent});
   ComputeCreateHook hook;
   PipelineCache cache(vulkan.RuntimeContext(), nullptr);
@@ -62449,7 +62449,7 @@ std::vector<size_t> GeneratedBuildOrder(VulkanHarness &vulkan, GuestGpu &gpu,
       DecodedModuleRecord(records[0]),
       {.tier = first_tier,
        .candidates = first_candidates,
-       .wide_tail = StoreGen::IsWideTail(first_tier, first_candidates)});
+       .wide_tail = StoreGen::IsBackLane(first_tier, first_candidates)});
   cache.PostGeneratedModule(DecodedModuleRecord(records[1]), {});
   ShaderComputeInputInfo first_input{};
   ShaderComputeInputInfo second_input{};
@@ -62468,33 +62468,40 @@ std::vector<size_t> GeneratedBuildOrder(VulkanHarness &vulkan, GuestGpu &gpu,
   return order;
 }
 
-// The wide tail is built after the other generated modules. The worker is held while record 0
-// (tier 1, 3 candidates, wide) and then record 1 (tier 0) are taken in, so the order they build in
-// is the queue's. The baselines change one thing. With 2 candidates, or an unknown count, record 0
-// is posted the same way but is not wide, so only the width can have moved record 1 ahead.
+// The Back lane is built after the other generated modules. The worker is held while record 0
+// and then record 1 (tier 0) are taken in, so the order they build in is the queue's. A wide
+// program (3 candidates) goes Back from tier 2 and a narrow one (2) from tier 1. The baselines
+// change one thing. Wide at tier 1 and an unknown count at tier 1 are posted the same way but are
+// Front, so only the tier and the count can have moved record 1 ahead.
 void CheckGeneratedWideTailLast(VulkanHarness &vulkan, GuestGpu &gpu,
                                 const std::vector<DecodedModuleRecord> &records) {
   constexpr const char *name = "GeneratedWideTailLast";
   constexpr uint64_t wide_candidates = 3;
   constexpr uint64_t narrow_candidates = 2;
+  constexpr uint32_t base_tier = 1;
+  constexpr uint32_t partial_tier = 2;
   const std::vector<size_t> in_post_order = {0, 1};
-  const std::vector<size_t> wide_last = {1, 0};
-  Require(name, "the wide tail builds last",
-          GeneratedBuildOrder(vulkan, gpu, records, wide_candidates) == wide_last,
-          "a wide record was not built after the one that was posted behind it");
-  Require(name, "a program of 2 candidates is not wide",
-          GeneratedBuildOrder(vulkan, gpu, records, narrow_candidates) == in_post_order,
-          "a record that is not wide was moved to the back");
-  Require(name, "an unknown count is not wide",
-          GeneratedBuildOrder(vulkan, gpu, records, std::nullopt) == in_post_order,
+  const std::vector<size_t> back_last = {1, 0};
+  Require(name, "a wide partial builds last",
+          GeneratedBuildOrder(vulkan, gpu, records, partial_tier, wide_candidates) == back_last,
+          "a wide partial was not built after the one that was posted behind it");
+  Require(name, "a wide base at tier 1 stays Front",
+          GeneratedBuildOrder(vulkan, gpu, records, base_tier, wide_candidates) == in_post_order,
+          "a wide base was moved to the back");
+  Require(name, "a narrow base at tier 1 builds last",
+          GeneratedBuildOrder(vulkan, gpu, records, base_tier, narrow_candidates) == back_last,
+          "a narrow base was not built after the one that was posted behind it");
+  Require(name, "an unknown count is not Back",
+          GeneratedBuildOrder(vulkan, gpu, records, base_tier, std::nullopt) == in_post_order,
           "a record with no candidate count was moved to the back");
   std::printf("[gpu]     %-32s ok\n", name);
 }
 
 // The warm-up of the main store stays on the front lane, so it builds before a generated module
-// that is taken in later, since only the generator's wide tail is left to the back. The first build is held in the
-// driver while the generated module is taken in, so the second store module and the generated one
-// are queued together. A warm-up posted on the back lane would build after the generated module.
+// that is taken in later, since only the generator's narrow bases and wide partials go to the back.
+// The first build is held in the driver while the generated module is taken in, so the second store
+// module and the generated one are queued together. A warm-up posted on the back lane would build
+// after the generated module.
 void CheckWarmUpStaysFront(VulkanHarness &vulkan, GuestGpu &gpu,
                            const std::vector<DecodedModuleRecord> &records) {
   constexpr const char *name = "WarmUpStaysFront";
@@ -62695,8 +62702,8 @@ constexpr auto GENERATION_WAIT = std::chrono::seconds(180);
 // own, so the modules are there with no compile on any thread of the game. A cache without the flag
 // has no generator and no files, and its lookup compiles, which is the baseline.
 //
-// The wide tail of the modules builds on the back lane, and every build must still be done once
-// the drain helper returns.
+// The back lane modules, the narrow bases and wide partials, build last, and every build must
+// still be done once the drain helper returns.
 void CheckStoreGenerationNormal(VulkanHarness &vulkan, GuestGpu &gpu) {
   constexpr const char *name = "StoreGenerationNormal";
   constexpr size_t candidates = StoreGenFixtures::MAIN_CANDIDATES;
@@ -62966,9 +62973,12 @@ void CheckStoreGenerationRows(VulkanHarness &vulkan, GuestGpu &gpu) {
   std::printf("[gpu]     %-32s ok\n", name);
 }
 
-// The tier, wide flag and candidate count of the module rows come from a real worker. Big has four
-// candidates, so its tiers 1 to 3 are wide and its tier 0 is not. Middle has two, so its tier 1 is
-// not wide, which is the one change from Big's tier 1. Small has one and only a tier 0.
+// The tier, Back flag, candidate count and id of the module rows come from a real worker. Big has
+// four candidates, so its tiers 2 and 3 are Back and its tiers 0 and 1 are not. Middle has two, so
+// its tier 1 is Back, which is the one change from Big's tier 1. Small has one and only a tier 0.
+// The ids pin the worker's order too. Big's tier 0 is the head {0,1} and its tier 1 the base {},
+// and Middle's tier 0 is the head {0} and its tier 1 the base {}. A tier is only a position, so
+// without the ids a worker that built in another order would still pass the flags.
 void CheckStoreGenerationTiers(VulkanHarness &vulkan, GuestGpu &gpu) {
   constexpr const char *name = "StoreGenerationTiers";
   constexpr uint64_t big_candidates = 4;
@@ -63006,19 +63016,41 @@ void CheckStoreGenerationTiers(VulkanHarness &vulkan, GuestGpu &gpu) {
     const auto row = program->second.find(tier);
     return row == program->second.end() ? nullptr : row->second;
   };
+  constexpr uint32_t wide_first_back_tier = StoreGen::WIDE_FIRST_BACK_TIER;
   bool big_right = by_count[big_candidates].size() == big_candidates;
   for (uint32_t tier = 0; tier < big_candidates; tier++) {
     const auto *row = tier_of(big_candidates, tier);
-    big_right = big_right && row != nullptr && row->wide_tail == (tier >= 1);
+    big_right = big_right && row != nullptr && row->wide_tail == (tier >= wide_first_back_tier);
   }
-  Require(name, "Big is wide from tier 1", big_right,
-          "Big's tier 0 was wide or one of its tiers 1 to 3 was not");
+  Require(name, "Big is Back from tier 2", big_right,
+          "Big's tier 0 or 1 was Back or one of its tiers 2 and 3 was not");
   const auto *middle_first = tier_of(middle_candidates, 0);
   const auto *middle_second = tier_of(middle_candidates, 1);
-  Require(name, "Middle tier 1 is not wide, with its own count",
+  Require(name, "Middle is Back from tier 1, with its own count",
           middle_first != nullptr && middle_second != nullptr && !middle_first->wide_tail &&
-              !middle_second->wide_tail && by_count[middle_candidates].size() == middle_candidates,
-          "a program of two candidates had a wide tail");
+              middle_second->wide_tail && by_count[middle_candidates].size() == middle_candidates,
+          "Middle's base was not Back or its head was");
+  // The ids that the tiers hold. The predictor names the candidates the worker built.
+  const auto scan = StoreGen::ScanEbootShaders(eboot);
+  const auto big = StoreGenFixtures::PredictedFor(StoreGenFixtures::ProgramBig(), scan.programs.at(0));
+  const auto middle =
+      StoreGenFixtures::PredictedFor(StoreGenFixtures::ProgramMiddle(), scan.programs.at(1));
+  const auto id_at = [&](uint64_t count, uint32_t tier) {
+    const auto *row = tier_of(count, tier);
+    return row != nullptr ? row->id : uint64_t{0};
+  };
+  const uint64_t big_head = StoreGenFixtures::Pick(big, {0, 1}).id;
+  const uint64_t big_base = StoreGenFixtures::Pick(big, {}).id;
+  const uint64_t middle_head = StoreGenFixtures::Pick(middle, {0}).id;
+  const uint64_t middle_base = StoreGenFixtures::Pick(middle, {}).id;
+  Require(name, "Big's head and base come first",
+          big_head != 0 && big_base != 0 && id_at(big_candidates, 0) == big_head &&
+              id_at(big_candidates, 1) == big_base,
+          "Big's tier 0 was not its head {0,1} or its tier 1 was not its base");
+  Require(name, "Middle's head comes before its base",
+          middle_head != 0 && middle_base != 0 && id_at(middle_candidates, 0) == middle_head &&
+              id_at(middle_candidates, 1) == middle_base,
+          "Middle's tier 0 was not its head {0} or its tier 1 was not its base");
   const auto *lone_row = tier_of(small_candidates, 0);
   Require(name, "Small is tier 0 with one candidate",
           lone_row != nullptr && !lone_row->wide_tail && by_count[small_candidates].size() == 1,

@@ -723,14 +723,14 @@ void StoreSupervisor::Impl::DeliverRecord(const TailedFrame& frame, RecordSource
 // Where a new record stands among its program's, and how many candidates the program has. It runs
 // after the id check, so a record the restart sent again was dropped before it could count. The
 // counter is kept across fresh restarts for the same reason as the ids. A record of the earlier
-// file has no prediction line of this run, so it has no count and is never wide.
+// file has no prediction line of this run, so it has no count and is never in the Back lane.
 GeneratedOrder StoreSupervisor::Impl::OrderOf(uint64_t program_hash, RecordSource source) {
 	GeneratedOrder order;
 	order.tier = delivered_per_program[program_hash]++;
 	if (source == RecordSource::Worker) {
 		order.candidates = progress.CandidatesOf(program_hash);
 	}
-	order.wide_tail = IsWideTail(order.tier, order.candidates);
+	order.wide_tail = IsBackLane(order.tier, order.candidates);
 	return order;
 }
 

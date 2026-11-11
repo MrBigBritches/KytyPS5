@@ -552,6 +552,58 @@ std::vector<ProgramSpec> MainPrograms() {
 	return {ProgramBig(), ProgramMiddle(), ProgramSmall()};
 }
 
+// ---- What the predictor says, from facts written by hand. ----
+
+// The buffers of a program in the order the translator lists them, which is the order the code
+// uses them in, with the flags the code gives them.
+ResourceFacts FactsOf(const ProgramSpec& spec) {
+	ResourceFacts facts;
+	for (const auto& load: spec.loads) {
+		facts.buffers.push_back(
+		    {{DescriptorKeyKind::User, load.sgpr, 0, 0, 0}, false, false, false});
+	}
+	if (spec.store) {
+		facts.buffers.push_back(
+		    {{DescriptorKeyKind::User, spec.output_sgpr, 0, 0, 0}, false, false, true});
+	}
+	return facts;
+}
+
+// A candidate of a program as the test expects the worker to name it.
+struct Expected {
+	uint64_t              hash = 0;
+	std::vector<uint32_t> nulls;
+	uint64_t              id = 0;
+};
+
+// The candidates of the program in `scanned`, from the predictor and the facts above.
+std::vector<Expected> PredictedFor(const ProgramSpec& spec, const ScannedProgram& scanned) {
+	const ComputeKeyDevice device {HOST_SUBGROUP_SIZE, MAX_SHARED_BYTES};
+	const auto             key     = BuildComputeStaticKey(scanned.header, device, MOTOR_DISPATCH);
+	const auto             slots   = DecodeHeaderSlots(scanned.header);
+	const auto             records = DecodeSl00Resources(scanned.metadata);
+	const auto             facts   = FactsOf(spec);
+	std::vector<Expected>  expected;
+	if (!key || !slots || !records) {
+		return expected;
+	}
+	const auto prediction = PredictCandidates({scanned.code_hash, key->user_data_count, key->state,
+	                                           facts, *slots, *records, NullPolicy::Subsets});
+	for (const auto& candidate: prediction.candidates) {
+		expected.push_back({scanned.code_hash, candidate.nulls, candidate.id});
+	}
+	return expected;
+}
+
+// The candidate with these nulls.
+const Expected& Pick(const std::vector<Expected>& candidates, const std::vector<uint32_t>& nulls) {
+	static const Expected none;
+	for (const auto& candidate: candidates) {
+		if (candidate.nulls == nulls) return candidate;
+	}
+	return none;
+}
+
 } // namespace
 
 } // namespace StoreGenFixtures

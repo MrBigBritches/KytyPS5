@@ -1078,9 +1078,9 @@ void TestInlineClaimOfBackJobRunsOnce() {
 	CHECK(back.runs == 1);
 }
 
-// A generated module's build goes on the back lane exactly when the module is wide tail. The rows
-// differ only in the wide flag, so a rule that ignores it gives a wrong lane in one of them. An
-// unknown candidate count is never wide, so it stays in front.
+// A generated module's build goes on the back lane exactly when its wide_tail flag, which marks
+// a Back lane module, is set. The rows differ only in that flag, so a rule that ignores it gives a
+// wrong lane in one of them. A module of unknown candidate count never has it, so stays in front.
 void TestWarmLaneOf() {
 	struct Row {
 		bool                    wide_tail;

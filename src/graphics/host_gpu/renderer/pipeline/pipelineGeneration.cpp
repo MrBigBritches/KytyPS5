@@ -247,7 +247,7 @@ void PipelineCache::AdoptGenerated(GeneratedModule&& item) {
 			StoreGen::GenRow* row = NoteAdopted(item);
 			// A deque, so the address that the queued build holds stays valid.
 			program->modules.push_back(std::move(item.module));
-			// The wide tail goes to the back lane, so it never delays the other builds.
+			// Narrow bases and wide partials go to the back lane and never delay the others.
 			StartWarmCompute(program->modules.back(), row, WarmLaneOf(item.order));
 			return;
 		}

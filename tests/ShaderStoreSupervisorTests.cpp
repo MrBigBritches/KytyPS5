@@ -592,12 +592,12 @@ bool FileBeginsWith(const fs::path& path, const Bytes& prefix) {
 }
 
 // The programs of the order modes. A and B are predicted, with counts that sit on either side of
-// the wide tail limit, and C has no prediction line at all.
+// the wide limit, WIDE_CANDIDATES_ABOVE, and C has no prediction line at all.
 constexpr size_t   ORDER_A          = 0;
 constexpr size_t   ORDER_B          = 1;
 constexpr size_t   ORDER_C          = 2;
-constexpr uint64_t ORDER_A_COUNT    = WIDE_TAIL_CANDIDATES_ABOVE + 1;
-constexpr uint64_t ORDER_B_COUNT    = WIDE_TAIL_CANDIDATES_ABOVE;
+constexpr uint64_t ORDER_A_COUNT    = WIDE_CANDIDATES_ABOVE + 1;
+constexpr uint64_t ORDER_B_COUNT    = WIDE_CANDIDATES_ABOVE;
 constexpr int      FIRST_FAKE_SPAWN = 0;
 
 // The records that an order mode writes, as program and index pairs.
@@ -2898,37 +2898,41 @@ void TestHelperRemovalFailureIsLogged() {
 	CHECK(baseline.stats.remove_failures == 0);
 }
 
-// ---- The order of generated modules: their tier and whether they are wide tail. ----
+// ---- The order of generated modules: their tier and whether they are in the Back lane. ----
 
-// The table of IsWideTail. Each row differs from a neighbour in one input. (1,2) against (1,3) is
-// the count at the limit, (0,3) against (1,3) is the tier, and an unknown count against any count
-// is not wide whatever the tier.
-void TestIsWideTailTable() {
+// The table of IsBackLane. Each row differs from a neighbour in one input. (1,3) against (2,3) is
+// the first Back tier of a wide program, (1,2) against (1,3) is the count at the limit, which moves
+// the first Back tier from 2 to 1, and an unknown count or 0 is Front whatever the tier.
+void TestIsBackLaneTable() {
 	struct Row {
 		uint32_t                tier;
 		std::optional<uint64_t> candidates;
-		bool                    wide;
+		bool                    back;
 	};
 	const Row rows[] = {{0, 3, false},
-	                    {1, 2, false},
-	                    {1, 3, true},
+	                    {1, 3, false},
+	                    {2, 3, true},
+	                    {1, 2, true},
+	                    {0, 2, false},
 	                    {5, 8, true},
 	                    {1, std::nullopt, false},
+	                    {2, std::nullopt, false},
 	                    {0, std::nullopt, false},
 	                    {1, 0, false}};
 	for (const auto& row: rows) {
-		CHECK(IsWideTail(row.tier, row.candidates) == row.wide);
+		CHECK(IsBackLane(row.tier, row.candidates) == row.back);
 	}
 }
 
-// The tiers and wide flags that wide_order gives, in the order its records arrive: A0 B0 C0 A1 B1
+// The tiers and Back flags that wide_order gives, in the order its records arrive: A0 B0 C0 A1 B1
 // A2 C1. A has 3 candidates and B has 2, and C has no prediction line. A1 and B1 are both tier 1
-// and differ only in the count, so the flag comes from the count. C1 is tier 1 with no count,
-// which is the fallback. A0 has a count and tier 0, so it is not wide for its tier.
+// and differ only in the count, so the flag comes from the count. A1 is a wide base and stays
+// Front, while B1 is a narrow base and goes Back. A2 is the first wide partial. C1 is tier 1 with
+// no count, which is the fallback.
 void CheckWideOrderRun(const Outcome& run) {
 	CHECK(run.ended && run.stats.outcome == SupervisorOutcome::Finished);
 	const std::vector<uint32_t> tiers {0, 0, 0, 1, 1, 2, 1};
-	const std::vector<bool>     wide {false, false, false, true, false, true, false};
+	const std::vector<bool>     wide {false, false, false, false, true, true, false};
 	CHECK(run.orders.size() == tiers.size());
 	for (size_t i = 0; i < run.orders.size() && i < tiers.size(); i++) {
 		CHECK(run.orders[i].tier == tiers[i]);
@@ -2958,7 +2962,7 @@ void TestWideOrderWithOnePoll() {
 }
 
 // A fresh restart writes the first two records again, and the supervisor drops them. Its counter
-// is not reset, so the third record is tier 2 and wide. A counter that the fresh start reset would
+// is not reset, so the third record is tier 2 and Back. A counter that the fresh start reset would
 // give it tier 0, and one that counted the repeats would give it tier 4.
 void TestWideOrderSurvivesAFreshRestart() {
 	const auto run = Run("wide_order_fresh");
@@ -2969,13 +2973,13 @@ void TestWideOrderSurvivesAFreshRestart() {
 	CHECK(run.orders.size() == 3);
 	if (run.orders.size() == 3) {
 		CHECK(run.orders[0].tier == 0 && run.orders[1].tier == 1 && run.orders[2].tier == 2);
-		CHECK(!run.orders[0].wide_tail && run.orders[1].wide_tail && run.orders[2].wide_tail);
+		CHECK(!run.orders[0].wide_tail && !run.orders[1].wide_tail && run.orders[2].wide_tail);
 	}
 }
 
-// The records of an earlier file have no count and are never wide, whatever their tier. The file
-// holds three records of program A. The baseline is a live run, whose A1 and A2 are the same tiers
-// of the same program and are wide, so only the source differs.
+// The records of an earlier file have no count and are never Back, whatever their tier. The file
+// holds three records of program A. The baseline is a live run, whose B1 and A2 are Back, so only
+// the source differs. B1 is a narrow base at tier 1 and A2 a wide partial at tier 2.
 void TestLoadedOrderIsNeverWide() {
 	Bytes file = EncodeGeneratedHeader(StoreHeader(), GENERATOR_VERSION, CURRENT_IDENTITY);
 	for (size_t index = 0; index < 3; index++) {
@@ -2992,7 +2996,7 @@ void TestLoadedOrderIsNeverWide() {
 		CHECK(!loaded.orders[index].wide_tail);
 	}
 	const auto live = Run("wide_order");
-	CHECK(live.orders.size() == 7 && live.orders[3].wide_tail && live.orders[5].wide_tail);
+	CHECK(live.orders.size() == 7 && live.orders[4].wide_tail && live.orders[5].wide_tail);
 }
 
 } // namespace
@@ -3069,7 +3073,7 @@ int main(int argc, char** argv) {
 	TestFailedRunKeepsItsFiles();
 	TestLoadedFinishRemovesTheOutFile();
 	TestHelperRemovalFailureIsLogged();
-	TestIsWideTailTable();
+	TestIsBackLaneTable();
 	TestWideOrderTiers();
 	TestWideOrderWithOnePoll();
 	TestWideOrderSurvivesAFreshRestart();

@@ -33,7 +33,7 @@ size_t HeadIndex(std::span<const Candidate> candidates);
 /// The order in which the worker builds candidates, and so what a rank means.
 ///
 /// The key is (pass, subset_rank, code_dwords, program index, role, candidate index). A base has no
-/// unbound buffers, and a wide program has more than WIDE_TAIL_CANDIDATES_ABOVE candidates.
+/// unbound buffers, and a wide program has more than WIDE_CANDIDATES_ABOVE candidates.
 /// Pass 0 holds the head of every program, and for a wide program its base right after, as role 0
 /// and role 1. A program with one candidate appears here once. subset_rank is 0.
 ///

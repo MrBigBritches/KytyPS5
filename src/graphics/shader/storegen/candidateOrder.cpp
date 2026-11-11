@@ -32,7 +32,7 @@ Placement PlaceCandidate(const OrderedProgram& program, size_t head, uint32_t ca
 	if (candidate == head) {
 		return {PASS_HEAD_AND_WIDE_BASE, 0, ROLE_HEAD};
 	}
-	const bool wide = program.candidates.size() > WIDE_TAIL_CANDIDATES_ABOVE;
+	const bool wide = program.candidates.size() > WIDE_CANDIDATES_ABOVE;
 	if (nulls.empty()) {
 		return wide ? Placement {PASS_HEAD_AND_WIDE_BASE, 0, ROLE_BASE}
 		            : Placement {PASS_NARROW_BASE, 0, ROLE_BASE};

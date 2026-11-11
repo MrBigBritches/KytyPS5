@@ -259,7 +259,7 @@ struct GenerationPrediction {
 /// happen is missing. lead_ms is first_use minus ready, so a negative number means the dispatch got
 /// there before a worker had finished the build. how is done, waited or inline, from the first use
 /// of the module, and unused when no dispatch took it. tier is how many records of the same program
-/// came before it, wide_tail says the warm queue builds it last, and candidates is the
+/// came before it, wide_tail says it is built in the Back lane, and candidates is the
 /// program's predicted variant count, missing when no prediction line was read.
 struct GeneratedModuleRow {
 	uint64_t                id         = 0;
