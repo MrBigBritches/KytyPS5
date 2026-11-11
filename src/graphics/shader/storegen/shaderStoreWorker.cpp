@@ -5,6 +5,7 @@
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/ir/Serialize.h"
 #include "graphics/shader/shaderStoreRecord.h"
+#include "graphics/shader/storegen/candidateOrder.h"
 #include "graphics/shader/storegen/computePredictor.h"
 #include "graphics/shader/storegen/computeStaticKey.h"
 #include "graphics/shader/storegen/ebootShaderScan.h"
@@ -159,30 +160,14 @@ struct PredictedProgram {
 	bool failed_earlier = false;
 };
 
-// One position in the ordering.
-struct RankedCandidate {
-	uint32_t program   = 0;
-	uint32_t candidate = 0;
-};
-
-// The ordering that RunShaderStoreWorker documents.
-std::vector<RankedCandidate> OrderCandidates(const std::vector<PredictedProgram>& programs) {
-	std::vector<RankedCandidate> ranked;
-	for (uint32_t program = 0; program < programs.size(); program++) {
-		for (uint32_t candidate = 0; candidate < programs[program].candidates.size(); candidate++) {
-			ranked.push_back({program, candidate});
-		}
+// The ordering that RunShaderStoreWorker documents, over the programs that were predicted.
+std::vector<RankedCandidate> OrderPredicted(const std::vector<PredictedProgram>& programs) {
+	std::vector<OrderedProgram> ordered;
+	ordered.reserve(programs.size());
+	for (const auto& program: programs) {
+		ordered.push_back({program.scanned->code.size(), program.candidates});
 	}
-	const auto sort_key = [&](const RankedCandidate& entry) {
-		const auto& program = programs[entry.program];
-		const bool  variant = !program.candidates[entry.candidate].nulls.empty();
-		return std::make_tuple(variant, program.scanned->code.size(), entry.program,
-		                       entry.candidate);
-	};
-	std::ranges::sort(ranked, [&](const auto& left, const auto& right) {
-		return sort_key(left) < sort_key(right);
-	});
-	return ranked;
+	return OrderCandidates(ordered);
 }
 
 // XXH3 of the candidate ids in rank order, which names the ordering. A restart compares it to be
@@ -586,7 +571,7 @@ int Worker::Generate(const ScanResult& scan, const HostValues& host,
 		return WORKER_EXIT_OUTPUT_FAILED;
 	}
 	m_result.predict_ms = MillisecondsSince(predict_start);
-	const auto ranked   = OrderCandidates(m_programs);
+	const auto ranked   = OrderPredicted(m_programs);
 	m_result.candidates = ranked.size();
 	m_result.order_hash = OrderHash(m_programs, ranked);
 	if (!m_progress.Line(fmt::format("order {} {:016x}", ranked.size(), m_result.order_hash))) {

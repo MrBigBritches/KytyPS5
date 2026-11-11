@@ -9,6 +9,7 @@
 #include "graphics/shader/moduleId.h"
 #include "graphics/shader/recompiler/ir/Serialize.h"
 #include "graphics/shader/shaderStoreRecord.h"
+#include "graphics/shader/storegen/candidateOrder.h"
 #include "graphics/shader/storegen/computePredictor.h"
 #include "graphics/shader/storegen/computeStaticKey.h"
 #include "graphics/shader/storegen/ebootShaderScan.h"
@@ -1313,9 +1314,55 @@ void TestOversizeRecordIsDroppedAlone() {
 	CHECK(ReadRealLog(MakeRequest(directory, eboot, "at_cap")).KindCount(ProgressKind::Drop) == 0);
 }
 
+// The pure order of candidates. The programs are listed out of size order so that neither the
+// program index nor the candidate index can stand in for the size, and a program with one candidate
+// shows that a lone base sorts with the bases. Base candidates go first by program size, then the
+// others by program size. Two programs share a size, so only the program index orders them.
+void TestOrderCandidatesPure() {
+	const std::vector<Candidate> with_variant(2);
+	std::vector<Candidate>       two = with_variant;
+	two[1].nulls                     = {0};
+	const std::vector<Candidate> lone(1);
+
+	const std::vector<OrderedProgram>  programs {{30, two}, {10, lone}, {20, two}, {20, two}};
+	const auto                         ranked = OrderCandidates(programs);
+	const std::vector<RankedCandidate> expected {{1, 0}, {2, 0}, {3, 0}, {0, 0},
+	                                             {2, 1}, {3, 1}, {0, 1}};
+	CHECK(ranked.size() == expected.size());
+	for (size_t i = 0; i < ranked.size() && i < expected.size(); i++) {
+		CHECK(ranked[i].program == expected[i].program &&
+		      ranked[i].candidate == expected[i].candidate);
+	}
+	CHECK(OrderCandidates({}).empty());
+
+	// With the program index in the key every key is unique, so there is one right order whatever
+	// the sort, and a stable sort of the indices by size is that order. Without the index, programs
+	// of one size tie, and std::ranges::sort can then scramble them. A run this long with sizes that
+	// cycle is partitioned rather than insertion sorted, which did scramble them on MSVC, but a sort
+	// that happened to keep ties in order would let that mutation pass.
+	constexpr size_t            TIED_PROGRAMS = 64;
+	constexpr size_t            SIZE_CLASSES  = 5;
+	constexpr size_t            SIZE_STRIDE   = 3;
+	std::vector<OrderedProgram> tied;
+	std::vector<uint32_t>       reference;
+	for (uint32_t i = 0; i < TIED_PROGRAMS; i++) {
+		tied.push_back({1 + (i * SIZE_STRIDE) % SIZE_CLASSES, lone});
+		reference.push_back(i);
+	}
+	std::ranges::stable_sort(reference, [&](uint32_t left, uint32_t right) {
+		return tied[left].code_dwords < tied[right].code_dwords;
+	});
+	const auto tied_ranked = OrderCandidates(tied);
+	CHECK(tied_ranked.size() == TIED_PROGRAMS);
+	for (size_t i = 0; i < tied_ranked.size() && i < reference.size(); i++) {
+		CHECK(tied_ranked[i].program == reference[i] && tied_ranked[i].candidate == 0);
+	}
+}
+
 } // namespace
 
 int main() {
+	TestOrderCandidatesPure();
 	TestRequestFormat();
 	TestRequestFile();
 	TestGeneratedHeader();
