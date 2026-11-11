@@ -406,6 +406,11 @@ void EmitMemoryBindings(EmitterState& state);
 // below Vulkan's storage buffer offset alignment, which is at most 256 bytes.
 inline constexpr uint32_t MEMORY_PREFIX_BITS = 8;
 
+// Turns a prefix's lane within its packed dword into a bit offset.
+inline constexpr uint32_t MEMORY_PREFIX_BITS_SHIFT = 3;
+static_assert((1u << MEMORY_PREFIX_BITS_SHIFT) == MEMORY_PREFIX_BITS,
+              "the prefix lane shift must match the prefix width");
+
 // The largest host prefix of a buffer binding.
 inline constexpr uint32_t MAX_BUFFER_PREFIX_BYTES = (1u << MEMORY_PREFIX_BITS) - 1u;
 
@@ -458,6 +463,11 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState&         st
                                                         const IR::MemoryInfo& mem,
                                                         BufferDefinition& buffer,
                                                         uint32_t array_index = 0);
+
+// Emits FormattedRecordLimit for SPIR-V values, the prefix and element count as ids and the last
+// byte offset and element shift as numbers.
+uint32_t EmitFormattedRecordLimit(EmitterState& state, uint32_t prefix, uint32_t last_byte,
+                                  uint32_t shift, uint32_t element_count);
 
 uint32_t EmitMemoryElementInBounds(EmitterState& state, const MemoryResourceAccess& access,
                                    uint32_t index);

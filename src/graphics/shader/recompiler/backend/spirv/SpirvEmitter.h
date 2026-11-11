@@ -28,6 +28,10 @@ struct Profile {
 	// Opts in to running safe guarded loads unconditionally and selecting the result, instead of
 	// branching around them. Off by default while it is new.
 	bool select_guarded_loads = false;
+	// Opts in to range checking a formatted buffer record with one compare of the guest address
+	// against a per binding limit, in place of a chain of compares. Both give the same answer, and
+	// the single compare is quicker for some drivers to compile. Off by default while it is new.
+	bool single_compare_record_guard = false;
 };
 
 inline constexpr Profile DefaultProfile {};

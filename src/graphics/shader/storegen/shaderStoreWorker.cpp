@@ -43,19 +43,19 @@ struct HostValues {
 
 // Whether every flag byte of a store header is 0 or 1. The header is read once more as plain bytes
 // in the order the fields are written, which is the build stamp, the jump table flag, the profile
-// (three flags, the device clock period and four flags) and the shared memory limit. A flag read
+// (three flags, the device clock period and five flags) and the shared memory limit. A flag read
 // into a bool from any other byte value would be undefined behaviour. If the profile gains a
 // field this read comes up short and the header is refused, which fails every test at once.
 bool HeaderFlagsAreBooleans(std::span<const uint8_t> bytes) {
 	IR::Reader reader {bytes};
 	uint64_t   stamp       = 0;
 	uint8_t    jump_tables = 0;
-	uint8_t    profile_flags[7] {};
+	uint8_t    profile_flags[8] {};
 	uint32_t   clock_period = 0;
 	uint32_t   shared       = 0;
 	IR::IoAll(reader, stamp, jump_tables, profile_flags[0], profile_flags[1], profile_flags[2],
 	          clock_period, profile_flags[3], profile_flags[4], profile_flags[5], profile_flags[6],
-	          shared);
+	          profile_flags[7], shared);
 	bool booleans = jump_tables <= 1;
 	for (const auto flag: profile_flags) {
 		booleans = booleans && flag <= 1;

@@ -11799,6 +11799,11 @@ bool SpirvSelectGuardsLoad(const std::vector<uint32_t> &binary) {
 
 // Selected guarded loads are opt-in, so the tests of the select form ask for it.
 constexpr ShaderRecompiler::Spirv::Profile SelectGuardedLoadsProfile{.select_guarded_loads = true};
+// The single compare record guard is opt-in too, with branched or selected loads.
+constexpr ShaderRecompiler::Spirv::Profile SingleCompareRecordGuardProfile{
+    .single_compare_record_guard = true};
+constexpr ShaderRecompiler::Spirv::Profile SelectSingleCompareRecordGuardProfile{
+    .select_guarded_loads = true, .single_compare_record_guard = true};
 
 // The parts of a SPIR-V module the clamp check reads. Users map each id to the instructions that
 // take it as an operand, so a load's value can be followed to the select that guards it.
@@ -12187,6 +12192,53 @@ void TestNewShaderRecompilerFormattedLoadSelectsWhenOptedIn() {
   CheckSpirvBinaryValidates(fallback.spirv);
   Check(SpirvInstructionOpcodeCount(fallback.spirv, spv::OpPhi) != 0u,
         "the default profile did not keep the branch around a formatted load");
+}
+
+// The single compare record guard checks a formatted record with one compare of the guest address
+// against a limit. It replaces ByteAddress's wrap select and the end >= start check, which are an
+// OpUGreaterThanEqual each, and the last element compare against the length. So with the flag on,
+// each formatted access has two fewer OpUGreaterThanEqual, one more OpUGreaterThan (whether the
+// view reaches past the prefix and last byte) and as many OpULessThan (the guest against the limit
+// in place of the last element against the length). The shaders hold only formatted accesses, so
+// no raw access adds compares of its own, and each pair of binaries comes from one shader and
+// differs only in the flag. A gate that dropped the bounds check altogether would also lose the
+// OpUGreaterThanEqual, which the OpUGreaterThan and OpULessThan counts rule out.
+void TestNewShaderRecompilerFormattedRecordGuardSingleCompare() {
+  constexpr uint32_t load_format_xyzw = 0x03u, store_format_xyzw = 0x07u, s_endpgm = 0x01u;
+  constexpr uint32_t record_vgpr = 96u, load_address_vgpr = 1u, store_address_vgpr = 2u;
+  constexpr uint32_t float4_stride = 16u, dropped_per_access = 2u;
+  const std::vector<uint32_t> load_and_store = {
+      EncodeMubuf0(load_format_xyzw, 0), EncodeMubuf1(record_vgpr, 0, load_address_vgpr),
+      EncodeMubuf0(store_format_xyzw, 0), EncodeMubuf1(record_vgpr, 0, store_address_vgpr),
+      EncodeSopp(s_endpgm)};
+  const std::vector<uint32_t> store_only = {
+      EncodeMubuf0(store_format_xyzw, 0), EncodeMubuf1(record_vgpr, 0, store_address_vgpr),
+      EncodeSopp(s_endpgm)};
+  const auto user_data = FormattedFixture(Prospero::BufferFormat::k32_32_32_32Float, float4_stride);
+  for (const auto &[shader, accesses] :
+       {std::pair {&load_and_store, 2u}, std::pair {&store_only, 1u}}) {
+    for (const bool select : {false, true}) {
+      auto options = MakeCompileOptions(ShaderType::Compute);
+      options.user_data = user_data;
+      options.profile = select ? &SelectGuardedLoadsProfile : &ShaderRecompiler::Spirv::DefaultProfile;
+      const auto off = RecompileForTest(*shader, options);
+      options.profile =
+          select ? &SelectSingleCompareRecordGuardProfile : &SingleCompareRecordGuardProfile;
+      const auto on = RecompileForTest(*shader, options);
+      CheckSpirvBinaryValidates(off.spirv);
+      CheckSpirvBinaryValidates(on.spirv);
+      const auto count = [](const TestCompileResult &result, spv::Op opcode) {
+        return SpirvInstructionOpcodeCount(result.spirv, opcode);
+      };
+      Check(count(off, spv::OpUGreaterThanEqual) ==
+                count(on, spv::OpUGreaterThanEqual) + dropped_per_access * accesses,
+            "the record guard did not drop the wrap select and end check of each formatted access");
+      Check(count(on, spv::OpUGreaterThan) == count(off, spv::OpUGreaterThan) + accesses,
+            "the record guard did not compute one limit per formatted access");
+      Check(count(on, spv::OpULessThan) == count(off, spv::OpULessThan),
+            "the record guard did not replace the last element compare with one compare");
+    }
+  }
 }
 
 // Compiles a buffer load followed by a second load of the given width, with EXEC written from
@@ -15022,6 +15074,7 @@ int main() {
   TestNewShaderRecompilerLdsLoadKeepsBranch();
   TestFormattedRecordLimitMatchesChain();
   TestNewShaderRecompilerFormattedLoadSelectsWhenOptedIn();
+  TestNewShaderRecompilerFormattedRecordGuardSingleCompare();
   TestNewShaderRecompilerExecGuardedLoadSelects();
   TestNewShaderRecompilerSelectedLoadsClampIndex();
   TestNewShaderRecompilerStageInputInfo();

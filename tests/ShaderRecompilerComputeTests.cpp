@@ -2656,6 +2656,19 @@ void CheckSpirvProfileNativeFloatMinMax() {
   std::printf("[host]    %-32s ok\n", name);
 }
 
+// The single compare record guard changes the SPIR-V, so a module compiled with it must not share
+// a shader store header with one compiled without it. The serialized profile must therefore differ
+// when only that field is set.
+void CheckSpirvProfileSingleCompareRecordGuardBytes() {
+  constexpr const char *name = "SpirvProfileSingleCompareRecordGuardBytes";
+  const ShaderRecompiler::Spirv::Profile off{};
+  ShaderRecompiler::Spirv::Profile on{};
+  on.single_compare_record_guard = true;
+  Require(name, "serialized", ProfileBytes(off) != ProfileBytes(on),
+          "the serialized profile ignores single_compare_record_guard");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 struct BdaMapping {
   uint64_t guest_base = 0;
   u32 backing_offset = 0;
@@ -2668,6 +2681,12 @@ constexpr ShaderProfile SrgbViewProfile{
 // Selected guarded loads are opt-in, so the tests of the select form ask for it.
 constexpr ShaderProfile SelectGuardedLoadsProfile{.maintenance8 = true,
                                                   .select_guarded_loads = true};
+// The single compare record guard is opt-in, so its tests ask for it, with branched or selected
+// loads.
+constexpr ShaderProfile SingleCompareRecordGuardProfile{.maintenance8 = true,
+                                                        .single_compare_record_guard = true};
+constexpr ShaderProfile SelectSingleCompareRecordGuardProfile{
+    .maintenance8 = true, .select_guarded_loads = true, .single_compare_record_guard = true};
 
 struct TestCase {
   const char *name = "";
@@ -2984,6 +3003,14 @@ size_t SpirvCodeWords(const std::vector<u32> &spirv) {
       words -= spirv[offset] >> 16u;
   }
   return words;
+}
+
+// How many instructions with the given opcode a SPIR-V module holds.
+size_t SpirvOpcodeCount(const std::vector<u32> &spirv, spv::Op opcode) {
+  size_t count = 0;
+  for (size_t offset = 5; offset < spirv.size(); offset += spirv[offset] >> 16u)
+    count += static_cast<spv::Op>(spirv[offset] & 0xffffu) == opcode;
+  return count;
 }
 
 void CheckSpirvEmission(const TestCase &test, const std::vector<u32> &spirv) {
@@ -47755,10 +47782,180 @@ TestCase BufferLoadFormatXyzwInactiveExecPreservesOverlappingAddressWave64() {
 // clamp their index to avoid it. The test GPU did not spoil neighbours, so these show the clamped
 // loads still give the right results and the device survives them. The CPU test proves the clamp
 // exists.
-TestCase TightCheckedRange(TestCase test, const char *name) {
-  test.name = name;
+// A null name keeps the test's own, for a caller that names it afterwards.
+TestCase TightCheckedRange(TestCase test, const char *name = nullptr) {
+  if (name != nullptr) test.name = name;
   test.storage_buffer_range_bytes = test.storage_buffer_shader_size_bytes;
   test.storage_buffer_shader_size_bytes = 0;
+  return test;
+}
+
+// Runs a formatted record test with the single compare record guard opted in, keeping the rest of
+// its profile, so the flag-on copy differs from the original only in how the record is checked.
+// TestCase keeps a plain string pointer, so the name is a literal.
+// In a flag-on copy a required "OpSelect %uint" is also met by the limit's own select, so the
+// forbidden "OpPhi %v4uint" is what proves the select form.
+TestCase WithRecordGuard(TestCase test, const char *name) {
+  test.name = name;
+  if (test.profile == &SelectGuardedLoadsProfile) {
+    test.profile = &SelectSingleCompareRecordGuardProfile;
+  } else {
+    Require(name, "record guard profile", test.profile == &Maintenance8Profile,
+            "the test's profile has no single compare record guard counterpart");
+    test.profile = &SingleCompareRecordGuardProfile;
+  }
+  return test;
+}
+
+// Which checked view a FormattedRecordGuard test binds. Wide leaves room for records on both sides
+// of its end. Short is the host prefix plus 8 bytes, so no record fits once the prefix is added.
+enum class RecordGuardView { Wide, Short };
+
+// One formatted record access of a FormattedRecordGuard test. Its guest byte address is a VGPR
+// literal plus an SGPR offset, and fits says whether the whole record lies inside the view.
+struct RecordGuardAccess {
+  u32 vaddr;
+  u32 soffset;
+  bool fits;
+};
+
+// The accesses of a FormattedRecordGuard test, for a view of view_bytes host bytes behind a host
+// prefix of prefix bytes and a record of record_bytes bytes.
+std::vector<RecordGuardAccess> RecordGuardAccesses(RecordGuardView view, u32 view_bytes,
+                                                   u32 prefix, u32 record_bytes) {
+  if (view == RecordGuardView::Short) return {{0u, 0u, false}}; // T5, the view is too short
+  constexpr u32 straddle = 8u, wrap_base = 0xfffffff0u, wrap_soffset = 0xfu;
+  // The guest address whose record ends on the last byte of the view.
+  const u32 exact = view_bytes - prefix - record_bytes;
+  return {{exact, 0u, true},                 // T1, ends exactly at the end of the view
+          {exact + 1u, 0u, false},           // T2, one byte over
+          {exact + straddle, 0u, false},     // T3, half inside
+          {0u - prefix, 0u, false},          // T4, wraps to host byte 0 when the prefix is added
+          {wrap_base, wrap_soffset, false}}; // T4, guest 0xffffffff through the SGPR offset
+}
+
+// Names one FormattedRecordGuard variant. TestCase keeps a plain string pointer, so the names live
+// in a table built once that outlives every test.
+const char *FormattedRecordGuardName(u32 wave_size, bool select, bool store, bool guard,
+                                     RecordGuardView view) {
+  constexpr u32 variants = 32u, wave64_bit = 1u, guard_bit = 2u, select_bit = 4u, store_bit = 8u,
+                short_bit = 16u;
+  static const auto names = [] {
+    std::array<std::string, variants> table;
+    for (u32 index = 0; index < variants; ++index)
+      table[index] = std::string("FormattedRecordGuard") +
+                     ((index & short_bit) != 0u ? "Short" : "Wide") +
+                     ((index & store_bit) != 0u ? "Store" : "Load") +
+                     ((index & select_bit) != 0u ? "Select" : "Branch") +
+                     ((index & guard_bit) != 0u ? "On" : "Off") +
+                     ((index & wave64_bit) != 0u ? "Wave64" : "Wave32");
+    return table;
+  }();
+  const u32 index = (view == RecordGuardView::Short ? short_bit : 0u) | (store ? store_bit : 0u) |
+                    (select ? select_bit : 0u) | (guard ? guard_bit : 0u) |
+                    (wave_size == 64u ? wave64_bit : 0u);
+  return names[index].c_str();
+}
+
+// The layout every FormattedRecordGuard test shares. A float4 record sits behind a host prefix of
+// 12 bytes, and the guest buffer is bound 256 bytes into the backing buffer, so a record that
+// wraps to host byte 0 would land on canaries too. Dwords below the binding hold the untouched
+// marker and the binding's dwords hold canaries.
+struct RecordGuardLayout {
+  static constexpr u32 prefix = 12u, record_bytes = 16u, components = 4u;
+  static constexpr u32 wide_view = 140u, short_view = prefix + 8u;
+  static constexpr u32 binding_offset = 256u, binding_bytes = 256u, output_bytes = 256u;
+  static constexpr u32 canary = 0xc0de0000u, untouched = 0x0badf00du, stored = 0x40000000u;
+};
+
+// Emits each FormattedRecordGuard access, a load into its own four VGPRs or a store of distinct
+// values, and sets what the test expects. A load that does not fit reads the out-of-range zeros,
+// and a store that does not fit leaves the canaries. Loaded records are then stored to dwords
+// 0 onwards through the output binding.
+void AppendRecordGuardAccesses(TestCase &test, bool store, RecordGuardView view, u32 view_bytes) {
+  using L = RecordGuardLayout;
+  constexpr u32 address_vgpr = 20u, soffset_sgpr = 40u, inline_zero = 128u;
+  constexpr u32 load_format_xyzw = 0x03u, store_format_xyzw = 0x07u;
+  const auto accesses = RecordGuardAccesses(view, view_bytes, L::prefix, L::record_bytes);
+  for (u32 access = 0; access < accesses.size(); ++access) {
+    const auto [vaddr, soffset, fits] = accesses[access];
+    const u32 data_vgpr = access * L::components;
+    // The dword holding the record's first byte. Only a record that fits is read from or written
+    // to it, and that one starts on a dword.
+    const u32 record_dword = (L::binding_offset + L::prefix + vaddr + soffset) / 4u;
+    for (u32 c = 0; c < L::components; ++c) {
+      if (store) {
+        const u32 value = L::stored + (access << 16u) + c;
+        AppendVMovLiteral(&test.code, data_vgpr + c, value);
+        if (fits) test.expected[record_dword + c] = value;
+      } else {
+        test.expected[data_vgpr + c] = fits ? test.initial[record_dword + c] : 0u;
+      }
+    }
+    AppendVMovLiteral(&test.code, address_vgpr, vaddr);
+    if (soffset != 0u) AppendSMovLiteral(&test.code, soffset_sgpr, soffset);
+    test.code.push_back(EncodeMubuf0(store ? store_format_xyzw : load_format_xyzw));
+    test.code.push_back(EncodeMubuf1(data_vgpr, 0, address_vgpr,
+                                     soffset != 0u ? soffset_sgpr : inline_zero));
+  }
+  if (!store) {
+    for (u32 i = 0; i < accesses.size() * L::components; ++i) AppendStoreVgpr(&test.code, i, i);
+  }
+  AppendEnd(&test.code);
+}
+
+// Binds the FormattedRecordGuard guest buffer behind its host prefix, plus the output buffer of a
+// load test, and checks every binding against a view of view_bytes.
+void BindRecordGuardBuffers(TestCase &test, bool store, u32 view_bytes) {
+  using L = RecordGuardLayout;
+  constexpr u32 output_descriptor = 48u, raw_records = 1u << 20u, raw_mode = 3u << 28u;
+  test.user_data = MakeStructuredStorageBufferData(
+      L::record_bytes, L::binding_bytes / L::record_bytes, false,
+      BufferFormat(Prospero::BufferFormat::k32_32_32_32Float));
+  test.user_data[output_descriptor + 2u] = raw_records;
+  test.user_data[output_descriptor + 3u] = raw_mode;
+  test.has_user_data = true;
+  test.storage_buffer_offsets = {L::prefix};
+  test.storage_buffer_ranges = {{L::binding_offset, L::binding_bytes}};
+  if (!store) test.storage_buffer_ranges.emplace_back(0u, L::output_bytes);
+  // Every binding is checked against this view, which the result dwords also fit inside.
+  test.storage_buffer_shader_size_bytes = view_bytes;
+}
+
+// A formatted float4 record sits behind a host prefix of 12 bytes and is checked against a view
+// that ends before readable canaries, so only the shader's guard keeps them out. Records exactly
+// fit, end one byte over, straddle the end, wrap past 2^32 when the prefix is added, or meet a
+// view shorter than any record. Each case runs with the single compare record guard off and on
+// with identical expectations, so the flag-off run is the baseline that differs only in how the
+// record is checked.
+TestCase FormattedRecordGuard(u32 wave_size, bool select, bool store, bool guard,
+                              RecordGuardView view) {
+  using O = ShaderOpcode;
+  using L = RecordGuardLayout;
+  constexpr u32 backing_dwords = (L::binding_offset + L::binding_bytes) / 4u;
+  const u32 view_bytes = view == RecordGuardView::Wide ? L::wide_view : L::short_view;
+  TestCase test;
+  test.name = FormattedRecordGuardName(wave_size, select, store, guard, view);
+  for (u32 i = 0; i < backing_dwords; ++i)
+    test.initial.push_back(i < L::binding_offset / 4u ? L::untouched : L::canary + i);
+  test.expected = test.initial;
+  AppendRecordGuardAccesses(test, store, view, view_bytes);
+  BindRecordGuardBuffers(test, store, view_bytes);
+  if (!store) {
+    // A branched record merges its four components through a vector phi and a selected one has
+    // none, so each strategy proves it ran.
+    (select ? test.forbidden_spirv : test.required_spirv).push_back("OpPhi %v4uint");
+  }
+  test.opcodes = {O::V_MOV_B32, O::S_MOV_B32, O::S_ENDPGM,
+                  store ? O::BUFFER_STORE_FORMAT_XYZW : O::BUFFER_LOAD_FORMAT_XYZW};
+  if (!store) test.opcodes.push_back(O::BUFFER_STORE_DWORD);
+  test.compute_info.threads_num[0] = wave_size;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = wave_size;
+  test.has_compute_info = true;
+  test.profile = select ? (guard ? &SelectSingleCompareRecordGuardProfile : &SelectGuardedLoadsProfile)
+                        : (guard ? &SingleCompareRecordGuardProfile : &Maintenance8Profile);
   return test;
 }
 
@@ -54359,7 +54556,10 @@ void CheckBoundedFormattedBufferCopy(VulkanHarness &vulkan) {
   std::printf("[compute] %-32s ok\n", "BoundedFormattedBufferCopy");
 }
 
-void CheckBoundedRecordBufferAccess(VulkanHarness &vulkan) {
+// Reads and writes records through a bounded loop of descriptors with mixed formats, empty
+// descriptors, partial payloads and per row host prefixes, with the given shader profile.
+void CheckBoundedRecordBufferAccess(VulkanHarness &vulkan,
+                                    const ShaderProfile &profile = Maintenance8Profile) {
   using namespace ShaderRecompiler::IR;
   using F = Prospero::BufferFormat;
   const u32 alignment = vulkan.RuntimeContext().GetPhysicalDeviceProperties()
@@ -54368,7 +54568,10 @@ void CheckBoundedRecordBufferAccess(VulkanHarness &vulkan) {
   for (const u32 wave : {32u, 64u}) {
     for (const u32 count : {0u, 2u, 3u, 6u}) {
       TestCase test;
-      test.name = wave == 32 ? "BoundedRecordBufferAccess32" : "BoundedRecordBufferAccess64";
+      test.name = profile.single_compare_record_guard
+          ? (wave == 32 ? "BoundedRecordBufferAccessRecordGuard32" : "BoundedRecordBufferAccessRecordGuard64")
+          : (wave == 32 ? "BoundedRecordBufferAccess32" : "BoundedRecordBufferAccess64");
+      test.profile = &profile;
       constexpr u32 table = 256u;
       test.initial.assign((slot * 13u + 6u * wave * 16u) / 4u, 0xdeadbeefu);
       test.has_user_data = test.has_compute_info = true;
@@ -54487,10 +54690,14 @@ void CheckBoundedRecordBufferAccess(VulkanHarness &vulkan) {
       vulkan.DestroyBuffer(&output_buffer);
     }
   }
-  std::printf("[compute] %-32s ok\n", "BoundedRecordBufferAccess");
+  std::printf("[compute] %-32s ok\n", profile.single_compare_record_guard
+                                          ? "BoundedRecordBufferAccessRecordGuard"
+                                          : "BoundedRecordBufferAccess");
 }
 
-void CheckGpuSelectedRecordBufferAccess(VulkanHarness &vulkan) {
+// Reads records through descriptors a GPU dispatch selects, with the given shader profile.
+void CheckGpuSelectedRecordBufferAccess(VulkanHarness &vulkan,
+                                        const ShaderProfile &profile = Maintenance8Profile) {
   const u32 alignment = vulkan.RuntimeContext().GetPhysicalDeviceProperties()
                             .limits.minStorageBufferOffsetAlignment;
   const u32 slot = (4096u + alignment - 1u) / alignment * alignment;
@@ -54502,7 +54709,10 @@ void CheckGpuSelectedRecordBufferAccess(VulkanHarness &vulkan) {
   for (const u32 wave : {32u, 64u}) {
     for (const u32 table_bytes : {0u, 536u, 544u}) {
       TestCase test;
-      test.name = wave == 32u ? "GpuSelectedRecordBufferAccess32" : "GpuSelectedRecordBufferAccess64";
+      test.name = profile.single_compare_record_guard
+          ? (wave == 32u ? "GpuSelectedRecordBufferAccessRecordGuard32" : "GpuSelectedRecordBufferAccessRecordGuard64")
+          : (wave == 32u ? "GpuSelectedRecordBufferAccess32" : "GpuSelectedRecordBufferAccess64");
+      test.profile = &profile;
       test.initial.assign((slot * 13u + keys.size() * wave * 16u) / 4u, 0xdeadbeefu);
       test.has_user_data = test.has_compute_info = true;
       const std::array<u32, 8> descriptors{selectors, 12u << 16u, keys.size(), 0x5204u,
@@ -54655,10 +54865,14 @@ void CheckGpuSelectedRecordBufferAccess(VulkanHarness &vulkan) {
       vulkan.DestroyBuffer(&buffer);
     }
   }
-  std::printf("[compute] %-32s ok\n", "GpuSelectedRecordBufferAccess");
+  std::printf("[compute] %-32s ok\n", profile.single_compare_record_guard
+                                          ? "GpuSelectedRecordBufferAccessRecordGuard"
+                                          : "GpuSelectedRecordBufferAccess");
 }
 
-void CheckGuardedWaterfallBufferRecords(VulkanHarness &vulkan) {
+// Reads formatted records inside guarded waterfall loops, with the given shader profile.
+void CheckGuardedWaterfallBufferRecords(VulkanHarness &vulkan,
+                                        const ShaderProfile &profile = Maintenance8Profile) {
   const u32 alignment = vulkan.RuntimeContext().GetPhysicalDeviceProperties()
                             .limits.minStorageBufferOffsetAlignment;
   const u32 slot = (4096u + alignment - 1u) / alignment * alignment;
@@ -54672,9 +54886,11 @@ void CheckGuardedWaterfallBufferRecords(VulkanHarness &vulkan) {
     const u32 iterations = outer_loop ? 2u : 1u;
     const std::string name = std::string(direct_gt ? "GuardedWaterfallGtRecords" : outer_loop
         ? "GuardedWaterfallLoopRecords" : "GuardedWaterfallRecords") +
-        (upper_only ? "Upper64" : std::to_string(wave));
+        (upper_only ? "Upper64" : std::to_string(wave)) +
+        (profile.single_compare_record_guard ? "RecordGuard" : "");
     TestCase test;
     test.name = name.c_str();
+    test.profile = &profile;
     test.initial.assign((slot * 3u + wave * iterations * 16u + 16u) / 4u, 0xdeadbeefu);
     std::fill_n(test.initial.begin() + table / 4u, 976u / 4u, 0u);
     constexpr std::array poison{0x012b6890u, 0x501502f9u, 0x493ba30eu, 0x3ea2f352u};
@@ -54758,6 +54974,21 @@ void CheckGuardedWaterfallBufferRecords(VulkanHarness &vulkan) {
     test.required_spirv = {"OpLoopMerge", "OpGroupNonUniformShuffle", "Volatile"};
     test.forbidden_spirv = {"load_indirect_buffer_", "indirect_buffer_format_geometry"};
     const auto compiled = CompileCase(test, vulkan.SubgroupSize());
+    if (profile.single_compare_record_guard) {
+      // Every record here lies in range, so the readback cannot tell the two guards apart. The
+      // single compare instead shows in the SPIR-V against the default compile of the same test,
+      // with fewer OpUGreaterThanEqual (no wrap select or end check) and more OpUGreaterThan
+      // (the limit).
+      auto chain_test = test;
+      chain_test.profile = &Maintenance8Profile;
+      const auto chain = CompileCase(chain_test, vulkan.SubgroupSize());
+      Require(test.name, "single compare record guard",
+              SpirvOpcodeCount(compiled.spirv, spv::OpUGreaterThanEqual) <
+                      SpirvOpcodeCount(chain.spirv, spv::OpUGreaterThanEqual) &&
+                  SpirvOpcodeCount(compiled.spirv, spv::OpUGreaterThan) >
+                      SpirvOpcodeCount(chain.spirv, spv::OpUGreaterThan),
+              "the flag-on records did not take the single compare guard");
+    }
     for (const auto &descriptor : compiled.resources.buffers) {
       ShaderBufferResource resource{};
       std::copy_n(descriptor.dwords.begin(), 4u, resource.fields);
@@ -54801,10 +55032,14 @@ void CheckGuardedWaterfallBufferRecords(VulkanHarness &vulkan) {
                  test.expected, vulkan.ReadBuffer(test.name, buffer, test.expected.size()));
     vulkan.DestroyBuffer(&buffer);
   }
-  std::printf("[compute] %-32s ok\n", "GuardedWaterfallBufferRecords");
+  std::printf("[compute] %-32s ok\n", profile.single_compare_record_guard
+                                          ? "GuardedWaterfallBufferRecordsRecordGuard"
+                                          : "GuardedWaterfallBufferRecords");
 }
 
-void CheckGpuSelectedFormattedRecordStore(VulkanHarness &vulkan) {
+// Stores formatted records through GPU selected descriptors, with the given shader profile.
+void CheckGpuSelectedFormattedRecordStore(VulkanHarness &vulkan,
+                                          const ShaderProfile &profile = Maintenance8Profile) {
   constexpr u32 selectors = 128, table = 256, stride = 592, member = 448;
   const u32 alignment = vulkan.RuntimeContext().GetPhysicalDeviceProperties()
                             .limits.minStorageBufferOffsetAlignment;
@@ -54814,7 +55049,10 @@ void CheckGpuSelectedFormattedRecordStore(VulkanHarness &vulkan) {
     const std::array keys{wide ? 31u : 5u, 0u, 3u, 1u, 4u, 2u, 6u};
     const auto selector_index = [wide](u32 group) { return wide ? group ^ 1u : group; };
     TestCase test;
-    test.name = wide ? "GpuSelectedFormattedRgba16Store" : "GpuSelectedFormattedRecordStore";
+    test.name = profile.single_compare_record_guard
+                    ? (wide ? "GpuSelectedFormattedRgba16StoreRecordGuard" : "GpuSelectedFormattedRecordStoreRecordGuard")
+                    : (wide ? "GpuSelectedFormattedRgba16Store" : "GpuSelectedFormattedRecordStore");
+    test.profile = &profile;
     test.initial.assign((slot * 7u + keys.size() * wave * 4u) / 4u, 0xdeadbeefu);
     auto bytes = std::as_writable_bytes(std::span(test.initial));
     if (wide) std::fill_n(test.initial.begin() + table / 4u, 32u * 4u, 0u);
@@ -59736,12 +59974,23 @@ std::vector<TestCase> MakeCases() {
                                     "BufferFormatLoadTightRangeWave32"));
   cases.push_back(TightCheckedRange(BufferFormatLoadPastCheckedRange(64),
                                     "BufferFormatLoadTightRangeWave64"));
+  cases.push_back(WithRecordGuard(BufferFormatLoadPastCheckedRange(32),
+                                  "BufferFormatLoadPastCheckedRangeRecordGuardWave32"));
+  cases.push_back(WithRecordGuard(BufferFormatLoadPastCheckedRange(64),
+                                  "BufferFormatLoadPastCheckedRangeRecordGuardWave64"));
+  cases.push_back(WithRecordGuard(TightCheckedRange(BufferFormatLoadPastCheckedRange(32)),
+                                  "BufferFormatLoadTightRangeRecordGuardWave32"));
+  cases.push_back(WithRecordGuard(TightCheckedRange(BufferFormatLoadPastCheckedRange(64)),
+                                  "BufferFormatLoadTightRangeRecordGuardWave64"));
   for (const u32 components : {1u, 2u, 4u}) {
     cases.push_back(BufferLoadBranchlessInactiveLanes(32, components, InactiveLanes::Odd));
     cases.push_back(BufferLoadBranchlessInactiveLanes(64, components, InactiveLanes::Odd));
     cases.push_back(BufferLoadBranchlessInactiveLanes(64, components, InactiveLanes::UpperHalf));
   }
   cases.push_back(BufferLoadFormatXyzwInactiveExecPreservesOverlappingAddressWave64());
+  cases.push_back(
+      WithRecordGuard(BufferLoadFormatXyzwInactiveExecPreservesOverlappingAddressWave64(),
+                      "BufferLoadFormatXyzwInactiveExecPreservesOverlappingAddressRecordGuardWave64"));
   AddCase(ScalarBufferOffsetAlignmentAndCarry);
   AddCase(ScalarLoadSignedImmediateOffsetAddsSoffset);
   AddCase(ScalarLoadAlignsComponentsAndMasksAddress);
@@ -59803,6 +60052,18 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferStoreFormatXRejectsPartialRecord);
   AddCase(BufferLoadFormatXyRejectsPartialRecord);
   AddCase(BufferStoreFormatXyRejectsPartialRecord);
+  cases.push_back(WithRecordGuard(BufferLoadFormatXyzwRejectsPartialRecord(),
+                                  "BufferLoadFormatXyzwRejectsPartialRecordRecordGuard"));
+  cases.push_back(WithRecordGuard(BufferStoreFormatXyzwDropsPartialRecord(),
+                                  "BufferStoreFormatXyzwDropsPartialRecordRecordGuard"));
+  cases.push_back(WithRecordGuard(BufferLoadFormatXRejectsPartialRecord(),
+                                  "BufferLoadFormatXRejectsPartialRecordRecordGuard"));
+  cases.push_back(WithRecordGuard(BufferStoreFormatXRejectsPartialRecord(),
+                                  "BufferStoreFormatXRejectsPartialRecordRecordGuard"));
+  cases.push_back(WithRecordGuard(BufferLoadFormatXyRejectsPartialRecord(),
+                                  "BufferLoadFormatXyRejectsPartialRecordRecordGuard"));
+  cases.push_back(WithRecordGuard(BufferStoreFormatXyRejectsPartialRecord(),
+                                  "BufferStoreFormatXyRejectsPartialRecordRecordGuard"));
   AddCase(BufferStoreVariants);
   for (bool masked : {false, true}) {
     cases.push_back(BufferStoreD16Hi(false, masked, 64));
@@ -59815,6 +60076,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferLoadFormatXyzwResource323232FloatRepeatsSource);
   AddCase(BufferLoadFormatXyzwResource8_8_8_8UintAppliesWzy1);
   AddCase(BufferLoadFormatXyzwInactiveExecPreservesOverlappingAddress);
+  cases.push_back(WithRecordGuard(BufferLoadFormatXyzwInactiveExecPreservesOverlappingAddress(),
+                                  "BufferLoadFormatXyzwInactiveExecPreservesOverlappingAddressRecordGuard"));
   AddCase(BufferFormatStoreVariants);
   AddCase(BufferStoreFormatXResource16UintWritesHalfword);
   AddCase(BufferStoreFormatXResource16UintPreservesAdjacentLanes);
@@ -59845,10 +60108,24 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferStoreFormatXyzResource8UintWritesOneByte);
   AddCase(BufferStoreFormatXAddTidUsesLaneIndex);
   AddCase(BufferStoreFormatXDropsOutOfRangeRecord);
+  cases.push_back(WithRecordGuard(BufferStoreFormatXDropsOutOfRangeRecord(),
+                                  "BufferStoreFormatXDropsOutOfRangeRecordRecordGuard"));
+  for (const auto view : {RecordGuardView::Wide, RecordGuardView::Short})
+    for (const bool store : {false, true})
+      for (const bool select : {false, true})
+        for (const bool guard : {false, true})
+          for (const u32 wave : {32u, 64u})
+            cases.push_back(FormattedRecordGuard(wave, select, store, guard, view));
   AddCase(TBufferLoadVariants);
   AddCase([] { return TBufferCapturedZeroStrideOob(); });
   AddCase([] { return TBufferCapturedZeroStrideOob(true); });
   AddCase([] { return TBufferCapturedZeroStrideOob(false, true); });
+  cases.push_back(WithRecordGuard(TBufferCapturedZeroStrideOob(),
+                                  "TBufferCapturedZeroStrideOobRecordGuard"));
+  cases.push_back(WithRecordGuard(TBufferCapturedZeroStrideOob(true),
+                                  "TBufferZeroStrideRawBoundsStillLoadsRecordGuard"));
+  cases.push_back(WithRecordGuard(TBufferCapturedZeroStrideOob(false, true),
+                                  "TBufferZeroStrideOobPreservesScalarReadRecordGuard"));
   AddCase(BufferZeroStrideOobFormatsAndWidths);
   AddCase(TBufferLoadFormatXyzwSnapshotsOverlappingAddress);
   AddCase(TBufferLoadFormatXyzwPackedSnapshotsOverlappingAddress);
@@ -70311,6 +70588,7 @@ int main(int argc, char **argv) {
   CheckModuleIdGolden();
   CheckNativeFloatMinMaxConfig();
   CheckSpirvProfileNativeFloatMinMax();
+  CheckSpirvProfileSingleCompareRecordGuardBytes();
   if (argc == 2 && std::strcmp(argv[1], "--native-float-minmax-only") == 0) {
     return 0;
   }
@@ -70943,6 +71221,10 @@ int main(int argc, char **argv) {
     CheckGpuSelectedRecordBufferAccess(vulkan);
     CheckGuardedWaterfallBufferRecords(vulkan);
     CheckGpuSelectedFormattedRecordStore(vulkan);
+    CheckBoundedRecordBufferAccess(vulkan, SingleCompareRecordGuardProfile);
+    CheckGpuSelectedRecordBufferAccess(vulkan, SingleCompareRecordGuardProfile);
+    CheckGuardedWaterfallBufferRecords(vulkan, SingleCompareRecordGuardProfile);
+    CheckGpuSelectedFormattedRecordStore(vulkan, SingleCompareRecordGuardProfile);
     CheckRuntimeBufferRecords(vulkan);
     CheckSharedIndirectBufferLoads(vulkan);
     RunCase(&vulkan, BufferLoadFormatXGpuSelectedDescriptors());
@@ -71801,6 +72083,10 @@ int main(int argc, char **argv) {
   CheckGpuSelectedRecordBufferAccess(vulkan);
   CheckGuardedWaterfallBufferRecords(vulkan);
   CheckGpuSelectedFormattedRecordStore(vulkan);
+  CheckBoundedRecordBufferAccess(vulkan, SingleCompareRecordGuardProfile);
+  CheckGpuSelectedRecordBufferAccess(vulkan, SingleCompareRecordGuardProfile);
+  CheckGuardedWaterfallBufferRecords(vulkan, SingleCompareRecordGuardProfile);
+  CheckGpuSelectedFormattedRecordStore(vulkan, SingleCompareRecordGuardProfile);
   CheckFiniteBufferSelection(vulkan);
   CheckStorageBufferBindingOver2GiB(vulkan);
   CheckRuntimeBufferRecords(vulkan);

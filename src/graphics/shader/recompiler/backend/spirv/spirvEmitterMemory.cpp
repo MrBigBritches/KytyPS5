@@ -770,10 +770,49 @@ struct PreparedFormattedMemory {
 	bool                     speculative = false;
 };
 
+// Checks a formatted record with one compare of the guest address, before the host prefix is
+// added, against FormattedRecordLimit. The tests prove that equal to the chain of compares in
+// PrepareFormattedMemory for records of 1 to MAX_FORMATTED_RECORD_BYTES bytes.
+PreparedFormattedMemory PrepareFormattedRecordSingleCompare(ValueEmitContext& ctx,
+                                                            const IR::Inst& inst,
+                                                            const IR::MemoryInfo& mem,
+                                                            const MemoryResourceAccess& resource,
+                                                            const Format::BufferFormatInfo& info) {
+	if (info.byte_size == 0u || info.byte_size > Format::MAX_FORMATTED_RECORD_BYTES) {
+		EXIT("formatted record of %u bytes is outside the single compare guard's proof\n",
+		     info.byte_size);
+	}
+	auto& state = ctx.state;
+	PreparedFormattedMemory plan;
+	plan.info     = info;
+	plan.resource = resource;
+	const auto shift = static_cast<uint32_t>(std::countr_zero(resource.element_bits / 8u));
+	const auto guest = BufferByteAddress(ctx, inst, mem);
+	const auto limit = EmitFormattedRecordLimit(state, resource.byte_offset, info.byte_size - 1u,
+	                                            shift, resource.length);
+	plan.in_bounds = BufferIndexInBounds(
+	    ctx, inst, mem, resource, Binary(state, spv::OpULessThan, TypeBool(state), guest, limit));
+	// A record that fits cannot wrap when the prefix is added, so ByteAddress's wrap select is not
+	// needed. A record that does not fit never reaches memory through this base, since the branch
+	// skips it and the selected form clamps its element index.
+	const auto start = Binary(state, spv::OpIAdd, TypeU32(state), guest, resource.byte_offset);
+	plan.base        = Binary(state, spv::OpBitwiseAnd, TypeU32(state), start,
+	                          ConstantU32(state, ~(std::min(4u, info.byte_size) - 1u)));
+	return plan;
+}
+
+// Plans a formatted record access, giving the aligned base address and whether the whole record
+// is in range.
 PreparedFormattedMemory PrepareFormattedMemory(ValueEmitContext& ctx, const IR::Inst& inst,
                                                const IR::MemoryInfo& mem,
                                                const MemoryResourceAccess& resource,
                                                const Format::BufferFormatInfo& info) {
+	// byte_offset is a SPIR-V id. Callers return before this for a resource with no binding, so a
+	// zero id only keeps the chain below as a fallback.
+	if (ctx.state.profile.single_compare_record_guard && mem.kind == IR::ResourceKind::Buffer &&
+	    resource.byte_offset != 0u) {
+		return PrepareFormattedRecordSingleCompare(ctx, inst, mem, resource, info);
+	}
 	PreparedFormattedMemory plan;
 	plan.info      = info;
 	plan.resource  = resource;

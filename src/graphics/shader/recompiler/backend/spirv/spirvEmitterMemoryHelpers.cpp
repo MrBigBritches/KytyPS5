@@ -174,7 +174,8 @@ void EmitMemoryBindings(EmitterState& state) {
 		for (uint32_t lane = 0; lane < lanes; ++lane) {
 			if (dynamic_offsets[i + lane]) continue;
 			state.memory_byte_offsets[i + lane] = EmitNative<spv::OpBitFieldUExtract, IR::Type::U32>(
-			    state, word, ConstantU32(state, lane * 8u), ConstantU32(state, 8u));
+			    state, word, ConstantU32(state, lane * MEMORY_PREFIX_BITS),
+			    ConstantU32(state, MEMORY_PREFIX_BITS));
 			state.memory_byte_sizes[i + lane] =
 			    EmitShaderDataDwordLoad(state, state.program.bindings.MemorySizeDword() + i + lane);
 		}
@@ -267,9 +268,9 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
 		    Binary(state, spv::OpShiftRightLogical, TypeU32(state), array_index, ConstantU32(state, 2))));
 		const auto shift = Binary(state, spv::OpShiftLeftLogical, TypeU32(state),
 		    Binary(state, spv::OpBitwiseAnd, TypeU32(state), array_index, ConstantU32(state, 3)),
-		    ConstantU32(state, 3));
+		    ConstantU32(state, MEMORY_PREFIX_BITS_SHIFT));
 		access.byte_offset = EmitNative<spv::OpBitFieldUExtract, IR::Type::U32>(
-		    state, word, shift, ConstantU32(state, 8));
+		    state, word, shift, ConstantU32(state, MEMORY_PREFIX_BITS));
 		access.length = EmitShaderDataDwordLoadAt(state, EmitAddU32(
 		    state, ConstantU32(state, bindings.MemorySizeDword() + data_start), array_index));
 	} else {
@@ -332,6 +333,19 @@ MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::
 		}
 		default: EXIT("unsupported memory resource kind: %u\n", static_cast<unsigned>(mem.kind));
 	}
+}
+
+uint32_t EmitFormattedRecordLimit(EmitterState& state, uint32_t prefix, uint32_t last_byte,
+                                  uint32_t shift, uint32_t element_count) {
+	const auto view  = shift == 0u ? element_count
+	                               : Binary(state, spv::OpShiftLeftLogical, TypeU32(state),
+	                                        element_count, ConstantU32(state, shift));
+	const auto reach = last_byte == 0u ? prefix
+	                                   : Binary(state, spv::OpIAdd, TypeU32(state), prefix,
+	                                            ConstantU32(state, last_byte));
+	const auto fits  = Binary(state, spv::OpUGreaterThan, TypeBool(state), view, reach);
+	return Select(state, TypeU32(state), fits,
+	              Binary(state, spv::OpISub, TypeU32(state), view, reach), ConstantU32(state, 0));
 }
 
 uint32_t EmitMemoryElementInBounds(EmitterState& state, const MemoryResourceAccess& access,
