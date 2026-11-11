@@ -238,6 +238,32 @@ constexpr BufferFormatInfo GetFormatInfo(Prospero::BufferFormat format) {
 	}
 }
 
+// The largest formatted record, four 32 bit components. The single compare record guard needs a
+// record of at least one byte, so the last byte offset does not wrap, and this upper bound keeps
+// the host prefix plus the last byte offset far from the top of the 32 bit range.
+inline constexpr uint32_t MAX_FORMATTED_RECORD_BYTES = 16;
+
+// Every value the 9 bit format field of a buffer descriptor can hold.
+inline constexpr uint32_t BUFFER_FORMAT_ENCODINGS = 512;
+
+// Whether every format with a known component type has a record of 1 to MAX_FORMATTED_RECORD_BYTES
+// bytes, which the single compare record guard relies on as MAX_FORMATTED_RECORD_BYTES explains.
+constexpr bool EveryFormattedRecordIsBounded() {
+	for (uint32_t encoding = 0; encoding < BUFFER_FORMAT_ENCODINGS; encoding++) {
+		const auto info = GetFormatInfo(static_cast<Prospero::BufferFormat>(encoding));
+		if (info.type == ComponentType::Unknown) {
+			continue;
+		}
+		if (info.byte_size == 0u || info.byte_size > MAX_FORMATTED_RECORD_BYTES) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static_assert(EveryFormattedRecordIsBounded(),
+              "a buffer format record outside 1 to 16 bytes breaks the single compare record guard");
+
 constexpr uint32_t GetFormatComponentByteOffset(const BufferFormatInfo& info, uint32_t component) {
 	if (component >= info.component_count) {
 		return 0;

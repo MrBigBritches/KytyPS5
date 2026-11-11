@@ -12096,6 +12096,60 @@ void TestNewShaderRecompilerLdsLoadKeepsBranch() {
         "LDS load lost its bounds branch");
 }
 
+// Proves the single compare `guest < FormattedRecordLimit(...)` equal to the emitter's chain of
+// compares, over every host prefix, every record size a buffer format has, every element shift,
+// byte sizes at the small, odd and wrapping edges (rounded down to whole elements as the emitter's
+// length is), and guest addresses on both sides of the limit and of every wrap. This proves the
+// formula only, and the GPU tests prove the emitter applies it.
+void TestFormattedRecordLimitMatchesChain() {
+  using ShaderRecompiler::Spirv::Emitter::FormattedRecordChainFits;
+  using ShaderRecompiler::Spirv::Emitter::FormattedRecordLimit;
+  using ShaderRecompiler::Spirv::Emitter::MAX_BUFFER_PREFIX_BYTES;
+  namespace Format = ShaderRecompiler::Format;
+  constexpr uint32_t max_shift = 2u, probe_reach = 2u;
+  std::set<uint32_t> last_bytes;
+  for (uint32_t encoding = 0; encoding < Format::BUFFER_FORMAT_ENCODINGS; encoding++) {
+    const auto info = Format::GetFormatInfo(static_cast<Prospero::BufferFormat>(encoding));
+    if (info.type != Format::ComponentType::Unknown) last_bytes.insert(info.byte_size - 1u);
+  }
+  Check(last_bytes.contains(0u) && last_bytes.contains(Format::MAX_FORMATTED_RECORD_BYTES - 1u),
+        "record sizes from the format table miss the 1 and 16 byte ends");
+  const std::vector<uint32_t> views{0u,          1u,          2u,          3u,          4u,
+                                    5u,          15u,         16u,         17u,         255u,
+                                    256u,        270u,        271u,        0x7fffffffu, 0x80000000u,
+                                    0x80000001u, 0xfffffffcu, 0xfffffffdu, 0xfffffffeu, 0xffffffffu};
+  uint64_t cases = 0, fits = 0;
+  for (uint32_t prefix = 0; prefix <= MAX_BUFFER_PREFIX_BYTES; prefix++) {
+    for (const uint32_t last_byte: last_bytes) {
+      for (uint32_t shift = 0; shift <= max_shift; shift++) {
+        for (const uint32_t view: views) {
+          const uint32_t element_count = view >> shift;
+          const uint32_t limit = FormattedRecordLimit(prefix, last_byte, shift, element_count);
+          // Unsigned wrap is intended, so each probe also lands near the top of memory.
+          std::vector<uint32_t> guests{0u, 1u, UINT32_MAX, 0u - prefix, 0u - prefix - 1u,
+                                       0u - prefix - last_byte, 0u - prefix - last_byte - 1u};
+          for (uint32_t delta = 0; delta <= 2u * probe_reach; delta++) {
+            guests.push_back(limit - probe_reach + delta);
+          }
+          for (const uint32_t guest: guests) {
+            const bool chain = FormattedRecordChainFits(guest, prefix, last_byte, shift, element_count);
+            if (chain != (guest < limit)) {
+              std::fprintf(stderr,
+                           "guest %08x prefix %u last byte %u shift %u view %08x limit %08x chain %d\n",
+                           guest, prefix, last_byte, shift, view, limit, chain ? 1 : 0);
+              Check(false, "single compare record guard differs from the chain");
+            }
+            cases++;
+            fits += chain ? 1u : 0u;
+          }
+        }
+      }
+    }
+  }
+  // A sweep where every record fits or none does would pass for a guard that ignores the limit.
+  Check(fits != 0u && fits != cases, "record limit sweep never saw both outcomes");
+}
+
 // Formatted loads select each component against its out-of-range value, with no phi for the
 // driver to merge, and without opting in they keep the branch. The xy record uses a two-word
 // array type that a vector select could not take, so it checks the scalar selects validate.
@@ -14966,6 +15020,7 @@ int main() {
   TestNewShaderRecompilerScalarBufferLoadSelectsWhenOptedIn();
   TestNewShaderRecompilerBufferLoadSelectsWhenOptedIn();
   TestNewShaderRecompilerLdsLoadKeepsBranch();
+  TestFormattedRecordLimitMatchesChain();
   TestNewShaderRecompilerFormattedLoadSelectsWhenOptedIn();
   TestNewShaderRecompilerExecGuardedLoadSelects();
   TestNewShaderRecompilerSelectedLoadsClampIndex();

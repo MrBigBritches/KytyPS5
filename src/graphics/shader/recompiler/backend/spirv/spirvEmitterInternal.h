@@ -402,6 +402,37 @@ uint32_t SharedIndirectBufferResource(const EmitterState& state, uint32_t resour
 
 void EmitMemoryBindings(EmitterState& state);
 
+// Width of the host prefix field of a buffer binding. The prefix is the bound offset's remainder
+// below Vulkan's storage buffer offset alignment, which is at most 256 bytes.
+inline constexpr uint32_t MEMORY_PREFIX_BITS = 8;
+
+// The largest host prefix of a buffer binding.
+inline constexpr uint32_t MAX_BUFFER_PREFIX_BYTES = (1u << MEMORY_PREFIX_BITS) - 1u;
+
+// The limit below which a guest byte address starts a record that ends inside the view once the
+// host prefix is added. It is zero when no record fits. The view is element_count whole elements
+// of 1 << shift bytes, because the chain checks the last element index, so a byte in a partial
+// final element never counts as inside. The sum of the prefix and the last byte offset cannot
+// wrap, since the prefix is at most MAX_BUFFER_PREFIX_BYTES and the last byte offset at most
+// MAX_FORMATTED_RECORD_BYTES - 1.
+constexpr uint32_t FormattedRecordLimit(uint32_t prefix, uint32_t last_byte, uint32_t shift,
+                                        uint32_t element_count) {
+	const uint32_t view_bytes = element_count << shift;
+	const uint32_t reach      = prefix + last_byte;
+	return view_bytes > reach ? view_bytes - reach : 0u;
+}
+
+// The range check the emitter does with a chain of compares, written out on the CPU so tests can
+// prove the single compare against FormattedRecordLimit equal to it. A guest address that wraps
+// when the prefix is added clamps to the top of memory, and a record whose end wraps never fits.
+constexpr bool FormattedRecordChainFits(uint32_t guest, uint32_t prefix, uint32_t last_byte,
+                                        uint32_t shift, uint32_t element_count) {
+	const uint32_t sum   = guest + prefix;
+	const uint32_t start = sum >= prefix ? sum : UINT32_MAX;
+	const uint32_t end   = start + last_byte;
+	return end >= start && (end >> shift) < element_count;
+}
+
 uint32_t LdsDwordCount(const EmitterState& state);
 void EnsureLdsStorage(EmitterState& state);
 
