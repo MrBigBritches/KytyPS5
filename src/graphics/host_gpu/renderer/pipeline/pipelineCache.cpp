@@ -1592,10 +1592,15 @@ void PipelineCache::StartWarmCompute(const ShaderModule& module, StoreGen::GenRo
 	// The module lives in the program cache, which outlasts the queue because StopBuilds runs
 	// first. A refusal leaves the module to build on first use, as it would without the warm-up.
 	// The row is in the generation state, which outlasts the queue for the same reason.
-	auto build = [this, &module, row](Pipeline& pipeline) {
-		// The rows of worker compiles show how many warm builds were running when they began.
-		const Common::FirstRunReport::WarmBuildScope running;
-		const auto                                   build_start = std::chrono::steady_clock::now();
+	auto build = [this, &module, row, lane](Pipeline& pipeline) {
+		// The rows of worker compiles show how many warm builds were running when they began, and
+		// on which lane. The report has its own lane type because common cannot see the queue's.
+		// A job the GPU thread takes inline before a worker starts it still counts on its lane,
+		// which is fine for a figure of contention.
+		const Common::FirstRunReport::WarmBuildScope running(
+		    lane == PipelineBuildQueue::Lane::Back ? Common::FirstRunReport::WarmLane::Back
+		                                           : Common::FirstRunReport::WarmLane::Front);
+		const auto build_start = std::chrono::steady_clock::now();
 		CreatePipelineInternal(m_graphics, pipeline, module, m_driver_cache);
 		if (row != nullptr) {
 			const auto build_end = std::chrono::steady_clock::now();

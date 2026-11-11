@@ -1627,6 +1627,157 @@ void TestWorkerCompileContext() {
 	global.Reset();
 }
 
+// A warm build counts toward its own lane and the total, and not the other lane. A Front scope is
+// the baseline for a Back scope and the reverse, and a scope with no lane counts toward the total
+// only. Every count drops back to zero when the scopes end.
+void TestWarmBuildScopeLanes() {
+	using Common::FirstRunReport::WarmBackBuildsRunning;
+	using Common::FirstRunReport::WarmBuildScope;
+	using Common::FirstRunReport::WarmBuildsRunning;
+	using Common::FirstRunReport::WarmFrontBuildsRunning;
+	using Common::FirstRunReport::WarmLane;
+	Common::FirstRunReport::Configure(true, false);
+	{
+		const WarmBuildScope front(WarmLane::Front);
+		Check(WarmFrontBuildsRunning() == 1 && WarmBackBuildsRunning() == 0 &&
+		          WarmBuildsRunning() == 1,
+		      "a front scope did not count as front and total only");
+	}
+	{
+		const WarmBuildScope back(WarmLane::Back);
+		Check(WarmFrontBuildsRunning() == 0 && WarmBackBuildsRunning() == 1 &&
+		          WarmBuildsRunning() == 1,
+		      "a back scope did not count as back and total only");
+	}
+	{
+		const WarmBuildScope other;
+		Check(WarmFrontBuildsRunning() == 0 && WarmBackBuildsRunning() == 0 &&
+		          WarmBuildsRunning() == 1,
+		      "a scope with no lane counted toward a lane");
+	}
+	Check(WarmFrontBuildsRunning() == 0 && WarmBackBuildsRunning() == 0 && WarmBuildsRunning() == 0,
+	      "a finished scope is still counted");
+	Common::FirstRunReport::Configure(false, false);
+	{
+		const WarmBuildScope off(WarmLane::Back);
+		Check(WarmBackBuildsRunning() == 0, "a lane was counted while the report was off");
+	}
+}
+
+// A worker row carries the Front and Back builds it met. The baseline is a row begun with none
+// running, and the row begun with 1 Front and 2 Back must carry 1 and 2, not 2 and 1.
+void TestWorkerCompileLaneCounts() {
+	using Common::FirstRunReport::CompileScope;
+	using Common::FirstRunReport::WarmBuildScope;
+	using Common::FirstRunReport::WarmLane;
+	auto& global = Common::FirstRunReport::Global();
+	global.Reset();
+	Common::FirstRunReport::Configure(true, false);
+	{
+		CompileScope baseline(Kind::Graphics, 1, 2, false);
+	}
+	{
+		const WarmBuildScope front(WarmLane::Front);
+		const WarmBuildScope back_one(WarmLane::Back);
+		const WarmBuildScope back_two(WarmLane::Back);
+		CompileScope         busy(Kind::Graphics, 3, 4, false);
+	}
+	const auto rows = nlohmann::json::parse(global.ToJson({}, 0, 1.0, 0.0))["compiles"];
+	Check(rows.size() == 2, "the compile rows were lost");
+	if (rows.size() == 2) {
+		Check(rows[0].contains("warm_front") && rows[0].contains("warm_back") &&
+		          rows[0]["warm_front"] == 0 && rows[0]["warm_back"] == 0,
+		      "the baseline row lacks the lane keys or has lanes it did not meet");
+		Check(rows[1]["warm_front"] == 1 && rows[1]["warm_back"] == 2 &&
+		          rows[1]["warm_running"] == 3,
+		      "the row did not carry the lanes it met");
+	}
+	Common::FirstRunReport::Configure(false, false);
+	global.Reset();
+}
+
+// Each underrun carries what ran when it happened, in the order of its time. The first has 0 Front
+// and 3 Back with the generator alive and the second 2 Front and 0 Back with it not alive, so a
+// value that was not stored, or that was taken from the other slot, differs. Totals are not
+// compared with the lanes, since they are separate loads.
+void TestAudioUnderrunsCarryLanes() {
+	using Common::FirstRunReport::WarmBuildScope;
+	using Common::FirstRunReport::WarmLane;
+	Report report;
+	Common::FirstRunReport::Configure(true, false);
+	{
+		const WarmBuildScope back_one(WarmLane::Back);
+		const WarmBuildScope back_two(WarmLane::Back);
+		const WarmBuildScope back_three(WarmLane::Back);
+		Common::FirstRunReport::SetGeneratorChildAlive(true);
+		report.AddAudioUnderrun();
+	}
+	{
+		const WarmBuildScope front_one(WarmLane::Front);
+		const WarmBuildScope front_two(WarmLane::Front);
+		Common::FirstRunReport::SetGeneratorChildAlive(false);
+		report.AddAudioUnderrun();
+	}
+	Common::FirstRunReport::Configure(false, false);
+	const auto taken = report.AudioUnderrunsSoFar();
+	Check(taken.at_ns.size() == 2 && taken.warm_front.size() == 2 && taken.warm_back.size() == 2 &&
+	          taken.child_alive.size() == 2,
+	      "the underrun fields are not parallel to the times");
+	if (taken.at_ns.size() == 2 && taken.warm_front.size() == 2 && taken.warm_back.size() == 2 &&
+	    taken.child_alive.size() == 2) {
+		Check(taken.warm_front[0] == 0 && taken.warm_back[0] == 3 && taken.child_alive[0] == 1,
+		      "the first underrun lost its lanes or its generator");
+		Check(taken.warm_front[1] == 2 && taken.warm_back[1] == 0 && taken.child_alive[1] == 0,
+		      "the second underrun lost its lanes or its generator");
+	}
+	const auto json = nlohmann::json::parse(report.ToJson({}, 0, 1.0, 0.0))["audio_underruns"];
+	Check(json["warm_front"] == nlohmann::json::array({0, 2}) &&
+	          json["warm_back"] == nlohmann::json::array({3, 0}) &&
+	          json["child_alive"] == nlohmann::json::array({1, 0}),
+	      "the underrun arrays in the file are not parallel to at_ms");
+	// Reset clears the counts with the times, so a refill starts from nothing.
+	report.Reset();
+	Check(report.AudioUnderrunsSoFar().warm_back.empty(), "Reset kept the underrun counts");
+	report.AddAudioUnderrun();
+	const auto again = report.AudioUnderrunsSoFar();
+	Check(again.warm_front.size() == 1 && again.warm_front[0] == 0 && again.warm_back[0] == 0 &&
+	          again.child_alive[0] == 0,
+	      "Reset left old counts in a reused slot");
+	const auto empty = nlohmann::json::parse(Report().ToJson({}, 0, 1.0, 0.0))["audio_underruns"];
+	Check(empty["warm_front"].is_array() && empty["warm_front"].empty() &&
+	          empty["child_alive"].is_array(),
+	      "an empty report lacks the underrun arrays");
+}
+
+// The flag-off free function stores no lanes, and an overflowed underrun adds no entry to them. The
+// baseline is the same call with the report on, which stores one.
+void TestAudioUnderrunLanesFlagAndOverflow() {
+	auto& global = Common::FirstRunReport::Global();
+	global.Reset();
+	Common::FirstRunReport::Configure(false, false);
+	Common::FirstRunReport::AddAudioUnderrun();
+	Check(global.AudioUnderrunsSoFar().warm_front.empty() &&
+	          global.AudioUnderrunsSoFar().child_alive.empty(),
+	      "lanes were stored while the report was off");
+	Common::FirstRunReport::Configure(true, false);
+	Common::FirstRunReport::AddAudioUnderrun();
+	Check(global.AudioUnderrunsSoFar().warm_front.size() == 1,
+	      "lanes were not stored with the report on");
+	Common::FirstRunReport::Configure(false, false);
+	global.Reset();
+
+	constexpr size_t capacity = Common::FirstRunReport::AUDIO_UNDERRUN_CAPACITY;
+	Report           over;
+	for (size_t index = 0; index < capacity + 3; index++) {
+		over.AddAudioUnderrun();
+	}
+	const auto taken = over.AudioUnderrunsSoFar();
+	Check(taken.overflow == 3 && taken.at_ns.size() == capacity &&
+	          taken.warm_front.size() == capacity && taken.warm_back.size() == capacity &&
+	          taken.child_alive.size() == capacity,
+	      "an overflow changed the stored lanes or was not counted");
+}
+
 // With a source, the writer asks it each time. A final figure replaces it at once and the source is
 // never called again, so the owner may destroy what the source reads. The baseline is the same
 // report before the final figure.
@@ -1743,6 +1894,10 @@ int main() {
   TestAudioUnderrunsOverflow();
   TestMachineBlock();
   TestWorkerCompileContext();
+  TestWarmBuildScopeLanes();
+  TestWorkerCompileLaneCounts();
+  TestAudioUnderrunsCarryLanes();
+  TestAudioUnderrunLanesFlagAndOverflow();
   TestGenerationSourceThenFinal();
   TestGenerationWriterNeverTouchesADestroyedSource();
   TestGenerationFinalWaitsForAWriterInTheSource();

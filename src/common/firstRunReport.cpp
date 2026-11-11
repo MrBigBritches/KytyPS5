@@ -15,6 +15,7 @@
 #include <exception>
 #include <fmt/format.h>
 #include <fstream>
+#include <limits>
 #include <nlohmann/json.hpp>
 #include <random>
 #include <string_view>
@@ -281,6 +282,8 @@ void Report::AddCompile(Kind kind, uint64_t id, uint64_t id_ps, double create_ms
 	if (thread == Thread::Worker) {
 		entry.at_ns        = start_ns;
 		entry.warm_running = context.warm_running;
+		entry.warm_front   = context.warm_front;
+		entry.warm_back    = context.warm_back;
 		entry.child_alive  = context.child_alive;
 	}
 	// Only the GPU thread works through submissions, so a worker row never takes the current one.
@@ -311,7 +314,17 @@ void Report::AddAudioUnderrun() noexcept {
 		m_underrun_overflow.fetch_add(1, std::memory_order_relaxed);
 		return;
 	}
-	m_underrun_ns[slot].store(NowNs(), std::memory_order_relaxed);
+	// The counts go in first and the time publishes the slot with release, so a reader that sees
+	// the time also sees them. All of it stays lock-free, with no allocation and no logging.
+	constexpr uint32_t count_limit = std::numeric_limits<uint16_t>::max();
+	m_underrun_warm_front[slot].store(
+	    static_cast<uint16_t>(std::min(WarmFrontBuildsRunning(), count_limit)),
+	    std::memory_order_relaxed);
+	m_underrun_warm_back[slot].store(
+	    static_cast<uint16_t>(std::min(WarmBackBuildsRunning(), count_limit)),
+	    std::memory_order_relaxed);
+	m_underrun_child_alive[slot].store(GeneratorChildAlive() ? 1 : 0, std::memory_order_relaxed);
+	m_underrun_ns[slot].store(NowNs(), std::memory_order_release);
 }
 
 AudioUnderruns Report::AudioUnderrunsSoFar() const {
@@ -320,9 +333,15 @@ AudioUnderruns Report::AudioUnderrunsSoFar() const {
 	const size_t taken =
 	    std::min(m_underrun_next.load(std::memory_order_relaxed), AUDIO_UNDERRUN_CAPACITY);
 	for (size_t slot = 0; slot < taken; slot++) {
-		const auto time = m_underrun_ns[slot].load(std::memory_order_relaxed);
+		// Acquire pairs with the release store of the time, which follows the counts.
+		const auto time = m_underrun_ns[slot].load(std::memory_order_acquire);
 		if (time != 0) {
 			result.at_ns.push_back(time);
+			result.warm_front.push_back(
+			    m_underrun_warm_front[slot].load(std::memory_order_relaxed));
+			result.warm_back.push_back(m_underrun_warm_back[slot].load(std::memory_order_relaxed));
+			result.child_alive.push_back(
+			    m_underrun_child_alive[slot].load(std::memory_order_relaxed));
 		}
 	}
 	return result;
@@ -526,6 +545,11 @@ void Report::Reset() {
 	for (auto& slot: m_underrun_ns) {
 		slot.store(0, std::memory_order_relaxed);
 	}
+	for (size_t slot = 0; slot < AUDIO_UNDERRUN_CAPACITY; slot++) {
+		m_underrun_warm_front[slot].store(0, std::memory_order_relaxed);
+		m_underrun_warm_back[slot].store(0, std::memory_order_relaxed);
+		m_underrun_child_alive[slot].store(0, std::memory_order_relaxed);
+	}
 	m_underrun_next.store(0, std::memory_order_relaxed);
 	m_underrun_overflow.store(0, std::memory_order_relaxed);
 }
@@ -651,6 +675,8 @@ nlohmann::json CompileToJson(const CompileEntry& compile, int64_t epoch_ns) {
 		const int64_t base  = epoch_ns == NO_TIME_NS ? 0 : epoch_ns;
 		row["at_ms"]        = Round3(static_cast<double>(compile.at_ns - base) / NS_PER_MS);
 		row["warm_running"] = compile.warm_running;
+		row["warm_front"]   = compile.warm_front;
+		row["warm_back"]    = compile.warm_back;
 		row["child_alive"]  = compile.child_alive;
 	}
 	// Left out when unset, so older readers see no new keys.
@@ -1088,9 +1114,13 @@ nlohmann::json AudioUnderrunsToJson(const AudioUnderruns& underruns, int64_t epo
 	for (const auto at_ns: underruns.at_ns) {
 		times.push_back(Round3(static_cast<double>(at_ns - base) / NS_PER_MS));
 	}
+	// The three arrays are parallel to at_ms. child_alive is written as 0 or 1.
 	return {{"count", underruns.at_ns.size() + underruns.overflow},
 	        {"overflow", underruns.overflow},
-	        {"at_ms", times}};
+	        {"at_ms", times},
+	        {"warm_front", underruns.warm_front},
+	        {"warm_back", underruns.warm_back},
+	        {"child_alive", underruns.child_alive}};
 }
 
 nlohmann::json MachineToJson(const MachineInfo& info) {
@@ -1669,7 +1699,10 @@ CompileScope::CompileScope(Kind kind, uint64_t id, uint64_t id_ps, bool on_gpu_t
 	if (m_active) {
 		m_start    = std::chrono::steady_clock::now();
 		m_start_ns = ToNs(m_start);
-		m_context  = {.warm_running = WarmBuildsRunning(), .child_alive = GeneratorChildAlive()};
+		m_context  = {.warm_running = WarmBuildsRunning(),
+		              .warm_front   = WarmFrontBuildsRunning(),
+		              .warm_back    = WarmBackBuildsRunning(),
+		              .child_alive  = GeneratorChildAlive()};
 	}
 }
 

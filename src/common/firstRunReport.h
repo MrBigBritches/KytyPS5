@@ -90,9 +90,13 @@ struct TranslateEntry {
 /// What a pipeline creation met when it began, for the rows of worker compiles. warm_running is how
 /// many background warm-up builds were running, and child_alive whether the shader store
 /// generator's worker process was, so a row can be compared across runs with the generator on and
-/// off.
+/// off. warm_front and warm_back split the warm builds by queue lane. The three counts are separate
+/// relaxed loads, so warm_running may briefly differ from warm_front + warm_back. A build outside
+/// both lanes is in warm_running only.
 struct CompileContext {
 	uint32_t warm_running = 0;
+	uint32_t warm_front   = 0;
+	uint32_t warm_back    = 0;
 	bool     child_alive  = false;
 };
 
@@ -123,6 +127,8 @@ struct CompileEntry {
 	/// compiles have them. start_ns stays for the rows that join a submission.
 	int64_t  at_ns        = NO_TIME_NS;
 	uint32_t warm_running = 0;
+	uint32_t warm_front   = 0;
+	uint32_t warm_back    = 0;
 	bool     child_alive  = false;
 };
 
@@ -339,10 +345,15 @@ inline constexpr double SLOW_TAKE_MS = 250.0;
 inline constexpr size_t AUDIO_UNDERRUN_CAPACITY = 8192;
 
 /// The guest audio underruns of the run: how many were stored, how many came past the capacity, and
-/// when each stored one happened on the NowNs clock, in the order they were stored.
+/// when each stored one happened on the NowNs clock, in the order they were stored. warm_front,
+/// warm_back and child_alive are parallel to at_ns and hold what was running at each underrun. They
+/// are separate relaxed loads, so they may briefly disagree with the total warm count.
 struct AudioUnderruns {
-	uint64_t             overflow = 0;
-	std::vector<int64_t> at_ns;
+	uint64_t              overflow = 0;
+	std::vector<int64_t>  at_ns;
+	std::vector<uint16_t> warm_front;
+	std::vector<uint16_t> warm_back;
+	std::vector<uint8_t>  child_alive;
 };
 
 /// What the report says about the machine and the emulator's own process. A figure the system did
@@ -646,10 +657,12 @@ public:
 	/// Records one guest audio underrun at the time now, which is the NowNs clock. It takes no
 	/// lock, allocates nothing and never logs, since it is called from the guest's audio submit. A
 	/// slot is reserved with one relaxed increment, and an underrun past AUDIO_UNDERRUN_CAPACITY
-	/// only adds to the overflow count, so the index cannot wrap.
+	/// only adds to the overflow count, so the index cannot wrap. The warm builds running per lane
+	/// and the generator's liveness are stored in the slot before its time is published with
+	/// release.
 	void AddAudioUnderrun() noexcept;
 	/// The underruns recorded so far. Slots that a racing call reserved and has not written yet are
-	/// left out.
+	/// left out, and only a slot with a time has its counts read.
 	[[nodiscard]] AudioUnderruns AudioUnderrunsSoFar() const;
 	/// Notes the submission the GPU thread is processing. count is true when it should join the
 	/// submission totals, which the caller does once per command list.
@@ -793,8 +806,13 @@ private:
 	// The audio underruns, written without a lock from the audio submit. A slot holds 0 until its
 	// time is stored, and a time is never 0 on the steady clock.
 	std::array<std::atomic<int64_t>, AUDIO_UNDERRUN_CAPACITY> m_underrun_ns {};
-	std::atomic<size_t>                                       m_underrun_next {0};
-	std::atomic<uint64_t>                                     m_underrun_overflow {0};
+	// What was running at each underrun, stored before its time so that a reader of the time sees
+	// them. Warm counts saturate at the uint16 range.
+	std::array<std::atomic<uint16_t>, AUDIO_UNDERRUN_CAPACITY> m_underrun_warm_front {};
+	std::array<std::atomic<uint16_t>, AUDIO_UNDERRUN_CAPACITY> m_underrun_warm_back {};
+	std::array<std::atomic<uint8_t>, AUDIO_UNDERRUN_CAPACITY>  m_underrun_child_alive {};
+	std::atomic<size_t>                                        m_underrun_next {0};
+	std::atomic<uint64_t>                                      m_underrun_overflow {0};
 };
 
 /// The report of this process.
@@ -847,27 +865,57 @@ inline void AddAudioUnderrun() noexcept {
 
 namespace Detail {
 inline std::atomic<int32_t>  g_warm_running {0};
+inline std::atomic<int32_t>  g_warm_front_running {0};
+inline std::atomic<int32_t>  g_warm_back_running {0};
 inline std::atomic<bool>     g_child_alive {false};
 inline std::atomic<uint32_t> g_warm_workers {0};
+
+/// A counter never reads below zero, which a reader racing a scope could otherwise see.
+[[nodiscard]] inline uint32_t ReadCount(const std::atomic<int32_t>& counter) noexcept {
+	const auto running = counter.load(std::memory_order_relaxed);
+	return running > 0 ? static_cast<uint32_t>(running) : 0;
+}
 } // namespace Detail
 
-/// How many background warm-up builds are running now.
+/// The queue lane a warm build runs on. This is the report's own type, since common cannot include
+/// the graphics headers. The pipeline cache maps its PipelineBuildQueue::Lane onto it. Other is for
+/// a build that is not on the warm queue, and counts toward the total only.
+enum class WarmLane : uint8_t { Front, Back, Other };
+
+/// How many background warm-up builds are running now, in every lane.
 [[nodiscard]] inline uint32_t WarmBuildsRunning() noexcept {
-	const auto running = Detail::g_warm_running.load(std::memory_order_relaxed);
-	return running > 0 ? static_cast<uint32_t>(running) : 0;
+	return Detail::ReadCount(Detail::g_warm_running);
+}
+
+/// How many warm-up builds from the front lane are running now.
+[[nodiscard]] inline uint32_t WarmFrontBuildsRunning() noexcept {
+	return Detail::ReadCount(Detail::g_warm_front_running);
+}
+
+/// How many warm-up builds from the back lane are running now.
+[[nodiscard]] inline uint32_t WarmBackBuildsRunning() noexcept {
+	return Detail::ReadCount(Detail::g_warm_back_running);
 }
 
 /// Counts one warm-up build as running for as long as it lives, when the report is on. A worker
-/// makes it around the build, and the rows of worker compiles read the count when they begin.
+/// makes it around the build, and the rows of worker compiles read the count when they begin. It
+/// raises the total and its lane's count, and lowers both on exit.
 class WarmBuildScope {
 public:
-	WarmBuildScope() noexcept: m_active(Enabled()) {
+	explicit WarmBuildScope(WarmLane lane = WarmLane::Other) noexcept
+	    : m_active(Enabled()), m_lane(lane) {
 		if (m_active) {
 			Detail::g_warm_running.fetch_add(1, std::memory_order_relaxed);
+			if (auto* lane_count = LaneCount()) {
+				lane_count->fetch_add(1, std::memory_order_relaxed);
+			}
 		}
 	}
 	~WarmBuildScope() {
 		if (m_active) {
+			if (auto* lane_count = LaneCount()) {
+				lane_count->fetch_sub(1, std::memory_order_relaxed);
+			}
 			Detail::g_warm_running.fetch_sub(1, std::memory_order_relaxed);
 		}
 	}
@@ -875,7 +923,18 @@ public:
 	WarmBuildScope& operator=(const WarmBuildScope&) = delete;
 
 private:
-	bool m_active;
+	/// The counter of this scope's lane, or null for a build outside both lanes.
+	[[nodiscard]] std::atomic<int32_t>* LaneCount() const noexcept {
+		switch (m_lane) {
+			case WarmLane::Front: return &Detail::g_warm_front_running;
+			case WarmLane::Back: return &Detail::g_warm_back_running;
+			case WarmLane::Other: break;
+		}
+		return nullptr;
+	}
+
+	bool     m_active;
+	WarmLane m_lane;
 };
 
 /// Says whether the shader store generator is running a worker. The supervisor sets it when a
