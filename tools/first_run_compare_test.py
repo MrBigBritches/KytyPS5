@@ -484,24 +484,35 @@ class GateWaitedTakes(unittest.TestCase):
 
 
 class GateGraphics(unittest.TestCase):
-    """The graphics gate compares first runs, with 15 percent of room."""
+    """Graphics blocked on the first runs is information up to 30 percent over gpl and fails past
+    it. Gpl is 10 s in the fixtures."""
 
-    def test_within_the_allowance(self):
+    @staticmethod
+    def graphics_verdict(gen_ms):
+        def edit(report):
+            report["play"]["blocked_ms"]["graphics"] = gen_ms
+        return gate_line(run_new({"new_gen_first.json": edit}), "GFX").split(" ")[1]
+
+    def test_within_the_guard_is_information(self):
         out = run_new()
         self.assertEqual(gate_line(out, "GFX"),
-                         "GFX PASS graphics blocked s, gen first run 11.00 vs gpl first run 10.00 + 15%")
+                         "GFX INFO graphics blocked s, gen first run 11.00 vs gpl first run 10.00,"
+                         " fails past + 30% (a trade for less compute blocked)")
 
-    def test_over_the_allowance(self):
-        def over(report):
-            report["play"]["blocked_ms"]["graphics"] = 12000.0
-        out = run_new({"new_gen_first.json": over})
-        self.assertEqual(gate_line(out, "GFX").split(" ")[1], "FAIL")
+    def test_the_old_allowance_no_longer_fails(self):
+        # 20 percent over failed the old 15 percent gate and is information now.
+        self.assertEqual(self.graphics_verdict(12000.0), "INFO")
+
+    def test_the_guard_edge(self):
+        # Exactly 30 percent over is still information, and anything past it fails.
+        self.assertEqual(self.graphics_verdict(13000.0), "INFO")
+        self.assertEqual(self.graphics_verdict(13010.0), "FAIL")
 
     def test_second_boot_graphics_do_not_move_it(self):
         def huge(report):
             report["play"]["blocked_ms"]["graphics"] = 99000.0
         out = run_new({"new_gen_second.json": huge})
-        self.assertEqual(gate_line(out, "GFX").split(" ")[1], "PASS")
+        self.assertEqual(gate_line(out, "GFX").split(" ")[1], "INFO")
         self.assertEqual(gate_line(out, "P8c").split(" ")[1], "FAIL")
 
     def test_p3_p95_is_gated_with_a_quarter_of_room(self):
