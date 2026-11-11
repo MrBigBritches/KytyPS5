@@ -2744,6 +2744,8 @@ constexpr ShaderProfile SingleCompareRecordGuardProfile{.maintenance8 = true,
                                                         .single_compare_record_guard = true};
 // The exec select passes are opt-in, so the tests of the elided form ask for them.
 constexpr ShaderProfile ElideExecSelectsProfile{.maintenance8 = true, .elide_exec_selects = true};
+constexpr ShaderProfile SelectElideExecSelectsProfile{
+    .maintenance8 = true, .select_guarded_loads = true, .elide_exec_selects = true};
 constexpr ShaderProfile SelectSingleCompareRecordGuardProfile{
     .maintenance8 = true, .select_guarded_loads = true, .single_compare_record_guard = true};
 
@@ -2805,6 +2807,8 @@ struct TestCase {
   std::vector<u32> expected_gds;
   std::vector<std::pair<std::string, size_t>> decoded_counts;
   std::vector<std::pair<std::string, size_t>> ir_counts;
+  // Each text must appear more often than the count in the typed IR.
+  std::vector<std::pair<std::string, size_t>> ir_more_than;
   u32 expected_mip_descriptors = 0;
   std::optional<std::vector<u32>> expected_buffer_resources;
   size_t max_spirv_words = 0;
@@ -3207,6 +3211,12 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
     Require(test.name, "typed IR", actual == expected,
             text + " count=" + std::to_string(actual) +
                 ", expected=" + std::to_string(expected));
+  }
+  for (const auto &[text, bound] : test.ir_more_than) {
+    const auto actual = CountText(result.ir_dump, text);
+    Require(test.name, "typed IR", actual > bound,
+            text + " count=" + std::to_string(actual) +
+                ", expected more than " + std::to_string(bound));
   }
   if (test.expected_mip_descriptors != 0) {
     const auto image = std::ranges::find_if(
@@ -43649,6 +43659,442 @@ TestCase ExecSelectRegion(bool elide) {
   return test;
 }
 
+// ---- Differential tests of the exec select passes ---------------------------------------------
+// Every case runs with the passes off and on, at wave32 and wave64, and must read back the same
+// explicit values both times. Each case leaves registers written under a mask for lanes outside
+// that mask to read, so a select dropped by mistake changes the readback. Each also holds a decoy,
+// a register written twice under a mask and stored under the same mask, whose first select the
+// passes must drop. The typed IR then has fewer selects with the passes on, so a pass that does
+// not run fails the count.
+constexpr u32 ExecDiffSentinel = 0xdeadbeefu;
+constexpr u32 ExecDiffRegionDwords = 64; // one dword per lane, the same for both wave sizes
+constexpr u32 ExecDiffRegions = 8;
+
+enum class ExecDiffKind {
+  StraightLine,
+  NestedMasks,
+  DivergentLoops,
+  LaneCrossing,
+  LdsNeighbours,
+  InactiveAddresses,
+};
+
+// Guest code and expected output of one case. Lane 0 to wave - 1 are the lanes that exist.
+struct ExecDiff {
+  u32 wave;
+  std::vector<u32> code;
+  std::vector<u32> initial =
+      std::vector<u32>(ExecDiffRegions * ExecDiffRegionDwords, ExecDiffSentinel);
+  std::vector<u32> expected = initial;
+
+  explicit ExecDiff(u32 wave_size) : wave(wave_size) {}
+  bool Wide() const { return wave == 64; }
+
+  // The wave64 forms act on a pair of SGPRs and the wave32 forms on one.
+  void SaveExecVcc(u32 sdst) {
+    code.push_back(EncodeSop1(Wide() ? 0x24u : 0x3cu, sdst, 106)); // s_and_saveexec vcc
+  }
+  void CopyExec(u32 sdst) {
+    code.push_back(Wide() ? EncodeSop1(0x04, sdst, 126) : EncodeSMovB32(sdst, 126));
+  }
+  void CopyVcc(u32 sdst) {
+    code.push_back(Wide() ? EncodeSop1(0x04, sdst, 106) : EncodeSMovB32(sdst, 106));
+  }
+  void SetExec(u32 ssrc) {
+    code.push_back(Wide() ? EncodeSop1(0x04, 126, ssrc) : EncodeSMovB32(126, ssrc));
+  }
+  void OrExec(u32 ssrc) {
+    code.push_back(EncodeSop2(Wide() ? 0x11u : 0x10u, 126, 126, ssrc)); // s_or exec, exec, ssrc
+  }
+  void AndExec(u32 ssrc) {
+    code.push_back(EncodeSop2(Wide() ? 0x0fu : 0x0eu, 126, 126, ssrc)); // s_and exec, exec, ssrc
+  }
+  // vdst = src0 + vsrc1
+  void Add(u32 vdst, u32 src0, u32 vsrc1) { code.push_back(EncodeVop2(0x25, vdst, src0, vsrc1)); }
+  // vcc = n > lane, which holds for the lanes below n
+  void VccLanesBelow(u32 n) { code.push_back(EncodeVopc(0xc4, InlineU32(n), 0)); }
+  // v5 = lane & 1, then vcc = lane is even
+  void VccEvenLanes() {
+    code.push_back(EncodeVop2(0x1b, 5, InlineU32(1), 0));
+    code.push_back(EncodeVopc(0xc2, InlineU32(0), 5));
+  }
+  void Store(u32 vgpr, u32 region) {
+    AppendStoreVgprAtLaneDwordOffset(&code, vgpr, 0, region * ExecDiffRegionDwords);
+  }
+  void StoreScalar(u32 sgpr, u32 region) {
+    AppendStoreSgprAtLaneDwordOffset(&code, sgpr, 0, region * ExecDiffRegionDwords);
+  }
+  void Expect(u32 region, u32 lane, u32 value) {
+    expected[region * ExecDiffRegionDwords + lane] = value;
+  }
+  // The decoy. v20 is the lane id, then the lanes below n add 1 to it twice and store it. The
+  // first select feeds the second add and only the masked store reads the result.
+  void Decoy(u32 n, u32 region) {
+    code.push_back(EncodeVop1(0x01, 20, Vgpr(0)));
+    CopyExec(18);
+    code.push_back(EncodeVopc(0xd4, InlineU32(n), 0)); // v_cmpx_gt_u32 exec, n, lane
+    code.push_back(EncodeVop2(0x25, 20, InlineU32(1), 20));
+    code.push_back(EncodeVop2(0x25, 20, InlineU32(1), 20));
+    Store(20, region);
+    SetExec(18);
+    for (u32 lane = 0; lane < std::min(n, wave); ++lane) Expect(region, lane, lane + 2u);
+  }
+  // Patches the branch at word index at to land on the word index target.
+  void PatchBranch(size_t at, u32 opcode, size_t target) {
+    code[at] = EncodeSopp(opcode, static_cast<u32>(static_cast<int>(target) -
+                                                  static_cast<int>(at) - 1) & 0xffffu);
+  }
+};
+
+// Straight line. Two nested v_cmpx narrow EXEC, and registers written under each mask are read
+// at full EXEC, so the lanes outside each mask must read their old values.
+void BuildExecDiffStraightLine(ExecDiff &d) {
+  const u32 outer = d.wave * 5 / 8, inner = d.wave * 5 / 16;
+  AppendVMovU32(&d.code, 4, 1000);
+  AppendVMovU32(&d.code, 3, 100);
+  AppendVMovU32(&d.code, 6, 200);
+  d.Add(1, Vgpr(0), 3);
+  d.Add(2, Vgpr(0), 6);
+  d.Decoy(outer, 2);
+  d.CopyExec(10);
+  d.code.push_back(EncodeVopc(0xd4, InlineU32(outer), 0)); // v_cmpx_gt_u32 exec, outer, lane
+  d.Add(1, Vgpr(4), 1);
+  d.Add(2, Vgpr(1), 2);
+  d.code.push_back(EncodeVopc(0xd4, InlineU32(inner), 0));
+  d.Add(1, Vgpr(4), 1);
+  d.SetExec(10);
+  d.Store(1, 0);
+  d.Store(2, 1);
+  for (u32 lane = 0; lane < d.wave; ++lane) {
+    u32 v1 = lane + 100, v2 = lane + 200;
+    if (lane < outer) {
+      v1 += 1000;
+      v2 += v1;
+    }
+    if (lane < inner) v1 += 1000;
+    d.Expect(0, lane, v1);
+    d.Expect(1, lane, v2);
+  }
+}
+
+// Nested s_and_saveexec with an s_or restore. The inner region writes v1, and the lanes that are
+// in the outer mask but not the inner one read it after the restore.
+void BuildExecDiffNestedMasks(ExecDiff &d) {
+  const u32 outer = d.wave * 3 / 4, inner = d.wave / 4;
+  AppendVMovU32(&d.code, 3, 100);
+  AppendVMovU32(&d.code, 4, 1000);
+  d.Add(1, Vgpr(0), 3);
+  d.Decoy(inner, 7);
+  d.VccLanesBelow(outer);
+  d.SaveExecVcc(8);
+  d.Add(1, Vgpr(4), 1);
+  d.code.push_back(EncodeVop2(0x25, 7, InlineU32(1), 1)); // outer decoy, v_add_nc_u32 v7, 1, v1
+  d.code.push_back(EncodeVop2(0x25, 7, InlineU32(1), 7));
+  d.Store(7, 4);
+  d.VccLanesBelow(inner);
+  d.SaveExecVcc(10);
+  d.code.push_back(EncodeVop2(0x25, 1, InlineU32(20), 1));
+  d.code.push_back(EncodeVop2(0x25, 9, InlineU32(5), 1)); // inner decoy, v_add_nc_u32 v9, 5, v1
+  d.code.push_back(EncodeVop2(0x25, 9, InlineU32(5), 9));
+  d.Store(9, 5);
+  d.OrExec(10);
+  d.Store(1, 0);
+  d.OrExec(8);
+  d.Store(1, 1);
+  for (u32 lane = 0; lane < d.wave; ++lane) {
+    u32 v1 = lane + 100;
+    if (lane < outer) v1 += 1000;
+    if (lane < inner) v1 += 20;
+    if (lane < outer) {
+      d.Expect(0, lane, v1);
+      d.Expect(4, lane, lane + 1100u + 2u);
+    }
+    if (lane < inner) d.Expect(5, lane, lane + 1120u + 10u);
+    d.Expect(1, lane, v1);
+  }
+}
+
+// Loop A. The active lanes alternate by parity, so a lane that is active in the next iteration may
+// have been inactive in this one. The loop-carried register v2 is stored under the mask each
+// iteration and read nowhere else, which is the E5 hazard in guest form. Iteration i writes
+// region i.
+void BuildExecDiffAlternatingLoop(ExecDiff &d) {
+  d.Add(2, Vgpr(0), 3);
+  d.CopyExec(10);
+  d.code.push_back(EncodeSMovB32(4, InlineU32(0)));
+  const size_t loop_a = d.code.size();
+  d.Add(5, 4, 0);                                         // v5 = iteration + lane
+  d.code.push_back(EncodeVop2(0x1b, 6, InlineU32(1), 5)); // v6 = parity
+  d.code.push_back(EncodeVopc(0xd2, InlineU32(0), 6));    // v_cmpx_eq_u32 exec, 0, v6
+  d.code.push_back(EncodeVop1(0x01, 8, 4));
+  d.code.push_back(EncodeVop2(0x1a, 8, InlineU32(6), 8)); // iteration * 64
+  d.Add(8, Vgpr(0), 8);
+  d.code.push_back(EncodeVop2(0x1a, 8, InlineU32(2), 8)); // byte address
+  AppendBufferStoreDword(&d.code, 2, 8);
+  d.Add(2, InlineU32(1), 2); // the register written under the changing mask
+  d.SetExec(10);
+  d.code.push_back(EncodeSop2(0x00, 4, 4, InlineU32(1)));
+  d.code.push_back(EncodeSopc(0x0a, 4, InlineU32(4)));
+  d.code.push_back(0);
+  d.PatchBranch(d.code.size() - 1, 0x05, loop_a); // s_cbranch_scc1
+  std::vector<u32> r(d.wave);
+  for (u32 lane = 0; lane < d.wave; ++lane) r[lane] = lane + 100;
+  for (u32 iteration = 0; iteration < 4; ++iteration) {
+    for (u32 lane = 0; lane < d.wave; ++lane) {
+      if (((lane + iteration) & 1u) != 0) continue;
+      d.Expect(iteration, lane, r[lane]);
+      ++r[lane];
+    }
+  }
+}
+
+// Loop B. Lane L runs L & 3 iterations, so lanes leave at different iterations, and the registers
+// written in the loop are read at full EXEC afterwards. Region 5 gets the sum, region 6 the count.
+void BuildExecDiffDroppingLoop(ExecDiff &d) {
+  d.code.push_back(EncodeVop2(0x1b, 9, InlineU32(3), 0));
+  AppendVMovU32(&d.code, 10, 0);
+  d.Add(12, Vgpr(0), 13);
+  d.CopyExec(12);
+  const size_t loop_b = d.code.size();
+  d.code.push_back(EncodeVopc(0xd4, Vgpr(9), 10)); // v_cmpx_gt_u32 exec, v9, v10
+  const size_t exit_branch = d.code.size();
+  d.code.push_back(0);
+  d.code.push_back(EncodeVop2(0x25, 12, InlineU32(3), 12));
+  d.code.push_back(EncodeVop2(0x25, 10, InlineU32(1), 10));
+  d.code.push_back(0);
+  d.PatchBranch(d.code.size() - 1, 0x02, loop_b);  // s_branch
+  d.PatchBranch(exit_branch, 0x08, d.code.size()); // s_cbranch_execz
+  d.SetExec(12);
+  d.Store(12, 5);
+  d.Store(10, 6);
+  for (u32 lane = 0; lane < d.wave; ++lane) {
+    d.Expect(5, lane, 500u + lane + 3u * (lane & 3u));
+    d.Expect(6, lane, lane & 3u);
+  }
+}
+
+// Two loops, one after the other, after the decoy.
+void BuildExecDiffDivergentLoops(ExecDiff &d) {
+  AppendVMovU32(&d.code, 3, 100);
+  AppendVMovU32(&d.code, 13, 500);
+  d.Decoy(d.wave / 2, 7);
+  BuildExecDiffAlternatingLoop(d);
+  BuildExecDiffDroppingLoop(d);
+}
+
+// The lane crossing results that BuildExecDiffLaneCrossing must read back. Only the even lanes
+// store. Each source register holds lane + 1100 for an even lane and lane + 100 for an odd one,
+// because only the even lanes wrote it.
+void ExpectExecDiffLaneCrossing(ExecDiff &d, u32 readlane_lane) {
+  const auto v1 = [](u32 lane) { return (lane & 1u) == 0 ? lane + 1100u : lane + 100u; };
+  for (u32 lane = 0; lane < d.wave; lane += 2) {
+    d.Expect(0, lane, lane % 16u == 0 ? ExecDiffSentinel : v1(lane - 1) + lane + 2000u);
+    d.Expect(1, lane, v1(lane ^ 1u));
+    d.Expect(2, lane, v1((lane & 32u) | ((lane + 5u) & 31u)));
+    d.Expect(3, lane, v1(readlane_lane));
+    d.Expect(4, lane, v1(1));
+    d.Expect(5, lane, lane + 1100u + 2u);
+  }
+}
+
+// Lane crossing reads. Each register is written under the even lane mask. DPP, ds_swizzle,
+// ds_bpermute and v_readlane read theirs at full EXEC and v_readfirstlane reads its own under the
+// odd lanes, all from lanes that were inactive at the write. The results are stored under the even
+// mask again. At wave64 v_readlane takes lane 39, so the value comes from the other half.
+void BuildExecDiffLaneCrossing(ExecDiff &d) {
+  // Each operation reads its own register, so each is the only observer of its select.
+  constexpr u32 dpp_source = 1, swizzle_source = 22, bpermute_source = 23, readlane_source = 24,
+                readfirstlane_source = 25;
+  const u32 readlane_lane = d.Wide() ? 39u : 7u;
+  const u32 sources[] = {dpp_source, swizzle_source, bpermute_source, readlane_source,
+                         readfirstlane_source};
+  AppendVMovU32(&d.code, 3, 100);
+  AppendVMovU32(&d.code, 4, 1000);
+  AppendVMovU32(&d.code, 19, 2000);
+  AppendVMovLiteral(&d.code, 2, ExecDiffSentinel);
+  for (const u32 source : sources) d.Add(source, Vgpr(0), 3);
+  d.Add(9, Vgpr(0), 19);
+  d.VccEvenLanes();
+  d.CopyVcc(14);
+  d.SaveExecVcc(8);
+  for (const u32 source : sources) d.Add(source, Vgpr(4), source);
+  d.code.push_back(EncodeVop2(0x25, 7, InlineU32(1), dpp_source)); // decoy, v_add_nc_u32 v7, 1, v1
+  d.code.push_back(EncodeVop2(0x25, 7, InlineU32(1), 7));
+  d.Store(7, 5);
+  d.SetExec(8);
+  d.code.push_back(EncodeVop2(0x25, 2, 250, 9)); // v_add_nc_u32_dpp v2, v1, v9 row_shr:1
+  d.code.push_back(EncodeVop2Dpp(dpp_source, 0x111u));
+  d.code.push_back(EncodeDs0(0x35, 0x041fu)); // ds_swizzle_b32 v10, v22 xor 1
+  d.code.push_back(EncodeDs1(10, 0, swizzle_source));
+  d.code.push_back(EncodeVop2(0x25, 13, InlineU32(5), 0)); // partner address, in the same half
+  d.code.push_back(EncodeVop2(0x1b, 13, InlineU32(31), 13));
+  d.code.push_back(EncodeVop2(0x1b, 14, InlineU32(32), 0));
+  d.code.push_back(EncodeVop2(0x1c, 12, Vgpr(13), 14));
+  d.code.push_back(EncodeVop2(0x1a, 12, InlineU32(2), 12));
+  d.code.push_back(EncodeDs0(0xb3, 0)); // ds_bpermute_b32 v11, v12, v23
+  d.code.push_back(EncodeDs1(11, bpermute_source, 12));
+  AppendVop3(&d.code, 0x360, 20, Vgpr(readlane_source), InlineU32(readlane_lane)); // v_readlane
+  d.code.push_back(EncodeVopc(0xc2, InlineU32(1), 5));                              // odd lanes
+  d.SaveExecVcc(16);
+  d.code.push_back(EncodeVop1(0x02, 22, Vgpr(readfirstlane_source))); // v_readfirstlane_b32 s22
+  d.SetExec(16);
+  d.AndExec(14);
+  d.Store(2, 0);
+  d.Store(10, 1);
+  d.Store(11, 2);
+  d.StoreScalar(20, 3);
+  d.StoreScalar(22, 4);
+  ExpectExecDiffLaneCrossing(d, readlane_lane);
+}
+
+// LDS. Every lane writes its slot, then the even lanes overwrite theirs under the even mask, and
+// after a barrier every lane reads its neighbour slot, which for an even lane is a slot of a lane
+// that was inactive at the second write. The select on the register that the masked write stores
+// is the one the passes drop, so this case checks the masked write. It does not read a register
+// of an inactive lane.
+void BuildExecDiffLdsNeighbours(ExecDiff &d) {
+  AppendVMovU32(&d.code, 3, 100);
+  AppendVMovU32(&d.code, 4, 1000);
+  d.code.push_back(EncodeVop2(0x1a, 2, InlineU32(2), 0)); // v2 = slot byte address
+  d.Add(1, Vgpr(0), 3);
+  d.code.push_back(EncodeDs0(0x0d)); // ds_write_b32 v2, v1
+  d.code.push_back(EncodeDs1(0, 1, 2));
+  d.code.push_back(EncodeSopp(0x0a, 0)); // s_barrier
+  d.VccEvenLanes();
+  d.SaveExecVcc(8);
+  d.Add(1, Vgpr(4), 1);
+  d.code.push_back(EncodeDs0(0x0d));
+  d.code.push_back(EncodeDs1(0, 1, 2));
+  d.code.push_back(EncodeVop2(0x25, 7, InlineU32(1), 1)); // decoy, v_add_nc_u32 v7, 1, v1
+  d.code.push_back(EncodeVop2(0x25, 7, InlineU32(1), 7)); // v_add_nc_u32 v7, 1, v7
+  d.Store(7, 4);
+  d.SetExec(8);
+  d.code.push_back(EncodeSopp(0x0a, 0));
+  d.code.push_back(EncodeVop2(0x25, 6, InlineU32(1), 0)); // v_add_nc_u32 v6, 1, v0
+  d.code.push_back(EncodeVop2(0x1b, 6, InlineU32(d.wave - 1u), 6)); // v_and_b32 v6, wave - 1, v6
+  d.code.push_back(EncodeVop2(0x1a, 6, InlineU32(2), 6)); // v_lshlrev_b32 v6, 2, v6: the address
+  d.code.push_back(EncodeDs0(0x36)); // ds_read_b32 v12, v6
+  d.code.push_back(EncodeDs1(12, 0, 6));
+  d.code.push_back(EncodeDs0(0x36)); // ds_read_b32 v13, v2
+  d.code.push_back(EncodeDs1(13, 0, 2));
+  d.Store(12, 0);
+  d.Store(13, 1);
+  const auto slot = [](u32 lane) { return (lane & 1u) == 0 ? lane + 1100u : lane + 100u; };
+  for (u32 lane = 0; lane < d.wave; ++lane) {
+    d.Expect(0, lane, slot((lane + 1u) & (d.wave - 1u)));
+    d.Expect(1, lane, slot(lane));
+    if ((lane & 1u) == 0) d.Expect(4, lane, lane + 1100u + 2u);
+  }
+}
+
+// Addresses. The lanes below half the wave are inactive, and the address they would compute is far
+// outside every buffer, since (lane - n) wraps. The address register holds a safe zero outside the
+// mask. The masked buffer load, buffer store, ds_write and ds_read all use that address.
+// M2 without its guard is not visible in the readback of this case, because the emitter guards
+// every access in it by exec or by bounds. The readback cannot catch an M2 error and only the
+// select counts do. The go or no go for M2 stays with the emitter audit.
+void BuildExecDiffInactiveAddresses(ExecDiff &d) {
+  const u32 half = d.wave / 2;
+  for (u32 i = 0; i < ExecDiffRegionDwords; ++i) d.initial[i] = d.expected[i] = 5000u + i;
+  d.Decoy(half, 3);
+  AppendVMovLiteral(&d.code, 15, 0u - half);
+  AppendVMovU32(&d.code, 17, half);
+  d.Add(16, Vgpr(0), 15);
+  d.code.push_back(EncodeVop2(0x1a, 16, InlineU32(2), 16)); // (lane - n) * 4
+  AppendVMovU32(&d.code, 8, 0);
+  d.code.push_back(EncodeVopc(0xc6, Vgpr(0), 17)); // v_cmp_ge_u32 vcc, lane, n
+  d.SaveExecVcc(8);
+  d.code.push_back(EncodeVop1(0x01, 8, Vgpr(16))); // the address select
+  AppendBufferLoadDword(&d.code, 12, 8);
+  d.code.push_back(EncodeVop2(0x25, 13, InlineU32(1), 12));
+  d.Store(13, 1);
+  d.code.push_back(EncodeVop2(0x25, 14, InlineU32(7), 12));
+  AppendBufferStoreDword(&d.code, 14, 8);
+  d.code.push_back(EncodeDs0(0x0d)); // ds_write_b32 v8, v12
+  d.code.push_back(EncodeDs1(0, 12, 8));
+  d.code.push_back(EncodeSopp(0x0a, 0));
+  d.code.push_back(EncodeDs0(0x36)); // ds_read_b32 v21, v8
+  d.code.push_back(EncodeDs1(21, 0, 8));
+  d.Store(21, 2);
+  d.SetExec(8);
+  for (u32 lane = half; lane < d.wave; ++lane) {
+    const u32 slot = lane - half;
+    d.Expect(1, lane, 5000u + slot + 1u);
+    d.Expect(2, lane, 5000u + slot);
+    d.Expect(0, slot, 5000u + slot + 7u);
+  }
+}
+
+// Number of SelectU32 left in the typed IR of each case with the passes on. The count follows the
+// translator and the rule that an address is observed in every lane (M1), so a change to either
+// moves it. To regenerate the table, set an entry to 0 and read the actual count in the failure
+// message of the ir_counts check. The same count holds at wave32 and wave64. The passes off must
+// show more than this.
+size_t ExecDiffSelectsKept(ExecDiffKind kind) {
+  static constexpr size_t counts[] = {4, 6, 5, 11, 1, 4};
+  return counts[static_cast<size_t>(kind)];
+}
+
+// One case of the differential family. The select loads variant runs the loads of the address case
+// in the form that executes them in every lane.
+TestCase ExecDiffCase(ExecDiffKind kind, u32 wave, bool elide, bool select_loads = false) {
+  using O = ShaderOpcode;
+  static constexpr const char *names[] = {"StraightLine", "NestedMasks", "DivergentLoops",
+                                          "LaneCrossing", "LdsNeighbours", "InactiveAddresses"};
+  ExecDiff d(wave);
+  switch (kind) {
+  case ExecDiffKind::StraightLine: BuildExecDiffStraightLine(d); break;
+  case ExecDiffKind::NestedMasks: BuildExecDiffNestedMasks(d); break;
+  case ExecDiffKind::DivergentLoops: BuildExecDiffDivergentLoops(d); break;
+  case ExecDiffKind::LaneCrossing: BuildExecDiffLaneCrossing(d); break;
+  case ExecDiffKind::LdsNeighbours: BuildExecDiffLdsNeighbours(d); break;
+  case ExecDiffKind::InactiveAddresses: BuildExecDiffInactiveAddresses(d); break;
+  }
+  AppendEnd(&d.code);
+  TestCase test;
+  // The test case keeps a pointer to its name, so the names live in a container that never moves.
+  static std::deque<std::string> name_storage;
+  name_storage.push_back(std::string("ExecDiff") + names[static_cast<size_t>(kind)] +
+                         (select_loads ? "SelectLoads" : "") + (wave == 64 ? "Wave64" : "Wave32") +
+                         (elide ? "On" : "Off"));
+  test.name = name_storage.back().c_str();
+  test.code = std::move(d.code);
+  test.initial = std::move(d.initial);
+  test.expected = std::move(d.expected);
+  test.compute_info.wave_size = wave;
+  test.compute_info.threads_num[0] = wave;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  test.profile = select_loads
+                     ? (elide ? &SelectElideExecSelectsProfile : &SelectGuardedLoadsProfile)
+                     : (elide ? &ElideExecSelectsProfile : &Maintenance8Profile);
+  if (elide) {
+    test.ir_counts = {{" = SelectU32 ", ExecDiffSelectsKept(kind)}};
+  } else {
+    test.ir_more_than = {{" = SelectU32 ", ExecDiffSelectsKept(kind)}};
+  }
+  test.opcodes = {O::V_MOV_B32, O::V_ADD_NC_U32, O::V_LSHLREV_B32, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  return test;
+}
+
+// Every case at both wave sizes with the passes off and on, plus the address case with selected
+// loads.
+std::vector<TestCase> ExecDiffCases() {
+  std::vector<TestCase> cases;
+  for (const auto kind : {ExecDiffKind::StraightLine, ExecDiffKind::NestedMasks,
+                          ExecDiffKind::DivergentLoops, ExecDiffKind::LaneCrossing,
+                          ExecDiffKind::LdsNeighbours, ExecDiffKind::InactiveAddresses})
+    for (const u32 wave : {32u, 64u})
+      for (const bool elide : {false, true}) {
+        cases.push_back(ExecDiffCase(kind, wave, elide));
+        if (kind == ExecDiffKind::InactiveAddresses)
+          cases.push_back(ExecDiffCase(kind, wave, elide, true));
+      }
+  return cases;
+}
+
 TestCase VectorF64WideningConversions() {
   using O = ShaderOpcode;
   TestCase test;
@@ -59968,6 +60414,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(ScalarSaveExecOps);
   cases.push_back(ExecSelectRegion(false));
   cases.push_back(ExecSelectRegion(true));
+  for (auto &test : ExecDiffCases()) cases.push_back(std::move(test));
   AddCase(ScalarOrn2SaveexecUsesSourceOrNotExec);
   cases.push_back(ScalarOrn2SaveexecB32(32, 32));
   cases.push_back(ScalarOrn2SaveexecB32(64, 64));
@@ -70884,6 +71331,7 @@ int main(int argc, char **argv) {
   CheckSpirvProfileElideExecSelectsOption();
   if (argc == 2 && std::strcmp(argv[1], "--elide-exec-selects-only") == 0) {
     VulkanHarness vulkan;
+    for (const auto &test : ExecDiffCases()) RunCase(&vulkan, test);
     RunCase(&vulkan, ExecSelectRegion(false));
     RunCase(&vulkan, ExecSelectRegion(true));
     return 0;
