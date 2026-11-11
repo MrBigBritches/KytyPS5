@@ -11,6 +11,15 @@ lead per arm. It is for information and has no gate. Reports with no generation 
 After the main table come the Generation, Audio and Contention tables, each only for an arm whose
 reports carry the data. A set of older reports prints the main table alone, as before.
 
+Three more sections are for information only and have no gate. Contention by lane splits the graphics
+compiles of the compile workers by warm_front and warm_back, for reports that carry them. The Front
+drain cut splits those compiles at the latest ready_ms of a generated module that is not wide_tail.
+Underruns by warm lane lists each underrun with its lane counts and groups them into events, for
+reports whose audio_underruns carries the lane arrays. The lane and underrun sections need the lane
+fields (warm_front and warm_back on worker compile rows, and the three arrays on audio_underruns).
+The drain cut needs generated rows with wide_tail and ready_ms, so it also prints for older reports
+that have those and no lane fields. A report with neither prints none of the three.
+
 With --gate the named gpl arm is the baseline for the pass criteria of the shader store generation.
 A second boot is a report that started from a seeded store, and the P8 baseline is the gpl second
 boot, not the gen first run. P5 cuts both arms at the gen arm's median supervisor.finished_at_ms,
@@ -197,6 +206,8 @@ SOURCES_DIFFER = "n/a (sources differ)"
 PROCESS_PEAK_KEYS = ("peak_working_set_bytes", "peak_commit_bytes")
 # Warm builds running when a graphics compile began, grouped as name, lowest and highest.
 WARM_RUNNING_BUCKETS = (("0", 0, 0), ("1-2", 1, 2), ("3+", 3, None))
+# Front builds running at which a compile counts as taken while the Front lane was busy.
+FRONT_BUSY_MIN = 3
 
 # Limits of the pass criteria. P1 to P4, P6, P7 and P9 are from the audio review of step 6c.
 P1_MEAN_HELD_S = 15.0
@@ -289,13 +300,20 @@ def take_figures(report, generated_ids):
             "max_stopped": max((take.get("stopped_ms", 0.0) for take in takes), default=0.0)}
 
 
+def worker_graphics_rows(report):
+    """The graphics compile rows of the compile workers that carry a start time. A warm compute
+    worker's compile row sits inside its own warm build, so it counts itself in the warm counts and
+    is never used. Rows from before the context fields existed have no at_ms and are left out."""
+    return [row for row in report.get("compiles", []) if row.get("thread") == "worker"
+            and row.get("kind") == "graphics" and "at_ms" in row]
+
+
 def contention_figures(report):
     """Sums the graphics compiles of the compile workers. Only graphics rows count. A warm compute
     worker's compile row sits inside its own warm build, so it counts itself in warm_running and
     would put the warm-up's own work in the contention figure. Rows from before the context fields
     existed have no at_ms and are left out."""
-    rows = [row for row in report.get("compiles", []) if row.get("thread") == "worker"
-            and row.get("kind") == "graphics" and "at_ms" in row]
+    rows = worker_graphics_rows(report)
     if not rows:
         return None
     figures_by_name = {"n": len(rows), "sum": sum(row["create_ms"] for row in rows),
@@ -309,6 +327,53 @@ def contention_figures(report):
         figures_by_name[name + " n"] = len(group)
         figures_by_name[name + " sum"] = sum(row["create_ms"] for row in group)
     return figures_by_name
+
+
+def lane_rows(report):
+    """The graphics worker rows that carry both lane counts, as (create_ms, at_ms, front, back). The
+    split uses the lane fields only, never warm_running minus a lane, because the three counts are
+    separate relaxed loads and can disagree. None when no row has the lane fields."""
+    rows = [(row["create_ms"], row["at_ms"], row["warm_front"], row["warm_back"])
+            for row in worker_graphics_rows(report) if "warm_front" in row and "warm_back" in row]
+    return rows or None
+
+
+def drain_time_ms(report):
+    """When the Front drain finished, as the largest ready_ms among the generated modules that are
+    not wide_tail. The wide_tail modules are built later and must not move it. None when no such row
+    has a ready_ms, which is the case for a report without generated rows. Caveats. Front work for the
+    main store is not in generated_modules, so it can't move this time. Front work can also arrive
+    after Back has started, such as a C5 head drop or a late adoption, so the drain is not a clean
+    line between the lanes. The wide_tail_ready_ms below is printed beside it to show any overlap."""
+    block = generation_block(report)
+    if not block:
+        return None
+    ready = [row["ready_ms"] for row in block.get("generated_modules", [])
+             if row.get("wide_tail") is False and row.get("ready_ms") is not None]
+    return max(ready, default=None)
+
+
+def wide_tail_ready_ms(report):
+    """The earliest ready_ms of a wide_tail generated module, or None when there is none. A value
+    before the drain time means Back work finished before the Front drain did."""
+    block = generation_block(report)
+    if not block:
+        return None
+    ready = [row["ready_ms"] for row in block.get("generated_modules", [])
+             if row.get("wide_tail") is True and row.get("ready_ms") is not None]
+    return min(ready, default=None)
+
+
+def lane_underruns(report):
+    """The underruns as (at_ms, front, back, child_alive) in report order, or None when the report
+    lacks the lane arrays. The arrays are parallel to at_ms."""
+    underruns = report.get("audio_underruns")
+    if not isinstance(underruns, dict):
+        return None
+    keys = ("at_ms", "warm_front", "warm_back", "child_alive")
+    if not all(key in underruns for key in keys):
+        return None
+    return list(zip(*(underruns[key] for key in keys)))
 
 
 def tier_order_key(module):
@@ -400,7 +465,11 @@ def run_metrics(report):
                "gen": generation_figures(block) if block else None,
                "contention": contention_figures(report), "proc_peak": process_peak(report),
                "create_by_id": create_by_id(report),
-               "machine": report.get("machine")}
+               "machine": report.get("machine"),
+               "lane_rows": lane_rows(report), "drain_ms": drain_time_ms(report),
+               "wide_ready_ms": wide_tail_ready_ms(report),
+               "drain_rows": [(row["create_ms"], row["at_ms"]) for row in worker_graphics_rows(report)],
+               "lane_underruns": lane_underruns(report)}
     metrics.update(window_figures(report))
     metrics.update(take_figures(report, generated_ids))
     return metrics
@@ -557,6 +626,138 @@ def contention_table(arms):
         print(f"  {name}: {machine.get('cpu_model', 'unknown')}, {machine.get('logical_cores', 0)} logical cores,"
               f" {machine.get('warm_workers', 0)} warm workers,"
               f" {machine.get('ram_bytes', 0) / BYTES_PER_MB / 1024:.1f} GB RAM")
+
+
+def group_figures(durations):
+    """Count, sum in ms and mean in ms of some compile durations. The mean is None for none."""
+    return (len(durations), sum(durations), sum(durations) / len(durations) if durations else None)
+
+
+def figure_text(figures):
+    """Count, sum in seconds and mean in ms as one cell."""
+    count, total, mean = figures
+    return f"{count} / {total / MS_PER_SECOND:.2f} / {fmt_num(mean, 1)}"
+
+
+def median_figures(figure_list):
+    """The median over runs of each of count, sum and mean, skipping the runs with no mean."""
+    return (median_of(item[0] for item in figure_list), median_of(item[1] for item in figure_list),
+            median_of(item[2] for item in figure_list))
+
+
+def median_figure_text(figure_list):
+    """The median over runs of group figures as one cell."""
+    count, total, mean = median_figures(figure_list)
+    return f"{fmt_count(count)} / {fmt_num(None if total is None else total / MS_PER_SECOND, 2)} / {fmt_num(mean, 1)}"
+
+
+def lane_table(arms):
+    """Contention split by lane, for arms whose graphics worker rows carry warm_front and warm_back.
+    For information only. The split reads the lane fields and never warm_running."""
+    groups = (("back > 0", lambda front, back: back > 0), ("back == 0", lambda front, back: back == 0),
+              (f"front >= {FRONT_BUSY_MIN}", lambda front, back: front >= FRONT_BUSY_MIN),
+              (f"front <= {FRONT_BUSY_MIN - 1}", lambda front, back: front < FRONT_BUSY_MIN))
+    columns = [(f"{label} n / s / mean ms", 24) for label, _ in groups]
+    rows = []
+    for name in sorted(arms):
+        runs = [run for run in arms[name] if run["lane_rows"]]
+        if not runs:
+            continue
+        cells = []
+        for _, member in groups:
+            cells.append(median_figure_text([
+                group_figures([create for create, _, front, back in run["lane_rows"] if member(front, back)])
+                for run in runs]))
+        rows.append((name, cells))
+    if rows:
+        print_table("Contention by lane (information only, graphics compiles of the compile workers,"
+                    " lanes from warm_front and warm_back)", columns, rows)
+
+
+def drain_cut_lines(name, runs):
+    """One line per run of an arm that has a Front drain time, with the graphics compiles of the
+    compile workers split at it by their start time. A compile that starts at the drain counts after."""
+    lines = []
+    for number, run in enumerate(runs, 1):
+        drain = run["drain_ms"]
+        if drain is None or not run["drain_rows"]:
+            continue
+        before = group_figures([create for create, at_ms in run["drain_rows"] if at_ms < drain])
+        after = group_figures([create for create, at_ms in run["drain_rows"] if at_ms >= drain])
+        wide = run["wide_ready_ms"]
+        lines.append(f"  {name} run {number}: drain {drain:.1f} ms, before n / s / mean ms"
+                     f" {figure_text(before)}, after {figure_text(after)},"
+                     f" earliest wide_tail ready {'none' if wide is None else f'{wide:.1f} ms'}")
+    return lines
+
+
+def drain_cut_section(arms):
+    """The Front drain cut. Nothing prints for reports with no drain time."""
+    lines = [line for name in sorted(arms) for line in drain_cut_lines(name, arms[name])]
+    if lines:
+        print()
+        print("Front drain cut (information only, drain = last Front build done, the latest ready_ms"
+              " of a generated module that is not wide_tail. The Front queue empties earlier, and"
+              " Back builds can start while the last Front ones finish)")
+        for line in lines:
+            print(line)
+
+
+def lane_events(entries):
+    """Groups underruns into events with the P5 gap rule. A submit no more than P5_EVENT_GAP_MS after
+    the previous one joins its event. Entries are (at_ms, front, back, child_alive)."""
+    events = []
+    for entry in sorted(entries, key=lambda item: item[0]):
+        if events and entry[0] - events[-1][-1][0] <= P5_EVENT_GAP_MS:
+            events[-1].append(entry)
+        else:
+            events.append([entry])
+    return events
+
+
+def underrun_side(at_ms, drain):
+    """Whether an underrun falls before or after the run's Front drain."""
+    if drain is None:
+        return "drain unknown"
+    return "before drain" if at_ms < drain else "after drain"
+
+
+def underrun_lines(name, runs):
+    """The underrun list of one arm, then its event counts. An event has back > 0 when any of its
+    submits had a Back build running."""
+    lines = []
+    with_back = without_back = onset_total = 0
+    for number, run in enumerate(runs, 1):
+        entries = run["lane_underruns"]
+        if entries is None:
+            continue
+        events = lane_events(entries)
+        for index, event in enumerate(events, 1):
+            for at_ms, front, back, alive in event:
+                lines.append(f"  {name} run {number} event {index}: at {at_ms:.1f} ms front {front} back {back}"
+                             f" child_alive {'yes' if alive else 'no'} {underrun_side(at_ms, run['drain_ms'])}")
+        busy = sum(1 for event in events if any(entry[2] > 0 for entry in event))
+        # The onset is the first submit of the event, which is when the burst began.
+        onset = sum(1 for event in events if event[0][2] > 0)
+        with_back += busy
+        without_back += len(events) - busy
+        onset_total += onset
+        lines.append(f"  {name} run {number}: {len(events)} events, {busy} with back > 0 (any submit),"
+                     f" {onset} with back > 0 (first submit), {len(events) - busy} with back == 0 (any submit)")
+    if lines:
+        lines.append(f"  {name}: total over runs, events with back > 0 (any submit) {with_back}"
+                     f" against back == 0 {without_back}, with back > 0 (first submit) {onset_total}")
+    return lines
+
+
+def underrun_section(arms):
+    """The underrun list, for runs whose audio_underruns carries the lane arrays."""
+    lines = [line for name in sorted(arms) for line in underrun_lines(name, arms[name])]
+    if lines:
+        print()
+        print(f"Underruns by warm lane (information only, events join submits within {P5_EVENT_GAP_MS:g} ms)")
+        for line in lines:
+            print(line)
 
 
 def generation_extras(name, runs):
@@ -1047,6 +1248,9 @@ def main(patterns, gate_arm=None, watch=()):
         print_watch(watch_arms, list(watch))
     audio_table(new_arms)
     contention_table(new_arms)
+    lane_table(new_arms)
+    drain_cut_section(new_arms)
+    underrun_section(new_arms)
     return gate(records, common, gate_arm) if gate_arm else 0
 
 

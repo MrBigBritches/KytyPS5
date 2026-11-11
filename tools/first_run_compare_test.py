@@ -20,6 +20,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -1126,6 +1127,230 @@ class WatchList(unittest.TestCase):
         code, out, _ = run_script(paths, None, [GENERATED_ID])
         self.assertEqual(code, 0)
         self.assertEqual(out, expected)
+
+
+LANE_TITLE = "Contention by lane"
+DRAIN_TITLE = "Front drain cut"
+UNDERRUN_TITLE = "Underruns by warm lane"
+
+
+def compile_row(kind, create_ms, at_ms, running, front=None, back=None, thread="worker"):
+    """A compile row. The lane counts are left off when they are None, as in an older report."""
+    row = {"kind": kind, "create_ms": create_ms, "phase": "play", "thread": thread, "flip": 1,
+           "at_ms": at_ms, "warm_running": running, "child_alive": True}
+    row.update({"vs": "0000000000000001", "ps": "0000000000000002"} if kind == "graphics"
+               else {"id": "00000000000000dd"})
+    if front is not None:
+        row.update(warm_front=front, warm_back=back)
+    return row
+
+
+def set_compiles(rows):
+    """An edit that gives the gen first run exactly these compile rows."""
+    def edit(report):
+        report["compiles"] = list(rows)
+    return edit
+
+
+def lane_cells(output):
+    """The four lane cells of the gen first run's row in the Contention by lane table."""
+    for row in table_rows(output, LANE_TITLE):
+        if row.startswith(GEN_ARM + "  "):
+            return re.split(r"\s{2,}", row.strip())[1:]
+    return None
+
+
+def lane_section(output, title):
+    """The lines of a new section, from its title to the next blank line."""
+    lines = output.splitlines()
+    for index, line in enumerate(lines):
+        if line.startswith(title):
+            end = index + 1
+            while end < len(lines) and lines[end].strip():
+                end += 1
+            return lines[index + 1:end]
+    return []
+
+
+# Graphics rows whose warm_running contradicts the lanes, so a split by warm_running gives other
+# buckets. The compute row has back builds and a long create, so a table that counted it would show it.
+LANE_ROWS = [compile_row("graphics", 100.0, 1000.0, 0, front=1, back=2),
+             compile_row("graphics", 200.0, 2000.0, 5, front=3, back=0),
+             compile_row("graphics", 300.0, 3000.0, 5, front=0, back=0),
+             compile_row("compute", 7000.0, 4000.0, 5, front=0, back=5)]
+
+
+class LaneContention(unittest.TestCase):
+    """The Contention table split by lane, from graphics worker rows and the lane fields."""
+
+    def cells(self, rows):
+        return lane_cells(run_new({"new_gen_first.json": set_compiles(rows)}, gate=None))
+
+    def test_graphics_rows_split_by_back_and_front(self):
+        self.assertEqual(self.cells(LANE_ROWS), ["1 / 0.10 / 100.0", "2 / 0.50 / 250.0",
+                                                 "1 / 0.20 / 200.0", "2 / 0.40 / 200.0"])
+
+    def test_a_compute_row_is_ignored(self):
+        # The baseline holds a compute row with back builds and a 7 s create. Without it the cells
+        # are the same, and a graphics row added with the same counts does change them.
+        graphics_only = [row for row in LANE_ROWS if row["kind"] == "graphics"]
+        self.assertEqual(self.cells(LANE_ROWS), self.cells(graphics_only))
+        extra = graphics_only + [compile_row("graphics", 7000.0, 4000.0, 5, front=0, back=5)]
+        self.assertEqual(self.cells(extra)[0], "2 / 7.10 / 3550.0")
+
+    def test_the_split_uses_the_lane_fields_and_not_warm_running(self):
+        # Same rows with warm_running made to agree with the lanes. The split does not move.
+        agreeing = [dict(row, warm_running=row["warm_front"] + row["warm_back"]) for row in LANE_ROWS]
+        self.assertEqual(self.cells(agreeing), self.cells(LANE_ROWS))
+
+    def test_a_report_without_lane_fields_has_no_row(self):
+        plain = [compile_row("graphics", 100.0, 1000.0, 2)]
+        self.assertIsNone(self.cells(plain))
+        self.assertEqual(self.cells(plain + LANE_ROWS)[0], "1 / 0.10 / 100.0")
+
+
+def front_row(ready_ms, wide):
+    """A generated module row with a ready time."""
+    return {"id": "0000000000000007", "code_hash": "0000000000000017", "posted_ms": 1.0, "adopted_ms": 1.0,
+            "how": "done", "ready_ms": ready_ms, "wide_tail": wide}
+
+
+def with_drain(modules, rows):
+    """An edit that gives the gen first run these generated modules and compile rows."""
+    def edit(report):
+        set_modules(modules)(report)
+        set_compiles(rows)(report)
+    return edit
+
+
+DRAIN_ROWS = [compile_row("graphics", 100.0, 1000.0, 0), compile_row("graphics", 200.0, 4000.0, 0),
+              compile_row("graphics", 300.0, 6000.0, 0), compile_row("graphics", 400.0, 9500.0, 0),
+              compile_row("compute", 7000.0, 2000.0, 0)]
+DRAIN_MODULES = [front_row(3000.0, False), front_row(5000.0, False), front_row(9000.0, True)]
+DRAIN_LINE = (f"  {GEN_ARM} run 1: drain 5000.0 ms, before n / s / mean ms 2 / 0.30 / 150.0,"
+              " after 2 / 0.70 / 350.0, earliest wide_tail ready 9000.0 ms")
+
+
+class FrontDrainCut(unittest.TestCase):
+    """The graphics compiles of the workers, split at the Front drain time of each run."""
+
+    def lines(self, modules, rows=DRAIN_ROWS):
+        return lane_section(run_new({"new_gen_first.json": with_drain(modules, rows)}, gate=None), DRAIN_TITLE)
+
+    def test_the_drain_is_the_latest_front_ready_and_a_wide_row_does_not_move_it(self):
+        self.assertEqual(self.lines(DRAIN_MODULES), [DRAIN_LINE])
+        # Baseline above has the wide row ready at 9000. Moved to 100 it changes nothing but the
+        # earliest wide_tail figure, which shows the overlap with the drain.
+        early = self.lines([front_row(3000.0, False), front_row(5000.0, False), front_row(100.0, True)])
+        self.assertEqual(early, [DRAIN_LINE.replace("ready 9000.0 ms", "ready 100.0 ms")])
+
+    def test_the_earliest_wide_tail_ready_is_the_minimum_or_none(self):
+        wide = [front_row(3000.0, False), front_row(8000.0, True), front_row(6000.0, True)]
+        self.assertTrue(self.lines(wide)[0].endswith("earliest wide_tail ready 6000.0 ms"))
+        self.assertTrue(self.lines([front_row(3000.0, False)])[0].endswith("earliest wide_tail ready none"))
+
+    def test_a_front_row_with_the_later_ready_does_move_it(self):
+        # The same wide row as a front row, so the drain is 9000 and three compiles fall before it.
+        lines = self.lines([front_row(3000.0, False), front_row(5000.0, False), front_row(9000.0, False)])
+        self.assertEqual(lines, [f"  {GEN_ARM} run 1: drain 9000.0 ms, before n / s / mean ms 3 / 0.60 / 200.0,"
+                                 " after 1 / 0.40 / 400.0, earliest wide_tail ready none"])
+
+    def test_a_compute_row_is_not_counted(self):
+        graphics_only = [row for row in DRAIN_ROWS if row["kind"] == "graphics"]
+        self.assertEqual(self.lines(DRAIN_MODULES, graphics_only), [DRAIN_LINE])
+
+    def test_nothing_prints_without_a_front_ready_time(self):
+        self.assertEqual(self.lines([front_row(9000.0, True)]), [])
+        self.assertEqual(lane_section(run_new(gate=None), DRAIN_TITLE), [])
+
+
+UNDERRUN_ARRAYS = {"at_ms": [1000.0, 1030.0, 1080.0, 2000.0, 3000.0], "warm_front": [1, 0, 0, 2, 0],
+                   "warm_back": [0, 3, 0, 0, 0], "child_alive": [1, 1, 0, 0, 1]}
+
+
+def with_underruns(**arrays):
+    """An edit that sets lane arrays on the gen first run's underruns, and a drain at 1500 ms."""
+    def edit(report):
+        report["audio_underruns"].update(dict(UNDERRUN_ARRAYS, **arrays))
+        set_modules([front_row(1500.0, False)])(report)
+    return edit
+
+
+class UnderrunLanes(unittest.TestCase):
+    """Each underrun is listed with its lane counts, and grouped into events by the P5 gap."""
+
+    def lines(self, **arrays):
+        return lane_section(run_new({"new_gen_first.json": with_underruns(**arrays)}, gate=None), UNDERRUN_TITLE)
+
+    def test_each_underrun_shows_its_counts_and_side_of_the_drain(self):
+        lines = self.lines()
+        self.assertEqual(lines[0], f"  {GEN_ARM} run 1 event 1: at 1000.0 ms front 1 back 0 child_alive yes before drain")
+        self.assertEqual(lines[1], f"  {GEN_ARM} run 1 event 1: at 1030.0 ms front 0 back 3 child_alive yes before drain")
+        self.assertEqual(lines[2], f"  {GEN_ARM} run 1 event 1: at 1080.0 ms front 0 back 0 child_alive no before drain")
+        self.assertEqual(lines[3], f"  {GEN_ARM} run 1 event 2: at 2000.0 ms front 2 back 0 child_alive no after drain")
+
+    def test_submits_within_50_ms_are_one_event_and_back_counts_by_event(self):
+        # The submits at 1000, 1030 and 1080 chain (the last gap is exactly 50), so there are 3 events,
+        # and only the first has a back build.
+        lines = self.lines()
+        self.assertIn(self.summary(3, 1, 0, 2), lines)
+        self.assertEqual(lines[-1], f"  {GEN_ARM}: total over runs, events with back > 0 (any submit) 1"
+                                    " against back == 0 2, with back > 0 (first submit) 0")
+
+    def summary(self, events, any_back, first_back, no_back):
+        """The per-run summary line for the gen first run."""
+        return (f"  {GEN_ARM} run 1: {events} events, {any_back} with back > 0 (any submit),"
+                f" {first_back} with back > 0 (first submit), {no_back} with back == 0 (any submit)")
+
+    def test_events_without_back_builds_count_on_the_other_side(self):
+        # Baseline above has one back event. With back zero everywhere that event moves across.
+        lines = self.lines(warm_back=[0, 0, 0, 0, 0])
+        self.assertIn(self.summary(3, 0, 0, 3), lines)
+
+    def test_the_two_event_rules_differ_when_back_starts_mid_event(self):
+        # Baseline above has back 0, 3, 0 in the first event, so any counts it and the first submit
+        # does not. With back on the first submit instead, both count it.
+        self.assertIn(self.summary(3, 1, 0, 2), self.lines())
+        self.assertIn(self.summary(3, 1, 1, 2), self.lines(warm_back=[3, 0, 0, 0, 0]))
+
+    def test_a_gap_over_50_ms_starts_a_new_event(self):
+        lines = self.lines(at_ms=[1000.0, 1030.0, 1081.0, 2000.0, 3000.0])
+        self.assertIn(self.summary(4, 1, 0, 3), lines)
+
+    def test_a_report_without_the_lane_arrays_lists_nothing(self):
+        self.assertEqual(lane_section(run_new(gate=None), UNDERRUN_TITLE), [])
+        def drop(report):
+            with_underruns()(report)
+            del report["audio_underruns"]["child_alive"]
+        self.assertEqual(lane_section(run_new({"new_gen_first.json": drop}, gate=None), UNDERRUN_TITLE), [])
+
+
+class LaneSectionsAreAdditions(unittest.TestCase):
+    """Reports without the new fields print none of the sections, and the old text never changes."""
+
+    def test_no_section_without_the_fields(self):
+        out = run_new()
+        for title in (LANE_TITLE, DRAIN_TITLE, UNDERRUN_TITLE):
+            self.assertNotIn(title, out)
+
+    def test_old_fixtures_print_none_of_the_sections(self):
+        paths = [os.path.join(FIXTURES, "old_baseline.json"), os.path.join(FIXTURES, "old_gpl.json")]
+        out = run_script(paths)[1]
+        for title in (LANE_TITLE, DRAIN_TITLE, UNDERRUN_TITLE):
+            self.assertNotIn(title, out)
+
+    def test_adding_the_fields_only_appends(self):
+        # The one change is the lane fields on the same rows and underruns. Everything the baseline
+        # printed is still there first and unchanged.
+        def add(report):
+            for row in report["compiles"]:
+                row.update(warm_front=1, warm_back=1)
+            report["audio_underruns"].update(warm_front=[0] * 7, warm_back=[0] * 7, child_alive=[1] * 7)
+        base = run_new(gate=None)
+        out = run_new({"new_gen_first.json": add}, gate=None)
+        self.assertTrue(out.startswith(base))
+        self.assertIn(LANE_TITLE, out)
+        self.assertIn(UNDERRUN_TITLE, out)
 
 
 if __name__ == "__main__":
