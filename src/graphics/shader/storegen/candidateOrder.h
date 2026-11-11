@@ -24,12 +24,27 @@ struct RankedCandidate {
 	uint32_t candidate = 0;
 };
 
+/// The head of a program, which is the candidate with the largest set of unbound buffers. The
+/// candidate the predictor lists first wins a tie.
+/// @param candidates the program's candidates, in the predictor's order.
+/// @return the index of the head, or 0 when there are no candidates.
+size_t HeadIndex(std::span<const Candidate> candidates);
+
 /// The order in which the worker builds candidates, and so what a rank means.
 ///
-/// A candidate that leaves every buffer bound is a base candidate, and every base candidate comes
-/// before any other. Within each group the smaller program comes first, by the size of its code and
-/// literals, then the program that comes first in the list, then the candidate the predictor lists
-/// first. The result depends on nothing but the programs given.
+/// The key is (pass, subset_rank, code_dwords, program index, role, candidate index). A base has no
+/// unbound buffers, and a wide program has more than WIDE_TAIL_CANDIDATES_ABOVE candidates.
+/// Pass 0 holds the head of every program, and for a wide program its base right after, as role 0
+/// and role 1. A program with one candidate appears here once. subset_rank is 0.
+///
+/// Pass 1 holds the other candidates of wide programs. subset_rank is minus the size of the
+/// candidate's unbound set, so the larger subsets of all programs come before the smaller ones.
+///
+/// Pass 2 holds the base of narrow programs, which have 2 candidates. subset_rank is 0.
+///
+/// code_dwords is the size of the program's code and literals, as the scan's `code.size()`. It
+/// belongs to the program and so is the same for every candidate of it. The smaller program comes
+/// first among equals. The result depends on nothing but the programs given.
 /// @param programs the predicted programs, in the order of the eboot.
 /// @return every candidate of every program, once, in build order.
 std::vector<RankedCandidate> OrderCandidates(std::span<const OrderedProgram> programs);

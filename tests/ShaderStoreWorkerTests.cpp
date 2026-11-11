@@ -265,15 +265,16 @@ const Expected& Pick(const std::vector<Expected>& candidates, const std::vector<
 	return none;
 }
 
-// The expected records of the main programs, in the order the rule gives. Every base candidate
-// comes first, smallest program first, and then the variants, in the same program order.
+// The expected records of the main programs, in the order the rule gives. Pass 0 holds the head of
+// every program, smallest program first, and the base of the wide big program right after its head.
+// Pass 1 holds the big program's other subsets, and pass 2 the base of the narrow middle program.
 std::vector<Expected> ExpectedOrder(const Bytes& eboot) {
 	const auto scan   = ScanEbootShaders(eboot);
 	const auto big    = PredictedFor(ProgramBig(), scan.programs.at(0));
 	const auto middle = PredictedFor(ProgramMiddle(), scan.programs.at(1));
 	const auto small  = PredictedFor(ProgramSmall(), scan.programs.at(2));
-	return {Pick(small, {}), Pick(middle, {}), Pick(big, {}),    Pick(middle, {0}),
-	        Pick(big, {0}),  Pick(big, {1}),   Pick(big, {0, 1})};
+	return {Pick(small, {}), Pick(middle, {0}), Pick(big, {0, 1}), Pick(big, {}),
+	        Pick(big, {0}),  Pick(big, {1}),    Pick(middle, {})};
 }
 
 // The ids of the records, in file order.
@@ -470,7 +471,7 @@ void TestRecordsInRankOrder() {
 	CHECK(exact);
 	CHECK(records.size() == expected.size());
 	// The order of the ids is the order of the rule. An eboot order walk would list the big program
-	// first, and a size only sort would put the middle program's variant before the big base.
+	// first, and the old base first order would put the middle program's base before the big head.
 	CHECK(IdsOf(records) == IdsOf(expected));
 	std::vector<uint64_t> distinct = IdsOf(records);
 	std::ranges::sort(distinct);
@@ -498,8 +499,8 @@ void TestProgressLog() {
 	const auto    request = MakeRequest(directory, eboot);
 	const auto    run     = Run(request);
 	const auto    scan    = ScanEbootShaders(eboot);
-	// Programs by rank, which are small, middle, big, middle, big, big, big.
-	const std::array<size_t, 7> program_of_rank {2, 1, 0, 1, 0, 0, 0};
+	// Programs by rank, which are small, middle, big, big, big, big, middle.
+	const std::array<size_t, 7> program_of_rank {2, 1, 0, 0, 0, 0, 1};
 	std::vector<std::string>    expected_starts;
 	for (size_t rank = 0; rank < program_of_rank.size(); rank++) {
 		expected_starts.push_back(std::to_string(rank) + " " +
@@ -606,7 +607,7 @@ void TestSkipHashes() {
 	CHECK(std::ranges::count(IdsOfHashes(kept), full.big) == 0);
 	if (kept.size() == 3 && full.records.size() == 7) {
 		CHECK(kept[0].raw == full.records[0].raw && kept[1].raw == full.records[1].raw &&
-		      kept[2].raw == full.records[3].raw);
+		      kept[2].raw == full.records[6].raw);
 	}
 	// Left out before prediction, so it is not even translated for the prediction.
 	CHECK(CountLines(run.log, "predict " + HashText(full.big)) == 0);
@@ -625,17 +626,17 @@ void TestFailedHashes() {
 	const auto rest      = ReadRecords(run.file, HeaderBytes(failed), exact);
 	CHECK(exact && rest.size() == 3 && run.result.candidates_failed_earlier == 4);
 	CHECK(run.result.candidates == 7 && run.result.records_written == 3);
-	// The ranks of the others are what they were, which are 0, 1 and 3.
+	// The ranks of the others are what they were, which are 0, 1 and 6.
 	const auto full_starts = StartLines(full.run.log);
 	const auto starts      = StartLines(run.log);
 	CHECK(starts.size() == 3 && full_starts.size() == 7);
 	if (starts.size() == 3 && full_starts.size() == 7) {
 		CHECK(starts[0] == full_starts[0] && starts[1] == full_starts[1] &&
-		      starts[2] == full_starts[3]);
+		      starts[2] == full_starts[6]);
 	}
 	if (rest.size() == 3 && full.records.size() == 7) {
 		CHECK(rest[0].raw == full.records[0].raw && rest[1].raw == full.records[1].raw &&
-		      rest[2].raw == full.records[3].raw);
+		      rest[2].raw == full.records[6].raw);
 	}
 	// A failed program is still predicted, which is what keeps its ranks.
 	CHECK(CountLines(run.log, "predict " + HashText(full.big)) == 1);
@@ -1009,29 +1010,27 @@ void TestPushStartTripwireDropsTheRest() {
 	CHECK(run.result.push_start_mismatches == 1 && run.result.drops.size() == 1);
 	if (run.result.drops.size() == 1) {
 		const auto& drop = run.result.drops[0];
-		CHECK(drop.hash == big && drop.rank == 2);
+		CHECK(drop.hash == big && drop.rank == 3);
 		CHECK(drop.predicted_push == WRONG_START && drop.actual_push == 0);
 	}
-	// Seven candidates, and the four of the big program are gone. Its base is rank 2, and the
-	// others are ranks 4, 5 and 6, which would not trip on their own.
-	CHECK(run.result.candidates == 7 && run.result.records_written == 3);
-	CHECK(run.result.candidates_dropped == 4);
+	// Seven candidates. The wrong start is on the big program's base, which is rank 3 now that its
+	// head, rank 2, comes first and is written. The base and the ranks 4 and 5 are dropped, and
+	// those two would not trip on their own. Rank 6 is another program and is written.
+	CHECK(run.result.candidates == 7 && run.result.records_written == 4);
+	CHECK(run.result.candidates_dropped == 3);
 	const auto records = ReadRecords(run.file, HeaderBytes(request), exact);
-	CHECK(exact && records.size() == 3 && all.size() == 7);
-	if (records.size() == 3 && all.size() == 7) {
+	CHECK(exact && records.size() == 4 && all.size() == 7);
+	if (records.size() == 4 && all.size() == 7) {
 		CHECK(records[0].raw == all[0].raw && records[1].raw == all[1].raw &&
-		      records[2].raw == all[3].raw);
+		      records[2].raw == all[2].raw && records[3].raw == all[6].raw);
 	}
-	for (const auto& stored: records) {
-		CHECK(stored.record.hash != big);
-	}
-	// The ranks 4 to 6 have no start line, so nothing was translated for them.
-	CHECK(StartLines(run.log).size() == 3 + 1);
+	// Ranks 4 and 5 have no start line, so nothing was translated for them. Ranks 0 to 3 and 6 do.
+	CHECK(StartLines(run.log).size() == 4 + 1);
 	const auto log = ReadRealLog(request);
 	CHECK(log.KindCount(ProgressKind::Drop) == 1 && log.DropsSinceSpawn().size() == 1);
 	if (log.DropsSinceSpawn().size() == 1) {
 		const auto& drop = log.DropsSinceSpawn()[0];
-		CHECK(drop.reason == ProgressDropReason::PushStart && drop.rank_or_count == 2);
+		CHECK(drop.reason == ProgressDropReason::PushStart && drop.rank_or_count == 3);
 		CHECK(drop.hash == big && drop.predicted_push == WRONG_START && drop.actual_push == 0);
 	}
 }
@@ -1135,14 +1134,19 @@ void TestRestartAfterDrop() {
 	};
 	const auto request = MakeRequest(directory, eboot, "first");
 	const auto first   = Run(request, hooks);
-	CHECK(first.result.drops.size() == 1 && first.result.records_written == 3);
+	CHECK(first.result.drops.size() == 1 && first.result.records_written == 4);
 	if (first.result.drops.size() != 1) return;
 	const auto& drop    = first.result.drops[0];
 	bool        exact   = false;
 	const auto  records = ReadRecords(first.file, HeaderBytes(request), exact);
-	// The bytes the supervisor kept when it saw the drop line, which are the records before it.
+	// The bytes the supervisor kept when it saw the drop line, which are the records before it. A
+	// rank past the records read would index out of range, so it fails here instead.
+	CHECK(drop.rank <= records.size());
+	if (drop.rank > records.size()) {
+		return;
+	}
 	size_t cut = HeaderBytes(request);
-	for (size_t index = 0; index < 2; index++) {
+	for (size_t index = 0; index < drop.rank; index++) {
 		cut += FrameStoreRecord(records[index].raw).size();
 	}
 	const Bytes kept(first.file.begin(), first.file.begin() + static_cast<ptrdiff_t>(cut));
@@ -1233,11 +1237,12 @@ void TestResourceCountMismatch() {
 	CHECK(run.result.drops.size() == 1);
 	if (run.result.drops.size() == 1) {
 		CHECK(run.result.drops[0].reason == DropReason::ResourceCountMismatch);
-		CHECK(run.result.drops[0].hash == big && run.result.drops[0].rank == 2);
+		CHECK(run.result.drops[0].hash == big && run.result.drops[0].rank == 3);
 	}
-	// The big program's four candidates are gone and the other three are written.
-	CHECK(run.result.records_written == 3 && run.result.candidates_dropped == 4);
-	CHECK(StartLines(run.log).size() == 4);
+	// The big program's head is written first. Its base, which the hook broke, and the two
+	// partials after it are dropped, and the other four candidates are written.
+	CHECK(run.result.records_written == 4 && run.result.candidates_dropped == 3);
+	CHECK(StartLines(run.log).size() == 5);
 	bool logged = false;
 	for (const auto& line: run.log) {
 		logged = logged || line.ends_with("resource_count");
@@ -1247,7 +1252,7 @@ void TestResourceCountMismatch() {
 	CHECK(log.KindCount(ProgressKind::Drop) == 1 && log.DropsSinceSpawn().size() == 1);
 	if (log.DropsSinceSpawn().size() == 1) {
 		const auto& drop = log.DropsSinceSpawn()[0];
-		CHECK(drop.reason == ProgressDropReason::ResourceCount && drop.rank_or_count == 2);
+		CHECK(drop.reason == ProgressDropReason::ResourceCount && drop.rank_or_count == 3);
 		CHECK(drop.hash == big);
 	}
 }
@@ -1314,10 +1319,103 @@ void TestOversizeRecordIsDroppedAlone() {
 	CHECK(ReadRealLog(MakeRequest(directory, eboot, "at_cap")).KindCount(ProgressKind::Drop) == 0);
 }
 
+// Candidates with the given unbound sets, in the order given.
+std::vector<Candidate> CandidatesWithNulls(const std::vector<std::vector<uint32_t>>& null_sets) {
+	std::vector<Candidate> candidates(null_sets.size());
+	for (size_t index = 0; index < null_sets.size(); index++) {
+		candidates[index].nulls = null_sets[index];
+	}
+	return candidates;
+}
+
+// Whether the ranked candidates are exactly the expected ones, in order.
+bool RankedIs(const std::vector<RankedCandidate>& ranked,
+              const std::vector<RankedCandidate>& expected) {
+	return std::ranges::equal(ranked, expected, [](const auto& left, const auto& right) {
+		return left.program == right.program && left.candidate == right.candidate;
+	});
+}
+
+// T1. P has 4 candidates and is wide, Q has 2 and is narrow, and R has one. Every head comes first
+// with a wide base right after its head, then the wide partials, and last the narrow base. The
+// baseline is P cut to 2 candidates, which makes it narrow, and its base then goes to the end.
+void TestOrderHeadsBasesAndPartials() {
+	const auto                        wide   = CandidatesWithNulls({{}, {0}, {1}, {0, 1}});
+	const auto                        narrow = CandidatesWithNulls({{}, {0}});
+	const auto                        lone   = CandidatesWithNulls({{}});
+	const std::vector<OrderedProgram> programs {{10, wide}, {20, narrow}, {30, lone}};
+	CHECK(RankedIs(OrderCandidates(programs),
+	               {{0, 3}, {0, 0}, {1, 1}, {2, 0}, {0, 1}, {0, 2}, {1, 0}}));
+
+	const auto                        cut = CandidatesWithNulls({{}, {0, 1}});
+	const std::vector<OrderedProgram> baseline {{10, cut}, {20, narrow}, {30, lone}};
+	CHECK(RankedIs(OrderCandidates(baseline), {{0, 1}, {1, 1}, {2, 0}, {0, 0}, {1, 0}}));
+}
+
+// T2. The wide partials are ordered by the size of their unbound set across all programs. S is the
+// smaller program, so only the subset rank puts P's two buffer partials before S's single ones, and
+// only a descending rank puts P's single ones after S's.
+void TestOrderPartialsBySubsetSize() {
+	const auto small = CandidatesWithNulls({{}, {0, 1, 2}, {0}, {1}});
+	const auto large = CandidatesWithNulls({{}, {0, 1, 2}, {0, 1}, {0, 2}, {0}, {1}, {2}});
+	const std::vector<OrderedProgram> programs {{10, small}, {20, large}};
+	CHECK(RankedIs(
+	    OrderCandidates(programs),
+	    {{0, 1}, {0, 0}, {1, 1}, {1, 0}, {1, 2}, {1, 3}, {0, 2}, {0, 3}, {1, 4}, {1, 5}, {1, 6}}));
+}
+
+// T3. A Coupled like program has 2 candidates, all bound and all null. Its head is in pass 0 and
+// its base is last. The baseline has a third candidate, which makes it wide and moves the base up
+// to follow its head.
+void TestOrderCoupledLikeProgram() {
+	const auto                        coupled = CandidatesWithNulls({{}, {0, 1}});
+	const auto                        lone    = CandidatesWithNulls({{}});
+	const std::vector<OrderedProgram> programs {{10, coupled}, {20, lone}};
+	CHECK(RankedIs(OrderCandidates(programs), {{0, 1}, {1, 0}, {0, 0}}));
+
+	const auto                        wide = CandidatesWithNulls({{}, {0}, {0, 1}});
+	const std::vector<OrderedProgram> baseline {{10, wide}, {20, lone}};
+	CHECK(RankedIs(OrderCandidates(baseline), {{0, 2}, {0, 0}, {1, 0}, {0, 1}}));
+}
+
+// T4. A program with one candidate is built once, in pass 0. Treated as a narrow base it would come
+// after B's variant instead.
+void TestOrderLoneCandidateOnce() {
+	const auto                        lone   = CandidatesWithNulls({{}});
+	const auto                        narrow = CandidatesWithNulls({{}, {0}});
+	const std::vector<OrderedProgram> programs {{10, lone}, {20, narrow}};
+	const auto                        ranked = OrderCandidates(programs);
+	CHECK(RankedIs(ranked, {{0, 0}, {1, 1}, {1, 0}}));
+}
+
+// T5. The head is the largest unbound set, and the first listed wins a tie. For {}, {0}, {1} that
+// is {0}, and a head taken as the last index would be {1}.
+void TestOrderHeadTieRule() {
+	const auto trimmed = CandidatesWithNulls({{}, {0}, {1}});
+	CHECK(HeadIndex(trimmed) == 1);
+	CHECK(HeadIndex(CandidatesWithNulls({{}, {0, 1}})) == 1);
+	CHECK(HeadIndex(CandidatesWithNulls({{0, 1}, {}, {0, 1}})) == 0);
+	CHECK(HeadIndex(CandidatesWithNulls({{}})) == 0);
+	const std::vector<OrderedProgram> programs {{10, trimmed}};
+	CHECK(RankedIs(OrderCandidates(programs), {{0, 1}, {0, 0}, {0, 2}}));
+}
+
+// The key uses the size of the program, which every candidate of it shares. The first program is
+// the larger and is listed first, so the program index cannot stand in for the size. The sizes
+// decide the heads of pass 0, with each base after its own head, and the partials of pass 1 tie on
+// subset rank so that the size alone orders them. A Candidate has no size of its own to use
+// instead.
+void TestOrderUsesProgramSize() {
+	const auto                        wide = CandidatesWithNulls({{}, {0, 1}, {0}});
+	const std::vector<OrderedProgram> programs {{30, wide}, {10, wide}};
+	CHECK(RankedIs(OrderCandidates(programs), {{1, 1}, {1, 0}, {0, 1}, {0, 0}, {1, 2}, {0, 2}}));
+}
+
 // The pure order of candidates. The programs are listed out of size order so that neither the
 // program index nor the candidate index can stand in for the size, and a program with one candidate
-// shows that a lone base sorts with the bases. Base candidates go first by program size, then the
-// others by program size. Two programs share a size, so only the program index orders them.
+// shows that a lone candidate is built once, as a head. The heads go first by program size, then
+// the narrow bases by program size. Two programs share a size, so only the program index orders
+// them.
 void TestOrderCandidatesPure() {
 	const std::vector<Candidate> with_variant(2);
 	std::vector<Candidate>       two = with_variant;
@@ -1326,8 +1424,8 @@ void TestOrderCandidatesPure() {
 
 	const std::vector<OrderedProgram>  programs {{30, two}, {10, lone}, {20, two}, {20, two}};
 	const auto                         ranked = OrderCandidates(programs);
-	const std::vector<RankedCandidate> expected {{1, 0}, {2, 0}, {3, 0}, {0, 0},
-	                                             {2, 1}, {3, 1}, {0, 1}};
+	const std::vector<RankedCandidate> expected {{1, 0}, {2, 1}, {3, 1}, {0, 1},
+	                                             {2, 0}, {3, 0}, {0, 0}};
 	CHECK(ranked.size() == expected.size());
 	for (size_t i = 0; i < ranked.size() && i < expected.size(); i++) {
 		CHECK(ranked[i].program == expected[i].program &&
@@ -1335,11 +1433,11 @@ void TestOrderCandidatesPure() {
 	}
 	CHECK(OrderCandidates({}).empty());
 
-	// With the program index in the key every key is unique, so there is one right order whatever
-	// the sort, and a stable sort of the indices by size is that order. Without the index, programs
-	// of one size tie, and std::ranges::sort can then scramble them. A run this long with sizes that
-	// cycle is partitioned rather than insertion sorted, which did scramble them on MSVC, but a sort
-	// that happened to keep ties in order would let that mutation pass.
+	// With the program index in the key every key is unique, so there is one right order
+	// whatever the sort, and a stable sort of the indices by size is that order. Without the
+	// index, programs of one size tie, and std::ranges::sort can then scramble them. A run this
+	// long with sizes that cycle is partitioned rather than insertion sorted, which did scramble
+	// them on MSVC, but a sort that happened to keep ties in order would let that mutation pass.
 	constexpr size_t            TIED_PROGRAMS = 64;
 	constexpr size_t            SIZE_CLASSES  = 5;
 	constexpr size_t            SIZE_STRIDE   = 3;
@@ -1363,6 +1461,12 @@ void TestOrderCandidatesPure() {
 
 int main() {
 	TestOrderCandidatesPure();
+	TestOrderHeadsBasesAndPartials();
+	TestOrderPartialsBySubsetSize();
+	TestOrderCoupledLikeProgram();
+	TestOrderLoneCandidateOnce();
+	TestOrderHeadTieRule();
+	TestOrderUsesProgramSize();
 	TestRequestFormat();
 	TestRequestFile();
 	TestGeneratedHeader();

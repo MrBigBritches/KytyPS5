@@ -25,7 +25,7 @@ enum class WorkerMode : uint8_t {
 /// The version of the worker's rules, which are the prediction, the candidate order and the record
 /// encoding it drives. It is part of the generated file's header, so changing any of them means
 /// raising it, and an older file is generated again.
-constexpr uint32_t SHADER_STORE_GENERATOR_VERSION = 1;
+constexpr uint32_t SHADER_STORE_GENERATOR_VERSION = 2;
 
 /// Starts every request file, and holds "WSRQ".
 constexpr uint32_t WORKER_REQUEST_MAGIC = 0x51525357;

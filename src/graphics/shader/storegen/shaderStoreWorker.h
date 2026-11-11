@@ -128,12 +128,14 @@ struct WorkerHooks {
 
 /// Runs a worker request to the end, in this process.
 ///
-/// The order of the candidates is the rule the supervisor and the tests rely on. A candidate that
-/// leaves every buffer bound is a base candidate, and every base candidate comes before any other.
-/// Within each group the smaller program comes first, by the size of its code and literals, then
-/// the program that comes first in the eboot, then the candidate the predictor lists first. A
-/// rank is a position in this ordering, so it does not depend on the start rank, and not on the
-/// request's failed programs. It does depend on the request's skip hashes.
+/// The order of the candidates is the rule the supervisor and the tests rely on, and
+/// OrderCandidates documents its key. The head of a program is the candidate with the most unbound
+/// buffers. Pass 0 builds every head, and a wide program's base right after its head. Pass 1 builds
+/// the other candidates of wide programs, the larger unbound sets of all programs first. Pass 2
+/// builds the base of narrow programs. Within a pass the smaller program comes first, by the size
+/// of its code and literals, then the program that comes first in the eboot. A rank is a position
+/// in this ordering, so it does not depend on the start rank, and not on the request's failed
+/// programs. It does depend on the request's skip hashes.
 ///
 /// Before it predicts a program the worker appends `predict <hash>` to the progress log, and after
 /// it, on every path that ends the program's prediction, `prediction <hash> <outcome>
