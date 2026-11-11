@@ -145,6 +145,73 @@ class ArmNames(unittest.TestCase):
         self.assertNotEqual(SCRIPT.arm_name(with_flag, common), SCRIPT.arm_name(without, common))
 
 
+class WarmWorkerArms(unittest.TestCase):
+    """Runs with different warm worker counts are different arms, since --warm-workers is not a flag
+    in the report. The baseline for each test is the same pair of reports with the same count."""
+
+    @staticmethod
+    def report(workers):
+        return {"flags": {"--generate-shader-store": True}, "cold": True,
+                "machine": {"warm_workers": workers}}
+
+    def names(self, first, second):
+        reports = [self.report(first), self.report(second)]
+        common = SCRIPT.common_flags(reports)
+        return [SCRIPT.arm_name(report, common) for report in reports]
+
+    def test_reports_that_differ_only_in_the_count_are_two_arms(self):
+        names = self.names(4, 3)
+        self.assertNotEqual(names[0], names[1])
+        self.assertEqual(names[0], "--generate-shader-store (4 warm workers)")
+        self.assertEqual(names[1], "--generate-shader-store (3 warm workers)")
+
+    def test_reports_with_the_same_count_are_one_arm_and_unmarked(self):
+        names = self.names(3, 3)
+        self.assertEqual(names[0], names[1])
+        self.assertEqual(names[0], "--generate-shader-store")
+
+    def test_a_report_that_does_not_give_the_count_is_not_marked(self):
+        # Old reports have no machine block. Beside a new one they must keep their old name.
+        old = {"flags": {"--generate-shader-store": True}, "cold": True}
+        new = self.report(3)
+        common = SCRIPT.common_flags([old, new])
+        self.assertFalse(common.workers_differ)
+        self.assertEqual(SCRIPT.arm_name(old, common), "--generate-shader-store")
+
+    def test_the_count_stays_in_the_name_without_the_store_mark(self):
+        # The gate names arms without the store count, and two counts must still be two arms there.
+        reports = [self.report(4), self.report(3)]
+        common = SCRIPT.common_flags(reports)
+        self.assertEqual([SCRIPT.arm_name(report, common, with_store=False) for report in reports],
+                         ["--generate-shader-store (4 warm workers)",
+                          "--generate-shader-store (3 warm workers)"])
+
+    def test_the_table_has_a_row_for_each_count(self):
+        with tempfile.TemporaryDirectory() as folder:
+            paths = []
+            for workers in (4, 3):
+                report = read_fixture("new_gen_first.json")
+                report["machine"]["warm_workers"] = workers
+                path = os.path.join(folder, f"gen_{workers}.json")
+                with open(path, "w", encoding="utf-8") as handle:
+                    json.dump(report, handle)
+                paths.append(path)
+            code, out, err = run_script(paths)
+        self.assertEqual(code, 0, err)
+        self.assertIn(GEN_ARM + " (4 warm workers)", out)
+        self.assertIn(GEN_ARM + " (3 warm workers)", out)
+
+    def test_the_gate_refuses_gen_runs_with_different_counts_and_says_why(self):
+        other = read_fixture("new_gen_first.json")
+        other["machine"]["warm_workers"] = 3
+        code, err = GateOneGenArm.gate_with(other)
+        self.assertEqual(code, 1)
+        self.assertIn("more than one gen arm", err)
+        self.assertIn("warm worker count", err)
+        self.assertIn("(3 warm workers)", err)
+        self.assertIn("(4 warm workers)", err)
+
+
 class GateOneGenArm(unittest.TestCase):
     """The gate refuses reports that hold two gen arms, since it would judge them as one blend."""
 

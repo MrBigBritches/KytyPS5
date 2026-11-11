@@ -79,11 +79,32 @@ WARM_MARK = " (warm)"
 GPL_INACTIVE_MARK = " (gpl inactive)"
 
 
+class CommonFlags(frozenset):
+    """The flags on in every report. It also says whether the reports ran different numbers of warm
+    workers, which no flag shows, so that arm_name can keep those runs apart. A set operation on it
+    returns a plain frozenset without workers_differ, so pass this object itself to arm_name. A
+    report that does not give its count is left unmarked, as an arm of its own."""
+    workers_differ = False
+
+
+def warm_workers_of(report):
+    """How many warm workers the run made, or None for a report that does not say."""
+    return report.get("machine", {}).get("warm_workers") or None
+
+
+def workers_mark(report):
+    """The mark that names a run's warm worker count, or nothing when the report has none."""
+    workers = warm_workers_of(report)
+    return f" ({workers} warm workers)" if workers else ""
+
+
 def arm_name(report, common=frozenset(), with_store=True):
     """Names an arm by the flags that were on in it and not in every report, which keeps the label
     short when the launcher adds many base flags to all runs. A report with none of those is the
     baseline. A non-cold run is marked. With_store false leaves out the seeded store count, so the
-    first run and the second boot of one arm share a name."""
+    first run and the second boot of one arm share a name. When the reports ran different warm
+    worker counts, each name carries its own count, as the option that sets it is not a flag in the
+    report. Reports that agree on the count, or do not say, print the names they always did."""
     flags = sorted(name for name, on in report.get("flags", {}).items()
                    if on and name not in MEASUREMENT_FLAGS and name not in common)
     label = " ".join(flags) if flags else "baseline"
@@ -92,6 +113,8 @@ def arm_name(report, common=frozenset(), with_store=True):
     warmed = report.get("boot", {}).get("modules", 0)
     if warmed and with_store:
         label += f" (store {warmed})"
+    if getattr(common, "workers_differ", False):
+        label += workers_mark(report)
     # A device that cannot link libraries runs the GPL arm as if the flag were off, so that run must
     # not be merged with real GPL runs.
     library = report.get("graphics_pipeline_library", {})
@@ -104,7 +127,9 @@ def common_flags(reports):
     """The settings on in every report, which can be left out of arm names. Strategy flags are never
     among them, because they say what the arm is even when every report has them."""
     sets = [{name for name, on in report.get("flags", {}).items() if on} for report in reports]
-    return frozenset(set.intersection(*sets) - STRATEGY_FLAGS) if sets else frozenset()
+    common = CommonFlags(set.intersection(*sets) - STRATEGY_FLAGS if sets else ())
+    common.workers_differ = len({warm_workers_of(report) for report in reports} - {None}) > 1
+    return common
 
 
 def figures(report):
@@ -1121,7 +1146,8 @@ def gate(records, common, gpl_wanted):
     if len(gen_labels) > 1:
         # gate_runs puts every generation run in one group, so two gen arms given together would
         # be judged as one blend of both. Refuse, so each arm is gated on its own.
-        print("gate: the reports hold more than one gen arm, so pass one at a time:", file=sys.stderr)
+        print("gate: the reports hold more than one gen arm (they differ in flags or in warm worker "
+              "count), so pass one at a time:", file=sys.stderr)
         for label in gen_labels:
             print(f"  {label}", file=sys.stderr)
         return 1

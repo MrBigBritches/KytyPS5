@@ -65,6 +65,12 @@ $ArmTable = [ordered]@{
     "lookahead"      = @{ Flags = @("--shader-lookahead");                                                                 Ready = $false }
 }
 
+# The gen arm with the warm-up held to 3 and to 2 workers, to see how much the warm builds slow the
+# graphics compiles at the loading burst. The count and its flag are separate elements, because
+# each element becomes one argument. The report keeps the count, so these runs stay apart from gen.
+$ArmTable["gen-w3"] = @{ Flags = @($ArmTable["gen"].Flags + @("--warm-workers", "3")); Ready = $true }
+$ArmTable["gen-w2"] = @{ Flags = @($ArmTable["gen"].Flags + @("--warm-workers", "2")); Ready = $true }
+
 # "all" turns on every strategy, so it is Ready only once every strategy arm is, and its flags are
 # theirs together. The depth-only arm is left out, because it is the default skip rule with a
 # stricter gate. Both flags can be on at once, and then depth-only wins, so "all" would measure the
