@@ -22,6 +22,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
+#include "graphics/shader/recompiler/ir/passes/ExecSelectElision.h"
 #include "graphics/shader/recompiler/ir/passes/ReadLaneElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
@@ -42,9 +43,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <functional>
 #include <initializer_list>
 #include <iterator>
 #include <map>
+#include <memory>
 #include <set>
 #include <span>
 #include <sstream>
@@ -10400,6 +10403,379 @@ void TestLaneMaskProjection() {
   }
 }
 
+// Hand-built programs for the exec-select forwarding pass. Every condition is a distinct opaque
+// compare, so only the structure under test can relate two of them.
+struct ExecSelectFixture {
+  ShaderRecompiler::IR::Program program;
+  ShaderRecompiler::IR::Block *entry = nullptr;
+  ShaderRecompiler::IR::Block *join = nullptr;
+  std::unique_ptr<ShaderRecompiler::IR::IREmitter> emit;
+  uint32_t next_register = 0;
+
+  ExecSelectFixture() {
+    using namespace ShaderRecompiler::IR;
+    for (uint32_t id = 0; id < 2; ++id) {
+      program.block_storage.push_back(std::make_unique<Block>());
+      program.blocks.push_back(program.block_storage.back().get());
+      program.blocks.back()->id = id;
+    }
+    entry = program.blocks[0];
+    join = program.blocks[1];
+    emit = std::make_unique<IREmitter>(entry);
+  }
+
+  ShaderRecompiler::IR::U1 Condition() {
+    using namespace ShaderRecompiler::IR;
+    const auto raw = emit->GetUserData(static_cast<ScalarReg>(next_register++));
+    return emit->INotEqual(raw, U32(Value(0u)));
+  }
+  ShaderRecompiler::IR::U32 Data() {
+    return emit->GetUserData(
+        static_cast<ShaderRecompiler::IR::ScalarReg>(next_register++));
+  }
+  ShaderRecompiler::IR::U1 And(ShaderRecompiler::IR::U1 lhs,
+                               ShaderRecompiler::IR::U1 rhs) {
+    return emit->LogicalAnd(lhs, rhs);
+  }
+  ShaderRecompiler::IR::U1 Or(ShaderRecompiler::IR::U1 lhs,
+                              ShaderRecompiler::IR::U1 rhs) {
+    return emit->LogicalOr(lhs, rhs);
+  }
+  // Builds Select(condition, true_value, false_value) and returns the instruction.
+  ShaderRecompiler::IR::Inst *Select(ShaderRecompiler::IR::Value condition,
+                                     ShaderRecompiler::IR::Value true_value,
+                                     ShaderRecompiler::IR::Value false_value) {
+    return emit
+        ->Emit(ShaderRecompiler::IR::ValueOpcode::SelectU32,
+               {condition, true_value, false_value})
+        .TryInstruction();
+  }
+};
+
+struct ForwardOutcome {
+  bool forwarded_to_z = false;
+  bool left_in_place = false;
+  ShaderRecompiler::IR::ExecSelectStats stats;
+};
+
+// Builds Select(c, x, Select(inner_condition, y, z)) and reports where the outer false operand
+// points after the pass. The bypassed inner select must be left untouched.
+ForwardOutcome RunForwardCase(
+    const std::function<ShaderRecompiler::IR::U1(
+        ExecSelectFixture &, ShaderRecompiler::IR::U1)> &make_inner_condition) {
+  using namespace ShaderRecompiler::IR;
+  ExecSelectFixture fixture;
+  const auto c = fixture.Condition();
+  const auto x = fixture.Data();
+  const auto y = fixture.Data();
+  const auto z = fixture.Data();
+  const auto inner_condition = make_inner_condition(fixture, c);
+  auto *inner = fixture.Select(inner_condition, y, z);
+  auto *outer = fixture.Select(c, x, Value(inner));
+  ForwardOutcome outcome;
+  outcome.stats = ForwardSubsetSelects(fixture.program);
+  outcome.forwarded_to_z = outer->Arg(2) == z;
+  outcome.left_in_place = outer->Arg(2) == Value(inner);
+  Check(inner->Arg(2) == z && inner->Arg(1) == y &&
+            inner->Arg(0) == inner_condition,
+        "forwarding rewrote the bypassed inner select");
+  return outcome;
+}
+
+void ExpectForwarded(const ForwardOutcome &outcome, const char *what) {
+  Check(outcome.forwarded_to_z && outcome.stats.forwarded == 1u &&
+            outcome.stats.candidates == 1u,
+        what);
+}
+
+void ExpectKept(const ForwardOutcome &outcome, const char *what) {
+  Check(outcome.left_in_place && outcome.stats.forwarded == 0u &&
+            outcome.stats.candidates == 1u,
+        what);
+}
+
+// F1 an equal condition forwards, an unrelated one does not.
+void TestExecSelectForwardsEqualCondition() {
+  using namespace ShaderRecompiler::IR;
+  ExpectForwarded(
+      RunForwardCase([](ExecSelectFixture &, U1 c) { return c; }),
+      "an equal condition did not forward");
+  ExpectKept(RunForwardCase([](ExecSelectFixture &fixture, U1) {
+               return fixture.Condition();
+             }),
+             "an unrelated condition forwarded");
+}
+
+// F2 an And descendant forwards from either operand and at any depth. Or does not.
+void TestExecSelectForwardsAndDescendants() {
+  using namespace ShaderRecompiler::IR;
+  ExpectForwarded(RunForwardCase([](ExecSelectFixture &f, U1 c) {
+                    return f.And(c, f.Condition());
+                  }),
+                  "And with the condition on the left did not forward");
+  ExpectForwarded(RunForwardCase([](ExecSelectFixture &f, U1 c) {
+                    return f.And(f.Condition(), c);
+                  }),
+                  "And with the condition on the right did not forward");
+  ExpectForwarded(RunForwardCase([](ExecSelectFixture &f, U1 c) {
+                    return f.And(f.Condition(), f.And(f.Condition(), c));
+                  }),
+                  "a nested right And did not forward");
+  ExpectForwarded(RunForwardCase([](ExecSelectFixture &f, U1 c) {
+                    return f.And(f.And(c, f.Condition()), f.Condition());
+                  }),
+                  "a nested left And did not forward");
+  ExpectKept(RunForwardCase([](ExecSelectFixture &f, U1 c) {
+               return f.Or(c, f.Condition());
+             }),
+             "Or with the condition on the left forwarded");
+  ExpectKept(RunForwardCase([](ExecSelectFixture &f, U1 c) {
+               return f.Or(f.Condition(), c);
+             }),
+             "Or with the condition on the right forwarded");
+  ExpectKept(RunForwardCase([](ExecSelectFixture &f, U1) {
+               return f.And(f.Condition(), f.Condition());
+             }),
+             "an And of unrelated conditions forwarded");
+}
+
+// F3 a chain of three forwards to the bottom, a broken middle link stops it there.
+void TestExecSelectForwardsChain() {
+  using namespace ShaderRecompiler::IR;
+  const auto build = [](bool break_middle) {
+    ExecSelectFixture f;
+    const auto c = f.Condition();
+    const auto other = f.Condition();
+    const auto x = f.Data(), y = f.Data(), w = f.Data(), z = f.Data();
+    auto *bottom = f.Select(c, w, z);
+    auto *middle = f.Select(break_middle ? other : c, y, Value(bottom));
+    auto *top = f.Select(c, x, Value(middle));
+    const auto stats = ForwardSubsetSelects(f.program);
+    if (!break_middle) {
+      Check(top->Arg(2) == z && middle->Arg(2) == z && stats.forwarded == 2u &&
+                stats.candidates == 2u,
+            "a chain of three did not forward to the bottom");
+    } else {
+      Check(top->Arg(2) == Value(middle) && middle->Arg(2) == Value(bottom) &&
+                stats.forwarded == 0u && stats.candidates == 2u,
+            "a broken middle link did not stop the chain");
+    }
+  };
+  build(false);
+  build(true);
+}
+
+// F4 a Phi is not looked through, even when every incoming value is the condition.
+void TestExecSelectDoesNotLookThroughPhi() {
+  using namespace ShaderRecompiler::IR;
+  const auto build = [](bool use_phi, bool under_and) {
+    ExecSelectFixture f;
+    const auto c = f.Condition();
+    const auto k = f.Condition();
+    const auto x = f.Data(), y = f.Data(), z = f.Data();
+    Value condition = c;
+    IREmitter join_emit(f.join);
+    if (use_phi) {
+      auto &phi = f.join->AppendNewInst(ValueOpcode::Phi);
+      phi.SetFlags(Type::U1);
+      phi.AddPhiOperand(f.entry, c);
+      phi.AddPhiOperand(f.join, c);
+      condition = Value(&phi);
+    }
+    if (under_and) {
+      condition = join_emit.LogicalAnd(U1(condition), k);
+    }
+    auto *inner = &f.join->AppendNewInst(ValueOpcode::SelectU32,
+                                         {condition, y, z});
+    auto *outer =
+        &f.join->AppendNewInst(ValueOpcode::SelectU32, {c, x, Value(inner)});
+    const auto stats = ForwardSubsetSelects(f.program);
+    if (use_phi) {
+      Check(outer->Arg(2) == Value(inner) && stats.forwarded == 0u,
+            "a Phi condition was looked through");
+    } else {
+      Check(outer->Arg(2) == z && stats.forwarded == 1u,
+            "the Phi baseline did not forward");
+    }
+  };
+  build(false, false);
+  build(true, false);
+  build(false, true);
+  build(true, true);
+}
+
+// F5 selects of different opcodes are not forwarded through each other.
+// Valid IR cannot reach this state. U32 and F32 never overlap, so a SelectU32 operand is never a
+// SelectF32. The cases are type-invalid on purpose, to prove the opcode check and not the types.
+void TestExecSelectRequiresSameOpcode() {
+  using namespace ShaderRecompiler::IR;
+  const auto build = [](ValueOpcode inner_opcode) {
+    ExecSelectFixture f;
+    const auto c = f.Condition();
+    const auto x = f.Data(), y = f.Data(), z = f.Data();
+    const auto inner = f.emit->Emit(inner_opcode, {c, y, z});
+    auto *outer = f.Select(c, x, inner);
+    const auto stats = ForwardSubsetSelects(f.program);
+    if (inner_opcode == ValueOpcode::SelectU32) {
+      Check(outer->Arg(2) == z && stats.forwarded == 1u,
+            "the same opcode baseline did not forward");
+    } else {
+      Check(outer->Arg(2) == inner && stats.forwarded == 0u &&
+                stats.candidates == 0u,
+            "selects of different opcodes were forwarded");
+    }
+  };
+  build(ValueOpcode::SelectU32);
+  build(ValueOpcode::SelectF32);
+  // The opcode is also checked on later links. A select of another opcode ends the walk, and
+  // the walk stops on it rather than passing through to its own false operand.
+  {
+    ExecSelectFixture f;
+    const auto c = f.Condition();
+    const auto x = f.Data(), y = f.Data(), a = f.Data(), b = f.Data();
+    const auto bottom = f.emit->Emit(ValueOpcode::SelectF32, {c, a, b});
+    auto *middle = f.Select(c, y, bottom);
+    auto *top = f.Select(c, x, Value(middle));
+    const auto stats = ForwardSubsetSelects(f.program);
+    Check(top->Arg(2) == bottom && stats.forwarded == 1u &&
+              stats.candidates == 1u,
+          "the walk passed through a select of a different opcode");
+  }
+}
+
+// F6 the And depth cap. A chain of 32 levels forwards and 33 does not. An answer memoised for a
+// shallower chain must not widen the cap for a deeper one.
+void TestExecSelectAndDepthCap() {
+  using namespace ShaderRecompiler::IR;
+  // Spelled out on purpose, so the test does not move with the constant it checks.
+  constexpr uint32_t cap = 32u;
+  const auto build = [&](uint32_t levels, bool shallow_first) {
+    ExecSelectFixture f;
+    const auto c = f.Condition();
+    const auto x = f.Data(), y = f.Data(), z = f.Data();
+    auto chain = c;
+    Inst *shallow_outer = nullptr;
+    for (uint32_t level = 1; level <= levels; ++level) {
+      chain = f.And(chain, f.Condition());
+      if (shallow_first && level + 1 == levels) {
+        auto *shallow = f.Select(chain, y, z);
+        shallow_outer = f.Select(c, x, Value(shallow));
+      }
+    }
+    auto *inner = f.Select(chain, y, z);
+    auto *outer = f.Select(c, x, Value(inner));
+    const auto stats = ForwardSubsetSelects(f.program);
+    if (shallow_outer != nullptr) {
+      Check(shallow_outer->Arg(2) == z,
+            "the chain just under the cap did not forward");
+    }
+    if (levels <= cap) {
+      Check(outer->Arg(2) == z && stats.forwarded >= 1u,
+            "an And chain within the cap did not forward");
+    } else {
+      Check(outer->Arg(2) == Value(inner),
+            "an And chain beyond the cap forwarded");
+    }
+  };
+  build(cap - 1u, false);
+  build(cap, false);
+  build(cap + 1u, false);
+  build(cap + 2u, false);
+  build(cap + 1u, true);
+}
+
+// F7 the immediate rules. A false inner condition or a true outer condition forwards. The opposite
+// immediates do not, so flipping either rule cannot hide behind the other cases.
+void TestExecSelectImmediateConditions() {
+  using namespace ShaderRecompiler::IR;
+  const auto run = [](bool outer_is_immediate, bool immediate, bool expect_forward) {
+    ExecSelectFixture f;
+    const auto c = f.Condition();
+    const auto x = f.Data(), y = f.Data(), z = f.Data();
+    const Value outer_condition = outer_is_immediate ? Value(immediate) : Value(c);
+    const Value inner_condition = outer_is_immediate ? Value(c) : Value(immediate);
+    auto *inner = f.Select(inner_condition, y, z);
+    auto *outer = f.Select(outer_condition, x, Value(inner));
+    const auto stats = ForwardSubsetSelects(f.program);
+    Check(expect_forward ? (outer->Arg(2) == z && stats.forwarded == 1u)
+                         : (outer->Arg(2) == Value(inner) && stats.forwarded == 0u),
+          expect_forward ? "an immediate condition did not forward"
+                         : "an immediate condition forwarded");
+    Check(stats.candidates == 1u, "an immediate case missed its candidate");
+  };
+  run(false, false, true);  // inner false is a subset of anything
+  run(false, true, false);  // inner true is not a subset of an unknown condition
+  run(true, true, true);    // anything is a subset of an outer true
+  run(true, false, false);  // an unknown inner is not a subset of an outer false
+}
+
+// F8 the subset direction matters. The inner select is wider than the outer one, so it is kept.
+void TestExecSelectKeepsWiderInnerCondition() {
+  using namespace ShaderRecompiler::IR;
+  ExecSelectFixture f;
+  const auto c = f.Condition();
+  const auto k = f.Condition();
+  const auto x = f.Data(), y = f.Data(), z = f.Data();
+  auto *inner = f.Select(c, y, z);
+  auto *outer = f.Select(f.And(c, k), x, Value(inner));
+  const auto stats = ForwardSubsetSelects(f.program);
+  Check(outer->Arg(2) == Value(inner) && stats.forwarded == 0u &&
+            stats.candidates == 1u,
+        "an inner condition wider than the outer one forwarded");
+}
+
+// F9 every select opcode forwards on an equal condition, with correctly typed operands.
+void TestExecSelectForwardsEveryOpcode() {
+  using namespace ShaderRecompiler::IR;
+  for (const auto opcode :
+       {ValueOpcode::SelectU1, ValueOpcode::SelectU32, ValueOpcode::SelectF32,
+        ValueOpcode::SelectF64}) {
+    ExecSelectFixture f;
+    const auto c = f.Condition();
+    const auto make_data = [&]() -> Value {
+      switch (opcode) {
+      case ValueOpcode::SelectU1:
+        return f.Condition();
+      case ValueOpcode::SelectF32:
+        return f.emit->BitCastF32(f.Data());
+      case ValueOpcode::SelectF64:
+        return f.emit->Emit(ValueOpcode::BitCastF64U64,
+                            {f.emit->ConstructU64(f.Data(), f.Data())});
+      default:
+        return f.Data();
+      }
+    };
+    const auto x = make_data(), y = make_data(), z = make_data();
+    const auto inner = f.emit->Emit(opcode, {c, y, z});
+    auto *outer = f.emit->Emit(opcode, {c, x, inner}).TryInstruction();
+    const auto stats = ForwardSubsetSelects(f.program);
+    Check(outer->Arg(2) == z && stats.forwarded == 1u && stats.candidates == 1u,
+          "a select opcode did not forward on an equal condition");
+  }
+}
+
+// F10 forwarding across blocks keeps the program valid. The false value and the inner select are
+// defined in the entry block, which dominates the join block holding the outer select.
+void TestExecSelectForwardsAcrossBlocks() {
+  using namespace ShaderRecompiler::IR;
+  ExecSelectFixture f;
+  const auto c = f.Condition();
+  const auto x = f.Data(), y = f.Data(), z = f.Data();
+  auto *inner = f.Select(c, y, z);
+  f.entry->terminator.kind = ShaderRecompiler::CFG::TerminatorKind::Branch;
+  f.entry->terminator.true_block = f.join;
+  f.entry->AddBranch(f.join);
+  IREmitter join_emit(f.join);
+  auto *outer =
+      join_emit.Emit(ValueOpcode::SelectU32, {c, x, Value(inner)}).TryInstruction();
+  // A use of the select so the program has an observable consumer.
+  join_emit.Emit(ValueOpcode::IAdd32, {Value(outer), Value(1u)});
+  const auto stats = ForwardSubsetSelects(f.program);
+  Check(outer->Arg(2) == z && stats.forwarded == 1u,
+        "a cross-block select did not forward");
+  ValidateProgram(f.program);
+}
+
 void TestLateConstantPropagation() {
   using namespace ShaderRecompiler::IR;
   for (const uint32_t wave_size : {32u, 64u}) {
@@ -15035,6 +15411,16 @@ int main() {
   TestValuePhiValidation();
   TestLaneMaskProjection();
   TestLateConstantPropagation();
+  TestExecSelectForwardsEqualCondition();
+  TestExecSelectForwardsAndDescendants();
+  TestExecSelectForwardsChain();
+  TestExecSelectDoesNotLookThroughPhi();
+  TestExecSelectRequiresSameOpcode();
+  TestExecSelectAndDepthCap();
+  TestExecSelectImmediateConditions();
+  TestExecSelectKeepsWiderInnerCondition();
+  TestExecSelectForwardsEveryOpcode();
+  TestExecSelectForwardsAcrossBlocks();
   TestRepeatedBitcastPropagation();
   TestMaskedShiftConstantPropagation();
   TestU64ShiftConstantPropagation();
