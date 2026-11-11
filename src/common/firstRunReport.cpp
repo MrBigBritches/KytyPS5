@@ -926,8 +926,12 @@ nlohmann::json GenerationSupervisorToJson(const ShaderStoreGenerationReport& blo
 	}
 	supervisor["dropped"] = nlohmann::json::array();
 	for (const auto& drop: block.dropped) {
-		supervisor["dropped"].push_back(
-		    {{"hash", Hex(drop.hash)}, {"rank", drop.rank}, {"reason", drop.reason}});
+		nlohmann::json row = {
+		    {"hash", Hex(drop.hash)}, {"rank", drop.rank}, {"reason", drop.reason}};
+		if (drop.module_id) {
+			row["module_id"] = Hex(*drop.module_id);
+		}
+		supervisor["dropped"].push_back(std::move(row));
 	}
 	supervisor["failed_hashes"] = HashListToJson(block.failed_hashes);
 	supervisor["skip_hashes"]   = HashListToJson(block.skip_hashes);

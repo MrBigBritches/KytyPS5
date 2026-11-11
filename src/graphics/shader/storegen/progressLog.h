@@ -61,6 +61,9 @@ enum class ProgressDropReason : uint8_t {
 	PushStart,     ///< `push_start predicted=<n> actual=<n>`
 	ResourceCount, ///< `resource_count`
 	FrameTooLarge, ///< `frame_too_large`, which drops one candidate and not its program.
+	/// `push_start_head predicted=<n> actual=<n> id=<hex>`, which drops the head of a program and
+	/// not the program.
+	PushStartHead,
 };
 
 /// One parsed line. Only the fields of its kind mean anything.
@@ -77,6 +80,8 @@ struct ProgressLine {
 	/// Drop with PushStart only, the push data start the predictor assumed and the module has.
 	uint32_t predicted_push = 0;
 	uint32_t actual_push    = 0;
+	/// Drop with PushStartHead only, the id the runtime computes for the dropped head.
+	uint64_t module_id = 0;
 	/// Summary only. `exit=` and the rest of the fields in the order they were written, as text.
 	int                                              exit_code = 0;
 	std::vector<std::pair<std::string, std::string>> fields;

@@ -1067,8 +1067,10 @@ void StoreSupervisor::Impl::CollectDrops() {
 	}
 	Update([&](SupervisorStats& s) {
 		for (const auto& drop: drops) {
-			s.dropped.push_back(
-			    {.hash = drop.hash, .rank = drop.rank_or_count, .reason = drop.reason});
+			s.dropped.push_back({.hash      = drop.hash,
+			                     .rank      = drop.rank_or_count,
+			                     .reason    = drop.reason,
+			                     .module_id = drop.module_id});
 		}
 	});
 }
@@ -1111,10 +1113,12 @@ void StoreSupervisor::Impl::PublishHashLists() {
 }
 
 // Every program that a `drop` line gave up on stays out of the next run, except for the drop of a
-// record that was only too big, which belongs to that one record and not to its program.
+// record that was only too big, which belongs to that one record and not to its program. The drop
+// of a head with a wrong push start is the same, since the program's other candidates are built.
 void StoreSupervisor::Impl::AbsorbDrops() {
 	for (const auto& drop: progress.DropsSinceSpawn()) {
-		if (drop.reason != ProgressDropReason::FrameTooLarge) {
+		if (drop.reason != ProgressDropReason::FrameTooLarge &&
+		    drop.reason != ProgressDropReason::PushStartHead) {
 			AddUnique(request.failed_hashes, drop.hash);
 		}
 	}

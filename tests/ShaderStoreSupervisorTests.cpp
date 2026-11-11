@@ -69,6 +69,8 @@ constexpr size_t   CANDIDATES_EACH   = 2;
 constexpr uint64_t DROPPED_HASH      = 0xD0D0;
 constexpr uint64_t TOO_LARGE_HASH    = 0xF7F7;
 constexpr uint64_t PUSH_DROPPED_HASH = 0xE1E1;
+constexpr uint64_t HEAD_DROPPED_HASH = 0xE2E2;
+constexpr uint64_t HEAD_DROPPED_ID   = 0xABCD;
 constexpr uint32_t GENERATOR_VERSION = 9;
 constexpr size_t   STORE_HEADER_SIZE = 16;
 constexpr uint64_t EBOOT_SIZE        = 1234;
@@ -422,12 +424,21 @@ void FakeDrops(FakeRun& run) {
 	               " push_start predicted=3 actual=4");
 }
 
+// The drop lines of the head drops mode. It is FakeDrops with the push start drop made a head drop
+// and a second, program-level push start drop beside it, so the two differ in the reason word only.
+void FakeHeadDrops(FakeRun& run) {
+	run.files.Line("drop 1 " + FakeFiles::Hex(HEAD_DROPPED_HASH) +
+	               " push_start_head predicted=3 actual=4 id=" + FakeFiles::Hex(HEAD_DROPPED_ID));
+	run.files.Line("drop 1 " + FakeFiles::Hex(PUSH_DROPPED_HASH) +
+	               " push_start predicted=3 actual=4");
+}
+
 // What goes wrong at the start of a candidate, by mode. Returns true when the run ends there.
 bool FakeFaultAtStart(FakeRun& run, uint64_t rank, const FakeCandidate& candidate) {
 	if (run.Is("crash_start") && run.Arg(1) == rank) {
 		std::_Exit(CRASH_EXIT);
 	}
-	if (run.Is("drops_crash") && run.Arg(1) == rank) {
+	if ((run.Is("drops_crash") || run.Is("head_drops_crash")) && run.Arg(1) == rank) {
 		std::_Exit(CRASH_EXIT);
 	}
 	if (run.Is("crash_start_out") && run.Arg(1) == rank) {
@@ -529,6 +540,9 @@ int FakeBuild(FakeRun& run) {
 		}
 		if ((run.Is("drops_crash") || run.Is("drops_normal")) && rank == 1 + 0) {
 			FakeDrops(run);
+		}
+		if ((run.Is("head_drops_crash") || run.Is("head_drops_normal")) && rank == 1 + 0) {
+			FakeHeadDrops(run);
 		}
 		if (run.Is("crash_damaged_start") && run.spawn == 0 && rank == CRASH_DAMAGED_RANK) {
 			FakeWriteDamage(run);
@@ -988,6 +1002,25 @@ void TestDropLinesFeedFailedHashes() {
 		CHECK(Contains(failed, PUSH_DROPPED_HASH));
 		CHECK(Contains(failed, ProgramHash(2)));
 		CHECK(!Contains(failed, TOO_LARGE_HASH));
+	}
+}
+
+// A head drop stays out of the failed hashes, so the restart still builds the program's other
+// candidates. The push start drop beside it differs in the reason word only and is included.
+void TestHeadDropLeavesFailedHashes() {
+	const auto run = Run("head_drops_crash:4");
+	CHECK(run.ended && run.stats.outcome == SupervisorOutcome::Finished);
+	CHECK(run.stats.requests.size() == 2);
+	if (run.stats.requests.size() == 2) {
+		const auto& failed = run.stats.requests[1].failed_hashes;
+		CHECK(Contains(failed, PUSH_DROPPED_HASH));
+		CHECK(!Contains(failed, HEAD_DROPPED_HASH));
+	}
+	// The drop is still listed, with the id that classifies a runtime miss on the head.
+	CHECK(run.stats.dropped.size() == 2);
+	if (run.stats.dropped.size() == 2) {
+		CHECK(run.stats.dropped[0].reason == ProgressDropReason::PushStartHead &&
+		      run.stats.dropped[0].module_id == HEAD_DROPPED_ID);
 	}
 }
 
@@ -1621,6 +1654,7 @@ void TestReportNames() {
 	CHECK(std::string(DropReasonName(ProgressDropReason::PushStart)) == "push_start");
 	CHECK(std::string(DropReasonName(ProgressDropReason::ResourceCount)) == "resource_count");
 	CHECK(std::string(DropReasonName(ProgressDropReason::FrameTooLarge)) == "frame_too_large");
+	CHECK(std::string(DropReasonName(ProgressDropReason::PushStartHead)) == "push_start_head");
 	CHECK(std::string(PeakSourceName(Common::PeakMemorySource::WorkingSet)) == "working_set");
 	CHECK(std::string(PeakSourceName(Common::PeakMemorySource::WorkingSetSampled)) ==
 	      "working_set_sampled");
@@ -1708,6 +1742,19 @@ void TestReportRows() {
 		      dropped_block.dropped[0].hash == DROPPED_HASH && dropped_block.dropped[0].rank == 1);
 		CHECK(dropped_block.dropped[1].reason == "frame_too_large");
 		CHECK(dropped_block.dropped[2].reason == "push_start");
+	}
+	// The head drop's row reads push_start_head, where the same drop as a program drop reads
+	// push_start.
+	const auto head_dropped = Run("head_drops_normal");
+	const auto head_block   = MakeSupervisorReport(head_dropped.stats);
+	CHECK(head_block.dropped.size() == 2);
+	if (head_block.dropped.size() == 2) {
+		CHECK(head_block.dropped[0].reason == "push_start_head" &&
+		      head_block.dropped[0].hash == HEAD_DROPPED_HASH);
+		CHECK(head_block.dropped[1].reason == "push_start");
+		// Only the head drop carries its id, and the program-level row beside it has none.
+		CHECK(head_block.dropped[0].module_id == HEAD_DROPPED_ID);
+		CHECK(!head_block.dropped[1].module_id.has_value());
 	}
 	// The peak comes with the name of its source, where the system measured one.
 #ifndef __linux__
@@ -3014,6 +3061,7 @@ int main(int argc, char** argv) {
 	TestSilentChild();
 	TestOrderMismatchRestartsFresh();
 	TestDropLinesFeedFailedHashes();
+	TestHeadDropLeavesFailedHashes();
 	TestFreshRestartCutsTheFile();
 	TestDamagedFrameRestartsFresh();
 	TestTruncatedRestartsFresh();

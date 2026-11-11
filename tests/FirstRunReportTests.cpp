@@ -1137,6 +1137,19 @@ void TestGenerationBlockFields() {
 	     "/supervisor/dropped",
 	     nlohmann::json::array(
 	         {{{"hash", "0000000000000077"}, {"rank", 5}, {"reason", "push_start"}}})},
+	    // The same row with a module id gains exactly that key, and the row above has none.
+	    {"dropped_head",
+	     [](auto& b) {
+		     b.dropped = {{.hash      = 0x77,
+		                   .rank      = 5,
+		                   .reason    = "push_start_head",
+		                   .module_id = 0xabcdef0123456789ull}};
+	     },
+	     "/supervisor/dropped",
+	     nlohmann::json::array({{{"hash", "0000000000000077"},
+	                             {"rank", 5},
+	                             {"reason", "push_start_head"},
+	                             {"module_id", "abcdef0123456789"}}})},
 	    {"worker_number", [](auto& b) { b.worker = {{"exit", "0"}}; }, "/worker/exit", 0},
 	    {"worker_text", [](auto& b) { b.worker = {{"worst", "abc"}}; }, "/worker/worst", "abc"},
 	    // Hashes made only of decimal digits stay text, with their leading zeros.

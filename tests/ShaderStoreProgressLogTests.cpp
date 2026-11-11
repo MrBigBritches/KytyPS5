@@ -37,6 +37,8 @@ constexpr uint64_t HASH_A    = 0x0123456789abcdefull;
 constexpr uint64_t HASH_B    = 0xfedcba9876543210ull;
 constexpr uint64_t HASH_C    = 0x00000000000000a5ull;
 constexpr uint64_t ORDER_ONE = 0x1111222233334444ull;
+// The id a dropped head carries.
+constexpr uint64_t HEAD_ID   = 0x0123456789abcdefull;
 constexpr uint64_t ORDER_TWO = 0x5555666677778888ull;
 constexpr uint64_t RANK_FIVE = 5;
 constexpr uint64_t RANK_NINE = 9;
@@ -137,6 +139,12 @@ void TestEveryLineKind() {
 	auto push           = Drop(RANK_FIVE, HASH_B, ProgressDropReason::PushStart);
 	push.predicted_push = PREDICTED;
 	push.actual_push    = ACTUAL;
+	// The same line with the head word is the same drop with another reason, and so is the same
+	// line with its id, which only the head's line carries.
+	auto head              = push;
+	head.reason            = ProgressDropReason::PushStartHead;
+	auto head_with_id      = head;
+	head_with_id.module_id = HEAD_ID;
 	ProgressLine summary;
 	summary.kind      = ProgressKind::Summary;
 	summary.exit_code = 0;
@@ -148,6 +156,8 @@ void TestEveryLineKind() {
 	    {"start 5 " + Hex(HASH_B), WithRank(ProgressKind::Start, RANK_FIVE, HASH_B)},
 	    {"order 7 " + Hex(ORDER_ONE), WithRank(ProgressKind::Order, COUNT_7, ORDER_ONE)},
 	    {"drop 5 " + Hex(HASH_B) + " push_start predicted=3 actual=4", push},
+	    {"drop 5 " + Hex(HASH_B) + " push_start_head predicted=3 actual=4 id=" + Hex(HEAD_ID),
+	     head_with_id},
 	    {"drop 9 " + Hex(HASH_C) + " resource_count",
 	     Drop(RANK_NINE, HASH_C, ProgressDropReason::ResourceCount)},
 	    {"drop 9 " + Hex(HASH_C) + " frame_too_large",
@@ -203,6 +213,12 @@ void TestMalformedLines() {
 	    {"drop 1 " + hash + " push_start predicted=x actual=2",
 	     "drop 1 " + hash + " push_start predicted=1 actual=2"},
 	    {"drop 1 " + hash + " push_start actual=2 predicted=1",
+	     "drop 1 " + hash + " push_start predicted=1 actual=2"},
+	    {"drop 1 " + hash + " push_start_head predicted=1 actual=2",
+	     "drop 1 " + hash + " push_start_head predicted=1 actual=2 id=" + hash},
+	    {"drop 1 " + hash + " push_start_head predicted=1 actual=2 id=zz",
+	     "drop 1 " + hash + " push_start_head predicted=1 actual=2 id=" + hash},
+	    {"drop 1 " + hash + " push_start predicted=1 actual=2 id=" + hash,
 	     "drop 1 " + hash + " push_start predicted=1 actual=2"},
 	    {"prediction " + hash + " predicted", "prediction " + hash + " predicted 2"},
 	    {"prediction " + hash + " 2", "prediction " + hash + " predicted 2"},

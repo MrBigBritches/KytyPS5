@@ -983,6 +983,66 @@ void TestPushStartTripwireDropsTheRest() {
 	}
 }
 
+// The same wrong start on the big program's head, rank 2, drops that candidate alone. It differs
+// from the test above only in which candidate is wrong, so what is kept tells the two paths apart.
+// Nothing else in the run could give 6 records, since a program-level drop would leave 3.
+void TestPushStartHeadDropKeepsTheRest() {
+	TempDirectory directory;
+	const auto    eboot            = BuildEboot(MainPrograms());
+	const auto    scan             = ScanEbootShaders(eboot);
+	const auto    big              = scan.programs[0].code_hash;
+	const auto    baseline_request = MakeRequest(directory, eboot, "baseline");
+	const auto    baseline         = Run(baseline_request);
+	bool          exact            = false;
+	const auto    all = ReadRecords(baseline.file, HeaderBytes(baseline_request), exact);
+	CHECK(baseline.result.push_start_mismatches == 0 && all.size() == 7);
+
+	constexpr uint32_t WRONG_START = 7;
+	WorkerHooks        hooks;
+	hooks.after_prediction = [&](uint64_t hash, std::vector<Candidate>& candidates) {
+		if (hash == big) candidates[HeadIndex(candidates)].push_start = WRONG_START;
+	};
+	const auto request = MakeRequest(directory, eboot, "head");
+	const auto run     = Run(request, hooks);
+	CHECK(run.result.exit_code == WORKER_EXIT_DONE);
+	CHECK(run.result.push_start_mismatches == 1 && run.result.drops.size() == 1);
+	if (run.result.drops.size() == 1) {
+		const auto& drop = run.result.drops[0];
+		CHECK(drop.reason == DropReason::HeadPushStartMismatch);
+		CHECK(drop.hash == big && drop.rank == 2);
+		CHECK(drop.predicted_push == WRONG_START && drop.actual_push == 0);
+		// The id is the runtime's, built with the real start 0. The predictor's own id for the head
+		// used the start 0 too, since only the hook made the prediction wrong, so they are equal.
+		// An id built with the wrong predicted start would differ from both.
+		const auto head = Pick(PredictedFor(ProgramBig(), scan.programs[0]), {0, 1});
+		CHECK(head.id != 0 && drop.module_id == head.id);
+	}
+	CHECK(run.result.candidates == 7 && run.result.records_written == 6);
+	CHECK(run.result.candidates_dropped == 1);
+	const auto records = ReadRecords(run.file, HeaderBytes(request), exact);
+	CHECK(exact && records.size() == 6 && all.size() == 7);
+	if (records.size() == 6 && all.size() == 7) {
+		// Every rank but the head, in order, so the base and the partials are all there.
+		const size_t kept[] = {0, 1, 3, 4, 5, 6};
+		for (size_t index = 0; index < records.size(); index++) {
+			CHECK(records[index].raw == all[kept[index]].raw);
+		}
+	}
+	const auto log = ReadRealLog(request);
+	CHECK(log.KindCount(ProgressKind::Drop) == 1 && log.DropsSinceSpawn().size() == 1);
+	if (log.DropsSinceSpawn().size() == 1) {
+		const auto& drop = log.DropsSinceSpawn()[0];
+		CHECK(drop.reason == ProgressDropReason::PushStartHead && drop.rank_or_count == 2);
+		CHECK(drop.hash == big && drop.predicted_push == WRONG_START && drop.actual_push == 0);
+		CHECK(drop.module_id == run.result.drops[0].module_id);
+	}
+	bool logged = false;
+	for (const auto& line: run.log) {
+		logged = logged || line.find("push_start_head predicted=7 actual=0") != std::string::npos;
+	}
+	CHECK(logged);
+}
+
 // A restart with nothing left to write still cuts the file back to the kept bytes, so a torn record
 // does not stay at its end. The baseline is the torn file itself, which is longer.
 void TestKeptTruncatesTornBytes() {
@@ -1431,6 +1491,7 @@ int main() {
 	TestPredictionCandidateCounts();
 	TestPushStartTripwireOnRealMiss();
 	TestPushStartTripwireDropsTheRest();
+	TestPushStartHeadDropKeepsTheRest();
 	TestKeptTruncatesTornBytes();
 	TestOrderGuard();
 	TestPredictLineComesFirst();

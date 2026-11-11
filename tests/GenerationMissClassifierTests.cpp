@@ -501,6 +501,55 @@ void TestContextFromStats() {
 	CHECK(of(0xC4) == MissClass::Unscanned);
 }
 
+// A miss on the id of a head the worker dropped is head_dropped. Nothing else in the rows could
+// give it, so the baseline is the same miss with no drop record, which is wrong_spec once the
+// worker has finished. A drop of another id, or a program-level drop of the hash, is not the same
+// thing. The id must also survive the trip through the supervisor's statistics, where the drop of
+// the head does not make its program look dropped.
+void TestHeadDropped() {
+	auto miss    = Miss();
+	auto context = Context();
+	Predicted(context);
+	miss.at_ns = FINISHED + 1;
+	CHECK(Of(miss, context) == MissClass::WrongSpec);
+	context.head_dropped_ids.insert(MODULE_ID);
+	CHECK(Of(miss, context) == MissClass::HeadDropped);
+	CHECK(std::string(MissClassName(MissClass::HeadDropped)) == "head_dropped");
+	// Another module of the same program is still a wrong specification.
+	context.head_dropped_ids = {MODULE_ID + 1};
+	CHECK(Of(miss, context) == MissClass::WrongSpec);
+	// The id is what counts, so a miss with no id is not matched by a drop with no id.
+	context.head_dropped_ids = {0};
+	miss.id                  = 0;
+	CHECK(Of(miss, context) == MissClass::WrongSpec);
+
+	SupervisorStats stats;
+	stats.first_predict_ns = FIRST_PREDICT;
+	stats.finished_ns      = FINISHED;
+	stats.predictions      = {{PROGRAM, PredictionOutcome::Predicted, 2}};
+	stats.dropped          = {{.hash      = PROGRAM,
+	                           .rank      = 1,
+	                           .reason    = ProgressDropReason::PushStartHead,
+	                           .module_id = MODULE_ID}};
+	const auto from_stats  = MakeMissContext(stats, {});
+	CHECK(from_stats.head_dropped_ids.contains(MODULE_ID) && from_stats.dropped_hashes.empty());
+	const auto head_miss = MissRow {.code_hash = PROGRAM, .id = MODULE_ID, .at_ns = FINISHED + 1};
+	const auto other_miss =
+	    MissRow {.code_hash = PROGRAM, .id = MODULE_ID + 1, .at_ns = FINISHED + 1};
+	CHECK(ClassifyMiss(head_miss, from_stats) == MissClass::HeadDropped);
+	CHECK(ClassifyMiss(other_miss, from_stats) == MissClass::WrongSpec);
+	// Through the report, the class is listed by its name.
+	GenerationRowInputs rows;
+	rows.misses = {head_miss};
+	Report::ShaderStoreGenerationReport block;
+	FillMissReport(block.misses, SummarizeMisses(rows.misses, from_stats, {}));
+	size_t counted = 0;
+	for (const auto& row: block.misses.classes) {
+		counted += row.name == "head_dropped" ? row.count : 0;
+	}
+	CHECK(counted == 1 && block.misses.classes.size() == MISS_CLASS_COUNT);
+}
+
 // A Duplicate refusal that came after the miss means the runtime built the module first, so it is
 // not_yet_generated. The baseline is the same refusal before the miss, which is a real drop, and
 // a refusal with no time stays a drop. Nothing else in the rows could give not_yet_generated here,
@@ -731,6 +780,7 @@ int main() {
 	TestPrecedence();
 	TestSummary();
 	TestContextFromStats();
+	TestHeadDropped();
 	TestModuleRows();
 	TestModuleOrderFields();
 	TestSlowTakes();

@@ -245,6 +245,9 @@ struct GenerationDrop {
 	uint64_t    hash = 0;
 	uint64_t    rank = 0;
 	std::string reason;
+	/// The id the runtime computes for the dropped module, given for a head drop only. It joins the
+	/// drop to the runtime miss of that module.
+	std::optional<uint64_t> module_id;
 };
 
 /// What a worker's `prediction` line said about a program.

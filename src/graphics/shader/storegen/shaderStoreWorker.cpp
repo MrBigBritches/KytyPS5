@@ -187,6 +187,9 @@ struct BuiltCandidate {
 	std::optional<DropReason> drop;
 	std::vector<uint8_t>      record;
 	uint32_t                  actual_push = 0;
+	// The id the runtime computes for the module as it really compiled, set for a push start
+	// mismatch only.
+	uint64_t module_id = 0;
 };
 
 // Translates a candidate the way the runtime would, compiles it with its specialization and encodes
@@ -212,7 +215,11 @@ BuiltCandidate BuildCandidate(const PredictedProgram& program, const Candidate& 
 	const auto info   = std::move(result.program).TakeCompiledInfo();
 	const auto push   = info.bindings.push_data_start_dword;
 	if (push != candidate.push_start) {
-		return {DropReason::PushStartMismatch, {}, push};
+		// The runtime's id carries the real start, so this is the id a miss on the candidate has.
+		const auto actual_id =
+		    ShaderModuleId(ShaderType::Compute, scanned.code_hash, program.key.user_data_count,
+		                   program.key.state, push, candidate.specialization, {});
+		return {DropReason::PushStartMismatch, {}, push, actual_id};
 	}
 	const auto id =
 	    ShaderModuleId(ShaderType::Compute, scanned.code_hash, program.key.user_data_count,
@@ -323,6 +330,8 @@ private:
 	bool BuildOne(uint64_t rank, const RankedCandidate& entry, const HostValues& host);
 	bool Drop(uint64_t rank, const PredictedProgram& program, const BuiltCandidate& built,
 	          const Candidate& candidate);
+	bool DropHead(uint64_t rank, const PredictedProgram& program, const BuiltCandidate& built,
+	              const Candidate& candidate);
 	bool DropOversizeRecord(uint64_t rank, const PredictedProgram& program,
 	                        const Candidate& candidate);
 	void Summarize(int code);
@@ -460,6 +469,26 @@ bool Worker::DropOversizeRecord(uint64_t rank, const PredictedProgram& program,
 	return m_progress.Line(fmt::format("drop {} {:016x} frame_too_large", rank, hash));
 }
 
+// Whether a candidate is the head of a program that has others besides it. A program with one
+// candidate has nothing else to keep, so its head is dropped with the program as before.
+bool IsHeadOfSeveral(const PredictedProgram& program, uint32_t candidate_index) {
+	return program.candidates.size() >= 2 && HeadIndex(program.candidates) == candidate_index;
+}
+
+// Drops the head of a program whose push start was wrong, and nothing else of the program. The
+// program is not added to m_dropped, so its base and partials are still built. Returns false when
+// the log could not be written.
+bool Worker::DropHead(uint64_t rank, const PredictedProgram& program, const BuiltCandidate& built,
+                      const Candidate& candidate) {
+	const auto hash = program.scanned->code_hash;
+	m_result.push_start_mismatches++;
+	m_result.drops.push_back({hash, rank, DropReason::HeadPushStartMismatch, candidate.push_start,
+	                          built.actual_push, built.module_id});
+	return m_progress.Line(
+	    fmt::format("drop {} {:016x} push_start_head predicted={} actual={} id={:016x}", rank, hash,
+	                candidate.push_start, built.actual_push, built.module_id));
+}
+
 // Builds one candidate and appends its record. Returns false when the output or the log could not
 // be written.
 bool Worker::BuildOne(uint64_t rank, const RankedCandidate& entry, const HostValues& host) {
@@ -483,6 +512,10 @@ bool Worker::BuildOne(uint64_t rank, const RankedCandidate& entry, const HostVal
 	}
 	if (built.drop) {
 		m_result.candidates_dropped++;
+		if (*built.drop == DropReason::PushStartMismatch &&
+		    IsHeadOfSeveral(program, entry.candidate)) {
+			return DropHead(rank, program, built, candidate);
+		}
 		return Drop(rank, program, built, candidate);
 	}
 	const auto framed = FrameStoreRecord(built.record);

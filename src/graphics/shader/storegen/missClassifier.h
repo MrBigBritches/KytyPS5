@@ -47,6 +47,10 @@ enum class MissClass : uint8_t {
 	RejectedUnclassified,
 	RejectedUnreadable,
 	RejectedProblems,
+	/// The worker dropped this exact module, the head of its program, because its push start was
+	/// wrong. It comes before ProgramDropped and after the rejections, since it names one module
+	/// and not the program, and the program's other candidates were built.
+	HeadDropped,
 	/// The worker gave up on the program after a push start or resource count check.
 	ProgramDropped,
 	/// A worker crashed or hung on the program, so the supervisor kept it out of later runs.
@@ -80,6 +84,7 @@ constexpr size_t MISS_CLASS_COUNT = static_cast<size_t>(MissClass::Unscanned) + 
 		case MissClass::RejectedUnclassified: return "rejected_unclassified";
 		case MissClass::RejectedUnreadable: return "rejected_unreadable";
 		case MissClass::RejectedProblems: return "rejected_problems";
+		case MissClass::HeadDropped: return "head_dropped";
 		case MissClass::ProgramDropped: return "program_dropped";
 		case MissClass::ProgramFailed: return "program_failed";
 		case MissClass::GenerationIncomplete: return "generation_incomplete";
@@ -109,6 +114,9 @@ struct MissContext {
 	std::unordered_map<uint64_t, int64_t>        refused_ns_by_id;
 	std::unordered_map<uint64_t, PredictionFact> prediction_by_hash;
 	std::unordered_set<uint64_t>                 dropped_hashes;
+	/// The ids of heads the worker dropped for a wrong push start, which are the ids the runtime
+	/// computes for them.
+	std::unordered_set<uint64_t> head_dropped_ids;
 	/// Programs that a worker crashed or hung on, whether in prediction (skipped) or in a build
 	/// (failed).
 	std::unordered_set<uint64_t> failed_hashes;
@@ -153,6 +161,9 @@ struct MissContext {
 			case PredictionOutcome::Unreadable: return MissClass::RejectedUnreadable;
 			default: return MissClass::RejectedProblems;
 		}
+	}
+	if (miss.id != 0 && context.head_dropped_ids.contains(miss.id)) {
+		return MissClass::HeadDropped;
 	}
 	if (context.dropped_hashes.contains(miss.code_hash)) {
 		return MissClass::ProgramDropped;

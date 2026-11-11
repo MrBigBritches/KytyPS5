@@ -138,6 +138,9 @@ struct SupervisorDrop {
 	uint64_t           hash   = 0;
 	uint64_t           rank   = 0;
 	ProgressDropReason reason = ProgressDropReason::PushStart;
+	/// PushStartHead only, the id the runtime computes for the dropped head. 0 when the line had
+	/// none.
+	uint64_t module_id = 0;
 };
 
 /// What a program's prediction came to, from its latest `prediction` line.

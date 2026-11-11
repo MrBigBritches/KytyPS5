@@ -50,6 +50,12 @@ enum class DropReason : uint8_t {
 	/// Only this candidate is dropped, since the size belongs to one module and not to its
 	/// program, so a supervisor leaves this drop's hash out of the failed hashes.
 	FrameTooLarge,
+	/// The push data start was wrong on the head of a program with 2 or more candidates. Only the
+	/// head is dropped, so the base and the partials are still built, and a supervisor leaves this
+	/// drop's hash out of the failed hashes. The all-null is the candidate where specialization can
+	/// make buffers non-live, and the head is built first, so losing the whole program would lose
+	/// the base that the old order always built.
+	HeadPushStartMismatch,
 };
 
 /// One program the worker stopped generating, and the evidence.
@@ -60,6 +66,9 @@ struct WorkerDrop {
 	/// PushStartMismatch only, the start the predictor assumed and the start the module has.
 	uint32_t predicted_push = 0;
 	uint32_t actual_push    = 0;
+	/// HeadPushStartMismatch only, the id the runtime computes for the candidate, which uses the
+	/// start the module has. A runtime miss with this id is the dropped head.
+	uint64_t module_id = 0;
 };
 
 /// What a worker run did. The supervisor in another process reads the same figures from the last
@@ -151,7 +160,8 @@ struct WorkerHooks {
 /// <hash> ...`. A supervisor that restarts the worker adds the hash of each `drop` line to the
 /// request's failed_hashes, so the restart does not build the program again. The exception is a
 /// `frame_too_large` drop, which drops one candidate only and leaves the program's others to be
-/// built.
+/// built. So is a `push_start_head` drop, which is a wrong push start on the head of a program with
+/// 2 or more candidates. It ends with `id=<hex>`, the id the runtime would compute.
 /// The last line of the log is `summary` with the counts, whenever the log was opened.
 ///
 /// The recompiler can end the process through EXIT, so a caller that must survive that runs this

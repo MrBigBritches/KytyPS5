@@ -80,6 +80,7 @@ struct GenerationCounts {
 		case ProgressDropReason::PushStart: return "push_start";
 		case ProgressDropReason::ResourceCount: return "resource_count";
 		case ProgressDropReason::FrameTooLarge: return "frame_too_large";
+		case ProgressDropReason::PushStartHead: return "push_start_head";
 	}
 	return "";
 }
@@ -171,8 +172,12 @@ MakeSupervisorReport(const SupervisorStats& stats) {
 		block.peak_source = PeakSourceName(stats.peak_memory->source);
 	}
 	for (const auto& drop: stats.dropped) {
-		block.dropped.push_back(
-		    {.hash = drop.hash, .rank = drop.rank, .reason = DropReasonName(drop.reason)});
+		Common::FirstRunReport::GenerationDrop row {
+		    .hash = drop.hash, .rank = drop.rank, .reason = DropReasonName(drop.reason)};
+		if (drop.reason == ProgressDropReason::PushStartHead) {
+			row.module_id = drop.module_id;
+		}
+		block.dropped.push_back(std::move(row));
 	}
 	block.failed_hashes = stats.failed_hashes;
 	block.skip_hashes   = stats.skip_hashes;
@@ -238,7 +243,12 @@ struct GenerationRowInputs {
 		context.prediction_by_hash[row.hash] = {row.outcome, row.candidates};
 	}
 	for (const auto& drop: stats.dropped) {
-		context.dropped_hashes.insert(drop.hash);
+		// A head drop belongs to one module, so it must not make the whole program look dropped.
+		if (drop.reason == ProgressDropReason::PushStartHead) {
+			context.head_dropped_ids.insert(drop.module_id);
+		} else {
+			context.dropped_hashes.insert(drop.hash);
+		}
 	}
 	// A program that crashed in prediction is in skip_hashes and one that crashed in a build is in
 	// failed_hashes, and neither was served.

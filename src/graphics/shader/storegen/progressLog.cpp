@@ -55,10 +55,19 @@ std::optional<std::string_view> ValueOf(std::string_view word, std::string_view 
 	return word.substr(name.size() + 1);
 }
 
+// The push start fields of a drop line, which are the words from the fifth on.
+bool ParsePushFields(const std::vector<std::string_view>& words, ProgressLine& line) {
+	const auto predicted = ValueOf(words[4], "predicted");
+	const auto actual    = ValueOf(words[5], "actual");
+	return predicted && actual && ParseNumber(*predicted, line.predicted_push) &&
+	       ParseNumber(*actual, line.actual_push);
+}
+
 std::optional<ProgressLine> ParseDrop(const std::vector<std::string_view>& words) {
-	// drop <rank> <hash> <reason> [predicted=<n> actual=<n>]
-	constexpr size_t MIN_WORDS  = 4;
-	constexpr size_t PUSH_WORDS = 6;
+	// drop <rank> <hash> <reason> [predicted=<n> actual=<n> [id=<hex>, head only]]
+	constexpr size_t MIN_WORDS     = 4;
+	constexpr size_t PUSH_WORDS    = 6;
+	constexpr size_t PUSH_ID_WORDS = 7;
 	if (words.size() < MIN_WORDS) {
 		return std::nullopt;
 	}
@@ -76,14 +85,20 @@ std::optional<ProgressLine> ParseDrop(const std::vector<std::string_view>& words
 		line.reason = ProgressDropReason::FrameTooLarge;
 		return line;
 	}
-	if (reason == "push_start" && words.size() == PUSH_WORDS) {
-		const auto predicted = ValueOf(words[4], "predicted");
-		const auto actual    = ValueOf(words[5], "actual");
-		if (predicted && actual && ParseNumber(*predicted, line.predicted_push) &&
-		    ParseNumber(*actual, line.actual_push)) {
-			line.reason = ProgressDropReason::PushStart;
-			return line;
+	if (reason == "push_start" && words.size() == PUSH_WORDS && ParsePushFields(words, line)) {
+		line.reason = ProgressDropReason::PushStart;
+		return line;
+	}
+	// The head's id is required, since the worker always writes it and a miss cannot be classified
+	// without it.
+	if (reason == "push_start_head" && words.size() == PUSH_ID_WORDS &&
+	    ParsePushFields(words, line)) {
+		const auto id = ValueOf(words[PUSH_WORDS], "id");
+		if (!id || !ParseHash(*id, line.module_id)) {
+			return std::nullopt;
 		}
+		line.reason = ProgressDropReason::PushStartHead;
+		return line;
 	}
 	return std::nullopt;
 }
