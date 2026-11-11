@@ -2669,6 +2669,28 @@ void CheckSpirvProfileSingleCompareRecordGuardBytes() {
   std::printf("[host]    %-32s ok\n", name);
 }
 
+// --single-compare-record-guard reaches the device profile, and nothing else in the profile moves
+// with it. The baseline is the same device loaded without the option, so a profile field that is
+// always set, or one set from another option, cannot satisfy the check.
+void CheckSpirvProfileSingleCompareRecordGuardOption() {
+  constexpr const char *name = "SpirvProfileSingleCompareRecordGuardOption";
+  GraphicContext graphics;
+  graphics.maintenance8_enabled = true;
+  Config::Load({.printf_direction = Config::LogDirection::Silent});
+  const auto off = SpirvProfile(graphics);
+  Config::Load({.single_compare_record_guard = true,
+                .printf_direction = Config::LogDirection::Silent});
+  const auto on = SpirvProfile(graphics);
+  Config::Load({.printf_direction = Config::LogDirection::Silent});
+  auto on_without_flag = on;
+  on_without_flag.single_compare_record_guard = false;
+  Require(name, "option", !off.single_compare_record_guard && on.single_compare_record_guard,
+          "the option did not turn the profile flag on, or it was on without the option");
+  Require(name, "option", ProfileBytes(on_without_flag) == ProfileBytes(off),
+          "the option changed another profile field");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 struct BdaMapping {
   uint64_t guest_base = 0;
   u32 backing_offset = 0;
@@ -70781,6 +70803,7 @@ int main(int argc, char **argv) {
   CheckNativeFloatMinMaxConfig();
   CheckSpirvProfileNativeFloatMinMax();
   CheckSpirvProfileSingleCompareRecordGuardBytes();
+  CheckSpirvProfileSingleCompareRecordGuardOption();
   if (argc == 2 && std::strcmp(argv[1], "--native-float-minmax-only") == 0) {
     return 0;
   }

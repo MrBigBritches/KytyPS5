@@ -185,6 +185,10 @@ bool SelectGuardedLoadsEnabled() {
 	return g_config->select_guarded_loads;
 }
 
+bool SingleCompareRecordGuardEnabled() {
+	return g_config->single_compare_record_guard;
+}
+
 bool StructuredJumpTablesEnabled() {
 	return g_config->structured_jump_tables;
 }

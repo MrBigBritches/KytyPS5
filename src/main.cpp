@@ -68,6 +68,8 @@ static void PrintUsage() {
 	::printf("  --shader-cache                       Keep compiled shaders and pipelines between boots.\n");
 	::printf("  --select-guarded-loads               Select bounds-checked shader loads instead of\n"
 	         "                                       branching around them (experimental).\n");
+	::printf("  --single-compare-record-guard        Range check formatted buffer records with one\n"
+	         "                                       compare, which builds faster (experimental).\n");
 	::printf("  --structured-jump-tables             Compile shader jump tables as structured control\n"
 	         "                                       flow, which builds faster (experimental).\n");
 	::printf("  --tessellation                      Draw tessellation patches; skipped by default.\n");
@@ -252,6 +254,7 @@ static constexpr Flag FLAGS[] = {
     {"--shader-validation", &ConfigOptions::shader_validation_enabled},
     {"--shader-cache", &ConfigOptions::shader_cache_enabled},
     {"--select-guarded-loads", &ConfigOptions::select_guarded_loads},
+    {"--single-compare-record-guard", &ConfigOptions::single_compare_record_guard},
     {"--structured-jump-tables", &ConfigOptions::structured_jump_tables},
     {"--tessellation", &ConfigOptions::tessellation_enabled},
     {"--occlusion-queries", &ConfigOptions::occlusion_queries_enabled},

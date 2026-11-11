@@ -894,6 +894,8 @@ if(BUILD_TESTING)
 	set_tests_properties(emulator_present_mode_invalid PROPERTIES WILL_FAIL TRUE)
 	add_test(NAME emulator_select_guarded_loads_cli
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --select-guarded-loads)
+	add_test(NAME emulator_single_compare_record_guard_cli
+	         COMMAND $<TARGET_FILE:kyty_emulator> --help --single-compare-record-guard)
 	add_test(NAME emulator_structured_jump_tables_cli
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --structured-jump-tables)
 	add_test(NAME emulator_audio_compile_hold_cli
