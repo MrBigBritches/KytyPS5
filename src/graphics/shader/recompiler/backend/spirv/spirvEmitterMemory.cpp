@@ -516,8 +516,7 @@ uint32_t LoadSubword(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo
 }
 
 Prospero::BufferFormat BufferFormat(const ValueEmitContext& ctx, const IR::MemoryInfo& mem) {
-	return mem.typed ? Format::DecodeTBufferFormat(mem.data_format, mem.number_format)
-	                 : StorageBufferFormat(ctx.state, mem);
+	return FormattedRecordFormat(ctx.state, mem);
 }
 
 IR::MemoryInfo RebaseRawComponent(IR::MemoryInfo mem, uint32_t component) {
@@ -787,9 +786,19 @@ PreparedFormattedMemory PrepareFormattedRecordSingleCompare(ValueEmitContext& ct
 	plan.info     = info;
 	plan.resource = resource;
 	const auto shift = static_cast<uint32_t>(std::countr_zero(resource.element_bits / 8u));
-	const auto guest = BufferByteAddress(ctx, inst, mem);
-	const auto limit = EmitFormattedRecordLimit(state, resource.byte_offset, info.byte_size - 1u,
-	                                            shift, resource.length);
+	const auto guest     = BufferByteAddress(ctx, inst, mem);
+	const auto last_byte = info.byte_size - 1u;
+	// A constant slot reads the limit the entry block worked out. A slot picked by a GPU value is
+	// not known there, so its limit is worked out here.
+	auto limit = resource.non_uniform
+	                 ? 0u
+	                 : FindFormattedRecordLimit(
+	                       state, state.program.info.buffers.at(mem.resource).descriptor_index,
+	                       shift, last_byte);
+	if (limit == 0u) {
+		limit = EmitFormattedRecordLimit(state, resource.byte_offset, last_byte, shift,
+		                                 resource.length);
+	}
 	plan.in_bounds = BufferIndexInBounds(
 	    ctx, inst, mem, resource, Binary(state, spv::OpULessThan, TypeBool(state), guest, limit));
 	// A record that fits cannot wrap when the prefix is added, so ByteAddress's wrap select is not

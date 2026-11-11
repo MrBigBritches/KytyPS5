@@ -3013,6 +3013,27 @@ size_t SpirvOpcodeCount(const std::vector<u32> &spirv, spv::Op opcode) {
   return count;
 }
 
+// How many instructions with the given opcode the first block of a SPIR-V module's entry point
+// holds, which is where the emitter works out values once per invocation.
+size_t SpirvEntryBlockOpcodeCount(const std::vector<u32> &spirv, spv::Op opcode) {
+  u32 entry = 0;
+  bool in_entry = false, in_block = false;
+  size_t count = 0;
+  for (size_t offset = 5; offset < spirv.size(); offset += spirv[offset] >> 16u) {
+    const auto op = static_cast<spv::Op>(spirv[offset] & 0xffffu);
+    if (op == spv::OpEntryPoint) entry = spirv[offset + 2];
+    if (op == spv::OpFunction) in_entry = spirv[offset + 2] == entry;
+    if (in_entry && op == spv::OpLabel) {
+      if (in_block) return count; // The second block starts.
+      in_block = true;
+    }
+    if (in_block && op == opcode) count++;
+    if (in_block && (op == spv::OpBranch || op == spv::OpBranchConditional ||
+                     op == spv::OpSwitch || op == spv::OpReturn)) return count;
+  }
+  return count;
+}
+
 void CheckSpirvEmission(const TestCase &test, const std::vector<u32> &spirv) {
   std::vector<u32> result_types(spirv[3]);
   for (size_t offset = 5; offset < spirv.size();) {
@@ -47959,6 +47980,158 @@ TestCase FormattedRecordGuard(u32 wave_size, bool select, bool store, bool guard
   return test;
 }
 
+// Names one wave, strategy and flag variant of a record guard test family. TestCase keeps a plain
+// string pointer, so each family passes its own static table, which is filled on first use and
+// outlives every test.
+const char *RecordGuardVariantName(std::array<std::string, 8> &table, const char *family,
+                                   u32 wave_size, bool select, bool guard) {
+  constexpr u32 wave64_bit = 1u, guard_bit = 2u, select_bit = 4u;
+  if (table[0].empty()) {
+    for (u32 index = 0; index < table.size(); ++index)
+      table[index] = std::string(family) + ((index & select_bit) != 0u ? "Select" : "Branch") +
+                     ((index & guard_bit) != 0u ? "On" : "Off") +
+                     ((index & wave64_bit) != 0u ? "Wave64" : "Wave32");
+  }
+  return table[(select ? select_bit : 0u) | (guard ? guard_bit : 0u) |
+               (wave_size == 64u ? wave64_bit : 0u)]
+      .c_str();
+}
+
+// Sets the wave size, the strategy and the flag of a record guard variant. A branched load merges
+// its value through a phi and a selected one has none, so each strategy proves it ran.
+void SetRecordGuardVariant(TestCase &test, u32 wave_size, bool select, bool guard) {
+  (select ? test.forbidden_spirv : test.required_spirv).push_back("OpPhi");
+  test.compute_info.threads_num[0] = wave_size;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = wave_size;
+  test.has_compute_info = true;
+  test.profile = select ? (guard ? &SelectSingleCompareRecordGuardProfile : &SelectGuardedLoadsProfile)
+                        : (guard ? &SingleCompareRecordGuardProfile : &Maintenance8Profile);
+}
+
+// One typed load of FormattedRecordGuardShiftKey, with the bits its x component keeps.
+struct ShiftKeyLoad {
+  Prospero::BufferFormat format;
+  u32 mask;
+  u32 guest;
+  bool fits;
+};
+
+// One buffer slot read through typed 4 byte records whose element shift differs, k8_8_8_8 as
+// bytes, k16_16 as shorts and k32 as dwords, while the slot's descriptor holds a float4 format.
+// The checked view of 66 bytes is 2 past a dword, so byte and short elements view all 66 bytes and
+// a record behind the 12 byte prefix fits below guest 66 - 12 - 3 = 51, while dword elements view
+// only 64 bytes and it fits below 49. A hoisted limit keyed without the shift would hand one
+// limit to all three, and whichever won, a byte or short load at 50 or a dword load at 49 or 50
+// would come out wrong. Each fitting load reads the dword holding its aligned start.
+TestCase FormattedRecordGuardShiftKey(u32 wave_size, bool select, bool guard) {
+  using O = ShaderOpcode;
+  using F = Prospero::BufferFormat;
+  constexpr u32 prefix = 12u, view_bytes = 66u, descriptor_stride = 16u;
+  constexpr u32 binding_offset = 256u, binding_bytes = 256u, output_bytes = 256u;
+  constexpr u32 backing_dwords = (binding_offset + binding_bytes) / 4u;
+  constexpr u32 canary = 0xc0de0000u, untouched = 0x0badf00du;
+  constexpr u32 address_vgpr = 20u, load_format_x = 0x00u, byte_mask = 0xffu, short_mask = 0xffffu;
+  constexpr u32 output_descriptor = 48u, raw_records = 1u << 20u, raw_mode = 3u << 28u;
+  constexpr std::array<ShiftKeyLoad, 7> loads{{{F::k8_8_8_8UInt, byte_mask, 50u, true},
+                                               {F::k8_8_8_8UInt, byte_mask, 51u, false},
+                                               {F::k16_16UInt, short_mask, 50u, true},
+                                               {F::k16_16UInt, short_mask, 51u, false},
+                                               {F::k32UInt, UINT32_MAX, 48u, true},
+                                               {F::k32UInt, UINT32_MAX, 49u, false},
+                                               {F::k32UInt, UINT32_MAX, 50u, false}}};
+  static std::array<std::string, 8> names;
+  TestCase test;
+  test.name = RecordGuardVariantName(names, "FormattedRecordGuardShiftKey", wave_size, select, guard);
+  for (u32 i = 0; i < backing_dwords; ++i)
+    test.initial.push_back(i < binding_offset / 4u ? untouched : canary + i);
+  test.expected = test.initial;
+  for (u32 load = 0; load < loads.size(); ++load) {
+    const auto [format, mask, guest, fits] = loads[load];
+    const u32 aligned_dword = (binding_offset + ((prefix + guest) & ~3u)) / 4u;
+    test.expected[load] = fits ? test.initial[aligned_dword] & mask : 0u;
+    AppendVMovLiteral(&test.code, address_vgpr, guest);
+    AppendTBufferLoadFormatOpcode(&test.code, load_format_x, load, address_vgpr, format);
+  }
+  for (u32 load = 0; load < loads.size(); ++load) AppendStoreVgpr(&test.code, load, load);
+  AppendEnd(&test.code);
+  test.user_data = MakeStructuredStorageBufferData(
+      descriptor_stride, binding_bytes / descriptor_stride, false, BufferFormat(F::k32_32_32_32Float));
+  test.user_data[output_descriptor + 2u] = raw_records;
+  test.user_data[output_descriptor + 3u] = raw_mode;
+  test.has_user_data = true;
+  test.storage_buffer_offsets = {prefix};
+  test.storage_buffer_ranges = {{binding_offset, binding_bytes}, {0u, output_bytes}};
+  // Both bindings are checked against this view, which the result dwords also fit inside.
+  test.storage_buffer_shader_size_bytes = view_bytes;
+  test.opcodes = {O::V_MOV_B32, O::TBUFFER_LOAD_FORMAT_X, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  SetRecordGuardVariant(test, wave_size, select, guard);
+  return test;
+}
+
+// One buffer slot of FormattedRecordGuardTwoSlots: its descriptor base, host prefix, where it is
+// bound in the backing buffer and the bytes it views.
+struct RecordGuardSlot {
+  u32 base;
+  u32 prefix;
+  u32 binding_offset;
+  u32 view_bytes;
+};
+
+// Two buffer slots with different prefixes and views in one shader, each read with a float4 record
+// that exactly fits and one a byte further. Their limits differ (108 - 12 - 15 = 81 and
+// 68 - 4 - 15 = 49), so a hoisted limit handed to the wrong slot would either refuse the first
+// slot's fitting record or admit the second slot's record one over. The record one over aligns
+// down onto the fitting one, so a wrongly admitted load reads real data, even though each view
+// ends at its bound range.
+TestCase FormattedRecordGuardTwoSlots(u32 wave_size, bool select, bool guard) {
+  using O = ShaderOpcode;
+  constexpr u32 record_bytes = 16u, components = 4u, load_format_xyzw = 0x03u;
+  constexpr u32 untouched_bytes = 256u, backing_dwords = 192u, output_bytes = 256u;
+  constexpr u32 canary = 0xc0de0000u, untouched = 0x0badf00du, address_vgpr = 20u;
+  constexpr u32 descriptor_dwords = 4u, records = 16u;
+  constexpr u32 output_descriptor = 48u, raw_records = 1u << 20u, raw_mode = 3u << 28u;
+  constexpr std::array<RecordGuardSlot, 2> slots{{{0x1000u, 12u, 256u, 108u},
+                                                  {0x2000u, 4u, 512u, 68u}}};
+  static std::array<std::string, 8> names;
+  TestCase test;
+  test.name = RecordGuardVariantName(names, "FormattedRecordGuardTwoSlots", wave_size, select, guard);
+  for (u32 i = 0; i < backing_dwords; ++i)
+    test.initial.push_back(i < untouched_bytes / 4u ? untouched : canary + i);
+  test.expected = test.initial;
+  u32 dst = 0;
+  for (u32 slot = 0; slot < slots.size(); ++slot) {
+    const auto [base, prefix, binding_offset, view_bytes] = slots[slot];
+    auto descriptor = MakeStructuredStorageBufferData(
+        record_bytes, records, false, BufferFormat(Prospero::BufferFormat::k32_32_32_32Float));
+    descriptor[0] = base;
+    std::copy_n(descriptor.begin(), descriptor_dwords, test.user_data.begin() + slot * descriptor_dwords);
+    test.storage_buffer_offsets.push_back(prefix);
+    test.storage_buffer_ranges.emplace_back(binding_offset, view_bytes);
+    // The guest address whose record ends on the last byte of the view, then one byte further.
+    const u32 exact = view_bytes - prefix - record_bytes;
+    for (const u32 guest : {exact, exact + 1u}) {
+      const u32 record_dword = (binding_offset + prefix + exact) / 4u;
+      for (u32 c = 0; c < components; ++c)
+        test.expected[dst + c] = guest == exact ? test.initial[record_dword + c] : 0u;
+      AppendVMovLiteral(&test.code, address_vgpr, guest);
+      test.code.push_back(EncodeMubuf0(load_format_xyzw));
+      test.code.push_back(EncodeMubuf1(dst, slot, address_vgpr));
+      dst += components;
+    }
+  }
+  for (u32 i = 0; i < dst; ++i) AppendStoreVgpr(&test.code, i, i);
+  AppendEnd(&test.code);
+  test.has_user_data = true;
+  test.user_data[output_descriptor + 2u] = raw_records;
+  test.user_data[output_descriptor + 3u] = raw_mode;
+  test.storage_buffer_ranges.emplace_back(0u, output_bytes);
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_FORMAT_XYZW, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  SetRecordGuardVariant(test, wave_size, select, guard);
+  return test;
+}
+
 TestCase BufferFormatStoreVariants() {
   using O = ShaderOpcode;
 
@@ -54661,6 +54834,19 @@ void CheckBoundedRecordBufferAccess(VulkanHarness &vulkan,
                                "indirect_buffer_format_geometry"};
       } else if (count == 6u) test.required_spirv = {"OpSwitch"};
       auto compiled = CompileCase(test, vulkan.SubgroupSize());
+      if (profile.single_compare_record_guard && count == 6u) {
+        // The five non-empty candidate rows are constant slots of their own, so the entry block
+        // must hold a hoisted record limit for each. A candidate the hoist misses still gets the
+        // right answer by working its limit out per access, so only the SPIR-V shows the miss.
+        constexpr size_t hoisted_candidates = 5u;
+        auto chain_test = test;
+        chain_test.profile = &Maintenance8Profile;
+        const auto chain = CompileCase(chain_test, vulkan.SubgroupSize());
+        Require(test.name, "hoisted candidate limits",
+                SpirvEntryBlockOpcodeCount(compiled.spirv, spv::OpUGreaterThan) >=
+                    SpirvEntryBlockOpcodeCount(chain.spirv, spv::OpUGreaterThan) + hoisted_candidates,
+                "the entry block lacks a record limit for each formatted candidate");
+      }
       Require(test.name, "mixed native aliases", count != 6u ||
                   (compiled.program.info.buffer_u8 && compiled.program.info.buffer_u16),
               "mixed candidates lost an 8-bit or 16-bit native binding");
@@ -60116,6 +60302,12 @@ std::vector<TestCase> MakeCases() {
         for (const bool guard : {false, true})
           for (const u32 wave : {32u, 64u})
             cases.push_back(FormattedRecordGuard(wave, select, store, guard, view));
+  for (const bool select : {false, true})
+    for (const bool guard : {false, true})
+      for (const u32 wave : {32u, 64u}) {
+        cases.push_back(FormattedRecordGuardShiftKey(wave, select, guard));
+        cases.push_back(FormattedRecordGuardTwoSlots(wave, select, guard));
+      }
   AddCase(TBufferLoadVariants);
   AddCase([] { return TBufferCapturedZeroStrideOob(); });
   AddCase([] { return TBufferCapturedZeroStrideOob(true); });

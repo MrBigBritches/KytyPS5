@@ -1,5 +1,8 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 
+#include <bit>
+#include <set>
+
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
 uint32_t EmitPushDataLoad(EmitterState& state, uint32_t index) {
@@ -130,6 +133,75 @@ Prospero::BufferFormat StorageBufferFormat(const EmitterState& state, const IR::
 	return state.program.info.buffers[mem.resource].descriptor_format;
 }
 
+Prospero::BufferFormat FormattedRecordFormat(const EmitterState& state, const IR::MemoryInfo& mem) {
+	return mem.typed ? Format::DecodeTBufferFormat(mem.data_format, mem.number_format)
+	                 : StorageBufferFormat(state, mem);
+}
+
+uint32_t FindFormattedRecordLimit(const EmitterState& state, uint32_t slot, uint32_t shift,
+                                  uint32_t last_byte) {
+	const auto found = state.formatted_record_limits.find({slot, shift, last_byte});
+	return found == state.formatted_record_limits.end() ? 0u : found->second;
+}
+
+namespace {
+
+using RecordLimitKey = std::array<uint32_t, 3>;
+
+// Notes the limit key of one buffer resource a formatted access may resolve to. A slot whose
+// offset is only known per access has no entry block values, so it is left to the access.
+void CollectRecordLimitKey(const EmitterState& state, IR::MemoryInfo memory, uint32_t resource,
+                           std::set<RecordLimitKey>& keys) {
+	const auto& buffers = state.program.info.buffers;
+	if (resource >= buffers.size()) return;
+	const auto slot = buffers[resource].descriptor_index;
+	if (slot >= state.memory_byte_sizes.size() || state.memory_byte_sizes[slot] == 0u) return;
+	memory.resource = resource;
+	const auto info = Format::GetFormatInfo(FormattedRecordFormat(state, memory));
+	if (info.type == Format::ComponentType::Unknown) return;
+	const auto shift = static_cast<uint32_t>(
+	    std::countr_zero(IR::StorageBufferElementBits(state.program, memory) / 8u));
+	keys.insert({slot, shift, info.byte_size - 1u});
+}
+
+// Every limit key a formatted buffer access in the program may look up, for its own resource and
+// for each candidate an indirect descriptor can select.
+std::set<RecordLimitKey> CollectRecordLimitKeys(const EmitterState& state) {
+	std::set<RecordLimitKey> keys;
+	for (const auto* block: state.program.blocks) {
+		for (const auto& inst: *block) {
+			if (IR::BufferAccessOf(inst.GetOpcode()) == IR::BufferAccess::None) continue;
+			const auto& memory = state.program.memory_info.at(inst.Flags<IR::MemoryFlags>().index);
+			if (memory.kind != IR::ResourceKind::Buffer || !memory.formatted) continue;
+			CollectRecordLimitKey(state, memory, memory.resource, keys);
+			if (memory.resource >= state.program.info.buffers.size()) continue;
+			for (const auto child: state.program.info.buffers[memory.resource].indirect_resources) {
+				CollectRecordLimitKey(state, memory, child, keys);
+			}
+		}
+	}
+	return keys;
+}
+
+// Emits in the entry block the record limit each constant slot's formatted accesses will check,
+// so the uniform arithmetic runs once per slot and not once per access. A key no access asks
+// for only adds unused entry block values, and an access that finds no key computes its own.
+void EmitFormattedRecordLimits(EmitterState& state) {
+	state.formatted_record_limits.clear();
+	if (!state.profile.single_compare_record_guard) return;
+	for (const auto& key: CollectRecordLimitKeys(state)) {
+		const auto [slot, shift, last_byte] = key;
+		const auto bytes         = state.memory_byte_sizes[slot];
+		const auto element_count = shift == 0u ? bytes
+		                                       : Binary(state, spv::OpShiftRightLogical,
+		                                                TypeU32(state), bytes, ConstantU32(state, shift));
+		state.formatted_record_limits[key] = EmitFormattedRecordLimit(
+		    state, state.memory_byte_offsets[slot], last_byte, shift, element_count);
+	}
+}
+
+} // namespace
+
 uint32_t SharedIndirectBufferResource(const EmitterState& state, uint32_t resource) {
 	const auto& buffers = state.program.info.buffers;
 	const auto& root = buffers[resource];
@@ -180,6 +252,7 @@ void EmitMemoryBindings(EmitterState& state) {
 			    EmitShaderDataDwordLoad(state, state.program.bindings.MemorySizeDword() + i + lane);
 		}
 	}
+	EmitFormattedRecordLimits(state);
 }
 
 // Stages without a workgroup emulate LDS with one private array per invocation. A GPU keeps

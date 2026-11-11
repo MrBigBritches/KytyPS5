@@ -12197,16 +12197,19 @@ void TestNewShaderRecompilerFormattedLoadSelectsWhenOptedIn() {
 // The single compare record guard checks a formatted record with one compare of the guest address
 // against a limit. It replaces ByteAddress's wrap select and the end >= start check, which are an
 // OpUGreaterThanEqual each, and the last element compare against the length. So with the flag on,
-// each formatted access has two fewer OpUGreaterThanEqual, one more OpUGreaterThan (whether the
-// view reaches past the prefix and last byte) and as many OpULessThan (the guest against the limit
-// in place of the last element against the length). The shaders hold only formatted accesses, so
-// no raw access adds compares of its own, and each pair of binaries comes from one shader and
-// differs only in the flag. A gate that dropped the bounds check altogether would also lose the
-// OpUGreaterThanEqual, which the OpUGreaterThan and OpULessThan counts rule out.
+// each formatted access has two fewer OpUGreaterThanEqual and as many OpULessThan (the guest
+// against the limit in place of the last element against the length). The limit's own
+// OpUGreaterThan (whether the view reaches past the prefix and last byte) is emitted once per
+// constant slot and record size in the entry block, so both shaders, with one access or two on
+// the same slot and format, gain exactly one. The shaders hold only formatted accesses, so no raw
+// access adds compares of its own, and each pair of binaries comes from one shader and differs
+// only in the flag. A gate that dropped the bounds check altogether would also lose the
+// OpUGreaterThanEqual, which the OpUGreaterThan and OpULessThan counts rule out, and a limit
+// worked out per access would give the two access shader two OpUGreaterThan.
 void TestNewShaderRecompilerFormattedRecordGuardSingleCompare() {
   constexpr uint32_t load_format_xyzw = 0x03u, store_format_xyzw = 0x07u, s_endpgm = 0x01u;
   constexpr uint32_t record_vgpr = 96u, load_address_vgpr = 1u, store_address_vgpr = 2u;
-  constexpr uint32_t float4_stride = 16u, dropped_per_access = 2u;
+  constexpr uint32_t float4_stride = 16u, dropped_per_access = 2u, hoisted_limits = 1u;
   const std::vector<uint32_t> load_and_store = {
       EncodeMubuf0(load_format_xyzw, 0), EncodeMubuf1(record_vgpr, 0, load_address_vgpr),
       EncodeMubuf0(store_format_xyzw, 0), EncodeMubuf1(record_vgpr, 0, store_address_vgpr),
@@ -12233,8 +12236,8 @@ void TestNewShaderRecompilerFormattedRecordGuardSingleCompare() {
       Check(count(off, spv::OpUGreaterThanEqual) ==
                 count(on, spv::OpUGreaterThanEqual) + dropped_per_access * accesses,
             "the record guard did not drop the wrap select and end check of each formatted access");
-      Check(count(on, spv::OpUGreaterThan) == count(off, spv::OpUGreaterThan) + accesses,
-            "the record guard did not compute one limit per formatted access");
+      Check(count(on, spv::OpUGreaterThan) == count(off, spv::OpUGreaterThan) + hoisted_limits,
+            "the record guard did not compute one limit per constant slot and record size");
       Check(count(on, spv::OpULessThan) == count(off, spv::OpULessThan),
             "the record guard did not replace the last element compare with one compare");
     }

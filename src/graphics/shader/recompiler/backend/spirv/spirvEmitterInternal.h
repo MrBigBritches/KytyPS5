@@ -113,6 +113,9 @@ struct EmitterState {
 	std::array<BufferDefinition, 4>                  storage_buffers {};
 	std::vector<uint32_t>                           memory_byte_offsets;
 	std::vector<uint32_t>                           memory_byte_sizes;
+	// The formatted record limit of each constant buffer slot, emitted once in the entry block and
+	// keyed by {descriptor slot, element shift, last byte offset of the record}.
+	std::map<std::array<uint32_t, 3>, uint32_t>     formatted_record_limits;
 	uint32_t                                         bda_pagetable_variable  = 0;
 	uint32_t                                         fault_buffer_variable   = 0;
 	uint32_t                                         bda_pointer_function    = 0;
@@ -397,6 +400,14 @@ uint32_t EmitPushDataLoad(EmitterState& state, uint32_t index);
 uint32_t StorageBufferPackedStride(const EmitterState& state, const IR::MemoryInfo& mem);
 
 Prospero::BufferFormat StorageBufferFormat(const EmitterState& state, const IR::MemoryInfo& mem);
+
+// The format a formatted buffer access decodes, from the instruction for a typed access and from
+// the descriptor otherwise. The access and the hoisted record limits both use it, so they agree.
+Prospero::BufferFormat FormattedRecordFormat(const EmitterState& state, const IR::MemoryInfo& mem);
+
+// The hoisted formatted record limit of a constant slot, or zero when the entry block holds none.
+uint32_t FindFormattedRecordLimit(const EmitterState& state, uint32_t slot, uint32_t shift,
+                                  uint32_t last_byte);
 
 uint32_t SharedIndirectBufferResource(const EmitterState& state, uint32_t resource);
 
