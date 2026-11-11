@@ -10776,6 +10776,853 @@ void TestExecSelectForwardsAcrossBlocks() {
   ValidateProgram(f.program);
 }
 
+// Fixture for the demand elision pass. The program is a compute shader, every select is observed
+// through a masked buffer store, and every condition is a distinct opaque compare.
+struct ElideFixture : ExecSelectFixture {
+  ShaderRecompiler::IR::Value resource;
+
+  ElideFixture() {
+    using namespace ShaderRecompiler::IR;
+    program.stage = ShaderType::Compute;
+    // Every buffer access uses memory info 0, which ValidateProgram needs to see as a buffer.
+    program.memory_info.push_back({.kind = ResourceKind::Buffer});
+    resource = emit->Emit(ValueOpcode::GetBufferResource,
+                          {Value(0u), Value(0u), Value(0u), Value(0u)});
+  }
+
+  // Appends a masked 32-bit buffer store to the given block. The offset is operand 1 and the data
+  // is operand 4.
+  ShaderRecompiler::IR::Inst *StoreIn(ShaderRecompiler::IR::Block *block,
+                                      ShaderRecompiler::IR::Value offset,
+                                      ShaderRecompiler::IR::Value data,
+                                      ShaderRecompiler::IR::Value mask) {
+    using namespace ShaderRecompiler::IR;
+    return &block->AppendNewInst(
+        ValueOpcode::StoreBufferU32,
+        {resource, offset, Value(0u), Value(0u), data, mask});
+  }
+  ShaderRecompiler::IR::Inst *Store(ShaderRecompiler::IR::Value data,
+                                    ShaderRecompiler::IR::Value mask) {
+    return StoreIn(entry, ShaderRecompiler::IR::Value(0u), data, mask);
+  }
+  // Gives the join block a real predecessor edge so ValidateProgram accepts the program.
+  void Connect() {
+    entry->terminator.kind = ShaderRecompiler::CFG::TerminatorKind::Branch;
+    entry->terminator.true_block = join;
+    entry->AddBranch(join);
+  }
+};
+
+constexpr size_t StoreOffsetOperand = 1;
+constexpr size_t StoreDataOperand = 4;
+
+// E1 a select observed only under a mask inside its condition is elided. A mask that merely
+// contains the condition as an Or operand, or a second unmasked observer, keeps it.
+void TestExecElideStoreData() {
+  using namespace ShaderRecompiler::IR;
+  enum class Variant { AndMask, OrMask, AlsoUnmasked };
+  const auto run = [](Variant variant) {
+    ElideFixture f;
+    const auto k = f.Condition(), w = f.Condition();
+    const auto new_value = f.Data(), old_value = f.Data();
+    auto *select = f.Select(k, new_value, old_value);
+    const Value mask = variant == Variant::OrMask ? Value(f.Or(k, w)) : Value(f.And(k, w));
+    auto *store = f.Store(Value(select), mask);
+    auto *unmasked = variant == Variant::AlsoUnmasked
+                         ? f.Store(Value(select), Value(true))
+                         : nullptr;
+    const auto stats = ElideUnobservedSelects(f.program);
+    if (variant == Variant::AndMask) {
+      Check(stats.elided == 1u && store->Arg(StoreDataOperand) == new_value,
+            "a select under a covering mask was not elided");
+    } else {
+      Check(stats.elided == 0u && store->Arg(StoreDataOperand) == Value(select),
+            variant == Variant::OrMask
+                ? "a select under an Or mask was elided"
+                : "a select with an unmasked observer was elided");
+      Check(unmasked == nullptr || unmasked->Arg(StoreDataOperand) == Value(select),
+            "the unmasked store lost its select");
+    }
+  };
+  run(Variant::AndMask);
+  run(Variant::OrMask);
+  run(Variant::AlsoUnmasked);
+}
+
+// E2 a select whose condition is itself an And is elided when the mask descends from that And.
+// The mask that shares only one operand of it does not cover it.
+void TestExecElideAndCondition() {
+  using namespace ShaderRecompiler::IR;
+  const auto run = [](bool covers) {
+    ElideFixture f;
+    const auto c = f.Condition(), k = f.Condition(), w = f.Condition();
+    const auto new_value = f.Data(), old_value = f.Data();
+    const auto condition = f.And(c, k);
+    auto *select = f.Select(condition, new_value, old_value);
+    auto *store = f.Store(Value(select), covers ? Value(f.And(condition, w))
+                                                 : Value(f.And(c, w)));
+    const auto stats = ElideUnobservedSelects(f.program);
+    Check(covers ? (stats.elided == 1u && store->Arg(StoreDataOperand) == new_value)
+                 : (stats.elided == 0u && store->Arg(StoreDataOperand) == Value(select)),
+          covers ? "an And condition under its own mask was not elided"
+                 : "an And condition under a partly covering mask was elided");
+  };
+  run(true);
+  run(false);
+}
+
+// E3 every lane-crossing consumer keeps the select. A pure consumer of the same shape does not.
+void TestExecElideLaneCrossingKeepsSelect() {
+  using namespace ShaderRecompiler::IR;
+  const auto run = [](ValueOpcode consumer) {
+    ElideFixture f;
+    const auto k = f.Condition(), w = f.Condition();
+    const auto new_value = f.Data(), old_value = f.Data();
+    auto *select = f.Select(k, new_value, old_value);
+    const Value s(select);
+    Value result;
+    switch (consumer) {
+    case ValueOpcode::WriteLane:
+      result = f.emit->Emit(consumer, {s, Value(1u), Value(2u)});
+      break;
+    case ValueOpcode::ReadLane:
+    case ValueOpcode::IAdd32:
+      result = f.emit->Emit(consumer, {s, Value(1u)});
+      break;
+    case ValueOpcode::SubgroupUMinU32:
+      result = f.emit->Emit(consumer, {s});
+      break;
+    case ValueOpcode::ReadFirstLane:
+    case ValueOpcode::DppMoveU32:
+      result = f.emit->Emit(consumer, {s, Value(true)});
+      break;
+    default:
+      result = f.emit->Emit(consumer, {s, Value(1u), Value(true)});
+      break;
+    }
+    auto *store = f.Store(result, f.And(k, w));
+    const auto stats = ElideUnobservedSelects(f.program);
+    const bool pure = consumer == ValueOpcode::IAdd32;
+    Check(pure ? stats.elided == 1u : stats.elided == 0u,
+          pure ? "a select behind a pure consumer was not elided"
+               : "a select behind a lane-crossing consumer was elided");
+    Check(store->Arg(StoreDataOperand) == result, "the consumer was rewritten");
+  };
+  for (const auto consumer :
+       {ValueOpcode::IAdd32, ValueOpcode::ReadFirstLane, ValueOpcode::ReadLane,
+        ValueOpcode::WriteLane, ValueOpcode::SubgroupUMinU32,
+        ValueOpcode::PermuteU32, ValueOpcode::BpermuteU32,
+        ValueOpcode::SwizzleU32, ValueOpcode::DppMoveU32}) {
+    run(consumer);
+  }
+}
+
+// E4 an address operand is observed in every lane (M1). The same select as data is elided. A
+// load address keeps it too.
+void TestExecElideAddressKeepsSelect() {
+  using namespace ShaderRecompiler::IR;
+  enum class Use { Data, StoreOffset, LoadOffset };
+  const auto run = [](Use use) {
+    ElideFixture f;
+    const auto k = f.Condition(), w = f.Condition();
+    const auto new_value = f.Data(), old_value = f.Data();
+    auto *select = f.Select(k, new_value, old_value);
+    const Value mask = f.And(k, w);
+    Inst *store = nullptr;
+    if (use == Use::Data) {
+      store = f.Store(Value(select), mask);
+    } else if (use == Use::StoreOffset) {
+      store = f.StoreIn(f.entry, Value(select), f.Data(), mask);
+    } else {
+      const auto load = f.emit->Emit(ValueOpcode::LoadBufferU32,
+                                     {f.resource, Value(select), Value(0u),
+                                      Value(0u), mask});
+      store = f.Store(load, mask);
+    }
+    const auto stats = ElideUnobservedSelects(f.program);
+    Check(use == Use::Data ? stats.elided == 1u : stats.elided == 0u,
+          use == Use::Data ? "the data baseline was not elided"
+                           : "a select used as an address was elided");
+    if (use == Use::StoreOffset) {
+      Check(store->Arg(StoreOffsetOperand) == Value(select),
+            "the store offset was rewritten");
+    }
+  };
+  run(Use::Data);
+  run(Use::StoreOffset);
+  run(Use::LoadOffset);
+}
+
+// Builds a loop of header (the join block) with a self edge and an exit. The phi merges an initial
+// value with the select, which reads the phi back. The mask and the select condition are each built
+// either before the loop or in the header, where they can differ between iterations.
+struct LoopCase {
+  bool mask_in_header = false;
+  bool phi_cycle = false;
+  bool condition_in_header = false;
+};
+
+void RunExecElideLoop(const LoopCase &loop_case, bool expect_elided,
+                      const char *message) {
+  using namespace ShaderRecompiler::IR;
+  ElideFixture f;
+  f.program.block_storage.push_back(std::make_unique<Block>());
+  f.program.blocks.push_back(f.program.block_storage.back().get());
+  Block *exit_block = f.program.blocks.back();
+  exit_block->id = 2;
+  f.entry->AddBranch(f.join);
+  f.join->AddBranch(f.join);
+  f.join->AddBranch(exit_block);
+  const auto new_value = f.Data(), init = f.Data(), init2 = f.Data();
+  auto &phi = f.join->AppendNewInst(ValueOpcode::Phi);
+  phi.SetFlags(Type::U32);
+  Value false_arm(&phi);
+  Inst *other = nullptr;
+  if (loop_case.phi_cycle) {
+    other = &f.join->AppendNewInst(ValueOpcode::Phi);
+    other->SetFlags(Type::U32);
+    false_arm = Value(other);
+  }
+  IREmitter header_emit(f.join);
+  IREmitter &mask_emit = loop_case.mask_in_header ? header_emit : *f.emit;
+  const U1 c = loop_case.condition_in_header
+                   ? U1(header_emit.INotEqual(
+                         header_emit.GetUserData(
+                             static_cast<ScalarReg>(f.next_register++)),
+                         U32(Value(0u))))
+                   : f.Condition();
+  const auto w = U1(mask_emit.INotEqual(
+      mask_emit.GetUserData(static_cast<ScalarReg>(f.next_register++)),
+      U32(Value(0u))));
+  const auto mask = mask_emit.LogicalAnd(c, w);
+  auto *select = &f.join->AppendNewInst(ValueOpcode::SelectU32,
+                                        {c, new_value, false_arm});
+  phi.AddPhiOperand(f.entry, init);
+  phi.AddPhiOperand(f.join, Value(select));
+  if (other != nullptr) {
+    other->AddPhiOperand(f.entry, init2);
+    other->AddPhiOperand(f.join, Value(&phi));
+  }
+  f.StoreIn(f.join, Value(0u), Value(&phi), mask);
+  const auto stats = ElideUnobservedSelects(f.program);
+  Check(expect_elided ? (stats.elided == 1u && phi.Arg(1) == new_value)
+                      : (stats.elided == 0u && phi.Arg(1) == Value(select)),
+        message);
+}
+
+// E5 loop-carried select under the strict phi rule. A mask built before the loop reaches the
+// select. A mask built in the loop header does not, because the header does not strictly dominate
+// itself. When only the mask is in the header this is conservative, since the fixed condition keeps
+// the answer right either way.
+// The last case is the hazard. The condition c(i) and the mask are both built in the header, so a
+// lane active in iteration i+1 can have been inactive in iteration i and then reads the old phi value
+// through Select(c(i), new, phi). Eliding the select to new would be wrong for that lane, and the
+// V0 phi rule did so.
+void TestExecElideLoopCarriedPhi() {
+  RunExecElideLoop({true, false, true}, false,
+                   "a select whose condition and mask both vary per iteration was elided");
+  RunExecElideLoop({true, false, false}, false,
+                   "the strict phi rule did not apply to a loop-variant mask");
+  RunExecElideLoop({false, false, false}, true,
+                   "a loop-invariant mask did not elide the loop-carried select");
+}
+
+// E6 a mask defined in a block that strictly dominates the phi block is kept through a diamond.
+// The same mask built in the join block itself is not.
+void TestExecElideDiamondPhi() {
+  using namespace ShaderRecompiler::IR;
+  const auto run = [](bool mask_in_join) {
+    ElideFixture f;
+    for (uint32_t id = 2; id < 4; ++id) {
+      f.program.block_storage.push_back(std::make_unique<Block>());
+      f.program.blocks.push_back(f.program.block_storage.back().get());
+      f.program.blocks.back()->id = id;
+    }
+    auto *left = f.program.blocks[2];
+    auto *right = f.program.blocks[3];
+    f.entry->AddBranch(left);
+    f.entry->AddBranch(right);
+    left->AddBranch(f.join);
+    right->AddBranch(f.join);
+    const auto c = f.Condition();
+    const auto new_value = f.Data(), old_value = f.Data(), other = f.Data();
+    auto *select = &left->AppendNewInst(ValueOpcode::SelectU32,
+                                        {c, new_value, old_value});
+    auto &phi = f.join->AppendNewInst(ValueOpcode::Phi);
+    phi.SetFlags(Type::U32);
+    phi.AddPhiOperand(left, Value(select));
+    phi.AddPhiOperand(right, other);
+    IREmitter join_emit(f.join);
+    IREmitter &mask_emit = mask_in_join ? join_emit : *f.emit;
+    const auto w = U1(mask_emit.INotEqual(
+        mask_emit.GetUserData(static_cast<ScalarReg>(f.next_register++)),
+        U32(Value(0u))));
+    const auto mask = mask_emit.LogicalAnd(c, w);
+    f.StoreIn(f.join, Value(0u), Value(&phi), mask);
+    const auto stats = ElideUnobservedSelects(f.program);
+    Check(mask_in_join ? (stats.elided == 0u && phi.Arg(0) == Value(select))
+                       : (stats.elided == 1u && phi.Arg(0) == new_value),
+          mask_in_join ? "a mask built in the phi block was kept through the phi"
+                       : "a dominating mask was not kept through the phi");
+  };
+  run(false);
+  run(true);
+}
+
+// E7 a branch condition is observed in every lane. ConditionRef is lane-crossing. A pure
+// consumer of the same select elides it.
+void TestExecElideBranchConditionKeepsSelect() {
+  using namespace ShaderRecompiler::IR;
+  enum class Use { Pure, Branch, ConditionRef };
+  const auto run = [](Use use) {
+    ElideFixture f;
+    const auto k = f.Condition(), w = f.Condition();
+    const auto new_flag = f.Condition(), old_flag = f.Condition();
+    const auto a = f.Data(), b = f.Data();
+    auto *select = f.emit->Emit(ValueOpcode::SelectU1, {k, new_flag, old_flag})
+                       .TryInstruction();
+    const Value flag(select);
+    if (use == Use::Branch) f.entry->condition = flag;
+    Value consumer = flag;
+    if (use == Use::Pure) consumer = f.emit->LogicalNot(U1(flag));
+    if (use == Use::ConditionRef)
+      consumer = f.emit->Emit(ValueOpcode::ConditionRef, {flag});
+    f.Store(f.emit->Emit(ValueOpcode::SelectU32, {consumer, a, b}), f.And(k, w));
+    const auto stats = ElideUnobservedSelects(f.program);
+    Check(use == Use::Pure ? stats.elided == 1u : stats.elided == 0u,
+          use == Use::Pure ? "the pure baseline was not elided"
+                           : "a branch condition or ConditionRef select was elided");
+  };
+  run(Use::Pure);
+  run(Use::Branch);
+  run(Use::ConditionRef);
+}
+
+// E8 masks from two observers join to the smaller mask that covers both, or to everything.
+void TestExecElideJoinOfMasks() {
+  using namespace ShaderRecompiler::IR;
+  enum class Shape { Unrelated, SelectOnLarger, SelectOnSmaller };
+  const auto run = [](Shape shape) {
+    ElideFixture f;
+    const auto wide_mask = f.Condition(), w = f.Condition();
+    const auto new_value = f.Data(), old_value = f.Data();
+    const auto other = f.Condition();
+    const auto narrow_mask = f.And(wide_mask, w);
+    const U1 second = shape == Shape::Unrelated ? other : narrow_mask;
+    const U1 condition = shape == Shape::SelectOnSmaller ? narrow_mask : wide_mask;
+    auto *select = f.Select(condition, new_value, old_value);
+    f.Store(Value(select), wide_mask);
+    f.Store(Value(select), second);
+    const auto stats = ElideUnobservedSelects(f.program);
+    // The union of the observers is the larger mask, which covers a select on the larger mask only.
+    Check(shape == Shape::SelectOnLarger ? stats.elided == 1u : stats.elided == 0u,
+          shape == Shape::SelectOnLarger
+              ? "nested observers did not join to the larger mask"
+              : "observers whose union is not covered elided the select");
+  };
+  run(Shape::Unrelated);
+  run(Shape::SelectOnLarger);
+  run(Shape::SelectOnSmaller);
+}
+
+// E9 the true arm is observed only where the outer condition holds, the false arm wherever the
+// outer select is observed.
+void TestExecElideSelectArmRules() {
+  using namespace ShaderRecompiler::IR;
+  const auto run = [](bool inner_on_true_arm) {
+    ElideFixture f;
+    const auto c = f.Condition(), m = f.Condition();
+    const auto new_inner = f.Data(), old_inner = f.Data(), other = f.Data();
+    auto *inner = f.Select(c, new_inner, old_inner);
+    auto *outer = inner_on_true_arm ? f.Select(c, Value(inner), other)
+                                    : f.Select(c, other, Value(inner));
+    auto *store = f.Store(Value(outer), m);
+    const auto stats = ElideUnobservedSelects(f.program);
+    Check(inner_on_true_arm ? (stats.elided == 1u && outer->Arg(1) == new_inner)
+                            : (stats.elided == 0u && outer->Arg(2) == Value(inner)),
+          inner_on_true_arm
+              ? "the true arm was not narrowed by the outer condition"
+              : "the false arm was narrowed by the outer condition");
+    Check(store->Arg(StoreDataOperand) == Value(outer), "the outer select moved");
+  };
+  run(true);
+  run(false);
+}
+
+// E10 only compute shaders are changed.
+void TestExecElideComputeOnly() {
+  using namespace ShaderRecompiler::IR;
+  const auto run = [](ShaderType stage) {
+    ElideFixture f;
+    f.program.stage = stage;
+    const auto k = f.Condition(), w = f.Condition();
+    const auto new_value = f.Data(), old_value = f.Data();
+    auto *select = f.Select(k, new_value, old_value);
+    auto *store = f.Store(Value(select), f.And(k, w));
+    const auto stats = ElideUnobservedSelects(f.program);
+    Check(stage == ShaderType::Compute
+              ? (stats.elided == 1u && store->Arg(StoreDataOperand) == new_value)
+              : (stats.elided == 0u && stats.candidates == 0u &&
+                 store->Arg(StoreDataOperand) == Value(select)),
+          stage == ShaderType::Compute ? "the compute baseline was not elided"
+                                       : "a non-compute shader was changed");
+  };
+  run(ShaderType::Compute);
+  run(ShaderType::Pixel);
+  run(ShaderType::Vertex);
+}
+
+// E11 a mask that is an And chain of 32 levels over the condition covers it. 33 levels does not,
+// and the pass counts the query that hit the cap.
+void TestExecElideDepthCap() {
+  using namespace ShaderRecompiler::IR;
+  constexpr uint32_t cap = static_cast<uint32_t>(MaxMaskImplicationDepth);
+  const auto run = [](uint32_t levels) {
+    ElideFixture f;
+    const auto k = f.Condition();
+    const auto new_value = f.Data(), old_value = f.Data();
+    auto *select = f.Select(k, new_value, old_value);
+    auto mask = k;
+    for (uint32_t level = 0; level < levels; ++level)
+      mask = f.And(mask, f.Condition());
+    f.Store(Value(select), mask);
+    const auto stats = ElideUnobservedSelects(f.program);
+    Check(levels <= cap ? (stats.elided == 1u && stats.depth_cap_hits == 0u)
+                        : (stats.elided == 0u && stats.depth_cap_hits >= 1u),
+          levels <= cap ? "a mask within the cap did not cover the select"
+                        : "a mask beyond the cap covered the select");
+  };
+  run(cap);
+  run(cap + 1u);
+}
+
+// E12 a cycle of phis converges. The select is elided as in the loop without the cycle.
+void TestExecElidePhiCycle() {
+  RunExecElideLoop({false, false, false}, true,
+                   "the acyclic loop baseline was not elided");
+  RunExecElideLoop({false, true, false}, true,
+                   "a phi cycle did not converge to the elision");
+  RunExecElideLoop({true, true, false}, false,
+                   "a variant mask elided through a phi cycle");
+}
+
+// E13 every opcode is named by exactly one rule, and the classes of the important ones are right.
+void TestExecElideOpcodeClassification() {
+  using namespace ShaderRecompiler::IR;
+  for (size_t index = 0; index < static_cast<size_t>(ValueOpcode::Count); ++index) {
+    const auto opcode = static_cast<ValueOpcode>(index);
+    const std::string text = "opcode " + std::string(ValueOpcodeName(opcode)) +
+                             " is not named by exactly one rule";
+    Check(CountExecOpcodeRules(opcode) == 1u, text.c_str());
+  }
+  const auto is = [](ValueOpcode opcode, ExecOpClass expected) {
+    return ClassifyExecOpcode(opcode) == expected;
+  };
+  Check(is(ValueOpcode::ReadFirstLane, ExecOpClass::Lane) &&
+            is(ValueOpcode::ImageRead, ExecOpClass::Lane) &&
+            is(ValueOpcode::ConditionRef, ExecOpClass::Lane) &&
+            is(ValueOpcode::LoadBufferU32, ExecOpClass::Load) &&
+            is(ValueOpcode::StoreBufferU32, ExecOpClass::MemData) &&
+            is(ValueOpcode::BufferAtomicIAdd32, ExecOpClass::MemData) &&
+            is(ValueOpcode::SelectU1, ExecOpClass::Select) &&
+            is(ValueOpcode::LogicalAnd, ExecOpClass::And) &&
+            is(ValueOpcode::LogicalOr, ExecOpClass::Pure) &&
+            is(ValueOpcode::IAdd32, ExecOpClass::Pure) &&
+            is(ValueOpcode::Phi, ExecOpClass::Phi) &&
+            is(ValueOpcode::SetAttribute, ExecOpClass::Unlisted),
+        "an opcode was put in the wrong class");
+  // An opcode outside the table must be treated as observing every lane.
+  Check(is(ValueOpcode::Count, ExecOpClass::Unlisted),
+        "an unknown opcode was not Unlisted");
+}
+
+// E14 the replacement is the true operand, and the replaced select has no users left.
+void TestExecElideReplacementIsNewValue() {
+  using namespace ShaderRecompiler::IR;
+  ElideFixture f;
+  const auto k = f.Condition(), w = f.Condition();
+  const auto new_value = f.Data(), old_value = f.Data();
+  auto *select = f.Select(k, new_value, old_value);
+  auto *store = f.Store(Value(select), f.And(k, w));
+  const auto stats = ElideUnobservedSelects(f.program);
+  Check(stats.elided == 1u && store->Arg(StoreDataOperand) == new_value &&
+            !(store->Arg(StoreDataOperand) == old_value) && !select->HasUses(),
+        "the replacement was not the true operand");
+}
+
+// E15 a chain of three selects, each the true operand of the next, ends at the innermost true
+// operand.
+void TestExecElideReplacementChain() {
+  using namespace ShaderRecompiler::IR;
+  const auto run = [](bool covered) {
+    ElideFixture f;
+    f.Connect();
+    const auto k = f.Condition(), w = f.Condition();
+    const auto middle_old = f.Data();
+    const auto inner_new = f.Data(), inner_old = f.Data(), outer_old = f.Data();
+    auto *inner = f.Select(k, inner_new, inner_old);
+    auto *middle = f.Select(k, Value(inner), middle_old);
+    auto *outer = f.Select(k, Value(middle), outer_old);
+    auto *store = f.Store(Value(outer), covered ? Value(f.And(k, w))
+                                                : Value(f.Or(k, w)));
+    const auto stats = ElideUnobservedSelects(f.program);
+    if (covered) {
+      Check(stats.elided == 3u && store->Arg(StoreDataOperand) == inner_new,
+            "a replacement chain did not end at the innermost operand");
+    } else {
+      // Only the two inner selects go. They are observed solely where the outer condition holds.
+      Check(stats.elided == 2u && store->Arg(StoreDataOperand) == Value(outer) &&
+                outer->Arg(1) == inner_new,
+            "the uncovered chain baseline changed");
+    }
+    EliminateDeadCode(f.program.blocks);
+    ValidateProgram(f.program);
+  };
+  run(true);
+  run(false);
+}
+
+// E16 pins the shape of the And rule. It is not a soundness witness, because the unsound case is
+// unreachable in strict SSA (it needs a cycle of selects). A first operand is never justified by a sibling, and a
+// second operand is justified by the first.
+void TestExecElideAsymmetricAnd() {
+  using namespace ShaderRecompiler::IR;
+  enum class Shape { SiblingCoversFirst, MaskCoversFirst, FirstCoversSecond };
+  const auto run = [](Shape shape) {
+    ElideFixture f;
+    const auto cx = f.Condition(), z = f.Condition(), mask_extra = f.Condition();
+    const auto a = f.Data(), b = f.Data();
+    const auto new_flag = f.Condition(), old_flag = f.Condition();
+    Value first, second;
+    Inst *flag = nullptr;
+    if (shape == Shape::FirstCoversSecond) {
+      first = cx;
+      flag = f.emit->Emit(ValueOpcode::SelectU1, {cx, new_flag, old_flag})
+                 .TryInstruction();
+      second = Value(flag);
+    } else {
+      flag = f.emit->Emit(ValueOpcode::SelectU1, {cx, new_flag, old_flag})
+                 .TryInstruction();
+      first = Value(flag);
+      second = f.And(cx, z);
+    }
+    const auto both = f.And(U1(first), U1(second));
+    auto *select = f.Select(both, a, b);
+    const Value mask = shape == Shape::MaskCoversFirst
+                           ? Value(f.And(cx, mask_extra))
+                           : Value(mask_extra);
+    f.Store(Value(select), mask);
+    const auto stats = ElideUnobservedSelects(f.program);
+    const auto *both_inst = both.TryInstruction();
+    const bool first_replaced = !(both_inst->Arg(0) == first);
+    const bool second_replaced = !(both_inst->Arg(1) == second);
+    if (shape == Shape::SiblingCoversFirst) {
+      Check(!first_replaced && stats.elided == 0u,
+            "a first And operand was elided on the strength of its sibling");
+    } else if (shape == Shape::MaskCoversFirst) {
+      Check(first_replaced && both_inst->Arg(0) == new_flag,
+            "a first And operand was not elided under a mask that covers it");
+    } else {
+      Check(!first_replaced && second_replaced && both_inst->Arg(1) == new_flag,
+            "a second And operand was not elided under its first operand");
+    }
+  };
+  run(Shape::SiblingCoversFirst);
+  run(Shape::MaskCoversFirst);
+  run(Shape::FirstCoversSecond);
+}
+
+// E17 a load whose only user was an elided select dies, and the program stays valid.
+void TestExecElideDeadLoadStaysValid() {
+  using namespace ShaderRecompiler::IR;
+  const auto run = [](bool covered) {
+    ElideFixture f;
+    f.Connect();
+    const auto k = f.Condition(), w = f.Condition();
+    const auto new_value = f.Data();
+    const auto load =
+        f.emit->Emit(ValueOpcode::LoadBufferU32,
+                     {f.resource, Value(0u), Value(0u), Value(0u), Value(true)});
+    auto *select = f.Select(k, new_value, load);
+    auto *store = f.Store(Value(select), covered ? Value(f.And(k, w))
+                                                 : Value(f.Or(k, w)));
+    const auto stats = ElideUnobservedSelects(f.program);
+    EliminateDeadCode(f.program.blocks);
+    ValidateProgram(f.program);
+    size_t loads = 0;
+    for (const auto &inst : *f.entry)
+      loads += inst.GetOpcode() == ValueOpcode::LoadBufferU32 ? 1u : 0u;
+    Check(covered ? (stats.elided == 1u && loads == 0u &&
+                     store->Arg(StoreDataOperand) == new_value)
+                  : (stats.elided == 0u && loads == 1u),
+          covered ? "the dead load was not removed after elision"
+                  : "the load baseline lost its load");
+  };
+  run(true);
+  run(false);
+}
+
+// E18 which operands of a masked store or atomic are data. The select goes in every position of
+// every MemData opcode. It is elided only from the first data operand up to just before the
+// trailing mask. The expected first data position is spelled out here, per family.
+void TestExecElideMaskedOperandPositions() {
+  using namespace ShaderRecompiler::IR;
+  constexpr size_t AddressFamilyBegin = 3;
+  constexpr size_t BufferFamilyBegin = 4;
+  constexpr size_t SharedFamilyBegin = 1;
+  size_t opcodes_checked = 0;
+  for (size_t index = 0; index < static_cast<size_t>(ValueOpcode::Count);
+       ++index) {
+    const auto opcode = static_cast<ValueOpcode>(index);
+    if (ClassifyExecOpcode(opcode) != ExecOpClass::MemData) continue;
+    const std::string name(ValueOpcodeName(opcode));
+    size_t first_data = 0;
+    if (name.starts_with("StoreAddress")) {
+      first_data = AddressFamilyBegin;
+    } else if (name.starts_with("StoreBuffer") ||
+               name.starts_with("BufferAtomic")) {
+      first_data = BufferFamilyBegin;
+    } else if (name.starts_with("WriteShared") ||
+               name.starts_with("SharedAtomic")) {
+      first_data = SharedFamilyBegin;
+    }
+    const std::string unknown = "MemData opcode " + name + " has no family";
+    Check(first_data != 0u, unknown.c_str());
+    const size_t operands = NumArgsOf(opcode);
+    for (size_t position = 0; position < operands; ++position) {
+      ElideFixture f;
+      const auto k = f.Condition(), w = f.Condition();
+      const auto new_value = f.Data(), old_value = f.Data();
+      auto *select = f.Select(k, new_value, old_value);
+      const Value mask = f.And(k, w);
+      auto &inst = f.entry->Instructions().emplace_back(opcode);
+      inst.SetParent(f.entry);
+      for (size_t operand = 0; operand + 1 < operands; ++operand)
+        inst.SetArg(operand, operand == position ? Value(select) : Value(0u));
+      inst.SetArg(operands - 1, position + 1 == operands ? Value(select) : mask);
+      const auto stats = ElideUnobservedSelects(f.program);
+      const bool is_data = position >= first_data && position + 1 < operands;
+      const std::string text =
+          name + " operand " + std::to_string(position) +
+          (is_data ? " was not elided as data" : " was elided but is not data");
+      Check(is_data ? (stats.elided == 1u && inst.Arg(position) == new_value)
+                    : (stats.elided == 0u && inst.Arg(position) == Value(select)),
+            text.c_str());
+    }
+    ++opcodes_checked;
+  }
+  Check(opcodes_checked > 0u, "no MemData opcodes were checked");
+}
+
+// E19 a phi demand with a conjunct built in the phi block becomes All even when another conjunct
+// dominates. The select on the true arm of a join-block select adds the join-built condition as a
+// second conjunct. The same shape with that condition built in the entry block keeps the mask.
+void TestExecElidePhiWithTwoConjuncts() {
+  using namespace ShaderRecompiler::IR;
+  const auto run = [](bool condition_in_join) {
+    ElideFixture f;
+    for (uint32_t id = 2; id < 4; ++id) {
+      f.program.block_storage.push_back(std::make_unique<Block>());
+      f.program.blocks.push_back(f.program.block_storage.back().get());
+      f.program.blocks.back()->id = id;
+    }
+    auto *left = f.program.blocks[2];
+    auto *right = f.program.blocks[3];
+    f.entry->AddBranch(left);
+    f.entry->AddBranch(right);
+    left->AddBranch(f.join);
+    right->AddBranch(f.join);
+    const auto cl = f.Condition(), w = f.Condition();
+    const auto mask = f.And(cl, w);
+    const auto new_value = f.Data(), old_value = f.Data(), other = f.Data(),
+               other2 = f.Data();
+    auto *select = &left->AppendNewInst(ValueOpcode::SelectU32,
+                                        {cl, new_value, old_value});
+    auto &phi = f.join->AppendNewInst(ValueOpcode::Phi);
+    phi.SetFlags(Type::U32);
+    phi.AddPhiOperand(left, Value(select));
+    phi.AddPhiOperand(right, other);
+    IREmitter join_emit(f.join);
+    const U1 ct = condition_in_join
+                      ? U1(join_emit.INotEqual(
+                            join_emit.GetUserData(
+                                static_cast<ScalarReg>(f.next_register++)),
+                            U32(Value(0u))))
+                      : f.Condition();
+    auto *outer = &f.join->AppendNewInst(ValueOpcode::SelectU32,
+                                         {ct, Value(&phi), other2});
+    f.StoreIn(f.join, Value(0u), Value(outer), mask);
+    const auto stats = ElideUnobservedSelects(f.program);
+    Check(condition_in_join
+              ? (stats.elided == 0u && phi.Arg(0) == Value(select))
+              : (stats.elided == 1u && phi.Arg(0) == new_value),
+          condition_in_join
+              ? "a phi demand with a join-block conjunct kept the mask"
+              : "a phi demand with two dominating conjuncts lost the mask");
+  };
+  run(false);
+  run(true);
+}
+
+// E20 a demand with no room for another conjunct is kept as it is, and not widened to All. Four
+// nested true arms leave the innermost select with a full list when the fourth condition would be
+// added. It is still elided, because its own condition is already one of the conjuncts.
+void TestExecElideNarrowOverflow() {
+  using namespace ShaderRecompiler::IR;
+  const auto run = [](size_t arms) {
+    ElideFixture f;
+    const auto m = f.Condition();
+    const auto new_value = f.Data(), old_value = f.Data(), other = f.Data();
+    std::vector<ShaderRecompiler::IR::U1> conditions;
+    for (size_t index = 0; index < arms; ++index)
+      conditions.push_back(f.Condition());
+    auto *innermost = f.Select(conditions.front(), new_value, old_value);
+    Value inner(innermost);
+    Inst *last_arm = nullptr;
+    for (size_t index = arms; index-- > 0;) {
+      auto *arm = f.Select(conditions[index], inner, other);
+      if (last_arm == nullptr) last_arm = arm;
+      inner = Value(arm);
+    }
+    f.Store(inner, m);
+    const auto stats = ElideUnobservedSelects(f.program);
+    Check(stats.elided == 1u && last_arm->Arg(1) == new_value,
+          "the innermost select was not elided with a full conjunct list");
+    // The fourth nested arm cannot add its condition to a list of four, which is counted.
+    Check((stats.demand_truncations > 0u) == (arms >= 4u),
+          "the dropped conjunct was not counted exactly when the list overflowed");
+  };
+  run(3u);
+  run(4u);
+  run(5u);
+}
+
+// E21 a user outside the block list reads the value in every lane, so a select it uses is kept.
+void TestExecElideParentlessUserKeepsSelect() {
+  using namespace ShaderRecompiler::IR;
+  const auto run = [](bool outside_user) {
+    ElideFixture f;
+    const auto k = f.Condition(), w = f.Condition();
+    const auto new_value = f.Data(), old_value = f.Data();
+    auto *select = f.Select(k, new_value, old_value);
+    f.Store(Value(select), f.And(k, w));
+    if (outside_user) {
+      auto &retained = f.program.value_storage.emplace_back(ValueOpcode::IAdd32);
+      retained.SetArg(0, Value(select));
+      retained.SetArg(1, Value(1u));
+    }
+    const auto stats = ElideUnobservedSelects(f.program);
+    Check(outside_user ? stats.elided == 0u : stats.elided == 1u,
+          outside_user ? "a select read from outside the blocks was elided"
+                       : "the outside-user baseline was not elided");
+  };
+  run(false);
+  run(true);
+}
+
+// E22 an indirect branch target is observed in every lane.
+void TestExecElideIndirectTargetKeepsSelect() {
+  using namespace ShaderRecompiler::IR;
+  const auto run = [](bool as_target) {
+    ElideFixture f;
+    const auto k = f.Condition(), w = f.Condition();
+    const auto new_value = f.Data(), old_value = f.Data();
+    auto *select = f.Select(k, new_value, old_value);
+    f.Store(Value(select), f.And(k, w));
+    if (as_target) f.entry->indirect_target = Value(select);
+    const auto stats = ElideUnobservedSelects(f.program);
+    Check(as_target ? stats.elided == 0u : stats.elided == 1u,
+          as_target ? "an indirect target select was elided"
+                    : "the indirect target baseline was not elided");
+  };
+  run(false);
+  run(true);
+}
+
+// E23 the demand list limit is reachable. One user leaves the shared value with the demand
+// {a1, a2, a3, A} and another with {b1, b2, B}, where A implies b1 and b2 and B implies a1, a2 and
+// a3. Each side covers the other, so the join keeps a1, a2, a3, b1 and b2, which are five
+// unrelated conjuncts, and one must be dropped. With only the first user nothing is dropped.
+void TestExecElideJoinListLimit() {
+  using namespace ShaderRecompiler::IR;
+  const auto run = [](bool both_users) {
+    ElideFixture f;
+    const auto a1 = f.Condition(), a2 = f.Condition(), a3 = f.Condition();
+    const auto b1 = f.Condition(), b2 = f.Condition();
+    const auto big_a = f.And(b1, b2);
+    const auto big_b = f.And(f.And(a1, a2), a3);
+    const auto shared = f.Data();
+    const auto o1 = f.Data(), o2 = f.Data(), o3 = f.Data(), o4 = f.Data(),
+               o5 = f.Data();
+    auto *t3 = f.Select(big_a, Value(shared), o3);
+    auto *t2 = f.Select(a3, Value(t3), o2);
+    auto *t1 = f.Select(a2, Value(t2), o1);
+    f.Store(Value(t1), a1);
+    if (both_users) {
+      auto *u2 = f.Select(big_b, Value(shared), o5);
+      auto *u1 = f.Select(b2, Value(u2), o4);
+      f.Store(Value(u1), b1);
+    }
+    const auto stats = ElideUnobservedSelects(f.program);
+    Check(both_users ? stats.demand_truncations >= 1u
+                     : stats.demand_truncations == 0u,
+          both_users ? "a join of five unrelated conjuncts was not truncated"
+                     : "the single-user baseline reported a truncation");
+  };
+  run(false);
+  run(true);
+}
+
+// E24 narrowing by a mask that implies a conjunct replaces that conjunct. Six nested arms, each
+// condition an And over the previous one, keep a list of one. Without the replacement the list
+// would fill and overflow.
+void TestExecElideNarrowRemovesImpliedConjunct() {
+  using namespace ShaderRecompiler::IR;
+  constexpr size_t arms = 6;
+  const auto run = [](bool nested_conditions) {
+    ElideFixture f;
+    const auto m = f.Condition();
+    const auto new_value = f.Data(), old_value = f.Data(), other = f.Data();
+    std::vector<ShaderRecompiler::IR::U1> conditions;
+    auto previous = m;
+    for (size_t index = 0; index < arms; ++index) {
+      previous = nested_conditions ? f.And(previous, f.Condition())
+                                   : f.Condition();
+      conditions.push_back(previous);
+    }
+    auto *innermost = f.Select(m, new_value, old_value);
+    Value inner(innermost);
+    for (size_t index = arms; index-- > 0;)
+      inner = Value(f.Select(conditions[index], inner, other));
+    f.Store(inner, m);
+    const auto stats = ElideUnobservedSelects(f.program);
+    if (nested_conditions) {
+      Check(stats.demand_truncations == 0u && stats.elided == 1u,
+            "an implied conjunct was kept and the list overflowed");
+    } else {
+      Check(stats.demand_truncations > 0u,
+            "the unrelated-conditions baseline did not overflow");
+    }
+  };
+  run(true);
+  run(false);
+}
+
+// E25 a cycle of selects that each replace the other has no end, so neither is replaced.
+void TestExecElideReplacementCycleIsKept() {
+  using namespace ShaderRecompiler::IR;
+  ElideFixture f;
+  const auto k = f.Condition(), w = f.Condition();
+  const auto placeholder = f.Data(), old1 = f.Data(), old2 = f.Data();
+  auto *first = f.Select(k, placeholder, old1);
+  auto *second = f.Select(k, Value(first), old2);
+  first->SetArg(1, Value(second));
+  auto *store = f.Store(Value(first), f.And(k, w));
+  const auto stats = ElideUnobservedSelects(f.program);
+  Check(stats.elided == 0u && store->Arg(StoreDataOperand) == Value(first),
+        "a replacement cycle was replaced");
+}
+
 void TestLateConstantPropagation() {
   using namespace ShaderRecompiler::IR;
   for (const uint32_t wave_size : {32u, 64u}) {
@@ -15421,6 +16268,31 @@ int main() {
   TestExecSelectKeepsWiderInnerCondition();
   TestExecSelectForwardsEveryOpcode();
   TestExecSelectForwardsAcrossBlocks();
+  TestExecElideStoreData();
+  TestExecElideAndCondition();
+  TestExecElideLaneCrossingKeepsSelect();
+  TestExecElideAddressKeepsSelect();
+  TestExecElideLoopCarriedPhi();
+  TestExecElideDiamondPhi();
+  TestExecElideBranchConditionKeepsSelect();
+  TestExecElideJoinOfMasks();
+  TestExecElideSelectArmRules();
+  TestExecElideComputeOnly();
+  TestExecElideDepthCap();
+  TestExecElidePhiCycle();
+  TestExecElideOpcodeClassification();
+  TestExecElideReplacementIsNewValue();
+  TestExecElideReplacementChain();
+  TestExecElideAsymmetricAnd();
+  TestExecElideDeadLoadStaysValid();
+  TestExecElideMaskedOperandPositions();
+  TestExecElidePhiWithTwoConjuncts();
+  TestExecElideNarrowOverflow();
+  TestExecElideParentlessUserKeepsSelect();
+  TestExecElideIndirectTargetKeepsSelect();
+  TestExecElideJoinListLimit();
+  TestExecElideNarrowRemovesImpliedConjunct();
+  TestExecElideReplacementCycleIsKept();
   TestRepeatedBitcastPropagation();
   TestMaskedShiftConstantPropagation();
   TestU64ShiftConstantPropagation();
