@@ -11623,6 +11623,93 @@ void TestExecElideReplacementCycleIsKept() {
         "a replacement cycle was replaced");
 }
 
+// Program of one block holding the given number of instructions, as a given stage.
+void BuildSizedProgram(ShaderRecompiler::IR::Program &program, ShaderType stage,
+                       size_t instructions) {
+  using namespace ShaderRecompiler::IR;
+  program.stage = stage;
+  program.block_storage.push_back(std::make_unique<Block>());
+  program.blocks.push_back(program.block_storage.back().get());
+  for (size_t index = 0; index < instructions; ++index)
+    program.blocks.front()->AppendNewInst(ValueOpcode::UndefU32);
+}
+
+// The gate for the exec select passes. A compute program at the size limit runs them, one
+// instruction over does not, and a program that is not compute or not opted in never does. Each
+// case differs from the first in one thing only.
+void TestExecSelectGate() {
+  using namespace ShaderRecompiler::IR;
+  const auto gate = [](ShaderType stage, size_t instructions, bool opted_in) {
+    Program program;
+    BuildSizedProgram(program, stage, instructions);
+    return ClassifyExecSelectGate(program, opted_in);
+  };
+  constexpr size_t limit = 85000;
+  Check(MaxExecSelectInstructions == limit, "the instruction limit changed");
+  Check(gate(ShaderType::Compute, limit, true).gate == ExecSelectGate::Run &&
+            gate(ShaderType::Compute, limit, true).instructions == limit,
+        "a compute program at the limit did not run the passes with its count");
+  Check(gate(ShaderType::Compute, limit + 1u, true).gate == ExecSelectGate::TooLarge,
+        "a compute program over the limit ran the passes");
+  Check(gate(ShaderType::Pixel, 10u, true).gate == ExecSelectGate::NotCompute &&
+            gate(ShaderType::Pixel, 10u, true).instructions == 0u,
+        "a pixel program ran the passes, or was counted");
+  Check(gate(ShaderType::Compute, 10u, false).gate == ExecSelectGate::Off,
+        "a program that was not opted in ran the passes");
+  Check(gate(ShaderType::Compute, limit + 1u, false).gate == ExecSelectGate::Off &&
+            gate(ShaderType::Compute, limit + 1u, false).instructions == 0u,
+        "an oversized program that was not opted in was counted as too large");
+  Program program;
+  BuildSizedProgram(program, ShaderType::Compute, 3u);
+  Check(CountInstructions(program) == 3u, "the instruction count is wrong");
+}
+
+// A masked region compiled through CompileProgram, with and without the profile flag, for compute
+// and for pixel. v2 is a loaded value, then v_cmpx leaves the lanes below 8 active and adds 1 to it
+// twice, which a store under the same EXEC reads. In a compute shader the passes drop the select,
+// and without the flag it stays. A pixel shader with the flag on keeps it, so only the stage
+// differs from compute.
+size_t CountCompiledSelects(ShaderType stage, bool elide) {
+  constexpr uint32_t inline_1 = 129u, inline_8 = 136u;
+  constexpr uint32_t v_mov_b32 = 0x01u, v_add_nc_u32 = 0x25u, v_cmpx_gt_u32 = 0xd4u;
+  constexpr uint32_t store_dword = 0x1cu, vgpr_base = 256u;
+  constexpr uint32_t load_dword = 0x0cu, s_endpgm = 0x01u;
+  constexpr uint32_t mubuf = 0x38u << 26u, offen = 1u << 12u, opcode_shift = 18u;
+  // The lane limit comes from a loaded value, because a constant one would fold the mask away.
+  const uint32_t shader[] = {
+      mubuf | (load_dword << opcode_shift) | offen,
+      EncodeMubuf1(1, 0, 0), // buffer_load_dword v1, v0 offen
+      EncodeVop1(v_mov_b32, 2, vgpr_base + 1),
+      EncodeVopc(v_cmpx_gt_u32, inline_8, 1),
+      EncodeVop2(v_add_nc_u32, 2, inline_1, 1),
+      EncodeVop2(v_add_nc_u32, 2, inline_1, 2),
+      EncodeMubuf0(store_dword, 0, false),
+      EncodeMubuf1(2, 0, 0), // buffer_store_dword v2, v0 offen
+      EncodeSopp(s_endpgm),
+  };
+  ShaderRecompiler::Spirv::Profile profile;
+  profile.elide_exec_selects = elide;
+  auto options = MakeCompileOptions(stage);
+  options.profile = &profile;
+  auto result = RecompileForTest(shader, options);
+  CheckSpirvBinaryValidates(result.spirv);
+  size_t selects = 0;
+  for (const auto *block : result.program.blocks)
+    for (const auto &inst : *block)
+      selects += inst.GetOpcode() == ShaderRecompiler::IR::ValueOpcode::SelectU32 ? 1u : 0u;
+  return selects;
+}
+
+void TestExecSelectCompileProgram() {
+  const auto kept = CountCompiledSelects(ShaderType::Compute, false);
+  const auto elided = CountCompiledSelects(ShaderType::Compute, true);
+  Check(kept == 1u, "the masked region did not keep exactly one select without the flag");
+  Check(elided == 0u, "the passes did not drop the select on a compute shader with the flag on");
+  const auto pixel_kept = CountCompiledSelects(ShaderType::Pixel, false);
+  Check(pixel_kept == 1u && CountCompiledSelects(ShaderType::Pixel, true) == pixel_kept,
+        "the passes changed a pixel shader, or the pixel baseline has no select");
+}
+
 void TestLateConstantPropagation() {
   using namespace ShaderRecompiler::IR;
   for (const uint32_t wave_size : {32u, 64u}) {
@@ -16293,6 +16380,8 @@ int main() {
   TestExecElideJoinListLimit();
   TestExecElideNarrowRemovesImpliedConjunct();
   TestExecElideReplacementCycleIsKept();
+  TestExecSelectGate();
+  TestExecSelectCompileProgram();
   TestRepeatedBitcastPropagation();
   TestMaskedShiftConstantPropagation();
   TestU64ShiftConstantPropagation();

@@ -905,4 +905,20 @@ ExecSelectStats ElideUnobservedSelects(Program& program) {
 	return stats;
 }
 
+size_t CountInstructions(const Program& program) {
+	size_t count = 0;
+	for (const auto* block: program.blocks)
+		count += block->Instructions().size();
+	return count;
+}
+
+ExecSelectDecision ClassifyExecSelectGate(const Program& program, bool opted_in) {
+	if (!opted_in) return {ExecSelectGate::Off, 0};
+	if (program.stage != ShaderType::Compute) return {ExecSelectGate::NotCompute, 0};
+	const auto instructions = CountInstructions(program);
+	return {instructions > MaxExecSelectInstructions ? ExecSelectGate::TooLarge
+	                                                 : ExecSelectGate::Run,
+	        instructions};
+}
+
 } // namespace Libs::Graphics::ShaderRecompiler::IR

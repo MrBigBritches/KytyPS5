@@ -82,6 +82,8 @@ struct ConfigOptions {
 	bool                   select_guarded_loads        = false;
 	// Opts in to range checking formatted buffer records with one compare.
 	bool                   single_compare_record_guard = false;
+	// Opts in to eliding compute shader selects that no lane observes outside their mask.
+	bool                   elide_exec_selects          = false;
 	// Opts in to compiling S_SETPC_B64 jump tables as structured control flow.
 	bool                   structured_jump_tables      = false;
 	LogDirection           shader_log_direction        = LogDirection::Silent;
@@ -207,6 +209,8 @@ bool GraphicsDebugDumpEnabled();
 bool SelectGuardedLoadsEnabled();
 // True when formatted buffer records should be range checked with one compare.
 bool SingleCompareRecordGuardEnabled();
+// True when compute shader selects that no lane observes outside their mask should be elided.
+bool ElideExecSelectsEnabled();
 // True when jump tables should be compiled as structured control flow.
 bool StructuredJumpTablesEnabled();
 

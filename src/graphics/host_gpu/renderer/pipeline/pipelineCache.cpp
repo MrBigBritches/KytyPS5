@@ -315,7 +315,8 @@ ShaderRecompiler::Spirv::Profile SpirvProfile(const GraphicContext& graphics) {
 	        .r8_srgb_views          = graphics.r8_srgb_views,
 	        .r8g8_srgb_views        = graphics.r8g8_srgb_views,
 	        .select_guarded_loads   = Config::SelectGuardedLoadsEnabled(),
-	        .single_compare_record_guard = Config::SingleCompareRecordGuardEnabled()};
+	        .single_compare_record_guard = Config::SingleCompareRecordGuardEnabled(),
+	        .elide_exec_selects = Config::ElideExecSelectsEnabled()};
 }
 
 std::filesystem::path ShaderStorePath() {

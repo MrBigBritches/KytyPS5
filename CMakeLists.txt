@@ -896,6 +896,8 @@ if(BUILD_TESTING)
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --select-guarded-loads)
 	add_test(NAME emulator_single_compare_record_guard_cli
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --single-compare-record-guard)
+	add_test(NAME emulator_elide_exec_selects_cli
+	         COMMAND $<TARGET_FILE:kyty_emulator> --help --elide-exec-selects)
 	add_test(NAME emulator_structured_jump_tables_cli
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --structured-jump-tables)
 	add_test(NAME emulator_audio_compile_hold_cli
@@ -1079,6 +1081,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --mad-u16-only)
 	add_test(NAME shader_recompiler_mul_hi24
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --mul-hi24-only)
+	add_test(NAME shader_recompiler_elide_exec_selects
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --elide-exec-selects-only)
 	add_test(NAME shader_recompiler_alignbyte
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --alignbyte-only)
 	add_test(NAME graphics_pipeline_rasterization

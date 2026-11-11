@@ -11,6 +11,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
+#include "graphics/shader/recompiler/ir/passes/ExecSelectElision.h"
 #include "graphics/shader/recompiler/ir/passes/ReadLaneElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
@@ -909,6 +910,34 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 	return result;
 }
 
+// Runs the exec select passes when the profile opts in, for compute shaders under the size limit.
+// Forwarding runs first so that elision sees the shortened select chains, and dead code elimination
+// removes what both leave behind. The time and the counts are logged for every program they run
+// on, and a program that is too large is logged as skipped.
+static void RunExecSelectPasses(IR::Program& ir, bool opted_in, const char* stage) {
+	const auto decision = IR::ClassifyExecSelectGate(ir, opted_in);
+	const auto gate     = decision.gate;
+	if (gate == IR::ExecSelectGate::Off || gate == IR::ExecSelectGate::NotCompute) return;
+	const auto instructions = static_cast<uint64_t>(decision.instructions);
+	if (gate == IR::ExecSelectGate::TooLarge) {
+		LOGF("ShaderRecompiler %s exec selects skipped: hash=0x%016" PRIx64 " instructions=%" PRIu64
+		     " limit=%" PRIu64 "\n",
+		     stage, ir.shader_hash, instructions,
+		     static_cast<uint64_t>(IR::MaxExecSelectInstructions));
+		return;
+	}
+	const auto begin     = std::chrono::steady_clock::now();
+	const auto forwarded = IR::ForwardSubsetSelects(ir);
+	const auto elided    = IR::ElideUnobservedSelects(ir);
+	IR::EliminateDeadCode(ir.blocks);
+	const auto elapsed_ms =
+	    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
+	LOGF("ShaderRecompiler %s exec selects: hash=0x%016" PRIx64 " instructions=%" PRIu64
+	     " selects=%u forwarded=%u elided=%u depth_cap_hits=%u truncations=%u elapsed_ms=%.3f\n",
+	     stage, ir.shader_hash, instructions, elided.candidates, forwarded.forwarded, elided.elided,
+	     forwarded.depth_cap_hits + elided.depth_cap_hits, elided.demand_truncations, elapsed_ms);
+}
+
 CompileResult CompileProgram(TranslateResult translated, const CompileOptions& options,
                              const IR::ResourceSpecialization& specialization,
                              uint32_t push_data_start_dword) {
@@ -957,6 +986,7 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	IR::RemoveIdentities(ir);
 	IR::EliminateDeadCode(ir.blocks);
 
+	RunExecSelectPasses(ir, options.profile->elide_exec_selects, stage);
 	IR::CollectShaderInfo(ir, options.input_info);
 	std::string ir_dump;
 	if (options.dump_ir) {

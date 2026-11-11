@@ -2691,6 +2691,41 @@ void CheckSpirvProfileSingleCompareRecordGuardOption() {
   std::printf("[host]    %-32s ok\n", name);
 }
 
+// The exec select passes change the SPIR-V, so a module compiled with them must not share a shader
+// store header with one compiled without them. The serialized profile must therefore differ when
+// only that field is set.
+void CheckSpirvProfileElideExecSelectsBytes() {
+  constexpr const char *name = "SpirvProfileElideExecSelectsBytes";
+  const ShaderRecompiler::Spirv::Profile off{};
+  ShaderRecompiler::Spirv::Profile on{};
+  on.elide_exec_selects = true;
+  Require(name, "serialized", ProfileBytes(off) != ProfileBytes(on),
+          "the serialized profile ignores elide_exec_selects");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
+// --elide-exec-selects reaches the device profile, and nothing else in the profile moves with it.
+// The baseline is the same device loaded without the option, so a field that is always set, or one
+// set from another option, cannot satisfy the check.
+void CheckSpirvProfileElideExecSelectsOption() {
+  constexpr const char *name = "SpirvProfileElideExecSelectsOption";
+  GraphicContext graphics;
+  graphics.maintenance8_enabled = true;
+  Config::Load({.printf_direction = Config::LogDirection::Silent});
+  const auto off = SpirvProfile(graphics);
+  Config::Load({.elide_exec_selects = true,
+                .printf_direction = Config::LogDirection::Silent});
+  const auto on = SpirvProfile(graphics);
+  Config::Load({.printf_direction = Config::LogDirection::Silent});
+  auto on_without_flag = on;
+  on_without_flag.elide_exec_selects = false;
+  Require(name, "option", !off.elide_exec_selects && on.elide_exec_selects,
+          "the option did not turn the profile flag on, or it was on without the option");
+  Require(name, "option", ProfileBytes(on_without_flag) == ProfileBytes(off),
+          "the option changed another profile field");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 struct BdaMapping {
   uint64_t guest_base = 0;
   u32 backing_offset = 0;
@@ -2707,6 +2742,8 @@ constexpr ShaderProfile SelectGuardedLoadsProfile{.maintenance8 = true,
 // loads.
 constexpr ShaderProfile SingleCompareRecordGuardProfile{.maintenance8 = true,
                                                         .single_compare_record_guard = true};
+// The exec select passes are opt-in, so the tests of the elided form ask for them.
+constexpr ShaderProfile ElideExecSelectsProfile{.maintenance8 = true, .elide_exec_selects = true};
 constexpr ShaderProfile SelectSingleCompareRecordGuardProfile{
     .maintenance8 = true, .select_guarded_loads = true, .single_compare_record_guard = true};
 
@@ -43575,6 +43612,43 @@ TestCase VectorFractF64CapturedChainRuntimeExec() {
   return test;
 }
 
+// A masked region. v2 is the lane id in every lane, then the lanes below 8 run under EXEC, add 100
+// to it twice and store it. Each add is a select between the sum and the old v2 on the EXEC mask,
+// and the store folds the second one itself. The first select feeds the second add. This case
+// shows that the flag reaches the compiler, that a select goes, and that the readback is the same
+// with the passes off and on. It does not show which select goes. An IR dump showed it is the one
+// on the stored value.
+TestCase ExecSelectRegion(bool elide) {
+  using O = ShaderOpcode;
+  constexpr u32 active_lanes = 8;
+  TestCase test;
+  test.name = elide ? "ExecSelectRegionElided" : "ExecSelectRegionKept";
+  test.code.push_back(EncodeVop1(0x01, 2, Vgpr(0))); // v_mov_b32 v2, v0
+  AppendVMovU32(&test.code, 3, 100);
+  test.code.push_back(EncodeVopc(0xc4, InlineU32(active_lanes), 0)); // v_cmp_gt_u32 vcc, 8, v0
+  test.code.push_back(EncodeSop1(0x24, 8, 106)); // s_and_saveexec_b64 s[8:9], vcc
+  test.code.push_back(EncodeVop2(0x25, 2, Vgpr(0), 3)); // v_add_nc_u32 v2, v0, v3
+  test.code.push_back(EncodeVop2(0x25, 2, Vgpr(2), 3)); // v_add_nc_u32 v2, v2, v3
+  AppendStoreVgprAtLaneDwordOffset(&test.code, 2, 0, 0);
+  test.code.push_back(EncodeSop1(0x04, 126, 8)); // s_mov_b64 exec, s[8:9]
+  AppendEnd(&test.code);
+  test.initial.assign(64, 0xdeadbeefu);
+  test.expected = test.initial;
+  for (u32 lane = 0; lane < active_lanes; ++lane) test.expected[lane] = lane + 200u;
+  test.compute_info.wave_size = 64;
+  test.compute_info.threads_num[0] = 64;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  test.profile = elide ? &ElideExecSelectsProfile : &Maintenance8Profile;
+  // One select goes. The select on the store address stays, because an address is observed in
+  // every lane.
+  test.ir_counts = {{" = SelectU32 ", elide ? 1u : 2u}};
+  test.opcodes = {O::V_MOV_B32, O::V_CMP_GT_U32, O::S_AND_SAVEEXEC_B64, O::V_LSHLREV_B32,
+                  O::BUFFER_STORE_DWORD, O::S_MOV_B64, O::S_ENDPGM};
+  return test;
+}
+
 TestCase VectorF64WideningConversions() {
   using O = ShaderOpcode;
   TestCase test;
@@ -59892,6 +59966,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(ScalarFlbitI32B32Gpu);
   AddCase(ScalarFlbitSignedGpu);
   AddCase(ScalarSaveExecOps);
+  cases.push_back(ExecSelectRegion(false));
+  cases.push_back(ExecSelectRegion(true));
   AddCase(ScalarOrn2SaveexecUsesSourceOrNotExec);
   cases.push_back(ScalarOrn2SaveexecB32(32, 32));
   cases.push_back(ScalarOrn2SaveexecB32(64, 64));
@@ -70804,6 +70880,14 @@ int main(int argc, char **argv) {
   CheckSpirvProfileNativeFloatMinMax();
   CheckSpirvProfileSingleCompareRecordGuardBytes();
   CheckSpirvProfileSingleCompareRecordGuardOption();
+  CheckSpirvProfileElideExecSelectsBytes();
+  CheckSpirvProfileElideExecSelectsOption();
+  if (argc == 2 && std::strcmp(argv[1], "--elide-exec-selects-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, ExecSelectRegion(false));
+    RunCase(&vulkan, ExecSelectRegion(true));
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--native-float-minmax-only") == 0) {
     return 0;
   }

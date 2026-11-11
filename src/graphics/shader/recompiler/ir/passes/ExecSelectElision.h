@@ -94,4 +94,34 @@ enum class ExecOpClass : uint8_t {
 // resolved first. The replaced selects are left as dead instructions for dead code elimination.
 [[nodiscard]] ExecSelectStats ElideUnobservedSelects(Program& program);
 
+// Largest program, in instructions, that the exec select passes run on. The three passes (forward,
+// elide and the dead code elimination after them) took 41.6 ms on the largest of 203 real compute
+// shaders, which has about 75000 instructions, so about 0.55 microseconds per instruction. An
+// inline pipeline compile runs on the GPU thread and has about 50 ms to spare, so 85000
+// instructions (about 47 ms) is the most the passes may be given. Larger programs skip them and
+// keep every select.
+inline constexpr size_t MaxExecSelectInstructions = 85000;
+
+// Why the exec select passes run, or do not, on a program.
+enum class ExecSelectGate : uint8_t {
+	Run,        // opted in, a compute shader, and small enough
+	Off,        // the option is not set
+	NotCompute, // pixel, vertex and the other stages are left alone
+	TooLarge,   // more than MaxExecSelectInstructions
+};
+
+// Number of instructions in the program blocks.
+[[nodiscard]] size_t CountInstructions(const Program& program);
+
+// The gate verdict, with the instruction count that produced it. The count is 0 when the program
+// was not counted, which is when the option is off or the stage is not compute.
+struct ExecSelectDecision {
+	ExecSelectGate gate         = ExecSelectGate::Off;
+	size_t         instructions = 0;
+};
+
+// Decides whether the exec select passes run on a program. The option comes first, so a program
+// that was not asked for is never counted.
+[[nodiscard]] ExecSelectDecision ClassifyExecSelectGate(const Program& program, bool opted_in);
+
 } // namespace Libs::Graphics::ShaderRecompiler::IR

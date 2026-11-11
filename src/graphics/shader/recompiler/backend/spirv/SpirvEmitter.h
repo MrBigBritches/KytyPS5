@@ -32,6 +32,10 @@ struct Profile {
 	// against a per binding limit, in place of a chain of compares. Both give the same answer, and
 	// the single compare is quicker for some drivers to compile. Off by default while it is new.
 	bool single_compare_record_guard = false;
+	// Opts in to the exec select passes, which forward subset mask selects and drop selects that no
+	// lane observes outside their mask. Both keep every observable result, and they shrink compute
+	// shaders that mask most of their writes. Compute only. Off by default while it is new.
+	bool elide_exec_selects = false;
 };
 
 inline constexpr Profile DefaultProfile {};

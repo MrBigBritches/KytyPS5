@@ -189,6 +189,10 @@ bool SingleCompareRecordGuardEnabled() {
 	return g_config->single_compare_record_guard;
 }
 
+bool ElideExecSelectsEnabled() {
+	return g_config->elide_exec_selects;
+}
+
 bool StructuredJumpTablesEnabled() {
 	return g_config->structured_jump_tables;
 }
