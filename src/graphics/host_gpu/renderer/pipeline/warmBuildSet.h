@@ -29,6 +29,18 @@ constexpr uint32_t WarmUpWorkerCount(uint32_t hardware_threads) {
 	return most < 1 ? 1 : most;
 }
 
+/// How many warm-up workers to start. A test override wins, then the --warm-workers option, and
+/// zero for either means unset. With both unset the machine's hardware threads decide. The test
+/// hook comes first because a test that pins the count to one must get one worker whatever
+/// configuration an earlier test left loaded.
+constexpr uint32_t ChooseWarmUpWorkerCount(uint32_t test_override, uint32_t option,
+                                           uint32_t hardware_threads) {
+	if (test_override != 0) {
+		return test_override;
+	}
+	return option != 0 ? option : WarmUpWorkerCount(hardware_threads);
+}
+
 /// Builds that start before anything asks for them and are taken by key when something does. Each
 /// build writes into storage that only its job owns, so a worker never touches the structure the
 /// owner reads, and the owner adopts the result by moving it out. The owner is one thread, which

@@ -113,11 +113,11 @@ void PipelineCache::AddComputeWarmUp(const ModuleMap&                           
                                       std::vector<Common::UniqueFunction<void>>& jobs) {
 	// Read once. With the flag off no warm queue exists and boot builds every compute pipeline.
 	if (Config::BackgroundWarmUpEnabled()) {
-		const uint32_t workers = m_warm_worker_count_override != 0
-		                             ? m_warm_worker_count_override
-		                             : WarmUpWorkerCount(std::thread::hardware_concurrency());
-		m_warm_compute         = std::make_unique<WarmBuildSet<uint64_t, Pipeline>>(
-            workers, PipelineBuildQueueOptions {.low_priority = true});
+		const uint32_t workers =
+		    ChooseWarmUpWorkerCount(m_warm_worker_count_override, Config::GetWarmWorkers(),
+		                            std::thread::hardware_concurrency());
+		m_warm_compute = std::make_unique<WarmBuildSet<uint64_t, Pipeline>>(
+		    workers, PipelineBuildQueueOptions {.low_priority = true});
 		// The machine block of the report shows how many workers the warm-up runs.
 		Common::FirstRunReport::SetWarmWorkerCount(workers);
 		// The queue runs jobs in the order they are posted. A store is appended in the order the

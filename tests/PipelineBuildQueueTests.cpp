@@ -668,6 +668,13 @@ void TestWarmUpWorkerCount() {
 	static_assert(WarmUpWorkerCount(8) == 4);
 	static_assert(WarmUpWorkerCount(64) == 4);
 	CHECK(WarmUpWorkerCount(std::thread::hardware_concurrency()) >= 1);
+	// The test hook wins over --warm-workers, which wins over the hardware count, and zero is
+	// unset.
+	static_assert(ChooseWarmUpWorkerCount(0, 0, 8) == 4);
+	static_assert(ChooseWarmUpWorkerCount(0, 2, 8) == 2);
+	static_assert(ChooseWarmUpWorkerCount(0, 12, 8) == 12);
+	static_assert(ChooseWarmUpWorkerCount(1, 2, 8) == 1);
+	static_assert(ChooseWarmUpWorkerCount(1, 0, 8) == 1);
 }
 } // namespace
 

@@ -63275,6 +63275,51 @@ void CheckWarmUpRecordOrder(VulkanHarness &vulkan) {
   std::printf("[gpu]     %-32s ok\n", name);
 }
 
+// The worker count a boot reports when it is given the option and the test hook as stated. The
+// report keeps the count the boot made, so reading it back shows what WarmUp chose.
+uint32_t WarmWorkersOfBoot(VulkanHarness &vulkan, const std::filesystem::path &store,
+                           uint32_t option, uint32_t test_hook) {
+  Config::Load({.printf_direction = Config::LogDirection::Silent,
+                .background_warm_up_enabled = true,
+                .warm_workers = option});
+  Common::FirstRunReport::SetWarmWorkerCount(0);
+  PipelineCache cache(vulkan.RuntimeContext(), nullptr);
+  if (test_hook != 0) PipelineCacheTestAccess::SetWarmWorkerCount(cache, test_hook);
+  cache.WarmUp(store);
+  const uint32_t reported = Common::FirstRunReport::ReadMachineInfo().warm_workers;
+  cache.StopBuilds();
+  return reported;
+}
+
+// --warm-workers sets the warm-up's worker count and the report shows it. The baseline is the same
+// boot without the option, which must use the count the hardware gives. A count that happened to
+// equal the default would pass without the option, so the option asks for one that differs from it.
+// The test hook is set in the last boot to show it wins over the option.
+void CheckWarmWorkersOption(VulkanHarness &vulkan) {
+  constexpr const char *name = "WarmWorkersOption";
+  const uint32_t by_hardware = WarmUpWorkerCount(std::thread::hardware_concurrency());
+  const uint32_t asked = by_hardware == 3 ? 2 : 3;
+  const uint32_t hook = asked == 2 ? 3 : 2;
+  const auto dir = std::filesystem::temp_directory_path() /
+                   fmt::format("kyty_warm_workers_option_{}",
+                               std::chrono::steady_clock::now().time_since_epoch().count());
+  const auto store = dir / "TEST00001.shaders";
+  Require(name, "without the option the hardware count is used",
+          WarmWorkersOfBoot(vulkan, store, 0, 0) == by_hardware,
+          "the baseline boot did not use the default worker count");
+  Require(name, "the option sets the count",
+          WarmWorkersOfBoot(vulkan, store, asked, 0) == asked,
+          "the boot did not run the number of warm workers the option asked for");
+  Require(name, "the test hook wins over the option",
+          WarmWorkersOfBoot(vulkan, store, asked, hook) == hook,
+          "the option overrode the test hook");
+  Config::Load({.printf_direction = Config::LogDirection::Silent});
+  Common::FirstRunReport::SetWarmWorkerCount(0);
+  Common::FirstRunReport::Global().Reset();
+  std::filesystem::remove_all(dir);
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
 // Every --async-pipelines check, in the order they build on each other.
 void CheckAsyncPipelines(VulkanHarness &vulkan) {
   const auto run = [](const char *name, const std::function<void()> &check) {
@@ -63298,6 +63343,7 @@ void CheckAsyncPipelines(VulkanHarness &vulkan) {
   run("WarmComputePause", [&] { CheckWarmComputePause(vulkan); });
   run("BackgroundWarmUp", [&] { CheckBackgroundWarmUp(vulkan); });
   run("WarmUpRecordOrder", [&] { CheckWarmUpRecordOrder(vulkan); });
+  run("WarmWorkersOption", [&] { CheckWarmWorkersOption(vulkan); });
   vulkan.CheckAsyncGate();
   vulkan.CheckAsyncDrawsOff();
   vulkan.CheckAsyncDraws();

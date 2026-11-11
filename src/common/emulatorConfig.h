@@ -32,6 +32,9 @@ using ControllerColor = std::array<uint8_t, 3>;
 constexpr uint32_t DEFAULT_CONSOLE_LANGUAGE = 1;
 constexpr uint32_t MAX_CONSOLE_LANGUAGE     = 29;
 constexpr std::size_t MAX_USER_NAME_LENGTH = 16;
+// The most workers --warm-workers may ask for. It is above the default cap of 4 so a measurement
+// can overcommit a machine, and low enough that a typo cannot start hundreds of compile threads.
+constexpr uint32_t MAX_WARM_WORKERS = 16;
 constexpr int32_t DEFAULT_USER_ID           = 1000;
 
 constexpr int     MAX_PLAYERS         = 4;
@@ -113,6 +116,9 @@ struct ConfigOptions {
 	// Builds the compute pipelines of the shader store on low priority workers while the game runs,
 	// instead of making boot wait for all of them.
 	bool                   background_warm_up_enabled  = false;
+	// Sets how many workers the background warm-up runs, for measuring it. Zero, the default, sizes
+	// them from the hardware threads. Does nothing without background_warm_up_enabled.
+	uint32_t warm_workers = 0;
 	// Predicts the compute shaders of a Motor title from its eboot and translates them in a low
 	// priority helper process, so the warm-up finds them ready. Needs shader_cache_enabled and
 	// background_warm_up_enabled, and does nothing without both.
@@ -233,6 +239,8 @@ bool AsyncPipelinesEnabled();
 bool AsyncPipelinesDepthOnly();
 /// True when --background-warm-up builds the shader store's compute pipelines after boot.
 bool BackgroundWarmUpEnabled();
+/// The warm-up worker count --warm-workers asked for, or zero when the warm-up sizes it itself.
+uint32_t GetWarmWorkers();
 /// True when --generate-shader-store asks for the shader store to be generated from the eboot. The
 /// pipeline cache decides whether it can, and says why not.
 bool GenerateShaderStoreEnabled();

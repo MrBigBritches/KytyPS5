@@ -910,6 +910,29 @@ if(BUILD_TESTING)
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --background-warm-up)
 	add_test(NAME emulator_generate_shader_store_cli
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --generate-shader-store)
+	add_test(NAME emulator_warm_workers_cli
+	         COMMAND $<TARGET_FILE:kyty_emulator> --help --background-warm-up --warm-workers 3)
+	# The limits are the first and last values the option takes, and the values just outside them.
+	add_test(NAME emulator_warm_workers_max_cli
+	         COMMAND $<TARGET_FILE:kyty_emulator> --help --warm-workers 16)
+	foreach(warm_workers_bad IN ITEMS zero over_max not_a_number missing)
+		if(warm_workers_bad STREQUAL "zero")
+			set(warm_workers_args 0)
+		elseif(warm_workers_bad STREQUAL "over_max")
+			set(warm_workers_args 17)
+		elseif(warm_workers_bad STREQUAL "not_a_number")
+			set(warm_workers_args three)
+		else()
+			set(warm_workers_args "")
+		endif()
+		add_test(NAME emulator_warm_workers_${warm_workers_bad}
+		         COMMAND $<TARGET_FILE:kyty_emulator> --help --warm-workers ${warm_workers_args})
+		set_tests_properties(emulator_warm_workers_${warm_workers_bad} PROPERTIES WILL_FAIL TRUE)
+	endforeach()
+	add_test(NAME emulator_warm_workers_help
+	         COMMAND $<TARGET_FILE:kyty_emulator> --help --warm-workers 3)
+	set_tests_properties(emulator_warm_workers_help PROPERTIES
+	                     PASS_REGULAR_EXPRESSION "--warm-workers <1-16> +Run this many warm-up workers")
 	# A pass regex ignores the exit code, and the usage printed on a parse error also has this
 	# line, so the help text is checked separately from the flag parsing above.
 	add_test(NAME emulator_generate_shader_store_help

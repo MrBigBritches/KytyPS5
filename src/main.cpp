@@ -87,6 +87,11 @@ static void PrintUsage() {
 	::printf("  --background-warm-up                 Build the shader store's compute pipelines on low\n"
 	         "                                       priority workers while the game runs, instead of\n"
 	         "                                       making boot wait for them (experimental).\n");
+	::printf("  --warm-workers <1-%u>                Run this many warm-up workers, not the\n"
+	         "                                       count sized from the hardware threads.\n"
+	         "                                       For measuring the warm-up. Needs\n"
+	         "                                       --background-warm-up (experimental).\n",
+	         Config::MAX_WARM_WORKERS);
 	::printf("  --generate-shader-store              Predict a Motor title's compute shaders from its eboot\n"
 	         "                                       and translate them in a low priority helper process,\n"
 	         "                                       so the warm-up finds them ready. Extra variants of\n"
@@ -440,6 +445,14 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 		} else if (arg == "--vblank-frequency") {
 			if (!ParseUint32(value, options.config.vblank_frequency)) {
 				::printf("invalid vblank frequency: %s\n", value.c_str());
+				return false;
+			}
+		} else if (arg == "--warm-workers") {
+			if (!ParseUint32(value, options.config.warm_workers) ||
+			    options.config.warm_workers == 0 ||
+			    options.config.warm_workers > Config::MAX_WARM_WORKERS) {
+				::printf("invalid warm worker count (expected 1-%u): %s\n",
+				         Config::MAX_WARM_WORKERS, value.c_str());
 				return false;
 			}
 		} else if (arg == "--trophy-duration") {

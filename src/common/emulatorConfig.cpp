@@ -31,6 +31,7 @@ void Load(const ConfigOptions& cfg) {
 	EXIT_IF(!IsConfiguredUserIdValid(cfg.user_id));
 	EXIT_IF(cfg.controller_speaker_volume > 100 || cfg.controller_vibration_intensity > 100);
 	EXIT_IF(cfg.keyboard_player > static_cast<uint32_t>(MAX_PLAYERS));
+	EXIT_IF(cfg.warm_workers > MAX_WARM_WORKERS);
 
 	*g_config = cfg;
 	Common::DebugCounters::SetEnabled(cfg.perf_overlay_enabled);
@@ -270,6 +271,10 @@ bool AsyncPipelinesEnabled() {
 
 bool BackgroundWarmUpEnabled() {
 	return g_config->background_warm_up_enabled;
+}
+
+uint32_t GetWarmWorkers() {
+	return g_config->warm_workers;
 }
 
 bool GenerateShaderStoreEnabled() {

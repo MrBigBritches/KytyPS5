@@ -509,8 +509,8 @@ private:
 	// Module ids in the order their records appear in the shader store, one entry per record. Filled
 	// while WarmUp loads the store and emptied once the warm-up has queued its builds.
 	std::vector<uint64_t>                                                        m_module_record_order;
-	// Zero sizes the warm queue from the hardware threads. A test sets one to make the queue run
-	// jobs strictly in order.
+	// Zero sizes the warm queue from --warm-workers, or without it the hardware threads. A test
+	// sets one to make the queue run jobs strictly in order, and it wins over the option.
 	uint32_t                                                                     m_warm_worker_count_override = 0;
 	// Generated modules (--generate-shader-store). Null unless generation is enabled, so a cache
 	// without it has one pointer and one flag for it and nothing else. The inbox is filled by the
