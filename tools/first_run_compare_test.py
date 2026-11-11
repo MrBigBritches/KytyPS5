@@ -51,15 +51,15 @@ def read_fixture(name):
         return json.load(handle)
 
 
-def run_script(paths, gate=None):
+def run_script(paths, gate=None, watch=()):
     """Runs main on the paths and returns the exit code, stdout and stderr."""
     out, err = io.StringIO(), io.StringIO()
     with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-        code = SCRIPT.main(paths, gate)
+        code = SCRIPT.main(paths, gate, watch)
     return code, out.getvalue(), err.getvalue()
 
 
-def run_new(edits=None, gate=GPL_ARM, extra=None):
+def run_new(edits=None, gate=GPL_ARM, extra=None, watch=()):
     """Runs the four new fixtures, each optionally edited in memory by a function keyed on its file
     name. Extra is a list of (file name, report) added as further runs."""
     edits = edits or {}
@@ -73,7 +73,7 @@ def run_new(edits=None, gate=GPL_ARM, extra=None):
             with open(path, "w", encoding="utf-8") as handle:
                 json.dump(report, handle)
             paths.append(path)
-        code, out, err = run_script(paths, gate)
+        code, out, err = run_script(paths, gate, watch)
     assert code == 0, err
     return out
 
@@ -978,6 +978,154 @@ class HashText(unittest.TestCase):
             report["warm_takes"][0]["id"] = "0000000000000099"
         out = run_new({"new_gen_first.json": other_id}, gate=None)
         self.assertEqual(row_cells(out, "Audio", GEN_ARM)[5:7], ["0", "2"])
+
+
+WATCH_TITLE = "Watched modules"
+# Ids of the gen first run fixture. The first has a take and leading zeros, and 00000000000000dd has
+# only an inline compile row. The last one is in no row of the report.
+GENERATED_ID = "0000000000000002"
+TAKEN_ID = "0000000000000001"
+COMPILED_ID = "00000000000000dd"
+UNSEEN_ID = "00000000000000ee"
+
+
+def with_lead(module_id, lead_ms):
+    """An edit that gives a generated module of the gen first run a ready time, a first use and a
+    lead."""
+    def edit(report):
+        for row in report["shader_store_generation"]["generated_modules"]:
+            if row["id"] == module_id:
+                row.update({"ready_ms": 500.0, "first_use_ms": 500.0 + lead_ms, "lead_ms": lead_ms,
+                            "tier": 1, "wide_tail": True})
+    return edit
+
+
+def watch_lines(output, module_id):
+    """The Watched modules lines that name the id, squeezed to single spaces."""
+    return [" ".join(line.split()) for line in output.splitlines()
+            if line.startswith("  ") and f"{module_id}:" in line]
+
+
+class WatchList(unittest.TestCase):
+    """--watch lists named modules, and each test sets it against a baseline with one change."""
+
+    def test_parse_two_ids(self):
+        parsed = SCRIPT.parse_arguments(["--watch", f"{GENERATED_ID},{COMPILED_ID}", "a.json"])
+        self.assertEqual(parsed, (["a.json"], None, [GENERATED_ID, COMPILED_ID]))
+
+    def test_parse_repeated_ids_are_kept_once_in_order(self):
+        parsed = SCRIPT.parse_arguments(["--watch", f"{COMPILED_ID},{GENERATED_ID},{COMPILED_ID}", "--watch", GENERATED_ID, "a.json"])
+        self.assertEqual(parsed[2], [COMPILED_ID, GENERATED_ID])
+
+    def test_parse_without_watch_gives_no_ids(self):
+        self.assertEqual(SCRIPT.parse_arguments(["a.json"]), (["a.json"], None, []))
+
+    def test_parse_missing_value_is_none(self):
+        self.assertIsNone(SCRIPT.parse_arguments(["a.json", "--watch"]))
+
+    def test_parse_bad_hex_is_none(self):
+        for bad in ("00000000000000g2", "000000000000002", f"{GENERATED_ID},", f"{GENERATED_ID},12", "", "0x00000000000002"):
+            self.assertIsNone(SCRIPT.parse_arguments(["--watch", bad, "a.json"]), bad)
+
+    def test_no_watch_prints_no_section(self):
+        out = run_new(gate=None)
+        self.assertNotIn(WATCH_TITLE, out)
+        out = run_new(gate=None, watch=[GENERATED_ID])
+        self.assertIn(WATCH_TITLE, out)
+
+    def test_lead_prints_from_generated_row(self):
+        out = run_new({"new_gen_first.json": with_lead(GENERATED_ID, 1234.5)}, gate=None, watch=[GENERATED_ID])
+        line = next(line for line in watch_lines(out, GENERATED_ID) if "run 1" in line and GEN_ARM in line)
+        self.assertIn("tier 1 wide_tail yes posted 100.0 ready 500.0 first_use 1734.5 lead 1234.5 how done", line)
+
+    def test_late_line_replaces_lead_when_not_generated(self):
+        # The baseline above has the id in generated_modules. Here the id is only in late_modules.
+        def late_only(report):
+            block = report["shader_store_generation"]
+            block["generated_modules"] = [row for row in block["generated_modules"] if row["id"] != GENERATED_ID]
+            block["runtime_misses"]["late_modules"] = [
+                {"id": GENERATED_ID, "miss_ms": 900.0, "delivered_ms": 950.0, "via": "refused",
+                 "create_ms": 42.5, "misses": 3}]
+        out = run_new({"new_gen_first.json": late_only}, gate=None, watch=[GENERATED_ID])
+        line = next(line for line in watch_lines(out, GENERATED_ID) if "run 1" in line and GEN_ARM in line)
+        self.assertIn("late miss 900.0 refused 950.0 (drain refusal, post not recorded) create 42.5 misses 3", line)
+        self.assertNotIn("posted", line)
+        self.assertNotIn("lead", line)
+        self.assertNotIn("how", line)
+
+    def test_late_adopted_line_says_posted(self):
+        # Baseline, the refused wording above. Only via differs here.
+        def late_adopted(report):
+            block = report["shader_store_generation"]
+            block["generated_modules"] = [row for row in block["generated_modules"] if row["id"] != GENERATED_ID]
+            block["runtime_misses"]["late_modules"] = [
+                {"id": GENERATED_ID, "miss_ms": 900.0, "delivered_ms": 950.0, "via": "adopted",
+                 "create_ms": 42.5, "misses": 3}]
+        out = run_new({"new_gen_first.json": late_adopted}, gate=None, watch=[GENERATED_ID])
+        line = next(line for line in watch_lines(out, GENERATED_ID) if "run 1" in line and GEN_ARM in line)
+        self.assertIn("late miss 900.0 posted 950.0 create 42.5 misses 3", line)
+        self.assertNotIn("refused", line)
+
+    def test_generated_row_wins_over_late_entry(self):
+        def both(report):
+            with_lead(GENERATED_ID, 10.0)(report)
+            report["shader_store_generation"]["runtime_misses"]["late_modules"] = [
+                {"id": GENERATED_ID, "miss_ms": 900.0, "delivered_ms": 950.0, "via": "refused",
+                 "create_ms": 42.5, "misses": 3}]
+        out = run_new({"new_gen_first.json": both}, gate=None, watch=[GENERATED_ID])
+        line = next(line for line in watch_lines(out, GENERATED_ID) if "run 1" in line and GEN_ARM in line)
+        self.assertIn("lead 10.0", line)
+        self.assertNotIn("late miss", line)
+
+    def test_inline_compile_prints_create_ms(self):
+        out = run_new(gate=None, watch=[COMPILED_ID])
+        line = next(line for line in watch_lines(out, COMPILED_ID) if "run 1" in line and GEN_ARM in line)
+        self.assertIn("inline compile create 7000.0", line)
+
+    def test_neither_row_prints_not_seen(self):
+        # Baseline, the id that has a compile row. Here the compile row is removed too.
+        def no_compile(report):
+            report["compiles"] = [row for row in report["compiles"] if row.get("id") != COMPILED_ID]
+        out = run_new({"new_gen_first.json": no_compile}, gate=None, watch=[COMPILED_ID])
+        line = next(line for line in watch_lines(out, COMPILED_ID) if "run 1" in line and GEN_ARM in line)
+        self.assertTrue(line.endswith(f"{COMPILED_ID}: not seen"), line)
+        out = run_new(gate=None, watch=[UNSEEN_ID])
+        self.assertTrue(any(line.endswith("not seen") for line in watch_lines(out, UNSEEN_ID)))
+
+    def test_take_is_added(self):
+        # An id with a take gets it, and the baseline id with no take does not.
+        out = run_new(gate=None, watch=[TAKEN_ID, GENERATED_ID])
+        taken = next(line for line in watch_lines(out, TAKEN_ID) if "run 1" in line and GEN_ARM in line)
+        self.assertIn("; take waited stopped 500.0", taken)
+        other = next(line for line in watch_lines(out, GENERATED_ID) if "run 1" in line and GEN_ARM in line)
+        self.assertIn("; take done stopped 0.0", other)
+        out = run_new(gate=None, watch=[COMPILED_ID])
+        self.assertNotIn("take", next(line for line in watch_lines(out, COMPILED_ID) if "run 1" in line))
+
+    def test_leading_zeros_are_kept(self):
+        parsed = SCRIPT.parse_arguments(["--watch", GENERATED_ID, "a.json"])
+        out = run_new({"new_gen_first.json": with_lead(GENERATED_ID, 7.0)}, gate=None, watch=parsed[2])
+        self.assertIn(f"{GEN_ARM} run 1 {GENERATED_ID}: tier 1", out)
+        self.assertIn(f"{GEN_ARM} {GENERATED_ID}: median lead 7.0 over 1 of 1 runs", out)
+
+    def test_median_lead_over_two_runs_of_one_arm(self):
+        # Baseline, one run with lead 100 has median 100. A second run of the same arm with 300 moves it to 200.
+        out = run_new({"new_gen_first.json": with_lead(GENERATED_ID, 100.0)}, gate=None, watch=[GENERATED_ID])
+        self.assertIn(f"{GEN_ARM} {GENERATED_ID}: median lead 100.0 over 1 of 1 runs", out)
+        second = read_fixture("new_gen_first.json")
+        with_lead(GENERATED_ID, 300.0)(second)
+        out = run_new({"new_gen_first.json": with_lead(GENERATED_ID, 100.0)}, gate=None, watch=[GENERATED_ID],
+                      extra=[("new_gen_first_b.json", second)])
+        self.assertIn(f"{GEN_ARM} {GENERATED_ID}: median lead 200.0 over 2 of 2 runs", out)
+        self.assertIn(f"{GEN_ARM} run 2 {GENERATED_ID}", out)
+
+    def test_old_reports_print_nothing_with_watch(self):
+        paths = [os.path.join(FIXTURES, "old_baseline.json"), os.path.join(FIXTURES, "old_gpl.json")]
+        with open(os.path.join(FIXTURES, "old_expected.txt"), encoding="utf-8") as handle:
+            expected = handle.read()
+        code, out, _ = run_script(paths, None, [GENERATED_ID])
+        self.assertEqual(code, 0)
+        self.assertEqual(out, expected)
 
 
 if __name__ == "__main__":

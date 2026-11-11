@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 """Compares first-run reports written by `--first-run-report`.
 
-Usage: first_run_compare.py [--gate <gpl arm>] <report.json or glob>...
+Usage: first_run_compare.py [--gate <gpl arm>] [--watch <id,...>] <report.json or glob>...
+
+With --watch, a Watched modules section follows the tier table. It takes comma-separated 16-hex module
+ids, kept as text, and lists for each run and id the generated row (tier, wide_tail, posted, ready,
+first use, lead), the warm take, or else the late_modules entry or the inline compile, with the median
+lead per arm. It is for information and has no gate. Reports with no generation block print nothing.
 
 After the main table come the Generation, Audio and Contention tables, each only for an arm whose
 reports carry the data. A set of older reports prints the main table alone, as before.
@@ -217,6 +222,8 @@ P6_OVER_1MS_HANDFUL = 5
 P7_DECODE_MS = 50.0
 P8_GFX_ALLOWANCE = 0.10
 GFX_FIRST_RUN_ALLOWANCE = 0.15
+# A module id as the reports write it, 16 hex digits.
+MODULE_ID_PATTERN = re.compile(r"[0-9a-fA-F]{16}")
 
 
 def hash_text(value):
@@ -932,7 +939,75 @@ def gate(records, common, gpl_wanted):
     return 0
 
 
-def main(patterns, gate_arm=None):
+def watch_row(report, module_id):
+    """What one run says about one module id, as the text after the id. The generated row comes
+    first, then the late_modules entry, then an inline compile, and a module in none of them is not
+    seen. A warm take is added to any of them. Ids are matched as lowercase text."""
+    block = generation_block(report)
+    generated = next((row for row in block.get("generated_modules", [])
+                      if hash_text(row.get("id")).lower() == module_id), None)
+    late = next((row for row in block.get("runtime_misses", {}).get("late_modules", [])
+                 if hash_text(row.get("id")).lower() == module_id), None)
+    creates = [row.get("create_ms", 0.0) for row in report.get("compiles", [])
+               if "id" in row and hash_text(row["id"]).lower() == module_id]
+    take = next((row for row in report.get("warm_takes", [])
+                 if hash_text(row.get("id")).lower() == module_id), None)
+    if generated is not None:
+        wide = {True: "yes", False: "no"}.get(generated.get("wide_tail"), "-")
+        text = (f"tier {fmt_count(generated.get('tier'))} wide_tail {wide}"
+                f" posted {fmt_num(generated.get('posted_ms'), 1)} ready {fmt_num(generated.get('ready_ms'), 1)}"
+                f" first_use {fmt_num(generated.get('first_use_ms'), 1)}"
+                f" lead {fmt_num(generated.get('lead_ms'), 1)} how {generated.get('how', '-')}")
+    elif late is not None:
+        # A refused row's delivered_ms is when the drain refused it, and the worker's post time was
+        # not recorded, so it must not read as a post time.
+        if late.get("via") == "refused":
+            delivery = f"refused {fmt_num(late.get('delivered_ms'), 1)} (drain refusal, post not recorded)"
+        else:
+            delivery = f"posted {fmt_num(late.get('delivered_ms'), 1)}"
+        text = (f"late miss {fmt_num(late.get('miss_ms'), 1)} {delivery}"
+                f" create {fmt_num(late.get('create_ms'), 1)} misses {fmt_count(late.get('misses'))}")
+    elif creates:
+        text = f"inline compile create {fmt_num(max(creates), 1)}"
+    else:
+        text = "not seen"
+    if take is not None:
+        text += f"; take {take.get('how', '-')} stopped {fmt_num(take.get('stopped_ms'), 1)}"
+    return text
+
+
+def lead_of(report, module_id):
+    """The lead_ms of a module's generated row in one run, or None when it has none."""
+    block = generation_block(report)
+    row = next((row for row in block.get("generated_modules", [])
+                if hash_text(row.get("id")).lower() == module_id), None)
+    return None if row is None else row.get("lead_ms")
+
+
+def print_watch(watch_arms, watch_ids):
+    """The Watched modules section, for information only and with no gate. It lists one row per run
+    and id for each arm, then the median lead of each id across the arm's runs. A run without a
+    generation block adds nothing, so a set of old reports prints no section at all."""
+    if not any(watch_arms.values()):
+        return
+    print()
+    print("Watched modules (information only, times in ms from the run start, lead = first use - ready)")
+    for name in sorted(watch_arms):
+        runs = watch_arms[name]
+        for number, report in enumerate(runs, 1):
+            for module_id in watch_ids:
+                print(f"  {name} run {number} {module_id}: {watch_row(report, module_id.lower())}")
+        for module_id in watch_ids:
+            leads = [lead_of(report, module_id.lower()) for report in runs]
+            median_lead = median_of(leads)
+            present = sum(1 for lead in leads if lead is not None)
+            print(f"  {name} {module_id}: median lead {fmt_num(median_lead, 1)}"
+                  f" over {present} of {len(runs)} runs")
+
+
+def main(patterns, gate_arm=None, watch=()):
+    """Prints the tables for the reports. Watch is a list of module ids to list under Watched modules,
+    and the gate arm names the baseline for the pass criteria."""
     arms = {}
     refusals = {}
     gpu_translate = {}
@@ -964,27 +1039,51 @@ def main(patterns, gate_arm=None):
     print_refusals(refusals, gpu_translate)
     generation_table(new_arms)
     tier_table(new_arms)
+    if watch:
+        watch_arms = {}
+        for report, _ in records:
+            if generation_block(report):
+                watch_arms.setdefault(arm_name(report, common), []).append(report)
+        print_watch(watch_arms, list(watch))
     audio_table(new_arms)
     contention_table(new_arms)
     return gate(records, common, gate_arm) if gate_arm else 0
 
 
+def parse_watch_ids(text):
+    """Splits a comma-separated list of module ids, or returns None when any id is not 16 hex digits.
+    The ids stay text as given, so leading zeros are kept."""
+    ids = text.split(",")
+    if not all(MODULE_ID_PATTERN.fullmatch(module_id) for module_id in ids):
+        return None
+    # A repeated id would print its rows twice, so each is kept once in its first position.
+    return list(dict.fromkeys(ids))
+
+
 def parse_arguments(arguments):
-    """Splits out --gate and its value. Returns the patterns and the gate arm, or None when the
-    value is missing."""
+    """Splits out --gate and --watch with their values. Returns the patterns, the gate arm and the
+    watched ids (empty with no --watch), or None when a value is missing or is not valid, or there
+    are no patterns."""
     patterns = []
     gate_arm = None
+    watch = []
     index = 0
     while index < len(arguments):
-        if arguments[index] == "--gate":
+        if arguments[index] in ("--gate", "--watch"):
             if index + 1 >= len(arguments):
                 return None
-            gate_arm = arguments[index + 1]
+            if arguments[index] == "--gate":
+                gate_arm = arguments[index + 1]
+            else:
+                ids = parse_watch_ids(arguments[index + 1])
+                if ids is None:
+                    return None
+                watch += [module_id for module_id in ids if module_id not in watch]
             index += 2
         else:
             patterns.append(arguments[index])
             index += 1
-    return (patterns, gate_arm) if patterns else None
+    return (patterns, gate_arm, watch) if patterns else None
 
 
 if __name__ == "__main__":
@@ -992,4 +1091,4 @@ if __name__ == "__main__":
     if parsed is None:
         print(__doc__.strip())
         sys.exit(2)
-    sys.exit(main(parsed[0], parsed[1]))
+    sys.exit(main(parsed[0], parsed[1], parsed[2]))
