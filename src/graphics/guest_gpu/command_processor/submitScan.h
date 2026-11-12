@@ -1,6 +1,7 @@
 #ifndef GRAPHICS_GUEST_GPU_COMMAND_PROCESSOR_SUBMIT_SCAN_H
 #define GRAPHICS_GUEST_GPU_COMMAND_PROCESSOR_SUBMIT_SCAN_H
 
+#include "graphics/guest_gpu/command_processor/scanScratch.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 
 #include <algorithm>
@@ -23,9 +24,12 @@ using ScanMemoryReader = std::function<bool(uint64_t address, void* destination,
 /// How many indirect buffers may be nested. Four missed most dispatches of a game whose engine nests
 /// its command lists deeper, so it is 16, and the visited set and the budget still bound a walk.
 inline constexpr uint32_t SCAN_MAX_IB_DEPTH = 16;
-/// How many dwords one submission may read in all. A walk costs about 10 ns a dword, so this keeps the
-/// worst case near 1.3 ms against the 2 ms limit on a scan.
-inline constexpr uint32_t SCAN_DWORD_BUDGET = 1u << 17;
+/// How many dwords one submission may read in all, which is also the size of the scratch arena a
+/// scanning thread keeps, so it is 4 MB per scanning thread. It was 131072 when the scan ran on the
+/// submitting thread, and a game's top level lists ran into it, which left their tails unwalked and the
+/// program in doubt. The time cap still bounds how long a walk may take. Under --scan-differential the
+/// scan still runs on the submitting thread, so the raise lets it run there up to the 1 ms time cap.
+inline constexpr uint32_t SCAN_DWORD_BUDGET = 1u << 20;
 
 /// A small cache of the dispatches the caller has settled, so that the walk skips them without copying
 /// the registers or taking the posting lock. It is direct mapped on the dispatch's key hash and is
@@ -310,6 +314,12 @@ public:
 	/// @param async_queue whether that queue is an async compute queue.
 	void Scan(std::span<const uint32_t> commands, uint32_t queue, bool async_queue, CsShadow& shadow,
 	          std::vector<ScannedDispatch>& dispatches, ScanStats& stats,
+	          DispatchCache* cache = nullptr) const;
+
+	/// The same walk using the caller's storage in place of the calling thread's own. The caller must not
+	/// use one ScanScratch from two walks at once.
+	void Scan(std::span<const uint32_t> commands, uint32_t queue, bool async_queue, CsShadow& shadow,
+	          std::vector<ScannedDispatch>& dispatches, ScanStats& stats, ScanScratch& scratch,
 	          DispatchCache* cache = nullptr) const;
 
 private:

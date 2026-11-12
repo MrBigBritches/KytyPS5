@@ -192,7 +192,7 @@ uint64_t ScanDifferential::ScanSubmission(uint32_t queue, std::span<const uint32
 	state.scratch.clear();
 	ScanStats  stats;
 	const auto started = std::chrono::steady_clock::now();
-	m_scanner.Scan(commands, queue, queue != GRAPHICS_QUEUE, state.shadow, state.scratch, stats);
+	m_scanner.Scan(commands, queue, queue != GRAPHICS_QUEUE, state.shadow, state.scratch, stats, m_scratch);
 	const auto nanos = std::chrono::duration_cast<std::chrono::nanoseconds>(
 	                       std::chrono::steady_clock::now() - started)
 	                       .count();

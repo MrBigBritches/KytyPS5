@@ -76,7 +76,8 @@ static void PrintUsage() {
 	         "                                       flow, which builds faster (experimental).\n");
 	::printf("  --scan-differential                  Scan every command list as it is submitted and compare\n"
 	         "                                       the scan with what the GPU runs, into the first-run\n"
-	         "                                       report. Slows the submitting thread; measurement only.\n");
+	         "                                       report. Slows the submitting thread and keeps one 4 MB\n"
+	         "                                       scan arena; measurement only.\n");
 	::printf("  --tessellation                      Draw tessellation patches; skipped by default.\n");
 	::printf("  --occlusion-queries                  Count occlusion query samples on the GPU.\n");
 	::printf("  --audio-compile-hold                 Pause game audio while a long pipeline compile\n"

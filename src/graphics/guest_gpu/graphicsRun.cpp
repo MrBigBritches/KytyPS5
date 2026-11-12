@@ -398,20 +398,32 @@ void CommandProcessor::DmaData(uint8_t dst_sel, uint64_t dst_address_or_offset, 
 void GuestGpu::Enqueue(Submission submission) {
 	// Stamped before the lock, so the enqueue time does not include waiting for it.
 	submission.report = Common::FirstRunReport::SubmissionStamp::New(submission.queue_id);
-	// Scanned before the queue lock is taken, so the walk does not hold up the GPU thread's selection.
-	// The order lock stays held to the end of the function, past the push, to keep scan order the same as
-	// queue order. It is declared before the queue lock, so it is released after it.
-	std::unique_lock<std::mutex> scan_order;
-	if (m_scan_differential) {
-		scan_order = std::unique_lock(m_scan_order_mutex);
-		if (submission.type == SubmissionType::Commands) {
-			submission.scan_seq =
-			    m_scan_differential->ScanSubmission(submission.queue_id, submission.commands);
-		} else if (submission.type == SubmissionType::SuspendPoint) {
-			// The processor resets its compute state at a suspend point, and the shadow follows.
-			m_scan_differential->ResetShadow(submission.queue_id);
-		}
+	if (!m_scan_differential) {
+		PushSubmission(std::move(submission));
+		return;
 	}
+	// Scanned before the queue lock is taken, so the walk does not hold up the GPU thread's selection.
+	// The gate holds the queue's order lock past the push, to keep scan order the same as queue order.
+	const uint32_t queue_id = submission.queue_id;
+	m_scan_order.Run(
+	    queue_id,
+	    [&]() -> uint64_t {
+		    if (submission.type == SubmissionType::Commands) {
+			    return m_scan_differential->ScanSubmission(submission.queue_id, submission.commands);
+		    }
+		    if (submission.type == SubmissionType::SuspendPoint) {
+			    // The processor resets its compute state at a suspend point, and the shadow follows.
+			    m_scan_differential->ResetShadow(submission.queue_id);
+		    }
+		    return 0;
+	    },
+	    [&](uint64_t scan_seq) {
+		    submission.scan_seq = scan_seq;
+		    PushSubmission(std::move(submission));
+	    });
+}
+
+void GuestGpu::PushSubmission(Submission submission) {
 	Common::LockGuard lock(m_queue_mutex);
 	EXIT_IF(!m_accepting);
 	m_queues[submission.queue_id].push_back(std::move(submission));

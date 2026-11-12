@@ -1,5 +1,6 @@
 #include "graphics/guest_gpu/command_processor/submitScan.h"
 
+#include "graphics/guest_gpu/command_processor/scanScratch.h"
 #include "graphics/guest_gpu/csRegisters.h"
 #include "graphics/guest_gpu/pm4.h"
 
@@ -88,147 +89,9 @@ enum class WalkEnd : uint8_t {
 	Budget,
 };
 
-// The finishing step of splitmix64, which spreads every input bit over every output bit.
-uint64_t Scramble(uint64_t value) {
-	value ^= value >> 30u;
-	value *= 0xbf58476d1ce4e5b9ull;
-	value ^= value >> 27u;
-	value *= 0x94d049bb133111ebull;
-	value ^= value >> 31u;
-	return value;
-}
-
-// The buffers a walk has met, as a flat open-addressing table so that a walk of thousands of buffers
-// allocates nothing once the table has grown. Zero marks an empty slot, so a zero key is stored as two.
-// It is reset for each walk. Keys are already hashes, and the slot is chosen from their scrambled bits.
-class VisitedSet {
-public:
-	/// Adds the key. False when it was already there, and then `first_walk_clean` says whether the walk
-	/// that added it has finished and left the compute key state untouched. It is false while that walk
-	/// is still going, as when a buffer calls itself.
-	bool Insert(uint64_t key, bool& first_walk_clean) {
-		key = Normalize(key);
-		if (m_slots.empty()) {
-			m_slots.assign(INITIAL_SLOTS, 0);
-			m_growths++;
-		}
-		if ((m_count + 1) * 2 > m_slots.size()) {
-			Grow();
-		}
-		const auto mask  = m_slots.size() - 1;
-		auto       index = Scramble(key) & mask;
-		while (m_slots[index] != 0) {
-			if ((m_slots[index] & ~CLEAN_BIT) == key) {
-				first_walk_clean = (m_slots[index] & CLEAN_BIT) != 0;
-				return false;
-			}
-			index = (index + 1) & mask;
-		}
-		m_slots[index] = key;
-		m_count++;
-		return true;
-	}
-
-	/// Records that the walk which added the key finished without touching the key state. The bit lives
-	/// in the slot itself, so it needs no storage of its own and no allocation.
-	void MarkClean(uint64_t key) {
-		key        = Normalize(key);
-		const auto mask = m_slots.size() - 1;
-		auto       index = Scramble(key) & mask;
-		while (m_slots[index] != 0) {
-			if ((m_slots[index] & ~CLEAN_BIT) == key) {
-				m_slots[index] |= CLEAN_BIT;
-				return;
-			}
-			index = (index + 1) & mask;
-		}
-	}
-
-	/// Empties the set for the next walk. A table that was never used is not touched, and one that was
-	/// is cleared whole, which is a small memset at the sizes a walk reaches.
-	void Reset() {
-		if (m_count != 0) {
-			std::fill(m_slots.begin(), m_slots.end(), 0);
-			m_count = 0;
-		}
-	}
-
-	/// How many times the table was allocated or grown since this was last asked, then forgotten.
-	uint64_t TakeGrowths() { return std::exchange(m_growths, 0); }
-
-private:
-	static constexpr size_t   INITIAL_SLOTS = 256;
-	// The lowest bit of a stored key is the clean mark, so keys are compared without it.
-	static constexpr uint64_t CLEAN_BIT = 1;
-
-	// Clears the mark bit, and maps zero, which marks an empty slot, to a nonzero key.
-	static uint64_t Normalize(uint64_t key) {
-		key &= ~CLEAN_BIT;
-		return key == 0 ? 2 : key;
-	}
-
-	// Doubles the table and places every key again with its mark, which is counted as an allocation.
-	void Grow() {
-		std::vector<uint64_t> old(m_slots.size() * 2, 0);
-		old.swap(m_slots);
-		m_growths++;
-		const auto mask = m_slots.size() - 1;
-		for (const auto stored: old) {
-			if (stored == 0) {
-				continue;
-			}
-			auto index = Scramble(stored & ~CLEAN_BIT) & mask;
-			while (m_slots[index] != 0) {
-				index = (index + 1) & mask;
-			}
-			m_slots[index] = stored;
-		}
-	}
-
-	std::vector<uint64_t> m_slots;
-	size_t                m_count   = 0;
-	uint64_t              m_growths = 0;
-};
-
 // The most buffers that may be walked inside each other, chains included. A chain adds no nesting for
 // the depth limit, but each one is a frame of the walk, so a run of them is bounded here.
 constexpr uint32_t MAX_WALK_LEVELS = 256;
-
-// The buffers a walk reads indirect buffers into, one per level of the walk. They are kept for the
-// thread's life so that a walk of hundreds of small buffers allocates nothing after the first, and
-// are left uninitialized, since the read fills them.
-class ScratchPool {
-public:
-	/// A buffer of at least `dwords` dwords for the given level of the walk.
-	uint32_t* Get(size_t level, size_t dwords) {
-		if (m_levels.empty()) {
-			m_levels.reserve(MAX_WALK_LEVELS);
-			m_growths++;
-		}
-		if (m_levels.size() <= level) {
-			m_levels.resize(level + 1u);
-		}
-		auto& buffer = m_levels[level];
-		if (dwords > buffer.capacity) {
-			buffer.capacity = std::max<size_t>(dwords, buffer.capacity * 2);
-			buffer.data     = std::make_unique_for_overwrite<uint32_t[]>(buffer.capacity);
-			m_growths++;
-		}
-		return buffer.data.get();
-	}
-
-	/// How many times a buffer was allocated or grown since this was last asked, then forgotten.
-	uint64_t TakeGrowths() { return std::exchange(m_growths, 0); }
-
-private:
-	struct Buffer {
-		std::unique_ptr<uint32_t[]> data;
-		size_t                      capacity = 0;
-	};
-
-	std::vector<Buffer> m_levels;
-	uint64_t            m_growths = 0;
-};
 
 // The state of one submission's walk.
 struct Walk {
@@ -241,10 +104,9 @@ struct Walk {
 	bool                          async_queue;
 	uint32_t                      dwords_left;
 	VisitedSet&                   visited;
-	ScratchPool&                  scratch;
+	ScratchArena&                 scratch;
 	DispatchCache*                cache;
-	// How many buffers are being walked inside each other, chains included, which indexes the scratch
-	// buffer the next one is read into.
+	// How many buffers are being walked inside each other, chains included, which the level limit bounds.
 	uint32_t level = 0;
 	// The time the walk must end by, how many packets passed since the clock was read, and whether the
 	// cap has been hit, after which every loop ends at its next look.
@@ -471,7 +333,14 @@ WalkEnd FollowIndirectBuffer(Walk& walk, uint64_t address, uint32_t dword_count,
 	if (truncated) {
 		NoteBudgetCut(walk);
 	}
-	uint32_t* copy = walk.scratch.Get(walk.level, readable);
+	// The slice is given back when this returns. The dwords of all live slices never pass the budget,
+	// since each is counted against it before the walk goes deeper, so the arena always has room.
+	const ScratchSlice slice(walk.scratch, readable);
+	uint32_t*          copy = slice.Data();
+	if (copy == nullptr) {
+		NoteBudgetCut(walk);
+		return WalkEnd::Budget;
+	}
 	if (OutOfTime(walk, true)) {
 		return WalkEnd::Budget;
 	}
@@ -811,14 +680,22 @@ uint64_t ComputeDispatchKeyHash(const HW::CsStageRegisters& cs, bool thread_dime
 void SubmitScanner::Scan(std::span<const uint32_t> commands, uint32_t queue, bool async_queue,
                          CsShadow& shadow, std::vector<ScannedDispatch>& dispatches,
                          ScanStats& stats, DispatchCache* cache) const {
+	// One table and one arena per thread, so that no walk allocates after the thread's first.
+	thread_local ScanScratch scratch;
+	Scan(commands, queue, async_queue, shadow, dispatches, stats, scratch, cache);
+}
+
+void SubmitScanner::Scan(std::span<const uint32_t> commands, uint32_t queue, bool async_queue,
+                         CsShadow& shadow, std::vector<ScannedDispatch>& dispatches,
+                         ScanStats& stats, ScanScratch& storage, DispatchCache* cache) const {
 	stats.submissions++;
 	shadow.program_set_in_submission = false;
 	shadow.key_state_dirty           = false;
-	// One table and one set of buffers per thread, so that no walk allocates after the thread's first
-	// large one.
-	thread_local VisitedSet  visited;
-	thread_local ScratchPool scratch;
+	// The arena is the size of the budget, which is the most a walk reads into it.
+	VisitedSet&   visited = storage.visited;
+	ScratchArena& scratch = storage.arena;
 	visited.Reset();
+	scratch.Reserve(m_limits.dword_budget);
 	const uint32_t top_level =
 	    static_cast<uint32_t>(std::min<size_t>(commands.size(), m_limits.dword_budget));
 	Walk walk {.reader      = m_reader,

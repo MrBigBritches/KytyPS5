@@ -7,6 +7,7 @@
 #include "common/threads.h"
 #include "common/uniqueFunction.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
+#include "graphics/guest_gpu/command_processor/scanOrderGate.h"
 
 #include <array>
 #include <atomic>
@@ -52,6 +53,7 @@ private:
 	static constexpr uint32_t ComputeQueueCount    = ComputePipeCount * QueuesPerComputePipe;
 	static constexpr uint32_t ComputeQueueBase     = 0x20;
 	static constexpr uint32_t QueueCount           = 1 + ComputeQueueCount;
+	static_assert(QueueCount <= SCAN_MAX_QUEUES, "every queue needs its own scan order lock and sequence");
 
 	enum class SubmissionType { Commands, FlipPreparation, SuspendPoint };
 
@@ -72,6 +74,8 @@ private:
 	};
 
 	void              Enqueue(Submission submission);
+	// Puts a submission on its queue and wakes the GPU thread.
+	void              PushSubmission(Submission submission);
 	void              ProcessCommands();
 	bool              Process(Submission& submission);
 	static void       ThreadRun(void* data);
@@ -106,11 +110,11 @@ private:
 	// Null unless --scan-differential is on, and then every use is behind a null check, so a run without
 	// the flag does nothing more for it.
 	std::unique_ptr<ScanDifferential> m_scan_differential;
-	// With the flag on, held in Enqueue from before the scan or shadow reset until after the push to the
-	// queue, so the scans run in the order the submissions queue. A SuspendPoint and the command lists
-	// around it can come from different game threads, and a reset scanned out of order would leave the
-	// shadow with the wrong registers. The lock order is this mutex, then m_queue_mutex.
-	std::mutex m_scan_order_mutex;
+	// With the flag on, Enqueue runs the scan or shadow reset and the push to the queue through this, so
+	// the scans run in the order the submissions queue. A SuspendPoint and the command lists around it
+	// can come from different game threads, and a reset scanned out of order would leave the shadow with
+	// the wrong registers. The lock order is the gate's queue lock, then m_queue_mutex.
+	ScanOrderGate m_scan_order;
 	// The queue and scan sequence of the submission the GPU thread is processing, which the command
 	// processor reports its dispatches under. GPU thread only. A sequence of 0 means none.
 	uint32_t        m_scan_queue = 0;

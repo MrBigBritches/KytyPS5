@@ -124,8 +124,8 @@ private:
 /// Enqueue threads call ScanSubmission and ResetShadow. The GPU thread calls OnCpDispatch and
 /// FinishSubmission. Report threads call Snapshot. Scanning is serialized by one mutex, which keeps the
 /// shadows whole but does not order scans against queueing. A caller that needs the scan order to be the
-/// queue order must serialize the scan and the push itself, as GuestGpu::Enqueue does with its order
-/// mutex. The records are guarded by a second mutex that no scan holds.
+/// queue order must serialize the scan and the push itself, as GuestGpu::Enqueue does through its
+/// ScanOrderGate. The records are guarded by a second mutex that no scan holds.
 class ScanDifferential {
 public:
 	/// Makes the differential when `enabled`, and returns null otherwise, so a run without the flag
@@ -179,6 +179,9 @@ private:
 	// Held for a whole scan, so only enqueuing threads wait on it. It guards each queue's shadow and
 	// scratch, and next_seq.
 	std::mutex m_scan_mutex;
+	// The walk's table and arena, which every scan uses under the scan mutex, so the arena exists once and
+	// not for each thread that submits.
+	ScanScratch m_scratch;
 	// Guards everything else that a queue holds, and the totals and samples.
 	mutable std::mutex                                     m_data_mutex;
 	std::vector<QueueState>                                m_queues;

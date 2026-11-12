@@ -1,15 +1,24 @@
 // Tests the submit-time PM4 walk that finds compute dispatches. The walk reads indirect buffers through
 // a reader the test supplies, so no guest memory or device is needed. Each check that proves a
 // behaviour has a baseline that differs only in that behaviour, as the comments say.
+#include "graphics/guest_gpu/command_processor/scanJobQueue.h"
+#include "graphics/guest_gpu/command_processor/scanOrderGate.h"
+#include "graphics/guest_gpu/command_processor/scanScratch.h"
 #include "graphics/guest_gpu/command_processor/submitScan.h"
 #include "graphics/guest_gpu/pm4.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <map>
+#include <mutex>
+#include <numeric>
+#include <new>
 #include <set>
 #include <thread>
 #include <utility>
@@ -20,6 +29,10 @@ namespace {
 using namespace Libs::Graphics;
 
 int g_failures = 0;
+
+// Counts the allocations made while it is switched on, from every thread, by the operator new below.
+std::atomic<bool>     g_count_allocations {false};
+std::atomic<uint64_t> g_allocation_count {0};
 
 #define CHECK(condition)                                                                           \
 	do {                                                                                           \
@@ -1281,7 +1294,870 @@ void TestBusyPostIsRememberedAndProbed() {
 	CHECK(cache.Check(15) == DispatchCache::Verdict::Pass);
 }
 
+// The default before the scan moved off the submitting thread, which a game's top level lists outgrew.
+constexpr uint32_t OLD_DWORD_BUDGET = 1u << 17;
+
+// A top level list of `fillers` filler words that ends in a dispatch, after a program is set. Whether
+// the dispatch is found says whether the walk got to the end of the list.
+Stream LongListEndingInDispatch(size_t fillers) {
+	Stream list = SetProgram();
+	list.insert(list.end(), fillers, FILLER_WORD);
+	Append(list, Dispatch(1, 1, 1, 0));
+	return list;
+}
+
+// The default budget reads a list longer than the old one whole, and the shadow stays certain. The old
+// budget on the same list, which differs only in the limit, cuts it before the dispatch, finds nothing
+// and leaves the program in doubt. The same list behind an indirect buffer is read through the arena.
+void TestRaisedBudgetScansLongListCertain() {
+	constexpr size_t LONG_LIST_FILLERS = size_t {OLD_DWORD_BUDGET} + 70000;
+	static_assert(LONG_LIST_FILLERS > OLD_DWORD_BUDGET && LONG_LIST_FILLERS < SCAN_DWORD_BUDGET);
+	FakeMemory memory;
+	ScanLimits slow_machine;
+	slow_machine.time_cap = std::chrono::seconds(30);
+	ScanLimits old_limits = slow_machine;
+	old_limits.dword_budget = OLD_DWORD_BUDGET;
+
+	const Stream list = LongListEndingInDispatch(LONG_LIST_FILLERS);
+	CsShadow     raised_shadow;
+	const auto   raised = Scan(list, memory, raised_shadow, slow_machine);
+	CHECK(raised.dispatches.size() == 1 && raised.stats.budget_exhausted == 0);
+	CHECK(raised_shadow.certain);
+	CHECK(!raised.dispatches.empty() && !raised.dispatches[0].uncertain_program);
+	CsShadow   old_shadow;
+	const auto old = Scan(list, memory, old_shadow, old_limits);
+	CHECK(old.dispatches.empty() && old.stats.budget_exhausted >= 1 && !old_shadow.certain);
+
+	// The same list in an indirect buffer, which the walk reads into the arena.
+	Stream buffer(LONG_LIST_FILLERS, FILLER_WORD);
+	Append(buffer, Dispatch(1, 1, 1, 0));
+	memory.regions[0x900000u] = buffer;
+	Stream behind             = SetProgram();
+	Append(behind, IndirectBuffer(0x900000u, static_cast<uint32_t>(buffer.size())));
+	CsShadow   behind_shadow;
+	const auto through_buffer = Scan(behind, memory, behind_shadow, slow_machine);
+	CHECK(through_buffer.dispatches.size() == 1 && through_buffer.stats.budget_exhausted == 0);
+	CHECK(behind_shadow.certain);
+	CsShadow   behind_old_shadow;
+	const auto through_old = Scan(behind, memory, behind_old_shadow, old_limits);
+	CHECK(through_old.dispatches.empty() && through_old.stats.budget_exhausted >= 1);
+}
+
+// Builds `levels` buffers that call each other, each holding `fillers` filler words, and a dispatch in
+// the last. Returns the top level list that calls the first.
+Stream MakeDeepStream(FakeMemory& memory, uint32_t levels, size_t fillers) {
+	constexpr uint64_t LEVEL_SPACING = 0x400000u;
+	constexpr uint64_t FIRST_LEVEL   = 0x4000000u;
+	for (uint32_t level = 1; level <= levels; ++level) {
+		Stream buffer(fillers, FILLER_WORD);
+		if (level == levels) {
+			Append(buffer, Dispatch(1, 1, 1, 0));
+		} else {
+			const auto next_size = static_cast<uint32_t>(fillers + (level + 1 == levels ? DISPATCH_PACKET_DWORDS : 4u));
+			Append(buffer, IndirectBuffer(FIRST_LEVEL + (level + 1ull) * LEVEL_SPACING, next_size));
+		}
+		memory.regions[FIRST_LEVEL + level * LEVEL_SPACING] = std::move(buffer);
+	}
+	const auto first_size = static_cast<uint32_t>(fillers + (levels == 1 ? DISPATCH_PACKET_DWORDS : 4u));
+	Stream     top        = SetProgram();
+	Append(top, IndirectBuffer(FIRST_LEVEL + LEVEL_SPACING, first_size));
+	return top;
+}
+
+// The body of TestArenaStopsGrowingAfterWarmup, on a thread of its own so that no earlier test has
+// grown this thread's arena.
+void CheckArenaStopsGrowing() {
+	constexpr uint32_t DEEP_LEVELS   = 15;
+	constexpr size_t   DEEP_FILLERS  = 20000;
+	constexpr uint32_t WIDE_BUFFERS  = 700;
+	ScanLimits         limits;
+	limits.time_cap = std::chrono::seconds(30);
+	std::vector<ScannedDispatch> found;
+	found.reserve(SCAN_DISPATCH_CAPACITY);
+	const auto walk = [&](const Stream& stream, const FakeMemory& memory) {
+		found.clear();
+		CsShadow  shadow;
+		ScanStats stats;
+		SubmitScanner(memory.Reader(), limits).Scan(stream, 3, false, shadow, found, stats);
+		return stats.scan_allocations;
+	};
+
+	// The first walk of the thread is a shallow one with small buffers. It allocates the arena, once.
+	FakeMemory shallow_memory;
+	const auto shallow = MakeDeepStream(shallow_memory, 2, 100);
+	CHECK(walk(shallow, shallow_memory) >= 1 && found.size() == 1);
+
+	// A deep walk of buffers a thousand times as large is not met by growth, since the arena was sized by
+	// the budget. A per level scratch grew here, and an arena that is rebuilt per walk would too.
+	FakeMemory deep_memory;
+	const auto deep = MakeDeepStream(deep_memory, DEEP_LEVELS, DEEP_FILLERS);
+	for (int round = 0; round < 3; ++round) {
+		CHECK(walk(deep, deep_memory) == 0 && found.size() == 1);
+	}
+
+	// A wide walk grows the visited table once, which is a different piece of storage, and then not again.
+	FakeMemory wide_memory;
+	Stream     wide = SetProgram();
+	for (uint32_t index = 0; index < WIDE_BUFFERS; ++index) {
+		const uint64_t address = 0x300000u + index * 0x100u;
+		wide_memory.regions[address] = Dispatch(1, 1, 1, 0);
+		Append(wide, IndirectBuffer(address, DISPATCH_PACKET_DWORDS));
+	}
+	(void)walk(wide, wide_memory);
+	for (int round = 0; round < 3; ++round) {
+		CHECK(walk(wide, wide_memory) == 0 && found.size() == WIDE_BUFFERS);
+	}
+}
+
+// After its first walk a thread's scratch storage stops growing, whatever deep or wide streams follow.
+void TestArenaStopsGrowingAfterWarmup() {
+	std::thread worker(CheckArenaStopsGrowing);
+	worker.join();
+}
+
+// Reset starts a new generation and touches no slot, so the old entries are still stored, and yet none
+// is found. The baseline is the same set without the Reset, which finds every key. A mark left on an
+// old entry does not leak into the walk that follows. A generation counter that wraps clears the table,
+// since an entry from a whole cycle earlier would look current.
+void TestVisitedSetResetKeepsOldEntriesHidden() {
+	constexpr uint64_t KEYS = 2000;
+	VisitedSet         set;
+	bool               clean = false;
+	for (uint64_t key = 1; key <= KEYS; ++key) {
+		CHECK(set.Insert(key * 2, clean));
+	}
+	set.MarkClean(2 * 100);
+	CHECK(!set.Insert(2 * 100, clean) && clean);
+	CHECK(set.TakeGrowths() >= 1);
+
+	// Without a Reset every key is found.
+	for (uint64_t key = 1; key <= KEYS; ++key) {
+		CHECK(!set.Insert(key * 2, clean));
+	}
+
+	set.Reset();
+	CHECK(set.HoldsStaleEntry(2 * 100) && set.HoldsStaleEntry(KEYS * 2));
+	for (uint64_t key = 1; key <= KEYS; ++key) {
+		CHECK(set.Insert(key * 2, clean));
+	}
+	// The mark the key carried before the Reset is gone with it.
+	CHECK(!set.Insert(2 * 100, clean) && !clean);
+	CHECK(set.TakeGrowths() == 0);
+
+	VisitedSet wrapping;
+	CHECK(wrapping.Insert(2 * 7, clean));
+	wrapping.SetGenerationForTest(UINT32_MAX);
+	CHECK(wrapping.Insert(2 * 9, clean));
+	wrapping.Reset();
+	CHECK(!wrapping.HoldsStaleEntry(2 * 7) && !wrapping.HoldsStaleEntry(2 * 9));
+	CHECK(wrapping.Insert(2 * 7, clean) && wrapping.Insert(2 * 9, clean));
+}
+
+// What one dispatch looked like to the scan, for comparing two ways of running it.
+struct Seen {
+	uint32_t queue;
+	uint64_t program;
+	uint64_t key_hash;
+	bool     operator==(const Seen&) const = default;
+};
+
+// One step of a run, which is a command list on a queue or the reset a flip suspend point makes on it.
+struct Step {
+	uint32_t queue;
+	bool     reset;
+	Stream   commands;
+};
+
+// Works through jobs the way the scanner thread does, which is what C14a will wire up, and says what
+// each dispatch looked like.
+std::vector<Seen> DrainQueue(ScanJobQueue& queue, const FakeMemory& memory,
+                             std::map<uint32_t, CsShadow>& shadows) {
+	std::vector<Seen> found;
+	ScanJob           job;
+	while (queue.TryPop(job)) {
+		ScanResult result;
+		RunScanJob(SubmitScanner(memory.Reader()), job, false, shadows[job.queue_id], result.dispatches,
+		           result.stats);
+		for (const auto& dispatch: result.dispatches) {
+			found.push_back({job.queue_id, dispatch.program_address, dispatch.key_hash});
+		}
+	}
+	queue.Recycle(std::move(job));
+	return found;
+}
+
+// Runs the steps the way the off-thread mode does. The submit side copies and queues, and then the
+// scanner side takes the jobs in order and walks the copies with the same reader. `with_resets` false
+// leaves the reset markers out.
+std::vector<Seen> RunThroughQueue(const std::vector<Step>& steps, const FakeMemory& memory, bool with_resets) {
+	ScanJobQueue queue;
+	for (const auto& step: steps) {
+		if (step.reset) {
+			if (with_resets) {
+				(void)queue.Push(ScanJobQueue::MakeReset(step.queue));
+			}
+			continue;
+		}
+		(void)queue.Push(queue.MakeCommands(step.queue, step.commands));
+	}
+	std::map<uint32_t, CsShadow> shadows;
+	return DrainQueue(queue, memory, shadows);
+}
+
+// Runs the steps by scanning each list directly against a shadow for each queue, the way the scan on the
+// submitting thread does.
+std::vector<Seen> RunDirectly(const std::vector<Step>& steps, const FakeMemory& memory) {
+	std::map<uint32_t, CsShadow> shadows;
+	std::vector<Seen>            found;
+	for (const auto& step: steps) {
+		if (step.reset) {
+			shadows[step.queue].Reset();
+			continue;
+		}
+		ScanResult result;
+		SubmitScanner(memory.Reader()).Scan(step.commands, step.queue, false, shadows[step.queue],
+		                                    result.dispatches, result.stats);
+		for (const auto& dispatch: result.dispatches) {
+			found.push_back({step.queue, dispatch.program_address, dispatch.key_hash});
+		}
+	}
+	return found;
+}
+
+// The steps of TestQueuedScanMatchesDirectScan, which use two queues, an indirect buffer, a reset marker
+// between submissions and a reset packet inside a list.
+std::vector<Step> MixedQueueSteps(FakeMemory& memory) {
+	memory.regions[0xB0000u]      = Dispatch(4, 1, 1, 0);
+	const uint64_t second_program = PROGRAM_ADDRESS + 0x20000u;
+	Stream         first          = SetProgram();
+	Append(first, IndirectBuffer(0xB0000u, 5));
+	Stream other = SetProgram(second_program);
+	Append(other, Dispatch(2, 2, 2, WAVE32_BIT));
+	Stream inherits = Dispatch(1, 1, 1, 0);
+	Stream reset_inside {0xC0001024u, 0u};
+	Append(reset_inside, Dispatch(1, 1, 1, 0));
+	Stream again = SetProgram();
+	Append(again, Dispatch(9, 9, 9, 0));
+	return {
+	    {3, false, first},        // finds one dispatch through the buffer
+	    {5, false, other},        // another queue, with its own program
+	    {3, false, inherits},     // inherits queue 3's program
+	    {3, true, {}},            // the flip suspend point
+	    {3, false, inherits},     // nothing to inherit now
+	    {5, false, inherits},     // queue 5 was not reset, so it inherits
+	    {5, false, reset_inside}, // a reset packet inside the list
+	    {3, false, again},
+	};
+}
+
+// Scanning through the queue finds what scanning the lists directly finds, in the same order. Without
+// the reset marker the run differs, so the marker is what makes the later dispatch of queue 3 disappear.
+void TestQueuedScanMatchesDirectScan() {
+	FakeMemory memory;
+	const auto steps  = MixedQueueSteps(memory);
+	const auto direct = RunDirectly(steps, memory);
+	CHECK(direct.size() == 5);
+	CHECK(RunThroughQueue(steps, memory, true) == direct);
+	// Without the marker the shadow of queue 3 is not reset, and the dispatch after it is found.
+	CHECK(RunThroughQueue(steps, memory, false).size() == direct.size() + 1);
+}
+
+// Takes every job the queue hands out, as whether it is a reset marker and its queue id, in order.
+std::vector<std::pair<bool, uint32_t>> PopAll(ScanJobQueue& queue) {
+	std::vector<std::pair<bool, uint32_t>> met;
+	ScanJob                                job;
+	while (queue.TryPop(job)) {
+		met.emplace_back(job.kind == ScanJob::Kind::Reset, job.queue_id);
+	}
+	queue.Recycle(std::move(job));
+	return met;
+}
+
+// A full queue drops its oldest command list and counts it, and keeps the markers and the order of
+// what is left. Dropping the newest instead, or a marker, changes what the scanner meets.
+void TestQueueDropsOldestCommands() {
+	ScanJobQueue queue(3, 64);
+	const auto   list = [&](uint32_t tag) { return queue.MakeCommands(tag, Stream {1, 2, 3}); };
+	(void)queue.Push(list(1));
+	(void)queue.Push(list(2));
+	(void)queue.Push(ScanJobQueue::MakeReset(7));
+	(void)queue.Push(list(3)); // drops 1
+	(void)queue.Push(list(4)); // drops 2
+	(void)queue.Push(list(5)); // drops 3, and the marker stays
+	CHECK(queue.Stats().dropped == 3);
+	CHECK(queue.Size() == 3);
+	const std::vector<std::pair<bool, uint32_t>> expected {{true, 7}, {false, 4}, {false, 5}};
+	CHECK(PopAll(queue) == expected);
+
+	// Only markers waiting, so nothing is dropped however many arrive.
+	ScanJobQueue markers(2, 64);
+	for (uint32_t index = 0; index < 5; ++index) {
+		(void)markers.Push(ScanJobQueue::MakeReset(index));
+	}
+	CHECK(markers.Stats().dropped == 0 && markers.Size() == 5);
+}
+
+// Reset markers are never dropped, however full the queue is and whatever is waiting. The baseline is
+// the command lists on the same queue, which are dropped and counted, so a queue that never dropped
+// anything could not pass. Dropping the oldest job of any kind would take the first marker at the
+// second list.
+void TestResetMarkersNeverDropped() {
+	ScanJobQueue queue(3, 64);
+	const auto   list = [&](uint32_t tag) { return queue.MakeCommands(tag, Stream {1, 2, 3}); };
+	(void)queue.Push(ScanJobQueue::MakeReset(10));
+	(void)queue.Push(ScanJobQueue::MakeReset(11));
+	(void)queue.Push(list(1));
+	(void)queue.Push(list(2)); // drops list 1
+	(void)queue.Push(list(3)); // drops list 2
+	// The queue now holds two markers and the third list, and markers arrive at a full queue. They wait in
+	// the reserve and evict nothing, so list 3 survives and only lists 1 and 2 were dropped.
+	for (uint32_t marker = 20; marker < 25; ++marker) {
+		(void)queue.Push(ScanJobQueue::MakeReset(marker));
+	}
+	CHECK(queue.Stats().dropped == 2 && queue.Stats().markers_lost == 0);
+	const std::vector<std::pair<bool, uint32_t>> expected {{true, 10}, {true, 11}, {false, 3}, {true, 20},
+	                                                       {true, 21}, {true, 22}, {true, 23}, {true, 24}};
+	CHECK(PopAll(queue) == expected);
+}
+
+// Pushing past the capacity drops a list the GPU thread has already begun before an older one it has
+// not. The two runs differ only in the watermark, so the order the survivors come out in is the
+// preference and not the age.
+void TestDropPrefersExecutedJobs() {
+	const auto run = [](bool began) {
+		ScanJobQueue queue(3, 64);
+		const auto   list = [&](uint32_t tag) { return queue.MakeCommands(tag, Stream {1, 2, 3}); };
+		(void)queue.Push(list(5));
+		(void)queue.Push(list(3));
+		(void)queue.Push(list(3));
+		if (began) {
+			queue.NoteBegan(3, 1);
+		}
+		(void)queue.Push(list(6));
+		return PopAll(queue);
+	};
+	// Queue 3's first list began, so it is the one that goes, and the older list of queue 5 stays.
+	const std::vector<std::pair<bool, uint32_t>> preferred {{false, 5}, {false, 3}, {false, 6}};
+	CHECK(run(true) == preferred);
+	// With nothing begun the oldest, which is queue 5's, goes.
+	const std::vector<std::pair<bool, uint32_t>> plain {{false, 3}, {false, 3}, {false, 6}};
+	CHECK(run(false) == plain);
+}
+
+// The scanner skips the lists the GPU thread began and counts them, and walks the rest. The baseline is
+// the same queue with no watermark, which hands out every list. Ignoring the watermark would hand out
+// the late ones too.
+void TestWatermarkSkipsLateJobs() {
+	const auto fill = [](ScanJobQueue& queue) {
+		for (uint32_t index = 0; index < 3; ++index) {
+			(void)queue.Push(queue.MakeCommands(3, Stream {1, 2, 3}));
+		}
+		(void)queue.Push(queue.MakeCommands(4, Stream {1, 2, 3}));
+	};
+	ScanJobQueue plain;
+	fill(plain);
+	ScanJob job;
+	uint32_t handed_out = 0;
+	while (plain.TryPop(job)) {
+		handed_out++;
+	}
+	CHECK(handed_out == 4 && plain.Stats().late_skipped == 0);
+
+	ScanJobQueue queue;
+	fill(queue);
+	queue.NoteBegan(3, 2);
+	// The watermark only moves forward.
+	queue.NoteBegan(3, 1);
+	CHECK(queue.Watermark(3) == 2 && queue.Watermark(4) == 0);
+	std::vector<std::pair<uint32_t, uint64_t>> met;
+	std::vector<bool>                          doubts;
+	while (queue.TryPop(job)) {
+		met.emplace_back(job.queue_id, job.seq);
+		doubts.push_back(job.shadow_uncertain);
+	}
+	// Queue 3's third list and queue 4's first, in order. The skipped lists left queue 3 in doubt, and
+	// queue 4, which skipped nothing, is not.
+	const std::vector<std::pair<uint32_t, uint64_t>> expected {{3, 3}, {4, 1}};
+	CHECK(met == expected);
+	const std::vector<bool> expected_doubts {true, false};
+	CHECK(doubts == expected_doubts);
+	CHECK(queue.Stats().late_skipped == 2);
+}
+
+// A dropped list leaves the next list of its queue walked under a shadow that is marked uncertain, so
+// the dispatch it finds carries the doubt. The baseline is the same lists with room for all of them,
+// where that dispatch is certain. With the mark missing, the drop would leave it certain.
+void TestDropMarksShadowUncertain() {
+	const auto run = [](size_t capacity) {
+		FakeMemory   memory;
+		ScanJobQueue queue(capacity, 64);
+		CsShadow     shadow;
+		(void)queue.Push(queue.MakeCommands(3, SetProgram()));
+		ScanJob job;
+		CHECK(queue.TryPop(job));
+		ScanResult first;
+		RunScanJob(SubmitScanner(memory.Reader()), job, false, shadow, first.dispatches, first.stats);
+		CHECK(shadow.certain);
+		// Two more lists. The first of them is the one a full queue drops when the third arrives.
+		(void)queue.Push(queue.MakeCommands(3, SetSh(Pm4::COMPUTE_USER_DATA_0, {1u, 2u})));
+		(void)queue.Push(queue.MakeCommands(3, Dispatch(1, 1, 1, 0)));
+		(void)queue.Push(queue.MakeCommands(3, Dispatch(2, 1, 1, 0)));
+		// Hand jobs out until a dispatch turns up, which is the first dispatch list in both runs.
+		ScanResult second;
+		while (second.dispatches.empty() && queue.TryPop(job)) {
+			RunScanJob(SubmitScanner(memory.Reader()), job, false, shadow, second.dispatches, second.stats);
+		}
+		queue.Recycle(std::move(job));
+		CHECK(second.dispatches.size() == 1);
+		return second.dispatches.empty() ? false : second.dispatches[0].uncertain_program;
+	};
+	CHECK(run(8) == false);
+	// Capacity 2 holds the user data list and the first dispatch, and the third push drops the user data
+	// list, so the first dispatch is the next one handed out.
+	CHECK(run(2) == true);
+}
+
+// A list longer than the copy cap is cut to it and counted, and a shorter one is copied whole.
+void TestCopyIsCapped() {
+	ScanJobQueue queue(8, 8);
+	Stream       longer(20);
+	for (uint32_t index = 0; index < longer.size(); ++index) {
+		longer[index] = index + 100;
+	}
+	auto cut = queue.MakeCommands(1, longer);
+	CHECK(cut.CommandSpan().size() == 8 && cut.truncated && cut.CommandSpan()[7] == 107);
+	auto whole = queue.MakeCommands(1, Stream {1, 2, 3});
+	CHECK(whole.CommandSpan().size() == 3 && !whole.truncated);
+	(void)queue.Push(std::move(cut));
+	(void)queue.Push(std::move(whole));
+	CHECK(queue.Stats().truncated == 1 && queue.Stats().copied_dwords == 11);
+}
+
+// A list the copy cut short leaves the shadow uncertain after its walk, since the part that was cut may
+// have changed the program. The same list under a cap that holds it whole leaves the shadow certain, so
+// the difference is the cut and not the stream. The cut keeps the dispatch, so what was read is found.
+void TestTruncatedCopyLeavesShadowUncertain() {
+	Stream list = SetProgram();
+	Append(list, Dispatch(1, 1, 1, 0));
+	const size_t kept = list.size();
+	Append(list, SetProgram(PROGRAM_ADDRESS + 0x10000u));
+	const auto run = [&](size_t copy_cap) {
+		FakeMemory   memory;
+		ScanJobQueue queue(4, copy_cap);
+		CsShadow     shadow;
+		(void)queue.Push(queue.MakeCommands(3, list));
+		ScanJob job;
+		CHECK(queue.TryPop(job));
+		ScanResult result;
+		RunScanJob(SubmitScanner(memory.Reader()), job, false, shadow, result.dispatches, result.stats);
+		CHECK(result.dispatches.size() == 1);
+		return shadow.certain;
+	};
+	CHECK(run(list.size()));
+	CHECK(!run(kept));
+}
+
+// A list takes the smallest buffer that holds it, so a small one does not tie up a large one. A queue
+// that always handed out the largest would show in every capacity here.
+void TestBuffersFitBySizeClass() {
+	ScanJobQueue queue;
+	const Stream small(100, 1u);
+	const Stream medium(5000, 1u);
+	const Stream large(100000, 1u);
+	auto         small_job  = queue.MakeCommands(1, small);
+	auto         medium_job = queue.MakeCommands(1, medium);
+	auto         large_job  = queue.MakeCommands(1, large);
+	CHECK(small_job.buffer.capacity == SCAN_BUFFER_CLASS_DWORDS[0]);
+	CHECK(medium_job.buffer.capacity == SCAN_BUFFER_CLASS_DWORDS[1]);
+	CHECK(large_job.buffer.capacity == SCAN_BUFFER_CLASS_DWORDS[2]);
+	CHECK(small_job.CommandSpan().size() == 100 && large_job.CommandSpan().size() == 100000);
+}
+
+// A stopped queue copies nothing and queues nothing. The queue is stopped before the copy, so the job
+// has no buffer, and pushing it is refused without a count. A live queue copies the same list.
+void TestStoppedQueueCopiesNothing() {
+	ScanJobQueue live;
+	const auto   copied = live.MakeCommands(1, Stream {1, 2, 3});
+	CHECK(copied.copied && copied.buffer && copied.dwords == 3);
+
+	ScanJobQueue stopped;
+	stopped.Stop();
+	auto job = stopped.MakeCommands(1, Stream {1, 2, 3});
+	CHECK(!job.copied && !job.buffer && job.dwords == 0);
+	CHECK(stopped.Push(std::move(job)) == 0);
+	CHECK(stopped.Stats().pushed == 0 && stopped.Stats().dropped == 0 && stopped.Size() == 0);
+	ScanJob out;
+	CHECK(!stopped.Pop(out));
+}
+
+// When every buffer that could hold a list is out, the copy is refused and counted rather than
+// allocated. The first jobs get buffers and the later ones do not, and those are the ones counted.
+void TestNoBufferDropsInsteadOfAllocating() {
+	ScanJobQueue queue(2, 64);
+	const Stream list(100, 1u);
+	std::vector<ScanJob> held;
+	uint32_t             refused = 0;
+	// A capacity of 2 has 34 small, one medium, one large and the huge buffers.
+	constexpr uint32_t BUFFERS = 2 + SCAN_SMALL_BUFFER_SLACK + 1 + 1 + SCAN_HUGE_BUFFER_COUNT;
+	for (uint32_t index = 0; index < BUFFERS + 4; ++index) {
+		held.push_back(queue.MakeCommands(1, list));
+		refused += held.back().copied ? 0 : 1;
+	}
+	CHECK(refused == 4);
+	for (auto& job: held) {
+		(void)queue.Push(std::move(job));
+	}
+	CHECK(queue.Stats().dropped_no_buffer == 4);
+	// Only the lists that were copied have a copy time, and the refused ones have none.
+	const auto stats = queue.Stats();
+	CHECK(std::accumulate(stats.copy_us_histogram.begin(), stats.copy_us_histogram.end(), uint64_t {0}) == BUFFERS);
+}
+
+// The copy times fall in a fixed histogram, by powers of two of a microsecond, with the longest kept.
+// A list of samples would be unbounded, and this has no storage that grows.
+void TestCopyTimeHistogram() {
+	ScanJobQueue queue;
+	for (const double micros: {0.2, 1.0, 3.0, 100.0, 1.0e12}) {
+		(void)queue.Push(queue.MakeCommands(1, Stream {1}), micros);
+	}
+	const auto stats = queue.Stats();
+	CHECK(stats.copy_us_histogram[0] == 1 && stats.copy_us_histogram[1] == 1);
+	CHECK(stats.copy_us_histogram[2] == 1 && stats.copy_us_histogram[7] == 1);
+	CHECK(stats.copy_us_histogram[SCAN_COPY_HISTOGRAM_BUCKETS - 1] == 1);
+	CHECK(stats.copy_us_max == 1000000000000ull);
+}
+
+// Two producers submit to one queue and the order of the sequence numbers the scan gave is the order the
+// pushes reach the command processor's queue. A yield between the two steps widens the window a thread
+// could slip into, so without the gate's lock a number is overtaken within a few rounds. The pushes go
+// through ScanOrderGate, which production uses, so the lock that is mutated is the real one.
+void TestPerQueueOrderPreserved() {
+	constexpr uint32_t PRODUCERS    = 2;
+	constexpr uint32_t PER_PRODUCER = 20000;
+	constexpr uint32_t QUEUE        = 3;
+	ScanJobQueue          queue(8, 64);
+	ScanOrderGate         gate;
+	std::mutex            cp_mutex;
+	std::vector<uint64_t> cp_order;
+	cp_order.reserve(size_t {PRODUCERS} * PER_PRODUCER);
+	const auto produce = [&] {
+		for (uint32_t round = 0; round < PER_PRODUCER; ++round) {
+			auto job = queue.MakeCommands(QUEUE, Stream {1, 2, 3});
+			gate.Run(
+			    QUEUE, [&] { return queue.Push(std::move(job)); },
+			    [&](uint64_t seq) {
+				    std::this_thread::yield();
+				    std::scoped_lock lock(cp_mutex);
+				    cp_order.push_back(seq);
+			    });
+		}
+	};
+	std::vector<std::thread> threads;
+	for (uint32_t producer = 0; producer < PRODUCERS; ++producer) {
+		threads.emplace_back(produce);
+	}
+	for (auto& thread: threads) {
+		thread.join();
+	}
+	CHECK(cp_order.size() == size_t {PRODUCERS} * PER_PRODUCER);
+	const bool increasing = std::ranges::adjacent_find(cp_order, std::greater_equal<> {}) == cp_order.end();
+	CHECK(increasing);
+}
+
+// Runs the queue's whole submit path, copies and pushes and markers and drops and a cut list, for many
+// rounds, and counts what the heap saw.
+void CycleQueue(ScanJobQueue& queue, const std::vector<const Stream*>& lists, int rounds, ScanJob& job) {
+	constexpr uint32_t QUEUE = 3;
+	for (int round = 0; round < rounds; ++round) {
+		for (const Stream* list: lists) {
+			(void)queue.Push(queue.MakeCommands(QUEUE, *list), 1.5);
+		}
+		if (round % 5 == 0) {
+			(void)queue.Push(ScanJobQueue::MakeReset(QUEUE));
+		}
+		if (round % 3 == 0) {
+			(void)queue.TryPop(job);
+		}
+		// Slower than the pushes, so the newest list is always past it and a pop never has to wait.
+		queue.NoteBegan(QUEUE, static_cast<uint64_t>(round / 4));
+	}
+}
+
+// Once the queue is built the submit path allocates nothing, across every size class, a list cut by the
+// copy cap, a full queue that drops and a reset marker. The counter is not stuck at zero, since a
+// vector that grows in the same section is seen, and the stats show the drops and the cut did happen.
+void TestNoQueueAllocationAfterWarmup() {
+	const Stream small(100, 7u);
+	const Stream medium(10000, 7u);
+	const Stream large(100000, 7u);
+	const Stream huge(SCAN_COPY_CAP_DWORDS + 5000, 7u);
+	const std::vector<const Stream*> lists {&small, &medium, &large, &huge, &small};
+	ScanJob job;
+	// Counting starts as the constructor returns, so there is no warm-up to hide an allocation in.
+	ScanJobQueue queue(8, SCAN_COPY_CAP_DWORDS);
+	g_allocation_count  = 0;
+	g_count_allocations = true;
+	CycleQueue(queue, lists, 2050, job);
+	g_count_allocations = false;
+	CHECK(g_allocation_count == 0);
+	const auto stats = queue.Stats();
+	CHECK(stats.dropped > 0 && stats.truncated > 0 && stats.pushed > 2000);
+
+	g_allocation_count  = 0;
+	g_count_allocations = true;
+	std::vector<uint32_t> grown;
+	for (uint32_t index = 0; index < 100; ++index) {
+		grown.push_back(index);
+	}
+	g_count_allocations = false;
+	CHECK(g_allocation_count >= 1);
+}
+
+// What came out of running one long list through a queue.
+struct QueuedOutcome {
+	size_t dispatches = 0;
+	bool   certain    = false;
+	bool   truncated  = false;
+};
+
+// Pushes a list through a queue and the scan and says what the scan made of it.
+QueuedOutcome ScanListThroughQueue(ScanJobQueue& queue, const Stream& list, const FakeMemory& memory) {
+	ScanLimits slow_machine;
+	slow_machine.time_cap = std::chrono::seconds(30);
+	CsShadow   shadow;
+	ScanResult result;
+	ScanJob    job;
+	(void)queue.Push(queue.MakeCommands(3, list));
+	CHECK(queue.TryPop(job));
+	RunScanJob(SubmitScanner(memory.Reader(), slow_machine), job, false, shadow, result.dispatches, result.stats);
+	return {result.dispatches.size(), shadow.certain, job.truncated};
+}
+
+// A top level list longer than the old budget goes through the queue whole, is walked to its dispatch and
+// leaves the shadow certain. The baseline is a queue whose copy cap is the old budget, which cuts the
+// same list, never reaches the dispatch and leaves the shadow in doubt, so the copy cap is what is
+// proven and not the stream.
+void TestQueuedLongListScansCertain() {
+	FakeMemory   memory;
+	const Stream list = LongListEndingInDispatch(size_t {OLD_DWORD_BUDGET} + 70000);
+	ScanJobQueue queue;
+	const auto   whole = ScanListThroughQueue(queue, list, memory);
+	CHECK(whole.dispatches == 1 && whole.certain && !whole.truncated);
+	ScanJobQueue old_cap_queue(4, OLD_DWORD_BUDGET);
+	const auto   cut = ScanListThroughQueue(old_cap_queue, list, memory);
+	CHECK(cut.dispatches == 0 && !cut.certain && cut.truncated);
+}
+
+// The arena gets every slice back however the scope that took it ends. Nested slices stack and unwind,
+// an early return releases like a normal end, and a slice too big for the arena is null and leaves the
+// arena as it was. A destructor that released nothing would leave the dwords out.
+void TestArenaSliceReleasesOnEveryExit() {
+	constexpr size_t ARENA_DWORDS = 100;
+	ScratchArena     arena;
+	arena.Reserve(ARENA_DWORDS);
+	{
+		const ScratchSlice outer(arena, 40);
+		CHECK(outer.Data() != nullptr && arena.Used() == 40);
+		{
+			const ScratchSlice inner(arena, 30);
+			CHECK(inner.Data() == outer.Data() + 40 && arena.Used() == 70);
+		}
+		CHECK(arena.Used() == 40);
+	}
+	CHECK(arena.Used() == 0);
+
+	const auto leave_early = [&](bool early) {
+		const ScratchSlice slice(arena, 10);
+		if (early) {
+			return 1;
+		}
+		return 2;
+	};
+	CHECK(leave_early(true) == 1 && arena.Used() == 0);
+	CHECK(leave_early(false) == 2 && arena.Used() == 0);
+
+	const ScratchSlice held(arena, 60);
+	{
+		const ScratchSlice too_big(arena, ARENA_DWORDS - 59);
+		CHECK(too_big.Data() == nullptr && arena.Used() == 60);
+	}
+	CHECK(arena.Used() == 60);
+}
+
+// What the lists a queue hands out say about their shadow, for a run of pushes. 'L' is a list and 'R' a
+// reset marker, on a queue that holds three.
+std::vector<bool> DoubtOfListsAfter(const char* pattern) {
+	ScanJobQueue queue(3, 64);
+	for (const char* step = pattern; *step != '\0'; ++step) {
+		if (*step == 'R') {
+			(void)queue.Push(ScanJobQueue::MakeReset(3));
+		} else {
+			(void)queue.Push(queue.MakeCommands(3, Stream {1}));
+		}
+	}
+	std::vector<bool> doubts;
+	ScanJob           job;
+	while (queue.TryPop(job)) {
+		if (job.kind == ScanJob::Kind::Commands) {
+			doubts.push_back(job.shadow_uncertain);
+		}
+	}
+	return doubts;
+}
+
+// A reset marker clears the doubt of a list dropped before it, since the reset puts the shadow right,
+// and keeps the doubt of one dropped after it. Without a marker the same drop leaves the first list that
+// follows in doubt, which is the baseline. A marker that cleared nothing would leave the first case in doubt.
+void TestMarkerClearsOlderDoubt() {
+	// The first list is dropped by the fourth push, then the marker, then lists. Nothing is in doubt.
+	const std::vector<bool> after_marker {false, false};
+	CHECK(DoubtOfListsAfter("LRLL") == after_marker);
+	// The same drop with no marker between leaves the first list handed out in doubt.
+	const std::vector<bool> no_marker {true, false, false};
+	CHECK(DoubtOfListsAfter("LLLL") == no_marker);
+	// The marker comes first and the dropped list is newer than it, so the doubt stays.
+	const std::vector<bool> newer_drop {true, false};
+	CHECK(DoubtOfListsAfter("RLLL") == newer_drop);
+}
+
+// A list that wants a large buffer when those are out gets the largest smaller one, cut and counted, and
+// a larger one if that is what is free. The queue allocates nothing to serve it.
+void TestBufferFallsBackToSmallerClass() {
+	ScanJobQueue queue(8, SCAN_COPY_CAP_DWORDS);
+	const Stream hundred_thousand(100000, 1u);
+	const Stream two_hundred_thousand(200000, 1u);
+	auto         large = queue.MakeCommands(1, hundred_thousand);
+	auto         huge_a = queue.MakeCommands(1, two_hundred_thousand);
+	auto         huge_b = queue.MakeCommands(1, two_hundred_thousand);
+	CHECK(large.buffer.size_class == 2 && huge_a.buffer.size_class == 3 && huge_b.buffer.size_class == 3);
+	// Every class that holds 100,000 dwords is out, so the next one takes the medium class and is cut.
+	auto cut = queue.MakeCommands(1, hundred_thousand);
+	CHECK(cut.buffer.size_class == 1 && cut.truncated && cut.dwords == SCAN_BUFFER_CLASS_DWORDS[1]);
+	// With a huge buffer back, the same list is held whole in it.
+	queue.Recycle(std::move(huge_a));
+	auto whole = queue.MakeCommands(1, hundred_thousand);
+	CHECK(whole.buffer.size_class == 3 && !whole.truncated && whole.dwords == 100000);
+}
+
+// A full queue of markers and lists. A marker arriving at a full queue evicts a list, which is dropped
+// and counted, and when no list is left it is lost and counted, and the shadow is put in doubt in its
+// place. The lists the queue hands out afterwards are in doubt, which a loss that left no doubt would not.
+void TestMarkerLossIsCountedAndLeavesDoubt() {
+	ScanJobQueue queue(2, 64);
+	(void)queue.Push(queue.MakeCommands(3, Stream {1}));
+	(void)queue.Push(queue.MakeCommands(3, Stream {1}));
+	for (size_t marker = 0; marker < SCAN_MARKER_RESERVE; ++marker) {
+		(void)queue.Push(ScanJobQueue::MakeReset(3));
+	}
+	// Two lists and the whole reserve fill the ring.
+	const size_t ring_size = 2 + SCAN_MARKER_RESERVE;
+	CHECK(queue.Size() == ring_size && queue.Stats().dropped == 0 && queue.Stats().markers_lost == 0);
+	(void)queue.Push(ScanJobQueue::MakeReset(3));
+	(void)queue.Push(ScanJobQueue::MakeReset(3));
+	CHECK(queue.Size() == ring_size && queue.Stats().dropped == 2 && queue.Stats().markers_lost == 0);
+	(void)queue.Push(ScanJobQueue::MakeReset(3));
+	CHECK(queue.Size() == ring_size && queue.Stats().markers_lost == 1);
+
+	ScanJob job;
+	size_t  markers = 0;
+	while (queue.TryPop(job)) {
+		markers++;
+	}
+	CHECK(markers == ring_size);
+	(void)queue.Push(queue.MakeCommands(3, Stream {1}));
+	CHECK(queue.TryPop(job) && job.shadow_uncertain);
+}
+
+// A scan given its own storage uses it and not the calling thread's. The storage is allocated by the
+// first scan, on one thread, and a scan of the same stream on another thread finds it ready and allocates
+// nothing. A scan that used the thread's own would allocate again on the second thread.
+void TestScanUsesCallersScratch() {
+	FakeMemory memory;
+	Stream     stream = SetProgram();
+	Append(stream, Dispatch(1, 1, 1, 0));
+	ScanScratch scratch;
+	const auto  scan = [&](uint64_t& allocations) {
+		std::vector<ScannedDispatch> found;
+		found.reserve(SCAN_DISPATCH_CAPACITY);
+		CsShadow  shadow;
+		ScanStats stats;
+		SubmitScanner(memory.Reader()).Scan(stream, 3, false, shadow, found, stats, scratch);
+		CHECK(found.size() == 1);
+		allocations = stats.scan_allocations;
+	};
+	uint64_t first_allocations  = 0;
+	uint64_t second_allocations = 99;
+	std::thread([&] { scan(first_allocations); }).join();
+	std::thread([&] { scan(second_allocations); }).join();
+	CHECK(first_allocations >= 1 && scratch.arena.Capacity() == SCAN_DWORD_BUDGET);
+	CHECK(second_allocations == 0);
+}
+
+// Whether the dispatch of list C comes out uncertain after this flow on queue 3. A sets the program, X
+// writes user data and C dispatches with no program of its own. With `refuse_x` every other buffer is
+// held by jobs of queue 5 when X is copied, so X is refused and dropped, and the held jobs are given back
+// before C is copied. A is handed out and walked before C is pushed, so A pops after the drop and is older
+// than it.
+bool DispatchAfterRefusedListIsUncertain(bool refuse_x) {
+	constexpr uint32_t HELD_QUEUE = 5;
+	FakeMemory         memory;
+	ScanJobQueue       queue(2, 64);
+	const SubmitScanner scanner(memory.Reader());
+	CsShadow           shadow;
+	ScanResult         result;
+	std::vector<ScanJob> held;
+	// A capacity of 2 has 38 buffers, and A takes the last one.
+	constexpr uint32_t BUFFERS = 2 + SCAN_SMALL_BUFFER_SLACK + 1 + 1 + SCAN_HUGE_BUFFER_COUNT;
+	for (uint32_t index = 0; refuse_x && index + 1 < BUFFERS; ++index) {
+		held.push_back(queue.MakeCommands(HELD_QUEUE, Stream {1}));
+	}
+	(void)queue.Push(queue.MakeCommands(3, SetProgram()));
+	auto x = queue.MakeCommands(3, SetSh(Pm4::COMPUTE_USER_DATA_0, {1u, 2u}));
+	CHECK(x.copied != refuse_x);
+	(void)queue.Push(std::move(x));
+	for (auto& job: held) {
+		queue.Recycle(std::move(job));
+	}
+	ScanJob job;
+	CHECK(queue.TryPop(job));
+	RunScanJob(scanner, job, false, shadow, result.dispatches, result.stats);
+	(void)queue.Push(queue.MakeCommands(3, Dispatch(1, 1, 1, 0)));
+	while (result.dispatches.empty() && queue.TryPop(job)) {
+		RunScanJob(scanner, job, false, shadow, result.dispatches, result.stats);
+	}
+	CHECK(result.dispatches.size() == 1);
+	return result.dispatches.empty() || result.dispatches[0].uncertain_program;
+}
+
+// A list older than the drop that caused a doubt carries the doubt and does not use it up, so a program
+// it writes cannot make the list after the drop certain. The baseline is the same flow where X gets a
+// buffer and is walked, and there the dispatch is certain. A list that cleared the doubt on the way out
+// would report the dispatch certain under a program the missing list may have changed.
+void TestOlderListKeepsNewerDropDoubt() {
+	CHECK(!DispatchAfterRefusedListIsUncertain(false));
+	CHECK(DispatchAfterRefusedListIsUncertain(true));
+}
+
 } // namespace
+
+// Counts the allocations of the tests, for TestNoQueueAllocationAfterWarmup.
+void* operator new(std::size_t size) {
+	if (g_count_allocations.load(std::memory_order_relaxed)) {
+		g_allocation_count.fetch_add(1, std::memory_order_relaxed);
+	}
+	if (void* memory = std::malloc(size == 0 ? 1 : size)) {
+		return memory;
+	}
+	throw std::bad_alloc();
+}
+
+void operator delete(void* memory) noexcept {
+	std::free(memory);
+}
+
+void operator delete(void* memory, std::size_t) noexcept {
+	std::free(memory);
+}
 
 int main() {
 	TestDispatchBehindIndirectBuffer();
@@ -1323,6 +2199,30 @@ int main() {
 	TestDispatchStorageIsReused();
 	TestNoAllocationAfterWarmup();
 	TestBusyPostIsRememberedAndProbed();
+	TestRaisedBudgetScansLongListCertain();
+	TestArenaStopsGrowingAfterWarmup();
+	TestVisitedSetResetKeepsOldEntriesHidden();
+	TestQueueDropsOldestCommands();
+	TestResetMarkersNeverDropped();
+	TestDropPrefersExecutedJobs();
+	TestWatermarkSkipsLateJobs();
+	TestDropMarksShadowUncertain();
+	TestCopyIsCapped();
+	TestTruncatedCopyLeavesShadowUncertain();
+	TestBuffersFitBySizeClass();
+	TestStoppedQueueCopiesNothing();
+	TestNoBufferDropsInsteadOfAllocating();
+	TestCopyTimeHistogram();
+	TestQueuedScanMatchesDirectScan();
+	TestPerQueueOrderPreserved();
+	TestNoQueueAllocationAfterWarmup();
+	TestQueuedLongListScansCertain();
+	TestArenaSliceReleasesOnEveryExit();
+	TestMarkerClearsOlderDoubt();
+	TestBufferFallsBackToSmallerClass();
+	TestMarkerLossIsCountedAndLeavesDoubt();
+	TestScanUsesCallersScratch();
+	TestOlderListKeepsNewerDropDoubt();
 	if (g_failures != 0) {
 		std::fprintf(stderr, "%d check(s) failed\n", g_failures);
 		return 1;
