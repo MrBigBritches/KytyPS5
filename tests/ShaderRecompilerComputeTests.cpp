@@ -41,6 +41,9 @@
 #include "graphics/host_gpu/renderer/pipeline/generationState.h"
 #include "graphics/shader/recompiler/ir/Serialize.h"
 #include "graphics/shader/shaderStoreRecord.h"
+#include "graphics/guest_gpu/command_processor/prescanDispatchInputs.h"
+#include "graphics/guest_gpu/command_processor/submitScan.h"
+#include "graphics/shader/storegen/computeTranslation.h"
 #include "graphics/shader/storegen/ebootShaderScan.h"
 #include "graphics/shader/storegen/ebootSource.h"
 #include "graphics/shader/storegen/generationReport.h"
@@ -134,6 +137,7 @@
 #include <string_view>
 #include <tuple>
 #include <vector>
+#include <xxhash.h>
 
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 #include <cerrno>
@@ -1339,6 +1343,17 @@ struct PipelineCacheTestAccess {
     return count;
   }
   static size_t ProgramCount(const PipelineCache &cache) { return cache.m_program_cache.size(); }
+
+  // The static key words of every compute program of one shader that the cache holds, in no set
+  // order. They are the words GetProgram built from the input info of the dispatch that made it.
+  static std::vector<std::vector<uint32_t>> ComputeStaticStates(const PipelineCache &cache,
+                                                                uint64_t code_hash) {
+    std::vector<std::vector<uint32_t>> states;
+    for (const auto &entry : cache.m_program_cache)
+      if (entry.first.stage == ShaderType::Compute && entry.first.hash == code_hash)
+        states.push_back(entry.first.static_state);
+    return states;
+  }
 
   // Queues the warm-up build of a compute module, as WarmUp does.
   static void StartWarmCompute(PipelineCache &cache, const ShaderModule &module) {
@@ -63652,6 +63667,406 @@ void CheckGeneratedModules(VulkanHarness &vulkan) {
   std::filesystem::remove_all(dir);
 }
 
+// ---- The compute translation setup that the generator and the pre-scan share. ----
+
+// The bytes of one LDS allocation unit, which is what COMPUTE_PGM_RSRC2.LDS_SIZE counts.
+constexpr uint32_t LDS_BYTES_PER_UNIT = 512u;
+// The guest LDS of the setup fixtures, one allocation unit.
+constexpr uint16_t SETUP_LDS_UNITS = 1;
+constexpr uint32_t SETUP_LDS_BYTES = SETUP_LDS_UNITS * LDS_BYTES_PER_UNIT;
+// A device limit below the fixtures' LDS, so the runtime puts their LDS in a storage buffer.
+constexpr uint32_t SETUP_SMALL_SHARED_LIMIT = SETUP_LDS_BYTES / 2u;
+// The user data registers the setup program reads. With TGID_X_EN its group id X follows them.
+constexpr u32 SETUP_USER_SGPRS = 2;
+// Where the setup program's second LDS write goes, past the first one's dword.
+constexpr u32 SETUP_SECOND_WRITE_OFFSET = 4;
+// The scratch size both checks map. The runtime takes it from the shader map into the static key,
+// so it is not zero, and a pre-scan that ignored it would build another key.
+constexpr uint32_t MAPPED_SCRATCH_DWORDS = 16;
+// The host subgroup sizes a setup fixture's device can report.
+constexpr uint32_t HOST_SUBGROUP_64 = 64;
+constexpr uint32_t HOST_SUBGROUP_32 = 32;
+
+// Which shared memory limit a setup fixture's device reports.
+enum class SetupLimit { Device, Small, Boundary };
+
+// One fixture of the setup check. All share the code and registers, and each one past the first
+// differs from the plain fixture in one input only.
+struct SetupFixture {
+  const char *label;
+  uint8_t wave_size;
+  SetupLimit limit;
+  uint32_t host_subgroup;
+};
+
+constexpr size_t SETUP_PLAIN = 0;
+constexpr size_t SETUP_WAVE32 = 1;
+constexpr size_t SETUP_LDS_STORAGE = 2;
+constexpr size_t SETUP_LDS_BOUNDARY = 3;
+constexpr size_t SETUP_HOST32 = 4;
+constexpr std::array<SetupFixture, 5> SETUP_FIXTURES{{
+    {"plain", 64, SetupLimit::Device, HOST_SUBGROUP_64},
+    {"wave32", 32, SetupLimit::Device, HOST_SUBGROUP_64},
+    {"lds storage", 64, SetupLimit::Small, HOST_SUBGROUP_64},
+    {"lds boundary", 64, SetupLimit::Boundary, HOST_SUBGROUP_64},
+    {"host subgroup 32", 64, SetupLimit::Device, HOST_SUBGROUP_32}}};
+
+// What one path made of a fixture. These decide which module a lookup finds and what it runs.
+struct SetupModule {
+  uint64_t id = 0;
+  bool lds_storage = false;
+  std::vector<uint32_t> static_state;
+  std::vector<uint32_t> spirv;
+};
+
+using SetupModules = std::array<SetupModule, SETUP_FIXTURES.size()>;
+
+// The program of the setup fixtures. It writes user data register 0 and its group id X to LDS, so a
+// wrong user data count or a wrong place for LDS shows in its SPIR-V.
+const std::vector<u32> &SetupFixtureCode() {
+  static const std::vector<u32> code = [] {
+    std::vector<u32> shader;
+    shader.push_back(EncodeVop1(0x01, 1, 0)); // v_mov_b32 v1, s0
+    shader.push_back(EncodeDs0(0x0d));        // ds_write_b32 v0, v1
+    shader.push_back(EncodeDs1(0, 1, 0));
+    shader.push_back(EncodeVop1(0x01, 1, SETUP_USER_SGPRS)); // v_mov_b32 v1, s2
+    shader.push_back(EncodeDs0(0x0d, SETUP_SECOND_WRITE_OFFSET));
+    shader.push_back(EncodeDs1(0, 1, 0));
+    AppendEnd(&shader);
+    ShaderMapUserData(reinterpret_cast<uint64_t>(shader.data()),
+                      {.type = Prospero::ShaderBinaryType::kCs,
+                       .code_size_bytes = static_cast<u32>(shader.size() * sizeof(u32)),
+                       .scratch_size_dwords = MAPPED_SCRATCH_DWORDS});
+    return shader;
+  }();
+  return code;
+}
+
+// The compute registers of a fixture, as the command processor holds them at the dispatch.
+HW::ComputeShaderInfo SetupFixtureRegisters(const SetupFixture &fixture) {
+  HW::ComputeShaderInfo regs{};
+  regs.cs_regs.data_addr = reinterpret_cast<uint64_t>(SetupFixtureCode().data());
+  regs.cs_regs.num_thread_x = 1;
+  regs.cs_regs.num_thread_y = 1;
+  regs.cs_regs.num_thread_z = 1;
+  regs.cs_regs.wave_size = fixture.wave_size;
+  regs.cs_regs.lds_size = SETUP_LDS_UNITS;
+  regs.cs_regs.user_sgpr = SETUP_USER_SGPRS;
+  regs.cs_regs.tgid_x_en = true;
+  return regs;
+}
+
+// The shared memory limit a fixture's device reports.
+uint32_t SetupSharedLimit(VulkanHarness &vulkan, const SetupFixture &fixture) {
+  switch (fixture.limit) {
+    case SetupLimit::Small: return SETUP_SMALL_SHARED_LIMIT;
+    case SetupLimit::Boundary: return SETUP_LDS_BYTES;
+    case SetupLimit::Device: break;
+  }
+  return vulkan.RuntimeContext().GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize;
+}
+
+// Fills a context on the harness device for a fixture. GraphicContext holds mutexes and cannot be
+// copied, so the fields the shader profile, the host subgroup size and module creation read are
+// copied one by one. The fixture then sets the shared memory limit and the subgroup size, and the
+// subgroup size alone decides HostComputeSubgroupSize once size control is off.
+void FillSetupGraphics(VulkanHarness &vulkan, const SetupFixture &fixture, GraphicContext &graphics) {
+  const auto &source = vulkan.RuntimeContext();
+  graphics.instance = source.instance;
+  graphics.physical_device = source.physical_device;
+  graphics.device = source.device;
+  graphics.physical_device_properties = source.physical_device_properties;
+  graphics.physical_device_properties.limits.maxComputeSharedMemorySize =
+      SetupSharedLimit(vulkan, fixture);
+  graphics.subgroup_size = fixture.host_subgroup;
+  graphics.min_subgroup_size = fixture.host_subgroup;
+  graphics.max_subgroup_size = fixture.host_subgroup;
+  graphics.compute_subgroup_size_control_enabled = false;
+  graphics.shader_image_int64_atomics_enabled = source.shader_image_int64_atomics_enabled;
+  graphics.maintenance8_enabled = source.maintenance8_enabled;
+  graphics.robust_buffer_access_enabled = source.robust_buffer_access_enabled;
+  graphics.r8_srgb_views = source.r8_srgb_views;
+  graphics.r8g8_srgb_views = source.r8g8_srgb_views;
+  graphics.device_clock_period_ps = source.device_clock_period_ps;
+  graphics.float32_signed_zero_inf_nan_preserve = source.float32_signed_zero_inf_nan_preserve;
+  graphics.moltenvk_driver = source.moltenvk_driver;
+}
+
+// Compiles a fixture through GetComputeProgram, as a dispatch does, and reads back the record the
+// cache stored for it, which holds the SPIR-V the runtime compiled.
+SetupModule RuntimeSetupModule(VulkanHarness &vulkan, const SetupFixture &fixture,
+                               const std::filesystem::path &store) {
+  GraphicContext graphics;
+  FillSetupGraphics(vulkan, fixture, graphics);
+  SetupModule result;
+  {
+    PipelineCache cache(graphics, nullptr);
+    cache.WarmUp(store);
+    const auto regs = SetupFixtureRegisters(fixture);
+    ShaderComputeInputInfo input{};
+    result.id = cache.GetComputeProgram(regs, input)->id;
+    result.lds_storage = input.lds_storage;
+    cache.StopBuilds();
+  }
+  auto records = ReadStoredModuleRecords(store);
+  Require("SetupIdMatchesRuntime", "one stored module",
+          records.size() == 1 && records[0].id == result.id,
+          std::string(fixture.label) + ": the store did not hold exactly the module the lookup compiled");
+  result.static_state = std::move(records[0].static_state);
+  result.spirv = std::move(records[0].spirv);
+  return result;
+}
+
+// Translates and compiles a fixture through the shared setup, with the input info the pre-scan
+// builds from the same registers and the host values the store header would carry. The program
+// has no resources, so its specialization is empty, as the runtime's is.
+SetupModule SharedSetupModule(VulkanHarness &vulkan, const SetupFixture &fixture) {
+  GraphicContext graphics;
+  FillSetupGraphics(vulkan, fixture, graphics);
+  const auto limit = graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize;
+  const StoreGen::HostValues host{.structured_jump_tables = Config::StructuredJumpTablesEnabled(),
+                                  .profile = SpirvProfile(graphics),
+                                  .max_shared_bytes = limit};
+  ScannedDispatch dispatch;
+  dispatch.regs = SetupFixtureRegisters(fixture);
+  dispatch.program_address = dispatch.regs.cs_regs.data_addr;
+  const auto info = StoreGen::MakePrescanInputInfo(PrescanInputsOf(dispatch), MAPPED_SCRATCH_DWORDS,
+                                                   {HostComputeSubgroupSize(graphics), limit});
+  Require("SetupIdMatchesRuntime", "input info", info.has_value(),
+          std::string(fixture.label) + ": a direct dispatch was refused");
+  const auto &code = SetupFixtureCode();
+  const uint64_t hash = XXH3_64bits(code.data(), code.size() * sizeof(u32));
+  const uint32_t user_data_count = dispatch.regs.cs_regs.user_sgpr;
+  StoreGen::TranslationSetup setup(*info, user_data_count, hash, host);
+  const auto source = ShaderRecompiler::PrepareShaderSource(code, setup.Options());
+  auto translated = ShaderRecompiler::TranslateProgram(source.decoded, setup.Options());
+  const ShaderRecompiler::IR::ResourceSpecialization specialization;
+  auto compiled = ShaderRecompiler::CompileProgram(std::move(translated), setup.Options(),
+                                                   specialization, 0);
+  const auto push = std::move(compiled.program).TakeCompiledInfo().bindings.push_data_start_dword;
+  SetupModule result{.lds_storage = info->lds_storage, .spirv = std::move(compiled.spirv)};
+  BuildStageStaticKey(*info, result.static_state);
+  result.id = ShaderModuleId(ShaderType::Compute, hash, user_data_count, result.static_state, push,
+                             specialization, {});
+  return result;
+}
+
+// Shows that each fixture's input changes the runtime's module where the comparison looks, so a
+// setup that ignored the input could not match. The boundary fixture's limit equals its LDS, and
+// the runtime keeps that LDS in workgroup memory, which is the plain fixture's SPIR-V.
+void CheckSetupBaselines(const SetupModules &runtime) {
+  constexpr const char *name = "SetupIdMatchesRuntime";
+  const auto &plain = runtime[SETUP_PLAIN];
+  Require(name, "wave size changes the id", runtime[SETUP_WAVE32].id != plain.id,
+          "the runtime gave wave32 and wave64 one id, so the id check could not see the wave size");
+  Require(name, "host subgroup size changes the id", runtime[SETUP_HOST32].id != plain.id,
+          "the runtime gave host subgroups of 32 and 64 one id, so the check could not see it");
+  Require(name, "LDS storage changes the SPIR-V",
+          runtime[SETUP_LDS_STORAGE].lds_storage && !plain.lds_storage &&
+              runtime[SETUP_LDS_STORAGE].spirv != plain.spirv,
+          "the runtime compiled the same SPIR-V with LDS in a storage buffer, so the check could not "
+          "see the flag");
+  Require(name, "LDS at the limit stays in workgroup memory",
+          !runtime[SETUP_LDS_BOUNDARY].lds_storage && runtime[SETUP_LDS_BOUNDARY].spirv == plain.spirv,
+          "LDS exactly as large as the device limit was put in a storage buffer");
+}
+
+// The shared setup, given the input info the pre-scan builds from a dispatch's registers, gives
+// the module the runtime compiles for the same registers. Past the plain fixture each one differs
+// in one input, the wave size, a device limit below the LDS, a limit equal to it, or the host
+// subgroup size. The module id does not carry where LDS lives, so the SPIR-V is compared too.
+void CheckSetupIdMatchesRuntime(VulkanHarness &vulkan) {
+  constexpr const char *name = "SetupIdMatchesRuntime";
+  Config::Load({.printf_direction = Config::LogDirection::Silent});
+  Require(name, "device LDS limit",
+          vulkan.RuntimeContext().GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize >
+              SETUP_LDS_BYTES,
+          "the device holds less LDS than the plain fixture uses");
+  const auto dir = std::filesystem::temp_directory_path() /
+                   fmt::format("kyty_prescan_setup_{}",
+                               std::chrono::steady_clock::now().time_since_epoch().count());
+  SetupModules runtime;
+  for (size_t index = 0; index < SETUP_FIXTURES.size(); index++) {
+    const auto &fixture = SETUP_FIXTURES[index];
+    runtime[index] = RuntimeSetupModule(vulkan, fixture, dir / fmt::format("fixture{}.shaders", index));
+    const auto shared = SharedSetupModule(vulkan, fixture);
+    const std::string label = fixture.label;
+    Require(name, "static key", shared.static_state == runtime[index].static_state,
+            label + ": the setup's static key differs from the runtime's");
+    Require(name, "module id", shared.id == runtime[index].id,
+            label + ": the setup's module id differs from the runtime's");
+    Require(name, "LDS storage", shared.lds_storage == runtime[index].lds_storage,
+            label + ": the setup put LDS somewhere other than the runtime did");
+    Require(name, "SPIR-V", shared.spirv == runtime[index].spirv,
+            label + ": the setup compiled other SPIR-V than the runtime");
+  }
+  CheckSetupBaselines(runtime);
+  std::filesystem::remove_all(dir);
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
+// The registers the scanned key check's stream writes, as a game's shader setup does.
+constexpr u32 SCAN_KEY_USER_SGPRS = 2;
+constexpr u32 SCAN_KEY_THREADS_X = 64;
+constexpr u32 SCAN_KEY_FLOAT_MODE = 0xc0;
+constexpr u32 SCAN_KEY_LDS_UNITS = 1;
+// COMPUTE_SHADER_EN with FORCE_START_AT_000, which every dispatch of the other GPU checks sends.
+constexpr u32 SCAN_KEY_INITIATOR = 0x41u;
+constexpr u32 SCAN_KEY_WAVE32_BIT = 1u << Pm4::COMPUTE_DISPATCH_INITIATOR_CS_W32_EN_SHIFT;
+// The command processor ids of a graphics queue and of an async compute queue, which
+// IsAsyncComputeQueue tells apart at 0x20.
+constexpr int SCAN_KEY_GRAPHICS_QUEUE = 0;
+constexpr int SCAN_KEY_ASYNC_QUEUE = 0x20;
+// COMPUTE_PGM_LO holds the program address shifted right by 8, so the program is aligned to 256.
+constexpr size_t SCAN_KEY_PROGRAM_ALIGNMENT = 256;
+constexpr u32 SCAN_KEY_ADDRESS_LOW_SHIFT = 8;
+constexpr u32 SCAN_KEY_ADDRESS_HIGH_SHIFT = 40;
+constexpr u32 SCAN_KEY_SET_SH_HEADER_DWORDS = 2;
+constexpr u32 SCAN_KEY_DISPATCH_DWORDS = 5;
+
+// One stream of the scanned key check. Each past the first differs from the plain one in one way.
+struct ScanKeyCase {
+  const char *label;
+  u32 initiator_bits;
+  bool async;
+};
+
+constexpr std::array<ScanKeyCase, 4> SCAN_KEY_CASES{{
+    {"plain", 0u, false},
+    {"wave32", SCAN_KEY_WAVE32_BIT, false},
+    {"thread dimensions", Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS, false},
+    {"async queue", 0u, true}}};
+
+// The scanned key check's program, which only ends. Its address goes through COMPUTE_PGM_LO and HI.
+std::span<const u32> ScanKeyProgram() {
+  alignas(SCAN_KEY_PROGRAM_ALIGNMENT) static std::array<u32, 1> program{};
+  static const bool mapped = [] {
+    std::vector<u32> code;
+    AppendEnd(&code);
+    std::copy_n(code.begin(), program.size(), program.begin());
+    ShaderMapUserData(reinterpret_cast<uint64_t>(program.data()),
+                      {.type = Prospero::ShaderBinaryType::kCs,
+                       .code_size_bytes = static_cast<u32>(sizeof(program)),
+                       .scratch_size_dwords = MAPPED_SCRATCH_DWORDS});
+    return true;
+  }();
+  (void)mapped;
+  return program;
+}
+
+// A SET_SH_REG packet that writes consecutive registers from `reg`.
+void AppendScanKeySetSh(std::vector<u32> &stream, u32 reg, std::initializer_list<u32> values) {
+  const auto dwords = SCAN_KEY_SET_SH_HEADER_DWORDS + static_cast<u32>(values.size());
+  stream.insert(stream.end(), {KYTY_PM4(dwords, Pm4::IT_SET_SH_REG, Pm4::R_ZERO), reg});
+  stream.insert(stream.end(), values);
+}
+
+// A PM4 stream that makes the program current, writes its resource registers and dispatches one
+// group, with the given bits added to the plain initiator.
+std::vector<u32> ScanKeyStream(uint64_t address, u32 initiator_bits) {
+  const u32 rsrc1 = SCAN_KEY_FLOAT_MODE << Pm4::COMPUTE_PGM_RSRC1_FLOAT_MODE_SHIFT;
+  const u32 rsrc2 = (SCAN_KEY_USER_SGPRS << Pm4::COMPUTE_PGM_RSRC2_USER_SGPR_SHIFT) |
+                    (1u << Pm4::COMPUTE_PGM_RSRC2_TGID_X_EN_SHIFT) |
+                    (SCAN_KEY_LDS_UNITS << Pm4::COMPUTE_PGM_RSRC2_LDS_SIZE_SHIFT);
+  std::vector<u32> stream;
+  AppendScanKeySetSh(stream, Pm4::COMPUTE_PGM_LO,
+                     {static_cast<u32>(address >> SCAN_KEY_ADDRESS_LOW_SHIFT),
+                      static_cast<u32>(address >> SCAN_KEY_ADDRESS_HIGH_SHIFT)});
+  AppendScanKeySetSh(stream, Pm4::COMPUTE_PGM_RSRC1, {rsrc1, rsrc2});
+  AppendScanKeySetSh(stream, Pm4::COMPUTE_NUM_THREAD_X, {SCAN_KEY_THREADS_X, 1u, 1u});
+  stream.insert(stream.end(), {KYTY_PM4(SCAN_KEY_DISPATCH_DWORDS, Pm4::IT_DISPATCH_DIRECT, Pm4::R_ZERO),
+                               1u, 1u, 1u, SCAN_KEY_INITIATOR | initiator_bits});
+  return stream;
+}
+
+// Runs a stream through the command processor on the GPU thread of a fresh render context, so the
+// dispatch takes the emulator's own path to GetProgram. Returns the static key of every program of
+// the shader that its pipeline cache then holds.
+std::vector<std::vector<uint32_t>> RuntimeScanKeys(VulkanHarness &vulkan, std::span<const u32> stream,
+                                                   uint64_t code_hash, bool async) {
+  RenderContext context(vulkan.RuntimeContext(), std::filesystem::path{});
+  context.InitializeGpu(nullptr);
+  LibKernel::Memory::InstallGpuResources(&context);
+  bool complete = false;
+  context.GetGpu().SendCommandSync([&] {
+    CommandProcessor processor(context, async ? SCAN_KEY_ASYNC_QUEUE : SCAN_KEY_GRAPHICS_QUEUE);
+    processor.BufferInit();
+    Pm4Execution execution;
+    complete = processor.Process(execution, stream) == Pm4ProcessResult::Complete;
+    context.GetCommandScheduler().Finish();
+  });
+  context.ShutdownGpu();
+  LibKernel::Memory::InstallGpuResources(nullptr);
+  Require("ScannedKeyMatchesRuntimeKey", "stream completes", complete,
+          "the command processor did not run the stream to its end");
+  return PipelineCacheTestAccess::ComputeStaticStates(context.GetPipelineCache(), code_hash);
+}
+
+// Walks a stream with the submit scanner, as the pre-scan does when the game submits it, and
+// returns the static key built from the pre-scan's input info for the one dispatch it finds.
+std::vector<uint32_t> PrescanScanKey(VulkanHarness &vulkan, std::span<const u32> stream, bool async) {
+  // The stream has no indirect buffers, so the walk never needs to read guest memory.
+  const SubmitScanner scanner([](uint64_t, void *, uint64_t) { return false; });
+  CsShadow shadow;
+  std::vector<ScannedDispatch> dispatches;
+  ScanStats stats;
+  const auto queue = static_cast<uint32_t>(async ? SCAN_KEY_ASYNC_QUEUE : SCAN_KEY_GRAPHICS_QUEUE);
+  scanner.Scan(stream, queue, async, shadow, dispatches, stats);
+  Require("ScannedKeyMatchesRuntimeKey", "one certain dispatch",
+          dispatches.size() == 1 && !dispatches[0].uncertain_program,
+          "the scanner did not find the stream's one dispatch with a certain program");
+  const auto &graphics = vulkan.RuntimeContext();
+  const StoreGen::ComputeKeyDevice device{
+      HostComputeSubgroupSize(graphics),
+      graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize};
+  const auto info =
+      StoreGen::MakePrescanInputInfo(PrescanInputsOf(dispatches[0]), MAPPED_SCRATCH_DWORDS, device);
+  Require("ScannedKeyMatchesRuntimeKey", "input info", info.has_value(),
+          "a direct dispatch was refused");
+  std::vector<uint32_t> key;
+  BuildStageStaticKey(*info, key);
+  return key;
+}
+
+// The static key the pre-scan builds from what the scanner saw in a PM4 stream equals the key the
+// runtime builds when the command processor runs the same stream.
+//
+// Both sides share the register decoder DecodeCsRegister, Pm4::ComputeWaveSize,
+// ShaderGetStaticInputInfoCS and BuildStageStaticKey, and the test gives both the host subgroup size
+// HostComputeSubgroupSize reads from one context, so a bug in those cannot show here. The scratch
+// size is the value the test mapped, passed to the pre-scan by hand. What is independent is the
+// scanner's walk against the processor's packet handling, and how each side brings the wave size,
+// launch mode, queue and scratch size to the info, the scanner and MakePrescanInputInfo against the
+// processor, RenderExecutor, GetComputeProgram and the shader map.
+//
+// The baselines are streams that differ from the plain one only in the wave32 bit, the thread
+// dimensions bit or the queue. Each gives the runtime another key, so a pre-scan that lost that
+// input would not match it.
+void CheckScannedKeyMatchesRuntimeKey(VulkanHarness &vulkan) {
+  constexpr const char *name = "ScannedKeyMatchesRuntimeKey";
+  Config::Load({.printf_direction = Config::LogDirection::Silent});
+  const auto program = ScanKeyProgram();
+  const uint64_t hash = XXH3_64bits(program.data(), program.size_bytes());
+  std::array<std::vector<uint32_t>, SCAN_KEY_CASES.size()> runtime_keys;
+  for (size_t index = 0; index < SCAN_KEY_CASES.size(); index++) {
+    const auto &test = SCAN_KEY_CASES[index];
+    const auto stream = ScanKeyStream(reinterpret_cast<uint64_t>(program.data()), test.initiator_bits);
+    const auto runtime = RuntimeScanKeys(vulkan, stream, hash, test.async);
+    const std::string label = test.label;
+    Require(name, "one runtime program", runtime.size() == 1,
+            label + ": the runtime holds " + std::to_string(runtime.size()) + " programs of the shader");
+    Require(name, "key", PrescanScanKey(vulkan, stream, test.async) == runtime[0],
+            label + ": the pre-scan's static key differs from the runtime's");
+    runtime_keys[index] = runtime[0];
+  }
+  for (size_t index = 1; index < SCAN_KEY_CASES.size(); index++) {
+    Require(name, "input changes the key", runtime_keys[index] != runtime_keys[0],
+            std::string(SCAN_KEY_CASES[index].label) +
+                ": the runtime gave it the plain stream's key, so the check could not see it");
+  }
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
 // ---- The shader store generated by a real worker (--generate-shader-store). ----
 
 // What the fake worker of the hang check does, in this binary. It writes a predict line and then
@@ -71492,6 +71907,19 @@ int main(int argc, char **argv) {
     CheckStableProgramIds(vulkan);
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--prescan-setup-only") == 0) {
+    VulkanHarness vulkan;
+    CheckSetupIdMatchesRuntime(vulkan);
+    CheckScannedKeyMatchesRuntimeKey(vulkan);
+    return 0;
+  }
+  // The key check alone, so a change to the shared input info shows in it even when the setup
+  // check would fail first.
+  if (argc == 2 && std::strcmp(argv[1], "--scanned-key-only") == 0) {
+    VulkanHarness vulkan;
+    CheckScannedKeyMatchesRuntimeKey(vulkan);
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--cold-pipelines-only") == 0) {
     VulkanHarness vulkan;
     CheckColdPipelines(vulkan);
@@ -72906,6 +73334,8 @@ int main(int argc, char **argv) {
   vulkan.CheckNativeIndirectDispatch();
   CheckComputeLdsLimit(vulkan);
   CheckStableProgramIds(vulkan);
+  CheckSetupIdMatchesRuntime(vulkan);
+  CheckScannedKeyMatchesRuntimeKey(vulkan);
   CheckShaderStore(vulkan);
   CheckColdPipelines(vulkan);
   CheckAsyncPipelines(vulkan);

@@ -23,8 +23,6 @@ static_assert(offsetof(Shader, scratch_size_dw_per_thread) == Layout::OFFSET_SCR
 static_assert(offsetof(Shader, type) == Layout::OFFSET_TYPE);
 static_assert(offsetof(Shader, num_sh_registers) == Layout::OFFSET_NUM_SH_REGISTERS);
 
-constexpr uint32_t BYTES_PER_DWORD = 4;
-
 // Applies the header's SH register table to a fresh compute stage.
 // Returns false when the table is missing or out of range, or lacks either shader resource
 // register.
@@ -81,9 +79,9 @@ std::optional<ComputeStaticKey> BuildComputeStaticKey(std::span<const uint8_t>  
 	key.input_info.host_subgroup_size         = device.host_subgroup_size;
 	key.input_info.dispatch_thread_dimensions = dispatch.dispatch_thread_dimensions;
 	key.input_info.async_compute              = dispatch.async_compute;
-	// The same comparison GetComputeProgram makes.
-	key.input_info.lds_storage =
-	    key.input_info.lds_size_dwords * BYTES_PER_DWORD > device.max_compute_shared_memory_bytes;
+	// The same decision GetComputeProgram makes.
+	key.input_info.lds_storage = ComputeLdsNeedsStorage(key.input_info.lds_size_dwords,
+	                                                    device.max_compute_shared_memory_bytes);
 	key.user_data_count = cs_regs.user_sgpr;
 	BuildStageStaticKey(key.input_info, key.state);
 	return key;

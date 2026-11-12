@@ -1000,8 +1000,9 @@ const ShaderModule* PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo
                                                      ShaderComputeInputInfo&      input_info) {
 	input_info.host_subgroup_size = HostComputeSubgroupSize(m_graphics);
 	const auto        params      = PrepareProgram(regs, input_info);
-	input_info.lds_storage = input_info.lds_size_dwords * 4u >
-	    m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize;
+	input_info.lds_storage = ComputeLdsNeedsStorage(
+	    input_info.lds_size_dwords,
+	    m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize);
 	uint32_t          push_data_cursor = 0;
 	return GetProgram(params, input_info, push_data_cursor);
 }

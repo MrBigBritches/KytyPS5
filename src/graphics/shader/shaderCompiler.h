@@ -37,6 +37,13 @@ void BuildStageStaticKey(const ShaderComputeInputInfo& input_info, std::vector<u
 void ShaderGetStaticInputInfoCS(const HW::CsStageRegisters& cs_regs, uint32_t scratch_size_dwords,
                                 ShaderComputeInputInfo& info);
 
+/// Whether a compute program's LDS is larger than the device's shared memory, so the recompiler
+/// backs it with a storage buffer. GetComputeProgram, the shader store generator and the pre-scan
+/// all decide it here, because the module id does not carry the answer.
+/// @param lds_dwords       the program's LDS size in dwords, ShaderComputeInputInfo::lds_size_dwords.
+/// @param max_shared_bytes the device's maxComputeSharedMemorySize limit.
+[[nodiscard]] bool ComputeLdsNeedsStorage(uint32_t lds_dwords, uint32_t max_shared_bytes);
+
 ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context& context,
                             const HW::UserConfig& user_config, ShaderVertexInputInfo& input_info);
 // Each stage's tess holds the VGT fields; the caller adds the layout reflected from the programs.

@@ -696,6 +696,20 @@ add_executable(scan_differential_tests EXCLUDE_FROM_ALL
 target_link_libraries(scan_differential_tests common fmt::fmt xxhash nlohmann_json::nlohmann_json)
 target_include_directories(scan_differential_tests PRIVATE ${inc_headers})
 
+# The pre-scan's input info builder and the translation setup it shares with the generator. Neither
+# runs the recompiler here, so the test links only them and the device-free static key code.
+add_executable(compute_translation_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ComputeTranslationTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/shaderStaticKey.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/storegen/computeTranslation.cpp"
+)
+target_link_libraries(compute_translation_tests common Vulkan::Headers fmt::fmt xxhash xbyak::xbyak)
+target_include_directories(compute_translation_tests PRIVATE ${inc_headers})
+if (KYTY_CLANG_CL)
+	# The recompiler headers bring in the deprecated codecvt use the store worker test silences too.
+	target_compile_options(compute_translation_tests PRIVATE -Wno-deprecated-declarations)
+endif()
+
 # The prescan variant tracker and descriptor validation. Both are headers over the recompiler's
 # resource types, so the test links no translation, no walk and no device. The image conversion
 # predicate the validation shares with the emitter needs the texture format remap table.
@@ -1061,6 +1075,7 @@ if(BUILD_TESTING)
 	add_test(NAME submit_scan COMMAND $<TARGET_FILE:submit_scan_tests>)
 	add_test(NAME scan_differential COMMAND $<TARGET_FILE:scan_differential_tests>)
 	add_test(NAME prescan COMMAND $<TARGET_FILE:prescan_tests>)
+	add_test(NAME compute_translation COMMAND $<TARGET_FILE:compute_translation_tests>)
 	add_test(NAME shader_store_predictor COMMAND $<TARGET_FILE:shader_store_predictor_tests>)
 	add_test(NAME shader_store_keys COMMAND $<TARGET_FILE:shader_store_keys_tests>)
 	add_test(NAME shader_store_record COMMAND $<TARGET_FILE:shader_store_record_tests>)
@@ -1079,6 +1094,10 @@ if(BUILD_TESTING)
 	set_tests_properties(shader_recompiler_store_generation PROPERTIES TIMEOUT 600)
 	add_test(NAME shader_recompiler_generated_modules
 	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --generated-modules-only)
+	# The pre-scan's translation setup and static key against the runtime's, on the real device.
+	add_test(NAME shader_recompiler_prescan_setup
+	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --prescan-setup-only)
+	set_tests_properties(shader_recompiler_prescan_setup PROPERTIES TIMEOUT 120)
 	add_test(NAME shader_recompiler_submit_cadence
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --submit-cadence-only)
 	add_test(NAME shader_recompiler_submit_cadence_gpu
@@ -1213,6 +1232,7 @@ if(BUILD_TESTING)
 		submit_scan_tests
 		scan_differential_tests
 		prescan_tests
+		compute_translation_tests
 		shader_store_predictor_tests
 		shader_store_keys_tests
 		shader_store_record_tests

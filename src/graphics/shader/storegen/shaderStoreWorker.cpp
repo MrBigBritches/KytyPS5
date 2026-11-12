@@ -8,6 +8,7 @@
 #include "graphics/shader/storegen/candidateOrder.h"
 #include "graphics/shader/storegen/computePredictor.h"
 #include "graphics/shader/storegen/computeStaticKey.h"
+#include "graphics/shader/storegen/computeTranslation.h"
 #include "graphics/shader/storegen/ebootShaderScan.h"
 #include "graphics/shader/storegen/headerSlots.h"
 #include "graphics/shader/storegen/resourceKeys.h"
@@ -33,13 +34,6 @@ using Clock = std::chrono::steady_clock;
 double MillisecondsSince(Clock::time_point start) {
 	return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
 }
-
-// The values of the store header that translation depends on.
-struct HostValues {
-	bool                             structured_jump_tables = false;
-	ShaderRecompiler::Spirv::Profile profile;
-	uint32_t                         max_shared_bytes = 0;
-};
 
 // Whether every flag byte of a store header is 0 or 1. The header is read once more as plain bytes
 // in the order the fields are written, which is the build stamp, the jump table flag, the profile
@@ -79,32 +73,6 @@ std::optional<HostValues> DecodeHostHeader(std::span<const uint8_t> bytes) {
 	return host;
 }
 
-// The translation options of one program, set as the runtime sets them for a compute program. The
-// options point into this object, so it stays where it is.
-class TranslationSetup {
-public:
-	TranslationSetup(const ComputeStaticKey& key, uint64_t code_hash, const HostValues& host)
-	    : m_info(key.input_info), m_user_data(key.user_data_count, 0u) {
-		m_options.wave_size              = m_info.wave_size;
-		m_options.stage                  = ShaderType::Compute;
-		m_options.input_info.compute     = &m_info;
-		m_options.shader_hash            = code_hash;
-		m_options.dump_ir                = false;
-		m_options.structured_jump_tables = host.structured_jump_tables;
-		m_options.user_data              = m_user_data;
-		m_options.profile                = &host.profile;
-	}
-	TranslationSetup(const TranslationSetup&)            = delete;
-	TranslationSetup& operator=(const TranslationSetup&) = delete;
-
-	ShaderRecompiler::CompileOptions& Options() { return m_options; }
-
-private:
-	ShaderComputeInputInfo           m_info;
-	std::vector<uint32_t>            m_user_data;
-	ShaderRecompiler::CompileOptions m_options;
-};
-
 // How far a program got toward having candidates.
 enum class PredictKind {
 	Predicted,
@@ -129,7 +97,7 @@ const char* PredictOutcomeWord(PredictKind kind) {
 // Translates a program once to list its resources, then predicts its candidates.
 PredictKind PredictProgram(const ScannedProgram& scanned, const ComputeStaticKey& key,
                            const HostValues& host, std::vector<Candidate>& candidates) {
-	TranslationSetup setup(key, scanned.code_hash, host);
+	TranslationSetup setup(key.input_info, key.user_data_count, scanned.code_hash, host);
 	const auto       source = ShaderRecompiler::PrepareShaderSource(scanned.code, setup.Options());
 	// The store holds only programs without GPU-selected calls.
 	if (source.unsupported_call_pc != UINT32_MAX || !source.calls.empty()) {
@@ -199,7 +167,8 @@ struct BuiltCandidate {
 BuiltCandidate BuildCandidate(const PredictedProgram& program, const Candidate& candidate,
                               const HostValues& host) {
 	const auto&      scanned = *program.scanned;
-	TranslationSetup setup(program.key, scanned.code_hash, host);
+	TranslationSetup setup(program.key.input_info, program.key.user_data_count, scanned.code_hash,
+	                       host);
 	const auto       source = ShaderRecompiler::PrepareShaderSource(scanned.code, setup.Options());
 	auto       translated   = ShaderRecompiler::TranslateProgram(source.decoded, setup.Options());
 	const auto plan         = IR::ExtractResourcePlan(translated.program);

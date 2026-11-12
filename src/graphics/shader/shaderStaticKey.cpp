@@ -21,6 +21,7 @@ constexpr uint32_t FOOTER_LITERAL_WORD = 6;
 constexpr uint32_t FOOTER_MAGIC_BYTES  = 8;
 constexpr uint32_t LITERAL_ALIGNMENT   = 16;
 constexpr uint32_t LDS_DWORDS_PER_UNIT = 128;
+constexpr uint32_t BYTES_PER_DWORD     = 4;
 constexpr uint32_t ASYNC_COMPUTE_SHIFT = 1;
 constexpr uint32_t FLOAT_MODE_SHIFT    = 8;
 
@@ -56,6 +57,10 @@ void ShaderGetStaticInputInfoCS(const HW::CsStageRegisters& cs_regs, uint32_t sc
 	info.tg_size_en          = cs_regs.tg_size_en != 0;
 
 	info.workgroup_register = cs_regs.user_sgpr;
+}
+
+bool ComputeLdsNeedsStorage(uint32_t lds_dwords, uint32_t max_shared_bytes) {
+	return lds_dwords * BYTES_PER_DWORD > max_shared_bytes;
 }
 
 void BuildStageStaticKey(const ShaderComputeInputInfo& info, std::vector<uint32_t>& key) {
