@@ -1232,13 +1232,14 @@ GraphicsPipelineKey PipelineCache::MakeGraphicsPipelineKey(const CommandBuffer& 
 
 PipelineCache::Pipeline& PipelineCache::CreateGraphicsPipelineHere(Pipeline&                  slot,
                                                                    const GraphicsPipelineKey& key,
-                                                                   const Stages&              stages) {
+                                                                   const Stages&              stages,
+                                                                   Common::GpuStall::HoldCause cause) {
 	{
 		// A compile on the GPU command thread stops all guest rendering, so guest audio may wait
 		// for it. One on any other thread leaves the game running and must not hold audio.
 		std::optional<Common::GpuStall::Scope> stall;
 		if (GuestGpu::IsGpuThread()) {
-			stall.emplace();
+			stall.emplace(cause);
 		}
 		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::PipelinesCreated,
 		                                         Common::DebugCounters::Counter::PipelineCreateNs,
@@ -1293,7 +1294,8 @@ PipelineCache::Pipeline* PipelineCache::AcquireGraphicsPipeline(const CommandBuf
 		return &iter->second;
 	}
 	DumpPipelineInputs(state);
-	return &CreateGraphicsPipelineHere(iter->second, key, stages);
+	return &CreateGraphicsPipelineHere(iter->second, key, stages,
+	                                   Common::GpuStall::HoldCause::RequiredGraphics);
 }
 
 void PipelineCache::NoteIneligibleWait(const MissedDraw& missed, const Stages& stages) {
@@ -1395,10 +1397,14 @@ PipelineCache::Pipeline* PipelineCache::AcquireBuiltPipeline(const GraphicsPipel
 	}
 	bool       may_skip = false;
 	const auto fate     = ChooseMissedDrawFate(key, stages, policy, deferred, may_skip, missed.blocker);
+	// A draw that could not be deferred is the one NoteIneligibleWait reports, so its wait gets that
+	// cause. Any other draw that must wait for its pipeline needs it to render, so it is required.
+	const auto wait_cause = missed.blocker != nullptr ? Common::GpuStall::HoldCause::IneligibleDraw
+	                                                  : Common::GpuStall::HoldCause::RequiredGraphics;
 	if (pending == m_pending_graphics.end()) {
 		DumpPipelineInputs(state);
 		if (fate == DrawFate::Block) {
-			return &CreateGraphicsPipelineHere(m_graphics_pipelines[key], key, stages);
+			return &CreateGraphicsPipelineHere(m_graphics_pipelines[key], key, stages, wait_cause);
 		}
 		RequestBuild(key, stages);
 		pending = m_pending_graphics.find(key);
@@ -1416,7 +1422,7 @@ PipelineCache::Pipeline* PipelineCache::AcquireBuiltPipeline(const GraphicsPipel
 		pending->second.build->skipped_draws++;
 		return nullptr;
 	}
-	return &FinishBuild(pending->second.build, pending->second.job);
+	return &FinishBuild(pending->second.build, pending->second.job, wait_cause);
 }
 
 PipelineCache::Pipeline PipelineCache::AcquireDeferredPipeline(const GraphicsPipelineKey& key,
@@ -1431,7 +1437,8 @@ PipelineCache::Pipeline PipelineCache::AcquireDeferredPipeline(const GraphicsPip
 	}
 	const auto pending = m_pending_graphics.find(key);
 	EXIT_IF(pending == m_pending_graphics.end());
-	return FinishBuild(pending->second.build, pending->second.job, &waited_ms);
+	return FinishBuild(pending->second.build, pending->second.job,
+	                   Common::GpuStall::HoldCause::DeferredDrawResolve, &waited_ms);
 }
 
 std::vector<PipelineCache::Pipeline>
@@ -1454,7 +1461,7 @@ PipelineCache::AcquireDeferredPipelines(std::span<const GraphicsPipelineKey> key
 		// Recording the holes and saving the driver cache are outside it.
 		std::optional<Common::GpuStall::Scope> stall;
 		if (hold_audio) {
-			stall.emplace();
+			stall.emplace(Common::GpuStall::HoldCause::DeferredDrawResolve);
 		}
 		// A resolve is one pause of the GPU thread, so it is one sample of its longest hitch.
 		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::Count,
@@ -1525,7 +1532,8 @@ std::optional<double> AcquireBuildJob(PipelineBuildQueue& queue, PipelineBuildQu
 
 PipelineCache::Pipeline& PipelineCache::FinishBuild(const std::shared_ptr<GraphicsBuild>& build,
                                                     const PipelineBuildQueue::JobPtr&      job,
-                                                    double* resolve_waited_ms) {
+                                                    Common::GpuStall::HoldCause            wait_cause,
+                                                    double*                                resolve_waited_ms) {
 	// Keeps the build alive across the adoption below, which erases it from the pending map.
 	const auto keep_alive = build;
 	if (resolve_waited_ms != nullptr) {
@@ -1538,7 +1546,7 @@ PipelineCache::Pipeline& PipelineCache::FinishBuild(const std::shared_ptr<Graphi
 		// Both ways of getting the pipeline stop the GPU thread, so guest audio may wait for them.
 		std::optional<Common::GpuStall::Scope> stall;
 		if (GuestGpu::IsGpuThread()) {
-			stall.emplace();
+			stall.emplace(wait_cause);
 		}
 		// Running the compile here and waiting for a worker both stop the GPU thread, so both
 		// count as pipeline time and toward its longest hitch.
@@ -1618,7 +1626,10 @@ void PipelineCache::StartWarmCompute(const ShaderModule& module, StoreGen::GenRo
 		// Marked here because this build adds to the driver cache without a checkpoint of its own.
 		m_driver_cache_dirty.store(true, std::memory_order_relaxed);
 	};
-	(void)m_warm_compute->Start(module.id, std::move(build), lane);
+	// Only the generator passes a row, so the row marks the module as generated for the stall cause.
+	if (m_warm_compute->Start(module.id, std::move(build), lane) && row != nullptr) {
+		m_generated_warm_ids.insert(module.id);
+	}
 }
 
 namespace {
@@ -1637,6 +1648,20 @@ void RecordWarmTake(uint64_t id, PipelineBuildQueue::Acquired how, double stoppe
 }
 
 } // namespace
+
+Common::GpuStall::HoldCause WarmTakeCause(PipelineBuildQueue::Acquired how, bool paused,
+                                          bool generated) {
+	using Common::GpuStall::HoldCause;
+	if (how == PipelineBuildQueue::Acquired::Waited) {
+		return generated ? HoldCause::GeneratedWaited : HoldCause::WarmWaited;
+	}
+	// Generated and paused are both told apart, so neither wins. The cost of the pause is the two
+	// paused causes added, and the generator's misses are the two generated inline causes added.
+	if (generated) {
+		return paused ? HoldCause::GeneratedInlinePaused : HoldCause::GeneratedInline;
+	}
+	return paused ? HoldCause::WarmInlinePaused : HoldCause::WarmInline;
+}
 
 PipelineCache::Pipeline* PipelineCache::TakeWarmCompute(const ShaderComputeInputInfo& input_info) {
 	const auto id = input_info.stage.module->id;
@@ -1668,11 +1693,17 @@ PipelineCache::Pipeline* PipelineCache::TakeWarmCompute(const ShaderComputeInput
 
 std::optional<WarmBuildSet<uint64_t, PipelineCache::Pipeline>::Taken>
 PipelineCache::TakeUnfinishedWarmCompute(uint64_t id) {
+	// Looked up before the Scope, so no part of it counts toward a hold. The set belongs to the GPU
+	// thread, so another thread, which makes no Scope, does not read it.
+	const bool on_gpu_thread = GuestGpu::IsGpuThread();
+	const bool generated     = on_gpu_thread && m_generated_warm_ids.contains(id);
 	// Running the compile here and waiting for a worker both stop the GPU thread, so guest audio
 	// may wait for them and both count toward its longest hitch.
 	std::optional<Common::GpuStall::Scope> stall;
-	if (GuestGpu::IsGpuThread()) {
-		stall.emplace();
+	if (on_gpu_thread) {
+		// What the dispatch waits for is known only once Take says whether it ran the build or waited
+		// for a worker, so the cause is corrected below, before the Scope ends.
+		stall.emplace(Common::GpuStall::HoldCause::WarmInline);
 	}
 	Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::Count,
 	                                         Common::DebugCounters::Counter::PipelineCreateNs,
@@ -1681,6 +1712,9 @@ PipelineCache::TakeUnfinishedWarmCompute(uint64_t id) {
 	const bool paused = m_warm_compute->Paused();
 	auto       taken  = m_warm_compute->Take(id);
 	EXIT_IF(!taken);
+	if (stall) {
+		stall->Reclassify(WarmTakeCause(taken->how, paused, generated));
+	}
 	const auto stopped_ms = std::chrono::duration<double, std::milli>(
 	                            std::chrono::steady_clock::now() - start)
 	                            .count();
@@ -1817,7 +1851,7 @@ PipelineCache::Pipeline& PipelineCache::GetComputePipeline(const ShaderComputeIn
 		// for it. One on any other thread leaves the game running and must not hold audio.
 		std::optional<Common::GpuStall::Scope> stall;
 		if (GuestGpu::IsGpuThread()) {
-			stall.emplace();
+			stall.emplace(Common::GpuStall::HoldCause::RequiredCompute);
 		}
 		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::PipelinesCreated,
 		                                         Common::DebugCounters::Counter::PipelineCreateNs,

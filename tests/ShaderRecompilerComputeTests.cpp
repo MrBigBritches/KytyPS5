@@ -1437,7 +1437,8 @@ struct PipelineCacheTestAccess {
   // Waits for the pending build of a key and takes it, as a blocking draw of the same key does.
   static void FinishPending(PipelineCache &cache, const GraphicsPipelineKey &key) {
     const auto pending = cache.m_pending_graphics.find(key);
-    (void)cache.FinishBuild(pending->second.build, pending->second.job);
+    (void)cache.FinishBuild(pending->second.build, pending->second.job,
+                            Common::GpuStall::HoldCause::RequiredGraphics);
   }
 
   // A key no draw made, told apart from the others by its number alone.
@@ -2542,6 +2543,39 @@ void CheckSubmitCadenceLogic() {
   CheckSubmitCadenceBoundary();
   CheckSubmitCadenceLagMath();
   std::printf("[host]    %-32s ok\n", "SubmitCadence");
+}
+
+// The cause a stop for a warm-up build is charged to, for every way the take can end. Each row
+// differs from its neighbours in one input, so a swapped branch moves at least one row. A
+// unit test cannot see whether TakeUnfinishedWarmCompute applies it with Reclassify, because that
+// needs a renderer and a GPU-thread Scope, so deleting that call is only caught by the cause
+// counters of a run.
+void CheckWarmTakeCause() {
+  using Common::GpuStall::HoldCause;
+  using Acquired = Libs::Graphics::PipelineBuildQueue::Acquired;
+  struct Row {
+    Acquired how;
+    bool paused;
+    bool generated;
+    HoldCause expected;
+    const char *label;
+  };
+  const Row rows[] = {
+      {Acquired::Waited, false, true, HoldCause::GeneratedWaited, "waited generated"},
+      {Acquired::Waited, false, false, HoldCause::WarmWaited, "waited"},
+      {Acquired::Waited, true, false, HoldCause::WarmWaited, "waited while paused"},
+      {Acquired::RanInline, false, true, HoldCause::GeneratedInline, "inline generated"},
+      {Acquired::RanInline, true, true, HoldCause::GeneratedInlinePaused, "inline generated paused"},
+      {Acquired::RanInline, true, false, HoldCause::WarmInlinePaused, "inline paused"},
+      {Acquired::AlreadyDone, false, false, HoldCause::WarmInline, "already done"},
+      {Acquired::RanInline, false, false, HoldCause::WarmInline, "inline"},
+  };
+  for (const auto &row : rows) {
+    Require("WarmTakeCause", row.label,
+            Libs::Graphics::WarmTakeCause(row.how, row.paused, row.generated) == row.expected,
+            "a warm take was charged to the wrong hold cause");
+  }
+  std::printf("[host]    %-32s ok\n", "WarmTakeCause");
 }
 
 void CheckLeastRecentlyUsedCacheOrdering() {
@@ -62890,7 +62924,7 @@ void CheckGeneratedDrainBudget(VulkanHarness &vulkan, GuestGpu &gpu,
 
 // The number after a key in the generation block of the process-wide report, or nothing.
 std::optional<uint64_t> GenerationFigure(const std::string &key) {
-  const auto json = Common::FirstRunReport::Global().ToJson({}, 0, 1.0, 0.0);
+  const auto json = Common::FirstRunReport::Global().ToJson({}, 0, 1.0, 0.0, {});
   const auto block = json.find("\"shader_store_generation\"");
   if (block == std::string::npos) return std::nullopt;
   const std::string needle = "\"" + key + "\": ";
@@ -62902,7 +62936,7 @@ std::optional<uint64_t> GenerationFigure(const std::string &key) {
 // Whether the process-wide report's text holds this text, for the parts of the block that are not
 // numbers.
 bool GenerationReportHas(const std::string &text) {
-  return Common::FirstRunReport::Global().ToJson({}, 0, 1.0, 0.0).find(text) != std::string::npos;
+  return Common::FirstRunReport::Global().ToJson({}, 0, 1.0, 0.0, {}).find(text) != std::string::npos;
 }
 
 // The report reads the generation's figures from its own thread while the GPU thread drains, and
@@ -71319,6 +71353,7 @@ int main(int argc, char **argv) {
   CheckLeastRecentlyUsedCacheOrdering();
   CheckSubmitCadenceConfig();
   CheckSubmitCadenceLogic();
+  CheckWarmTakeCause();
   if (argc == 2 && std::strcmp(argv[1], "--submit-cadence-only") == 0) {
     return 0;
   }

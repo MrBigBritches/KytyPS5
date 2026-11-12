@@ -1518,7 +1518,7 @@
       if (stall != WindowStall::None) {
         std::thread audio;
         {
-          const Stall::Scope scope;
+          const Stall::Scope scope(Stall::HoldCause::Other);
           audio = std::thread([] { (void)Stall::WaitWhileStalled(); });
           if (stall == WindowStall::Held) {
             WaitUntilTrue(name, "parked", [&] { return Stall::WaiterCount() == 1; });

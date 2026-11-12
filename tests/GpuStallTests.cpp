@@ -1,6 +1,7 @@
 #include "common/debugCounters.h"
 #include "common/gpuStall.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -15,6 +16,8 @@ using Common::GpuStall::Clock;
 using Common::GpuStall::StallTracker;
 using std::chrono::milliseconds;
 
+// The existing cases do not look at the cause, which Scope now requires, so they all name this one.
+constexpr Common::GpuStall::HoldCause kAnyCause = Common::GpuStall::HoldCause::Other;
 constexpr milliseconds kThreshold {250};
 // How long a waiter thread may take to start and park before the test gives up.
 constexpr std::chrono::seconds kParkLimit {10};
@@ -82,14 +85,14 @@ void TestTrackerBackToBack() {
 
 void TestDisabledNeverWaits() {
   Common::GpuStall::Configure(false, milliseconds(0));
-  Common::GpuStall::Scope scope;
+  Common::GpuStall::Scope scope(kAnyCause);
   Check(!Common::GpuStall::IsStalled(), "a disabled module reported a stall");
   Check(!Common::GpuStall::WaitWhileStalled(), "a disabled module held");
 }
 
 void TestShortScopeNeverWaits() {
   Common::GpuStall::Configure(true, kNeverReached);
-  Common::GpuStall::Scope scope;
+  Common::GpuStall::Scope scope(kAnyCause);
   bool held = true;
   std::thread waiter([&] { held = Common::GpuStall::WaitWhileStalled(); });
   waiter.join();
@@ -100,7 +103,7 @@ void TestShortScopeNeverWaits() {
 // The GPU thread would deadlock if it waited for its own Scope to end.
 void TestScopeOwnerNeverWaits() {
   Common::GpuStall::Configure(true, milliseconds(0));
-  Common::GpuStall::Scope scope;
+  Common::GpuStall::Scope scope(kAnyCause);
   Check(Common::GpuStall::IsStalled(), "a Scope at the threshold was not reported");
   Check(!Common::GpuStall::WaitWhileStalled(), "the thread owning a Scope waited on itself");
   Common::GpuStall::Configure(false);
@@ -110,7 +113,7 @@ void TestScopeOwnerNeverWaits() {
 // the threshold, which is zero here.
 void TestEnableWithActiveScope() {
   Common::GpuStall::Configure(false, milliseconds(0));
-  Common::GpuStall::Scope scope;
+  Common::GpuStall::Scope scope(kAnyCause);
   Check(!Common::GpuStall::IsStalled(), "a disabled module reported a stall");
   Common::GpuStall::Configure(true, milliseconds(0));
   Check(Common::GpuStall::IsStalled(), "enabling with an old Scope did not stall");
@@ -121,7 +124,7 @@ void TestEnableWithActiveScope() {
 template <typename Release>
 void CheckWaiterReleased(Release release, const char *what) {
   Common::GpuStall::Configure(true, milliseconds(0));
-  auto scope = std::make_unique<Common::GpuStall::Scope>();
+  auto scope = std::make_unique<Common::GpuStall::Scope>(kAnyCause);
   std::atomic<bool> done {false};
   bool held = false;
   Clock::time_point woke;
@@ -157,7 +160,7 @@ void TestDisableReleasesWaiter() {
 void TestResumedFromHold() {
   Check(!Common::GpuStall::ResumedFromHold(), "a thread with no call that waited reported a hold");
   Common::GpuStall::Configure(true, milliseconds(0));
-  auto scope = std::make_unique<Common::GpuStall::Scope>();
+  auto scope = std::make_unique<Common::GpuStall::Scope>(kAnyCause);
   std::atomic<bool> held_once {false};
   bool resumed = false;
   bool cleared = false;
@@ -201,7 +204,7 @@ void TestHoldCounters() {
   const auto before = holds();
   const auto held_ns_before = Common::DebugCounters::Get(Counter::AudioHoldNs);
   {
-    auto scope = std::make_unique<Common::GpuStall::Scope>();
+    auto scope = std::make_unique<Common::GpuStall::Scope>(kAnyCause);
     auto waiters = StartParkedWaiters(2);
     scope.reset();
     for (auto &waiter : waiters) waiter.join();
@@ -209,11 +212,11 @@ void TestHoldCounters() {
   Check(holds() == before + 1, "one stall holding two threads was not counted once");
   Check(Common::DebugCounters::Get(Counter::AudioHoldNs) > held_ns_before,
         "a counted hold added no held time");
-  { Common::GpuStall::Scope scope; }
+  { Common::GpuStall::Scope scope(kAnyCause); }
   Check(holds() == before + 1, "a stall that held nothing was counted");
   {
-    auto outer = std::make_unique<Common::GpuStall::Scope>();
-    auto inner = std::make_unique<Common::GpuStall::Scope>();
+    auto outer = std::make_unique<Common::GpuStall::Scope>(kAnyCause);
+    auto inner = std::make_unique<Common::GpuStall::Scope>(kAnyCause);
     auto waiters = StartParkedWaiters(1);
     inner.reset();
     Check(holds() == before + 1, "a stall was counted before its last Scope ended");
@@ -223,6 +226,180 @@ void TestHoldCounters() {
   Check(holds() == before + 2, "overlapping Scopes were not counted as one stall");
   Common::GpuStall::Configure(false);
   Common::DebugCounters::SetEnabled(false);
+}
+
+using Common::GpuStall::Breakdown;
+using Common::GpuStall::HoldBreakdown;
+using Common::GpuStall::HoldCause;
+using Common::GpuStall::HoldHistogram;
+
+// How long a hold lasts in the cases below, so the held time is well above timer noise.
+constexpr milliseconds kHoldTime {20};
+
+// The position of a cause in the breakdown's tables.
+size_t Index(HoldCause cause) { return static_cast<size_t>(cause); }
+
+// Starts Scopes of the given causes in order, parks one audio waiter, and ends the Scopes in the order
+// given by end_order, which holds the indexes into causes. The one hold that results is counted when
+// the last Scope ends. With reclassify set, the first Scope's cause is changed while it is held.
+void RunHold(const std::vector<HoldCause> &causes, const std::vector<size_t> &end_order,
+             HoldCause reclassify_first_to = HoldCause::Other, bool reclassify = false) {
+  Common::GpuStall::Configure(true, milliseconds(0));
+  std::vector<std::unique_ptr<Common::GpuStall::Scope>> scopes;
+  for (const auto cause : causes) scopes.push_back(std::make_unique<Common::GpuStall::Scope>(cause));
+  auto waiters = StartParkedWaiters(1);
+  std::this_thread::sleep_for(kHoldTime);
+  if (reclassify) scopes[0]->Reclassify(reclassify_first_to);
+  for (const auto index : end_order) scopes[index].reset();
+  for (auto &waiter : waiters) waiter.join();
+  Common::GpuStall::Configure(false);
+}
+
+// The held nanoseconds of every cause added together.
+uint64_t SumNs(const HoldBreakdown &breakdown) {
+  uint64_t total = 0;
+  for (const auto nanoseconds : breakdown.cause_ns) total += nanoseconds;
+  return total;
+}
+
+// When Scopes overlap, the whole hold goes to the cause of the oldest, whichever ends last. The two
+// causes differ so a charge to the wrong Scope shows. The baseline is the same overlap with the old
+// Scope ending last, where the oldest and the last to end are the same Scope, so only the first run
+// tells "oldest" from "last to end".
+void TestOverlapChargesTheOldestScope() {
+  const auto older = HoldCause::RequiredGraphics;
+  const auto newer = HoldCause::WarmWaited;
+  const auto held_before = Common::GpuStall::HeldNs();
+  const auto before = Breakdown();
+  RunHold({older, newer}, {0, 1}); // The old Scope ends first, and the new one ends the stall.
+  const auto after = Breakdown();
+  const auto held = Common::GpuStall::HeldNs() - held_before;
+  Check(held > 0, "the overlapping stall held nothing");
+  Check(after.cause_ns[Index(older)] - before.cause_ns[Index(older)] == held,
+        "the hold was not charged in full to the oldest Scope");
+  Check(after.cause_ns[Index(newer)] == before.cause_ns[Index(newer)],
+        "the Scope that ended the stall was charged");
+  Check(after.cause_count[Index(older)] - before.cause_count[Index(older)] == 1,
+        "the oldest Scope's cause was not counted once");
+
+  const auto mid = Breakdown();
+  RunHold({older, newer}, {1, 0}); // The old Scope outlasts the new one.
+  const auto last = Breakdown();
+  Check(last.cause_count[Index(older)] - mid.cause_count[Index(older)] == 1 &&
+            last.cause_count[Index(newer)] == mid.cause_count[Index(newer)],
+        "an old Scope that ended last was not charged");
+}
+
+// A site that learns its cause late changes it before the Scope ends, and the hold follows.
+void TestReclassifyBeforeTheScopeEnds() {
+  const auto before = Breakdown();
+  RunHold({HoldCause::WarmInline}, {0}, HoldCause::GeneratedWaited, true);
+  const auto after = Breakdown();
+  Check(after.cause_count[Index(HoldCause::GeneratedWaited)] -
+                before.cause_count[Index(HoldCause::GeneratedWaited)] == 1,
+        "a reclassified Scope was not charged to its new cause");
+  Check(after.cause_count[Index(HoldCause::WarmInline)] ==
+            before.cause_count[Index(HoldCause::WarmInline)],
+        "a reclassified Scope was still charged to its first cause");
+}
+
+// The causes add up to the total that the tracker counts on its own. Three holds of three causes, so
+// a cause missing from the table is a hold that is in the total and in no cause. The total is read
+// from HeldNs, which is a counter of its own and not computed from the causes. The same three holds
+// go through the global histogram and the stored records, which must show them too. A histogram that
+// puts every hold in bucket 0 or never keeps the maximum, and a record that is not stored, all differ
+// from the three known holds, which are each at least kHoldTime long.
+void TestHeldCausesSumToTotal() {
+  const auto held_before  = Common::GpuStall::HeldNs();
+  const auto holds_before = Common::GpuStall::HoldCount();
+  const auto before       = Breakdown();
+  RunHold({HoldCause::RequiredCompute}, {0});
+  std::this_thread::sleep_for(milliseconds(5));
+  RunHold({HoldCause::PrescanWaited}, {0});
+  RunHold({HoldCause::IneligibleDraw}, {0});
+  const auto after = Breakdown();
+  for (const auto cause :
+       {HoldCause::RequiredCompute, HoldCause::PrescanWaited, HoldCause::IneligibleDraw}) {
+    Check(after.cause_ns[Index(cause)] > before.cause_ns[Index(cause)],
+          "a hold was not charged to its cause");
+    Check(after.cause_count[Index(cause)] - before.cause_count[Index(cause)] == 1,
+          "a cause was not counted once");
+  }
+  Check(Common::GpuStall::HoldCount() - holds_before == 3, "the tracker did not count three holds");
+  Check(SumNs(after) - SumNs(before) == Common::GpuStall::HeldNs() - held_before,
+        "the causes do not add up to the tracker's held time");
+  const auto total = Common::GpuStall::HeldNs();
+  const auto difference = SumNs(after) > total ? SumNs(after) - total : total - SumNs(after);
+  Check(difference < 1'000'000, "the causes since the start differ from the total by 1 ms or more");
+  Check(after.histogram.count - before.histogram.count == 3, "the histogram did not count three holds");
+
+  // The three records are the last three stored, in the order the holds ended.
+  const auto records = Common::GpuStall::HoldRecords();
+  Check(records.size() >= 3 && after.exact.overflow == 0, "the holds were not stored");
+  const std::vector<HoldCause> expected_causes {HoldCause::RequiredCompute, HoldCause::PrescanWaited,
+                                                HoldCause::IneligibleDraw};
+  HoldHistogram expected;
+  uint64_t      longest = 0;
+  for (size_t position = 0; position < 3; ++position) {
+    const auto &record = records[records.size() - 3 + position];
+    Check(record.cause == expected_causes[position], "a stored hold has the wrong cause");
+    Check(record.held_ns >= static_cast<uint64_t>(kHoldTime.count()) * 1'000'000,
+          "a stored hold is shorter than it was held");
+    expected.Add(record.held_ns);
+    longest = std::max(longest, record.held_ns);
+  }
+  Check(after.exact.count - before.exact.count == 3, "the exact figures did not count three holds");
+  Check(after.histogram.max_ns >= longest, "the histogram did not keep the longest hold");
+  Check(after.exact.max_ms * 1e6 >= static_cast<double>(longest), "the exact max is below a hold");
+  Check(after.histogram.buckets[0] == before.histogram.buckets[0],
+        "a hold of at least kHoldTime landed in the shortest bucket");
+  for (size_t bucket = 0; bucket < Common::GpuStall::HOLD_BUCKET_COUNT; ++bucket) {
+    const auto grown = after.histogram.buckets[bucket] - before.histogram.buckets[bucket];
+    Check(grown == expected.buckets[bucket], "a hold landed in the wrong histogram bucket");
+  }
+}
+
+// The exact percentiles are nearest rank over the sorted holds. Ten holds of 10 to 100 ms give p50 of
+// 50 and p95 of 100, where a rank that rounds down gives 90 for p95. Nineteen holds of 300 ms and one
+// of 600 ms give an exact p95 of 300, which the buckets, with a bound of 500, could not show.
+void TestExactPercentiles() {
+  constexpr uint64_t kNsPerMs = 1'000'000;
+  Check(Common::GpuStall::ExactPercentileMs({}, 0.5) == 0.0, "an empty list reported a hold");
+  std::vector<uint64_t> ladder;
+  for (uint64_t step = 1; step <= 10; ++step) ladder.push_back(step * 10 * kNsPerMs);
+  Check(Common::GpuStall::ExactPercentileMs(ladder, 0.5) == 50.0,
+        "the exact p50 is not the fifth shortest");
+  Check(Common::GpuStall::ExactPercentileMs(ladder, 0.95) == 100.0, "the exact p95 is not the tenth");
+  Check(Common::GpuStall::ExactPercentileMs(ladder, 0.0) == 10.0,
+        "a rank below the first was not clamped");
+  std::vector<uint64_t> mostly(19, 300 * kNsPerMs);
+  mostly.push_back(600 * kNsPerMs);
+  Check(Common::GpuStall::ExactPercentileMs(mostly, 0.95) == 300.0, "the exact p95 followed the bucket");
+}
+
+// Nine holds of 30 ms and one of 700 ms, so p50 lands in the 30 ms bucket and p95 in the 700 ms one.
+// A bucket that is one off gives p50 100 instead of 50, and the boundary checks show which side an
+// exact bound falls on. The percentile is the bucket's upper bound, never above the longest hold.
+void TestHoldHistogramPercentiles() {
+  constexpr uint64_t kNsPerMs = 1'000'000;
+  HoldHistogram histogram;
+  Check(histogram.PercentileMs(0.5) == 0.0 && histogram.MaxMs() == 0.0, "an empty histogram reported a hold");
+  for (int hold = 0; hold < 9; ++hold) histogram.Add(30 * kNsPerMs);
+  histogram.Add(700 * kNsPerMs);
+  Check(histogram.count == 10, "the histogram lost a hold");
+  Check(histogram.PercentileMs(0.5) == 50.0, "p50 is not the upper bound of the 30 ms bucket");
+  Check(histogram.PercentileMs(0.95) == 700.0, "p95 is not the longest hold, clamped from its bucket bound");
+  Check(histogram.MaxMs() == 700.0, "the max is wrong");
+
+  // An exact bound belongs to the bucket above it, and the last bucket has no bound.
+  Check(HoldHistogram::BucketOf(0) == 0, "0 ns is not in the first bucket");
+  Check(HoldHistogram::BucketOf(50 * kNsPerMs - 1) == 2, "just under a bound left its bucket");
+  Check(HoldHistogram::BucketOf(50 * kNsPerMs) == 3, "an exact bound stayed in the lower bucket");
+  Check(HoldHistogram::BucketOf(30000 * kNsPerMs) == Common::GpuStall::HOLD_BUCKET_COUNT - 1,
+        "a hold past the last bound is not in the last bucket");
+  HoldHistogram slow;
+  slow.Add(40000 * kNsPerMs);
+  Check(slow.PercentileMs(0.5) == 40000.0, "a hold in the last bucket did not report its own length");
 }
 
 } // namespace
@@ -240,6 +417,11 @@ int main() {
   TestDisableReleasesWaiter();
   TestResumedFromHold();
   TestHoldCounters();
+  TestOverlapChargesTheOldestScope();
+  TestReclassifyBeforeTheScopeEnds();
+  TestHeldCausesSumToTotal();
+  TestHoldHistogramPercentiles();
+  TestExactPercentiles();
   std::puts("GpuStallTests: all cases passed");
   return 0;
 }

@@ -1,4 +1,5 @@
 #include "common/firstRunReport.h"
+#include "common/gpuStall.h"
 
 #include <array>
 #include <atomic>
@@ -139,7 +140,7 @@ void TestReadyRows() {
   Check(rows.size() == 1 && rows[0].id == 0x11 && rows[0].id_ps == 0x22 &&
             Near(rows[0].ready_ms, 42.5) && rows[0].skipped_draws == 3,
         "the ready row lost a field");
-  const auto json = report.ToJson({}, 0, 1.0, 0.0);
+  const auto json = report.ToJson({}, 0, 1.0, 0.0, {});
   for (const char *needle : {"\"ready\"", "\"ready_ms\": 42.5", "\"skipped_draws\": 3",
                              "\"vs\": \"0000000000000011\""}) {
     Check(json.find(needle) != std::string::npos, needle);
@@ -164,7 +165,7 @@ void TestSampledAfterSkip() {
             summary.sampled_after_skip_by_target[0].second == 5 &&
             summary.sampled_after_skip_by_target[1].second == 1,
         "sampled skips were not summed per target class");
-  const auto json = report.ToJson({}, 0, 1.0, 0.0);
+  const auto json = report.ToJson({}, 0, 1.0, 0.0, {});
   Check(json.find("\"sampled_after_skip_by_target_class\"") != std::string::npos &&
             json.find("\"depth\": 5") != std::string::npos,
         "the file lacks the sampled skip counts");
@@ -185,7 +186,7 @@ void TestRefusalsAndBlockedTotals() {
             summary.refusals[0].draws == 2 && Near(summary.refusals[0].blocked_ms, 15.0) &&
             summary.refusals[1].draws == 1 && Near(summary.refusals[1].blocked_ms, 1.5),
         "refusals were not summed per rule");
-  const auto json = report.ToJson({}, 0, 1.0, 0.0);
+  const auto json = report.ToJson({}, 0, 1.0, 0.0, {});
   for (const char *needle : {"\"refused\"", "\"too_few_draws\"", "\"draws\": 2",
                              "\"blocked_ms\": 15.0"}) {
     Check(json.find(needle) != std::string::npos, needle);
@@ -282,7 +283,7 @@ void TestJsonContents() {
       .title_id = "PPSA00000", .build = "test-build", .flags = {{"--a", true}, {"--b", false}},
       .cold = true, .partial = true};
   report.AddStampFailure();
-  const auto json = report.ToJson(metadata, 7, 12.5, 2500.5);
+  const auto json = report.ToJson(metadata, 7, 12.5, 2500.5, {});
   for (const char *needle :
        {"\"title_id\": \"PPSA00000\"", "\"build\": \"test-build\"", "\"--a\": true",
         "\"--b\": false", "\"cold\": true", "\"warm_up_ms\": 1234.5", "\"blocked_ms\"",
@@ -303,7 +304,7 @@ void TestJsonContents() {
 // with their own numbers, so only the recording can have put them there, and Reset forgets them.
 void TestDeferredDrawsSection() {
   Report report;
-  const auto empty = nlohmann::json::parse(report.ToJson({}, 0, 1.0, 0.0))["deferred_draws"];
+  const auto empty = nlohmann::json::parse(report.ToJson({}, 0, 1.0, 0.0, {}))["deferred_draws"];
   Check(empty["resolves"].empty() && empty["resolves_per_flip"].empty() &&
             empty["ineligible"].empty() && empty["s2_would_skip"]["draws"] == 0 &&
             empty["s2_would_skip"]["waited_ms"] == 0.0,
@@ -355,7 +356,7 @@ void TestDeferredDrawsSection() {
   Check(summary.deferred_would_skip_draws == 2 && Near(summary.deferred_would_skip_waited_ms, 6.5),
         "would-skip draws were not summed");
 
-  const auto section = nlohmann::json::parse(report.ToJson({}, 0, 1.0, 0.0))["deferred_draws"];
+  const auto section = nlohmann::json::parse(report.ToJson({}, 0, 1.0, 0.0, {}))["deferred_draws"];
   const auto &rows   = section["resolves"];
   Check(rows.size() == 3 && rows[0]["holes"] == 3 && rows[0]["distinct_keys"] == 2 &&
             rows[0]["resolve_wait_ms"] == 12.5 && rows[0]["record_ms"] == 3.5 &&
@@ -427,15 +428,15 @@ constexpr double kMaxPlausibleMs = 60.0 * 1000.0; // No test here runs for a min
 // stored, so a report cannot claim libraries a device refused. Reset forgets the answer.
 void TestPipelineLibraryState() {
   Report report;
-  const auto empty = nlohmann::json::parse(report.ToJson({}, 0, 1.0, 0.0))["graphics_pipeline_library"];
+  const auto empty = nlohmann::json::parse(report.ToJson({}, 0, 1.0, 0.0, {}))["graphics_pipeline_library"];
   Check(empty["active"] == false && empty["inactive_reason"] == "",
         "a report whose device was never asked claimed pipeline libraries");
   report.SetPipelineLibrary({.active = false, .inactive_reason = "fast linking is missing"});
-  const auto refused = nlohmann::json::parse(report.ToJson({}, 0, 1.0, 0.0))["graphics_pipeline_library"];
+  const auto refused = nlohmann::json::parse(report.ToJson({}, 0, 1.0, 0.0, {}))["graphics_pipeline_library"];
   Check(refused["active"] == false && refused["inactive_reason"] == "fast linking is missing",
         "the reason a device refused pipeline libraries was not written");
   report.SetPipelineLibrary({.active = true});
-  const auto active = nlohmann::json::parse(report.ToJson({}, 0, 1.0, 0.0))["graphics_pipeline_library"];
+  const auto active = nlohmann::json::parse(report.ToJson({}, 0, 1.0, 0.0, {}))["graphics_pipeline_library"];
   Check(active["active"] == true && active["inactive_reason"] == "",
         "an active device was not written as active");
   report.Reset();
@@ -512,10 +513,10 @@ void CheckLibraryExample(const nlohmann::json &json) {
 void TestPipelineLibraryCounters() {
   Report report;
   CheckLibraryCountersAreZero(
-      nlohmann::json::parse(report.ToJson({}, 0, 1.0, 0.0))["graphics_pipeline_library"]);
+      nlohmann::json::parse(report.ToJson({}, 0, 1.0, 0.0, {}))["graphics_pipeline_library"]);
   AddLibraryExample(report);
   CheckLibraryExample(
-      nlohmann::json::parse(report.ToJson({}, 0, 1.0, 0.0))["graphics_pipeline_library"]);
+      nlohmann::json::parse(report.ToJson({}, 0, 1.0, 0.0, {}))["graphics_pipeline_library"]);
   report.Reset();
   Check(report.LibraryStats().links == 0 && report.LibraryStats().fallback_full[3] == 0 &&
             report.LibraryStats().libraries[1].built == 0,
@@ -533,7 +534,7 @@ void TestLibraryPipelineRows() {
   constexpr uint32_t kFragment = 1u << static_cast<uint32_t>(LibraryKind::Fragment);
   constexpr uint32_t kVertexInput = 1u << static_cast<uint32_t>(LibraryKind::VertexInput);
   Report report;
-  const auto empty = nlohmann::json::parse(report.ToJson({}, 0, 1.0, 0.0))["graphics_pipeline_library"]["pipelines"];
+  const auto empty = nlohmann::json::parse(report.ToJson({}, 0, 1.0, 0.0, {}))["graphics_pipeline_library"]["pipelines"];
   Check(empty["rows"].empty() && empty["summary"]["all"]["count"] == 0 &&
             empty["summary"]["all"]["built_both_stage_libraries"] == 0 &&
             empty["summary"]["gpu"]["total_ms"]["max"] == 0.0,
@@ -546,7 +547,7 @@ void TestLibraryPipelineRows() {
                              .link_ms = 0.5, .total_ms = 5.5, .built_count = 2,
                              .built_kinds = kFragment | kVertexInput});
   report.AddLibraryPipeline({.vs = 0xd, .ps = 0xe, .thread = Thread::Worker, .link_ms = 0.25, .total_ms = 0.5});
-  const auto json = nlohmann::json::parse(report.ToJson({}, 0, 1.0, 0.0))["graphics_pipeline_library"]["pipelines"];
+  const auto json = nlohmann::json::parse(report.ToJson({}, 0, 1.0, 0.0, {}))["graphics_pipeline_library"]["pipelines"];
   const auto &rows = json["rows"];
   Check(rows.size() == 3 && rows[0]["vs"] == "000000000000000a" && rows[0]["flip"] == 7 && rows[0]["thread"] == "gpu" &&
             rows[0]["built_ms"] == 4.0 && rows[0]["waited_ms"] == 1.0 && rows[0]["link_ms"] == 0.25 &&
@@ -614,7 +615,7 @@ void TestLibraryPipelineScope() {
 // the wrong reason or counted once per row. Reset forgets both.
 void TestIneligibleWaits() {
   Report report;
-  const auto empty = nlohmann::json::parse(report.ToJson({}, 0, 1.0, 0.0))["deferred_draws"];
+  const auto empty = nlohmann::json::parse(report.ToJson({}, 0, 1.0, 0.0, {}))["deferred_draws"];
   Check(empty["ineligible_waits"].empty() && empty["ineligible_waited_ms"].empty(),
         "an empty report had waits of draws that could not be deferred");
   report.AddDeferredIneligibleWait({.reason = "non_push", .vs = 0x11, .ps = 0x22, .waited_ms = 686.5, .flip = 99});
@@ -622,7 +623,7 @@ void TestIneligibleWaits() {
   report.AddDeferredIneligibleWait(
       {.reason = "indirect", .vs = 0x33, .ps = 0, .waited_ms = 40.25, .gpu_thread = false});
   report.AddDeferredIneligibleWait({.reason = "non_push", .vs = 0x44, .ps = 0x55, .waited_ms = 1081.0});
-  const auto section = nlohmann::json::parse(report.ToJson({}, 0, 1.0, 0.0))["deferred_draws"];
+  const auto section = nlohmann::json::parse(report.ToJson({}, 0, 1.0, 0.0, {}))["deferred_draws"];
   const auto &rows   = section["ineligible_waits"];
   Check(rows.size() == 3, "waits of draws that could not be deferred were lost or added");
   Check(rows[0]["reason"] == "non_push" && rows[0]["flip"] == 0 && rows[0]["vs"] == "0000000000000011" &&
@@ -651,7 +652,7 @@ void TestIneligibleWaits() {
 // row's data, or rows out of order, fail. Reset forgets them.
 void TestWarmTakeRows() {
   Report report;
-  Check(nlohmann::json::parse(report.ToJson({}, 0, 1.0, 0.0))["warm_takes"].empty(),
+  Check(nlohmann::json::parse(report.ToJson({}, 0, 1.0, 0.0, {}))["warm_takes"].empty(),
         "an empty report had warm-up take rows");
   report.SetEpoch(250 * kMs);
   report.AddWarmTake({.id = 0xab, .how = Common::FirstRunReport::WarmTakeHow::Done,
@@ -661,7 +662,7 @@ void TestWarmTakeRows() {
                       .stopped_ms = 12.5, .at_ns = 3250 * kMs});
   report.AddWarmTake({.id = 0xef, .how = Common::FirstRunReport::WarmTakeHow::Inline,
                       .stopped_ms = 7000.5});
-  const auto rows = nlohmann::json::parse(report.ToJson({}, 0, 1.0, 0.0))["warm_takes"];
+  const auto rows = nlohmann::json::parse(report.ToJson({}, 0, 1.0, 0.0, {}))["warm_takes"];
   Check(rows.size() == 3, "warm-up take rows were lost or added");
   Check(rows[0]["id"] == "00000000000000ab" && rows[0]["how"] == "done" && rows[0]["flip"] == 0 &&
             rows[0]["stopped_ms"] == 0.0 && rows[0]["at_ms"] == 1000.0,
@@ -714,7 +715,7 @@ void TestCompileRowsKeepSubmission() {
     Check(rows[index].submission == NO_SUBMISSION && rows[index].start_ns == NO_TIME_NS,
           "a worker, boot, untimed or between-submission row took a submission");
   }
-  const auto json = report.ToJson({}, 0, 1.0, 0.0);
+  const auto json = report.ToJson({}, 0, 1.0, 0.0, {});
   for (const char *needle : {"\"submission\": 7", "\"queue\": 1", "\"visible_ms\": 250.0",
                              "\"picked_ms\": 150.0", "\"start_ms\": 1000.0"}) {
     Check(json.find(needle) != std::string::npos, needle);
@@ -797,7 +798,7 @@ void TestSubmitLeadUsesContainingSubmission() {
   Check(leads.n == baseline.Summarize().submit_leads.n &&
             Near(leads.p50_ms, baseline.Summarize().submit_leads.p50_ms),
         "a second submission changed the lead");
-  const auto json = Compact(report.ToJson({}, 0, 1.0, 0.0));
+  const auto json = Compact(report.ToJson({}, 0, 1.0, 0.0, {}));
   Check(json.find("\"submit_lead_summary\":{\"max_ms\":300.0,\"n\":1,\"p10_ms\":300.0,\"p50_ms\":300.0,"
                   "\"p90_ms\":300.0}") != std::string::npos,
         "the file lacks the submit lead summary");
@@ -812,7 +813,7 @@ void TestSubmitLeadUsesContainingSubmission() {
 void TestSubmitLeadSummary() {
   constexpr int64_t kHugeLeadMs = 9999;
   Report            report;
-  const auto        empty = nlohmann::json::parse(report.ToJson({}, 0, 1.0, 0.0));
+  const auto        empty = nlohmann::json::parse(report.ToJson({}, 0, 1.0, 0.0, {}));
   Check(report.Summarize().submit_leads.n == 0 && empty.contains("submit_lead_summary") &&
             empty["submit_lead_summary"] == nlohmann::json({{"n", 0}}),
         "an empty report did not write exactly n 0");
@@ -854,7 +855,7 @@ void TestSubmissionCountsInJson() {
   report.OnFlip(2);
   report.BeginSubmission({.id = 3}, false); // A resume is not counted.
   report.OnFlip(3);
-  const auto json = Compact(report.ToJson({}, 0, 1.0, 0.0));
+  const auto json = Compact(report.ToJson({}, 0, 1.0, 0.0, {}));
   Check(json.find("\"submissions\":{\"per_flip\":[0,2,0],\"total\":2}") != std::string::npos,
         "the file lacks the submission counts");
   report.Reset();
@@ -1095,7 +1096,7 @@ constexpr const char* GENERATION_KEY = "shader_store_generation";
 
 // The generation block of a report's JSON, or null when it has none.
 nlohmann::json GenerationBlock(const Report& report) {
-	const auto json = nlohmann::json::parse(report.ToJson({}, 0, 1.0, 0.0));
+	const auto json = nlohmann::json::parse(report.ToJson({}, 0, 1.0, 0.0, {}));
 	return json.contains(GENERATION_KEY) ? json[GENERATION_KEY] : nlohmann::json(nullptr);
 }
 
@@ -1104,12 +1105,12 @@ nlohmann::json GenerationBlock(const Report& report) {
 // without the flag must keep.
 void TestGenerationBlockFlagOffAndInactive() {
 	Report     off;
-	const auto off_json = nlohmann::json::parse(off.ToJson({}, 0, 1.0, 0.0));
+	const auto off_json = nlohmann::json::parse(off.ToJson({}, 0, 1.0, 0.0, {}));
 	Check(!off_json.contains(GENERATION_KEY), "a report without the flag had a generation block");
 
 	Report refused;
 	refused.SetGenerationInactive("no_eboot");
-	const auto refused_json = nlohmann::json::parse(refused.ToJson({}, 0, 1.0, 0.0));
+	const auto refused_json = nlohmann::json::parse(refused.ToJson({}, 0, 1.0, 0.0, {}));
 	Check(refused_json.contains(GENERATION_KEY), "a refused generation left no block");
 	const nlohmann::json expected = {{"active", false}, {"inactive_reason", "no_eboot"}};
 	Check(refused_json[GENERATION_KEY] == expected, "the inactive block is not just the reason");
@@ -1124,7 +1125,7 @@ void TestGenerationBlockFlagOffAndInactive() {
 
 	// Reset, which tests use between cases, takes the generation state away again.
 	refused.Reset();
-	Check(!nlohmann::json::parse(refused.ToJson({}, 0, 1.0, 0.0)).contains(GENERATION_KEY),
+	Check(!nlohmann::json::parse(refused.ToJson({}, 0, 1.0, 0.0, {})).contains(GENERATION_KEY),
 	      "Reset kept the generation block");
 }
 
@@ -1505,7 +1506,7 @@ void TestGenerationRowsJson() {
 // shows it. The baseline of the count is the empty report.
 void TestAudioUnderrunsAreStamped() {
 	Report     report;
-	const auto empty = nlohmann::json::parse(report.ToJson({}, 0, 1.0, 0.0))["audio_underruns"];
+	const auto empty = nlohmann::json::parse(report.ToJson({}, 0, 1.0, 0.0, {}))["audio_underruns"];
 	Check(empty["count"] == 0 && empty["overflow"] == 0 && empty["at_ms"].is_array() &&
 	          empty["at_ms"].empty(),
 	      "an empty report lacks the underruns key or has an underrun");
@@ -1526,7 +1527,7 @@ void TestAudioUnderrunsAreStamped() {
 	// raw clock could not be.
 	constexpr int64_t epoch_lead_ns = 250 * 1000000;
 	report.SetEpoch(taken.at_ns[0] - epoch_lead_ns);
-	const auto json = nlohmann::json::parse(report.ToJson({}, 0, 1.0, 0.0))["audio_underruns"];
+	const auto json = nlohmann::json::parse(report.ToJson({}, 0, 1.0, 0.0, {}))["audio_underruns"];
 	Check(json["count"] == 2 && json["at_ms"].size() == 2 && json["at_ms"][0] == 250.0 &&
 	          json["at_ms"][1] >= 250.0,
 	      "the underruns are not counted from the run start in the file");
@@ -1580,7 +1581,7 @@ void TestAudioUnderrunsOverflow() {
 	const auto taken = over.AudioUnderrunsSoFar();
 	Check(taken.at_ns.size() == capacity && taken.overflow == 5,
 	      "underruns past the capacity were lost or wrapped");
-	const auto json = nlohmann::json::parse(over.ToJson({}, 0, 1.0, 0.0))["audio_underruns"];
+	const auto json = nlohmann::json::parse(over.ToJson({}, 0, 1.0, 0.0, {}))["audio_underruns"];
 	Check(json["count"] == capacity + 5 && json["overflow"] == 5 &&
 	          json["at_ms"].size() == capacity,
 	      "the count in the file does not include the overflow");
@@ -1611,7 +1612,7 @@ void TestAudioUnderrunsOverflow() {
 void TestMachineBlock() {
 	Common::FirstRunReport::SetWarmWorkerCount(7);
 	Report     report;
-	const auto json    = nlohmann::json::parse(report.ToJson({}, 0, 1.0, 0.0));
+	const auto json    = nlohmann::json::parse(report.ToJson({}, 0, 1.0, 0.0, {}));
 	const auto machine = json["machine"];
 	Check(machine["cpu_model"].is_string() && !machine["cpu_model"].get<std::string>().empty(),
 	      "the machine has no processor name");
@@ -1625,7 +1626,7 @@ void TestMachineBlock() {
 	Check(machine["ram_bytes"].get<uint64_t>() > smallest_memory, "the machine has no memory");
 	Check(machine["warm_workers"] == 7, "the warm worker count is not the one set");
 	Common::FirstRunReport::SetWarmWorkerCount(0);
-	Check(nlohmann::json::parse(report.ToJson({}, 0, 1.0, 0.0))["machine"]["warm_workers"] == 0,
+	Check(nlohmann::json::parse(report.ToJson({}, 0, 1.0, 0.0, {}))["machine"]["warm_workers"] == 0,
 	      "the warm worker count did not follow the setting");
 	const auto         process       = json["process"];
 	constexpr uint64_t smallest_peak = 1024 * 1024;
@@ -1678,7 +1679,7 @@ void TestWorkerCompileContext() {
 	Common::FirstRunReport::SetGeneratorChildAlive(false);
 	Check(Common::FirstRunReport::WarmBuildsRunning() == 0,
 	      "a finished warm build is still counted");
-	const auto rows = nlohmann::json::parse(global.ToJson({}, 0, 1.0, 0.0))["compiles"];
+	const auto rows = nlohmann::json::parse(global.ToJson({}, 0, 1.0, 0.0, {}))["compiles"];
 	Check(rows.size() == 3, "the compile rows were lost");
 	if (rows.size() == 3) {
 		Check(rows[0]["thread"] == "worker" && rows[0].contains("at_ms") &&
@@ -1751,7 +1752,7 @@ void TestWorkerCompileLaneCounts() {
 		const WarmBuildScope back_two(WarmLane::Back);
 		CompileScope         busy(Kind::Graphics, 3, 4, false);
 	}
-	const auto rows = nlohmann::json::parse(global.ToJson({}, 0, 1.0, 0.0))["compiles"];
+	const auto rows = nlohmann::json::parse(global.ToJson({}, 0, 1.0, 0.0, {}))["compiles"];
 	Check(rows.size() == 2, "the compile rows were lost");
 	if (rows.size() == 2) {
 		Check(rows[0].contains("warm_front") && rows[0].contains("warm_back") &&
@@ -1799,7 +1800,7 @@ void TestAudioUnderrunsCarryLanes() {
 		Check(taken.warm_front[1] == 2 && taken.warm_back[1] == 0 && taken.child_alive[1] == 0,
 		      "the second underrun lost its lanes or its generator");
 	}
-	const auto json = nlohmann::json::parse(report.ToJson({}, 0, 1.0, 0.0))["audio_underruns"];
+	const auto json = nlohmann::json::parse(report.ToJson({}, 0, 1.0, 0.0, {}))["audio_underruns"];
 	Check(json["warm_front"] == nlohmann::json::array({0, 2}) &&
 	          json["warm_back"] == nlohmann::json::array({3, 0}) &&
 	          json["child_alive"] == nlohmann::json::array({1, 0}),
@@ -1812,7 +1813,7 @@ void TestAudioUnderrunsCarryLanes() {
 	Check(again.warm_front.size() == 1 && again.warm_front[0] == 0 && again.warm_back[0] == 0 &&
 	          again.child_alive[0] == 0,
 	      "Reset left old counts in a reused slot");
-	const auto empty = nlohmann::json::parse(Report().ToJson({}, 0, 1.0, 0.0))["audio_underruns"];
+	const auto empty = nlohmann::json::parse(Report().ToJson({}, 0, 1.0, 0.0, {}))["audio_underruns"];
 	Check(empty["warm_front"].is_array() && empty["warm_front"].empty() &&
 	          empty["child_alive"].is_array(),
 	      "an empty report lacks the underrun arrays");
@@ -1845,6 +1846,81 @@ void TestAudioUnderrunLanesFlagAndOverflow() {
 	          taken.warm_front.size() == capacity && taken.warm_back.size() == capacity &&
 	          taken.child_alive.size() == capacity,
 	      "an overflow changed the stored lanes or was not counted");
+}
+
+// The held time by cause is written for every cause, prescan ones at 0 included, and adds up to the
+// held total within 1 ms. The total is a number the test chose and the causes are written from a
+// breakdown of 1 ms for the first cause, 2 ms for the second and so on, so a cause dropped from the
+// file leaves the sum short of the total and one fewer key.
+void TestHeldByCauseInJson() {
+  namespace GS = Common::GpuStall;
+  GS::HoldBreakdown holds;
+  double            total_ms = 0.0;
+  for (size_t cause = 0; cause < GS::HOLD_CAUSE_COUNT; cause++) {
+    holds.cause_ns[cause]    = (cause + 1) * 1'000'000;
+    holds.cause_count[cause] = cause + 1;
+    total_ms += static_cast<double>(cause + 1);
+  }
+  holds.histogram.Add(30'000'000);
+  holds.exact = {.count = 7, .overflow = 2, .p50_ms = 11.5, .p95_ms = 12.5, .max_ms = 13.5};
+  const auto json = nlohmann::json::parse(Report().ToJson({}, 3, 1.0, total_ms, holds));
+  const auto held = json["audio_held_by_cause"]["held_ms"];
+  Check(held.size() == GS::HOLD_CAUSE_COUNT, "a cause is missing from the held-by-cause object");
+  Check(json["audio_held_by_cause"]["holds"].size() == GS::HOLD_CAUSE_COUNT,
+        "a cause is missing from the hold counts");
+  double summed = 0.0;
+  for (const auto &entry : held.items()) summed += entry.value().get<double>();
+  Check(std::abs(summed - json["audio_held_ms"].get<double>()) < 1.0,
+        "the causes in the file do not add up to the held total");
+  for (const char *name :
+       {"required_graphics", "required_compute", "warm_inline", "warm_inline_paused",
+        "generated_inline", "generated_inline_paused", "warm_waited", "generated_waited", "prescan_waited", "prescan_in_flight",
+        "prescan_never_posted_async", "prescan_never_posted_indirect", "prescan_never_posted_deep",
+        "prescan_refused", "deferred_draw_resolve", "ineligible_draw", "library_once", "other"})
+    Check(held.contains(name), name);
+  Check(held["required_graphics"] == 1.0 && held["other"] == 18.0,
+        "a cause was written under another cause's name");
+  const auto histogram = json["audio_hold_histogram"];
+  Check(histogram["count"] == 1 && histogram["max_ms"] == 30.0 && histogram["p50_bound_ms"] == 30.0 &&
+            histogram["p95_bound_ms"] == 30.0,
+        "the hold histogram is not in the file");
+  const auto exact = json["audio_holds_exact"];
+  Check(exact["count"] == 7 && exact["overflow"] == 2 && exact["p50_ms"] == 11.5 &&
+            exact["p95_ms"] == 12.5 && exact["max_ms"] == 13.5,
+        "the exact hold figures are not in the file as given");
+  const auto empty = nlohmann::json::parse(Report().ToJson({}, 0, 1.0, 0.0, {}));
+  Check(empty["audio_held_by_cause"]["held_ms"].size() == GS::HOLD_CAUSE_COUNT &&
+            empty["audio_held_by_cause"]["held_ms"]["other"] == 0.0,
+        "a report with no breakdown lacks the causes");
+}
+
+// The prescan tag is its own count. The first underrun has the generator alive and no pre-scan work,
+// the second three units of pre-scan work and no generator, and the third more than a uint16 holds,
+// so a tag that was copied from the generator's flag, never stored, or not saturated, differs.
+void TestUnderrunsCarryThePrescanTag() {
+  Report report;
+  Common::FirstRunReport::Configure(true, false);
+  Check(Common::FirstRunReport::PrescanRunning() == 0, "the pre-scan tag is not 0 by default");
+  Common::FirstRunReport::SetGeneratorChildAlive(true);
+  report.AddAudioUnderrun();
+  Common::FirstRunReport::SetGeneratorChildAlive(false);
+  Common::FirstRunReport::SetPrescanRunning(3);
+  report.AddAudioUnderrun();
+  Common::FirstRunReport::SetPrescanRunning(70000);
+  report.AddAudioUnderrun();
+  Common::FirstRunReport::SetPrescanRunning(0);
+  Common::FirstRunReport::Configure(false, false);
+  const auto taken = report.AudioUnderrunsSoFar();
+  Check(taken.prescan_running == std::vector<uint16_t> {0, 3, 65535} &&
+            taken.child_alive == std::vector<uint8_t> {1, 0, 0},
+        "the pre-scan tag is not kept apart from the generator's");
+  const auto json = nlohmann::json::parse(report.ToJson({}, 0, 1.0, 0.0, {}))["audio_underruns"];
+  Check(json["prescan_running"] == nlohmann::json::array({0, 3, 65535}),
+        "the pre-scan tag is not in the file");
+  report.Reset();
+  report.AddAudioUnderrun();
+  Check(report.AudioUnderrunsSoFar().prescan_running == std::vector<uint16_t> {0},
+        "Reset left an old pre-scan tag in a reused slot");
 }
 
 // With a source, the writer asks it each time. A final figure replaces it at once and the source is
@@ -1969,6 +2045,8 @@ int main() {
   TestWorkerCompileLaneCounts();
   TestAudioUnderrunsCarryLanes();
   TestAudioUnderrunLanesFlagAndOverflow();
+  TestHeldByCauseInJson();
+  TestUnderrunsCarryThePrescanTag();
   TestGenerationSourceThenFinal();
   TestGenerationWriterNeverTouchesADestroyedSource();
   TestGenerationFinalWaitsForAWriterInTheSource();

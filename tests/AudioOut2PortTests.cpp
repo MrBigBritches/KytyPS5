@@ -989,7 +989,7 @@ public:
 	explicit GpuCompile(bool hold_enabled) {
 		Common::GpuStall::Configure(hold_enabled, std::chrono::milliseconds(0));
 		m_gpu = std::thread([this]() {
-			Common::GpuStall::Scope compile;
+			Common::GpuStall::Scope compile(Common::GpuStall::HoldCause::Other);
 			m_started = true;
 			while (!m_finish) {
 				std::this_thread::yield();

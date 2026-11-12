@@ -1,6 +1,8 @@
 #ifndef KYTY_COMMON_FIRST_RUN_REPORT_H_
 #define KYTY_COMMON_FIRST_RUN_REPORT_H_
 
+#include "common/gpuStall.h"
+
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -360,6 +362,11 @@ struct AudioUnderruns {
 	std::vector<uint16_t> warm_front;
 	std::vector<uint16_t> warm_back;
 	std::vector<uint8_t>  child_alive;
+	/// How much pre-scan work was in progress at each underrun, as a count of pre-scan builds
+	/// compiling plus child requests outstanding. It is kept apart from child_alive so pre-scan
+	/// activity is never excused as the generator's. Saturates at the uint16 range, and is parallel
+	/// to at_ns.
+	std::vector<uint16_t> prescan_running;
 };
 
 /// What the report says about the machine and the emulator's own process. A figure the system did
@@ -735,9 +742,13 @@ public:
 	/// Works out the totals, histogram and top lists from what was recorded so far.
 	[[nodiscard]] Summary Summarize() const;
 	/// Renders the whole report as JSON text. `audio_held_ms` is the whole run's guest audio held
-	/// time, which also catches holds that land outside every deferred-draw window.
+	/// time, which also catches holds that land outside every deferred-draw window. It comes from
+	/// the hold tracker's own counter, and `holds` is the same time split by cause, so a reader can
+	/// check that the causes add up to it. A caller with no breakdown passes an empty one and gets
+	/// zero in every cause.
 	[[nodiscard]] std::string ToJson(const Metadata& metadata, uint64_t audio_holds,
-	                                 double run_seconds, double audio_held_ms) const;
+	                                 double run_seconds, double audio_held_ms,
+	                                 const GpuStall::HoldBreakdown& holds) const;
 	/// Copy of the compile rows, for tests.
 	[[nodiscard]] std::vector<CompileEntry> Compiles() const;
 	/// Copy of the ready rows, for tests.
@@ -832,6 +843,7 @@ private:
 	std::array<std::atomic<uint16_t>, AUDIO_UNDERRUN_CAPACITY> m_underrun_warm_front {};
 	std::array<std::atomic<uint16_t>, AUDIO_UNDERRUN_CAPACITY> m_underrun_warm_back {};
 	std::array<std::atomic<uint8_t>, AUDIO_UNDERRUN_CAPACITY>  m_underrun_child_alive {};
+	std::array<std::atomic<uint16_t>, AUDIO_UNDERRUN_CAPACITY> m_underrun_prescan_running {};
 	std::atomic<size_t>                                        m_underrun_next {0};
 	std::atomic<uint64_t>                                      m_underrun_overflow {0};
 };
@@ -889,6 +901,7 @@ inline std::atomic<int32_t>  g_warm_running {0};
 inline std::atomic<int32_t>  g_warm_front_running {0};
 inline std::atomic<int32_t>  g_warm_back_running {0};
 inline std::atomic<bool>     g_child_alive {false};
+inline std::atomic<uint32_t> g_prescan_running {0};
 inline std::atomic<uint32_t> g_warm_workers {0};
 
 /// A counter never reads below zero, which a reader racing a scope could otherwise see.
@@ -966,6 +979,19 @@ inline void SetGeneratorChildAlive(bool alive) noexcept {
 }
 [[nodiscard]] inline bool GeneratorChildAlive() noexcept {
 	return Detail::g_child_alive.load(std::memory_order_relaxed);
+}
+
+/// Sets the figure behind the prescan_running underrun tag. It is the number of pre-scan builds
+/// compiling plus the requests to the pre-scan child that are outstanding. It is a measure of work
+/// in progress and not of whether the child process is alive, so an idle child counts 0. The owner
+/// of the pre-scan updates it as builds start and end and as requests are sent and answered. Nothing
+/// sets it yet, since the pre-scan is not part of this build, so the tag is 0 until then. It is
+/// deliberately not folded into GeneratorChildAlive.
+inline void SetPrescanRunning(uint32_t in_progress) noexcept {
+	Detail::g_prescan_running.store(in_progress, std::memory_order_relaxed);
+}
+[[nodiscard]] inline uint32_t PrescanRunning() noexcept {
+	return Detail::g_prescan_running.load(std::memory_order_relaxed);
 }
 
 /// Says how many workers the background warm-up runs, which the machine block shows.

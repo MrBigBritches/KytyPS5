@@ -6,6 +6,7 @@
 #include "common/common.h"
 #include "common/file.h"
 #include "common/firstRunReport.h"
+#include "common/gpuStall.h"
 #include "common/uniqueFunction.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
@@ -37,9 +38,20 @@
 #include <thread>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace Libs::Graphics {
+
+/// The cause a dispatch's stop for a warm-up build is charged to, once Take has said how it got the
+/// build. A build a worker had started is a wait, and one no worker had started ran on the GPU thread.
+/// Inline builds are told apart by whether the queue was paused and by whether the module is
+/// generated, and a generated module that ran inline while paused has its own cause, so neither
+/// wins. The cost of the pause is WarmInlinePaused plus GeneratedInlinePaused, and the generator's
+/// misses are GeneratedInline plus GeneratedInlinePaused. A build that was already done stops
+/// nothing and is charged like an inline one.
+[[nodiscard]] Common::GpuStall::HoldCause WarmTakeCause(PipelineBuildQueue::Acquired how, bool paused,
+                                                        bool generated);
 
 struct GraphicContext;
 struct ShaderParams;
@@ -506,6 +518,9 @@ private:
 	// Only the GPU thread touches them.
 	bool                                                                         m_warm_paused = false;
 	uint32_t                                                                     m_warm_inline_during_pause = 0;
+	// Ids of the modules whose warm build came from the generator. The GPU thread fills it when it
+	// starts such a build and reads it before a stall, so a hold never waits on a lock for it.
+	std::unordered_set<uint64_t>                                                 m_generated_warm_ids;
 	// Module ids in the order their records appear in the shader store, one entry per record. Filled
 	// while WarmUp loads the store and emptied once the warm-up has queued its builds.
 	std::vector<uint64_t>                                                        m_module_record_order;
@@ -545,8 +560,9 @@ private:
 	                                                          const DrawRenderState& state,
 	                                                          const Stages&          stages) const;
 	// Creates the pipeline on this thread and stores it, as every miss does without background builds.
+	// The cause names what a hold of guest audio during the compile is charged to.
 	Pipeline& CreateGraphicsPipelineHere(Pipeline& slot, const GraphicsPipelineKey& key,
-	                                     const Stages& stages);
+	                                     const Stages& stages, Common::GpuStall::HoldCause cause);
 	// What AcquireBuiltPipeline tells its caller about a draw that missed its pipeline. The caller
 	// sets timed when the report is on, and start is then read just before the draw's fate is chosen,
 	// so the drain of other keys' builds is left out of its wait. blocker is the reason the draw could
@@ -590,9 +606,13 @@ private:
 	void RunBuild(const std::shared_ptr<GraphicsBuild>& build);
 	// Waits for, or runs, a queued build and takes its pipeline. With resolve_waited_ms set the caller
 	// owns the stall scope, the timing and the driver cache save, as a resolve of deferred draws does,
-	// and a wait for a running build is added to it instead of being recorded here.
+	// and a wait for a running build is added to it instead of being recorded here. Otherwise the
+	// cause names what a hold of guest audio during the wait is charged to. Every caller names one.
+	// With resolve_waited_ms set no Scope is made here, so the cause is not read, and the caller's
+	// own Scope carries its cause.
 	Pipeline& FinishBuild(const std::shared_ptr<GraphicsBuild>& build,
 	                      const PipelineBuildQueue::JobPtr&      job,
+	                      Common::GpuStall::HoldCause            wait_cause,
 	                      double*                                resolve_waited_ms = nullptr);
 	// The pipeline of one key of a resolve. See AcquireDeferredPipelines.
 	[[nodiscard]] Pipeline AcquireDeferredPipeline(const GraphicsPipelineKey& key,

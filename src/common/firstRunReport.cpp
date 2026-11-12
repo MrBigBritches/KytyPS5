@@ -324,6 +324,8 @@ void Report::AddAudioUnderrun() noexcept {
 	    static_cast<uint16_t>(std::min(WarmBackBuildsRunning(), count_limit)),
 	    std::memory_order_relaxed);
 	m_underrun_child_alive[slot].store(GeneratorChildAlive() ? 1 : 0, std::memory_order_relaxed);
+	m_underrun_prescan_running[slot].store(
+	    static_cast<uint16_t>(std::min(PrescanRunning(), count_limit)), std::memory_order_relaxed);
 	m_underrun_ns[slot].store(NowNs(), std::memory_order_release);
 }
 
@@ -342,6 +344,8 @@ AudioUnderruns Report::AudioUnderrunsSoFar() const {
 			result.warm_back.push_back(m_underrun_warm_back[slot].load(std::memory_order_relaxed));
 			result.child_alive.push_back(
 			    m_underrun_child_alive[slot].load(std::memory_order_relaxed));
+			result.prescan_running.push_back(
+			    m_underrun_prescan_running[slot].load(std::memory_order_relaxed));
 		}
 	}
 	return result;
@@ -549,6 +553,7 @@ void Report::Reset() {
 		m_underrun_warm_front[slot].store(0, std::memory_order_relaxed);
 		m_underrun_warm_back[slot].store(0, std::memory_order_relaxed);
 		m_underrun_child_alive[slot].store(0, std::memory_order_relaxed);
+		m_underrun_prescan_running[slot].store(0, std::memory_order_relaxed);
 	}
 	m_underrun_next.store(0, std::memory_order_relaxed);
 	m_underrun_overflow.store(0, std::memory_order_relaxed);
@@ -1171,13 +1176,52 @@ nlohmann::json AudioUnderrunsToJson(const AudioUnderruns& underruns, int64_t epo
 	for (const auto at_ns: underruns.at_ns) {
 		times.push_back(Round3(static_cast<double>(at_ns - base) / NS_PER_MS));
 	}
-	// The three arrays are parallel to at_ms. child_alive is written as 0 or 1.
+	// The arrays are parallel to at_ms. child_alive is written as 0 or 1, and prescan_running is a
+	// count of pre-scan work in progress.
 	return {{"count", underruns.at_ns.size() + underruns.overflow},
 	        {"overflow", underruns.overflow},
 	        {"at_ms", times},
 	        {"warm_front", underruns.warm_front},
 	        {"warm_back", underruns.warm_back},
-	        {"child_alive", underruns.child_alive}};
+	        {"child_alive", underruns.child_alive},
+	        {"prescan_running", underruns.prescan_running}};
+}
+
+// The audio held time by cause. Each cause is written, even at 0, so a gate can read every one
+// without checking that it exists. warm_inline_paused is a cause of its own and not a part of
+// warm_inline, so the figures add up to the whole held time.
+nlohmann::json HeldByCauseToJson(const GpuStall::HoldBreakdown& holds) {
+	nlohmann::json held_ms    = nlohmann::json::object();
+	nlohmann::json hold_count = nlohmann::json::object();
+	for (size_t cause = 0; cause < GpuStall::HOLD_CAUSE_COUNT; cause++) {
+		const char* name = GpuStall::HoldCauseName(static_cast<GpuStall::HoldCause>(cause));
+		held_ms[name]    = Round3(static_cast<double>(holds.cause_ns[cause]) / NS_PER_MS);
+		hold_count[name] = holds.cause_count[cause];
+	}
+	return {{"held_ms", held_ms}, {"holds", hold_count}};
+}
+
+// The lengths of the holds in fixed buckets, for display. bounds_ms are the upper edges, and buckets
+// has one more entry for the holds past the last edge. The percentiles here are bucket upper bounds
+// and are named so, since they can be hundreds of ms above the truth. A gate reads
+// audio_holds_exact instead.
+nlohmann::json HoldHistogramToJson(const GpuStall::HoldHistogram& histogram) {
+	return {{"count", histogram.count},
+	        {"p50_bound_ms", Round3(histogram.PercentileMs(0.5))},
+	        {"p95_bound_ms", Round3(histogram.PercentileMs(0.95))},
+	        {"max_ms", Round3(histogram.MaxMs())},
+	        {"bounds_ms", GpuStall::HOLD_BUCKET_BOUNDS_MS},
+	        {"buckets", histogram.buckets}};
+}
+
+// The exact nearest-rank figures of the hold lengths. count is the holds stored, and overflow the
+// ones past the capacity, which the percentiles leave out. max_ms covers every hold.
+nlohmann::json HoldExactToJson(const GpuStall::HoldExact& exact) {
+	return {{"count", exact.count},
+	        {"overflow", exact.overflow},
+	        {"p50_ms", Round3(exact.p50_ms)},
+	        {"p95_ms", Round3(exact.p95_ms)},
+	        {"max_ms", Round3(exact.max_ms)}};
 }
 
 nlohmann::json MachineToJson(const MachineInfo& info) {
@@ -1302,7 +1346,7 @@ nlohmann::json PipelineLibraryToJson(const PipelineLibraryInfo&  info,
 } // namespace
 
 std::string Report::ToJson(const Metadata& metadata, uint64_t audio_holds, double run_seconds,
-                           double audio_held_ms) const {
+                           double audio_held_ms, const GpuStall::HoldBreakdown& holds) const {
 	const auto summary  = Summarize();
 	const auto compiles = Compiles();
 	const auto boot     = Boot();
@@ -1364,6 +1408,9 @@ std::string Report::ToJson(const Metadata& metadata, uint64_t audio_holds, doubl
 	    {"deferred_draws", DeferredToJson(summary)},
 	    {"audio_holds", audio_holds},
 	    {"audio_held_ms", Round3(audio_held_ms)},
+	    {"audio_held_by_cause", HeldByCauseToJson(holds)},
+	    {"audio_hold_histogram", HoldHistogramToJson(holds.histogram)},
+	    {"audio_holds_exact", HoldExactToJson(holds.exact)},
 	    {"audio_underruns", AudioUnderrunsToJson(AudioUnderrunsSoFar(), epoch_ns)},
 	    {"machine", MachineToJson(machine)},
 	    {"process", ProcessToJson(machine)},
@@ -1465,8 +1512,12 @@ void WriteReportUnguarded() {
 		                  .count();
 	}
 	metadata.partial = g_partial.load(std::memory_order_relaxed);
-	const auto text = Global().ToJson(metadata, GpuStall::HoldCount(), run_seconds,
-	                                  static_cast<double>(GpuStall::HeldNs()) / NS_PER_MS);
+	// The breakdown is read before the total, and a hold adds to the total before its cause, so a
+	// hold that ends meanwhile can only leave the causes short of the total and never over it.
+	const auto breakdown = GpuStall::Breakdown();
+	const auto holds     = GpuStall::HoldCount();
+	const auto held_ms   = static_cast<double>(GpuStall::HeldNs()) / NS_PER_MS;
+	const auto text      = Global().ToJson(metadata, holds, run_seconds, held_ms, breakdown);
 	const auto path = ReportPath(metadata.title_id, std::chrono::system_clock::now());
 	File::CreateDirectories(path.parent_path());
 	if (WriteWhole(path, text)) {
