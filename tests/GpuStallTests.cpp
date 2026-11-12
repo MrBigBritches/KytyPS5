@@ -350,7 +350,11 @@ void TestHeldCausesSumToTotal() {
   }
   Check(after.exact.count - before.exact.count == 3, "the exact figures did not count three holds");
   Check(after.histogram.max_ns >= longest, "the histogram did not keep the longest hold");
-  Check(after.exact.max_ms * 1e6 >= static_cast<double>(longest), "the exact max is below a hold");
+  // max_ms is nanoseconds divided by a million, so compare in milliseconds with a margin far below
+  // a nanosecond. Scaling it back up can round to just under the whole nanoseconds it came from.
+  constexpr double kMsMargin = 1e-9;
+  Check(after.exact.max_ms + kMsMargin >= static_cast<double>(longest) / 1e6,
+        "the exact max is below a hold");
   Check(after.histogram.buckets[0] == before.histogram.buckets[0],
         "a hold of at least kHoldTime landed in the shortest bucket");
   for (size_t bucket = 0; bucket < Common::GpuStall::HOLD_BUCKET_COUNT; ++bucket) {
