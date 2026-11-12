@@ -1,6 +1,7 @@
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 #include "graphics/shader/recompiler/frontend/decode/ImageOps.h"
+#include "graphics/shader/recompiler/ir/ImageConversion.h"
 
 #include <algorithm>
 #include <bit>
@@ -386,21 +387,14 @@ uint32_t InverseSwizzle(uint32_t swizzle, uint32_t component) {
 	return UINT32_MAX;
 }
 
+// The record an image access converts texels through, empty when the image needs no conversion. A
+// format the emitter cannot convert stops the emulator.
 Format::BufferFormatInfo ImageConversionFormat(const EmitterState&   state,
                                                const IR::MemoryInfo& mem) {
 	const auto& image = state.program.info.images[mem.resource];
-	const auto format = image.conversion_format;
-	if (format == Prospero::BufferFormat::kInvalid) return {};
-	const auto info = Format::GetFormatInfo(format);
-	if (IR::ReadsDepthBits(image)) return info;
-	const bool raw_signed = IR::RawSignedStorageFormat(image, format) != Prospero::BufferFormat::kInvalid;
-	EXIT_IF((Prospero::RemapTextureFormat(format) == format && !raw_signed) || info.component_count == 0u ||
-	        info.component_count > 4u);
-	EXIT_IF(!raw_signed && info.type != Format::ComponentType::Uscaled &&
-	        ((info.type != Format::ComponentType::Uint &&
-	          info.type != Format::ComponentType::Unorm) || !info.packed_bitfield ||
-	         info.byte_size != sizeof(uint32_t)));
-	return info;
+	// The prescan's descriptor validation asks the same predicate, so the two never disagree.
+	EXIT_IF(!IR::ImageConversionAccepted(image, IR::ImageConversionUse::Load));
+	return IR::ImageConversionInfo(image);
 }
 
 // 8 and 8_8 sRGB decode after filtering where the device has no sRGB view of them. Correctly
@@ -652,14 +646,15 @@ uint32_t EmitOneDimensionalGatherLz(ValueEmitContext& ctx, const IR::MemoryInfo&
 	return result;
 }
 
+// Builds the texel a store writes from the shader's data, encoded through the image's conversion
+// format when it has one. A format the emitter cannot store through stops the emulator.
 uint32_t StoreTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t data, bool integer) {
 	const auto swizzle = ctx.state.program.info.images[mem.resource].shader_swizzle;
 	const auto info = ImageConversionFormat(ctx.state, mem);
 	const bool converted = info.format != Prospero::BufferFormat::kInvalid;
 	const bool packed = info.packed_bitfield;
-	EXIT_IF(converted && info.type != Format::ComponentType::Sint &&
-	        (!packed || (info.type != Format::ComponentType::Uint &&
-	                     info.type != Format::ComponentType::Unorm)));
+	EXIT_IF(!IR::ImageConversionAccepted(ctx.state.program.info.images[mem.resource],
+	                                     IR::ImageConversionUse::Store));
 	const auto zero = ConstantU32(ctx.state, 0);
 	uint32_t values[4] {zero, zero, zero, zero};
 	auto packed_value = zero;

@@ -696,6 +696,16 @@ add_executable(scan_differential_tests EXCLUDE_FROM_ALL
 target_link_libraries(scan_differential_tests common fmt::fmt xxhash nlohmann_json::nlohmann_json)
 target_include_directories(scan_differential_tests PRIVATE ${inc_headers})
 
+# The prescan variant tracker and descriptor validation. Both are headers over the recompiler's
+# resource types, so the test links no translation, no walk and no device. The image conversion
+# predicate the validation shares with the emitter needs the texture format remap table.
+add_executable(prescan_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/PrescanTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/gpu_format.cpp"
+)
+target_link_libraries(prescan_tests common fmt::fmt xxhash)
+target_include_directories(prescan_tests PRIVATE ${inc_headers})
+
 # The predictor rules, the header slots and the module id need no device and no translated program.
 add_executable(shader_store_predictor_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ShaderStorePredictorTests.cpp"
@@ -1050,6 +1060,7 @@ if(BUILD_TESTING)
 	add_test(NAME shader_store_scan COMMAND $<TARGET_FILE:shader_store_scan_tests>)
 	add_test(NAME submit_scan COMMAND $<TARGET_FILE:submit_scan_tests>)
 	add_test(NAME scan_differential COMMAND $<TARGET_FILE:scan_differential_tests>)
+	add_test(NAME prescan COMMAND $<TARGET_FILE:prescan_tests>)
 	add_test(NAME shader_store_predictor COMMAND $<TARGET_FILE:shader_store_predictor_tests>)
 	add_test(NAME shader_store_keys COMMAND $<TARGET_FILE:shader_store_keys_tests>)
 	add_test(NAME shader_store_record COMMAND $<TARGET_FILE:shader_store_record_tests>)
@@ -1201,6 +1212,7 @@ if(BUILD_TESTING)
 		shader_store_scan_tests
 		submit_scan_tests
 		scan_differential_tests
+		prescan_tests
 		shader_store_predictor_tests
 		shader_store_keys_tests
 		shader_store_record_tests
