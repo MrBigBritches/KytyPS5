@@ -647,6 +647,32 @@ static bool IsReadableRange(uint64_t addr, uint64_t size) {
 	return true;
 }
 
+// Completes a faulting SRT walker load as a zero read when this thread runs a non-faulting walk.
+// Returns true after the skip. Returns false after printing the fatal message when the fault is
+// not one of the walker's loads. in_non_faulting_walk tells the caller whether the thread was in
+// such a walk at all, because then the fault must never reach the GPU fault handler.
+// Why reading the route state here is safe is documented beside the thread_locals in SrtWalker.cpp.
+// This branch deliberately does not reject AccessViolationType::Unknown, because the walker's
+// mov eax,[r10] only produces reads.
+static bool TrySkipNonFaultingWalkerLoad(const Common::HostException::ExceptionInfo& info,
+                                         bool&                                       in_non_faulting_walk) {
+	using Libs::Graphics::ShaderRecompiler::IR::SrtFaultRoute;
+	uint32_t   length = 0;
+	const auto route  = Libs::Graphics::ShaderRecompiler::IR::SrtWalkerRouteFault(
+        info.exception_address, length);
+	in_non_faulting_walk = route != SrtFaultRoute::NotWalker;
+	if (route == SrtFaultRoute::SkipLoad) {
+		Loader::X64InstructionEmulator::SkipLoad(info.native_context, length);
+		return true;
+	}
+	if (route == SrtFaultRoute::Fatal) {
+		std::printf("Fault during a non-faulting SRT walk at pc=0x%016" PRIx64
+		            " outside the walker's guest loads, not offering it to the GPU\n",
+		            info.exception_address);
+	}
+	return false;
+}
+
 static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info) {
 	const auto* info = &exception_info;
 
@@ -656,7 +682,15 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		return true;
 	}
 
-	if (info->type == Common::HostException::ExceptionType::AccessViolation) {
+	// Asked before HandleGpuFault, which may wait on a readback guard or mutate GPU-owned caches.
+	bool in_non_faulting_walk = false;
+	if (info->type == Common::HostException::ExceptionType::AccessViolation &&
+	    TrySkipNonFaultingWalkerLoad(*info, in_non_faulting_walk)) {
+		return true;
+	}
+
+	if (info->type == Common::HostException::ExceptionType::AccessViolation &&
+	    !in_non_faulting_walk) {
 		using CoreAccess = Common::HostException::AccessViolationType;
 		using GpuAccess  = Libs::Graphics::PageFaultAccess;
 		GpuAccess access;

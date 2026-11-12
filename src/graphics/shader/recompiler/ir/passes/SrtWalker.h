@@ -70,10 +70,22 @@ bool ValidateWaveUniformValue(const ResourcePlan& program, Value value);
 // Compiles the plan's x86 walker. Without values it walks the plan's resources; otherwise it
 // only evaluates the values, with every block reachable.
 void CompileSrtWalker(ResourcePlan& plan, std::span<const Value> values = {});
+// Options for a walk. The defaults are the GPU thread behaviour, where a faulting load may wait
+// on readbacks and retry.
+struct SrtWalkOptions {
+	// A faulting load completes as zero and is never offered to the GPU fault handler. Only a
+	// thread that does not own the GPU caches may set it. Host threads only, a guest thread
+	// must never walk this way.
+	bool non_faulting = false;
+	// When non-null receives how many loads this walk completed as zero.
+	uint32_t* skipped_loads = nullptr;
+};
 // Runs the walker. flat receives the scalar reads of reachable blocks and reads, when non-null,
-// one DWORD range per guest load. False when a reachable read is unknown.
+// one DWORD range per guest load. False when a reachable read is unknown, and also when a
+// non-faulting walk skipped a load because its results are then not trustworthy.
 bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<uint32_t>& flat,
-             std::vector<std::pair<uint64_t, uint64_t>>* reads);
+             std::vector<std::pair<uint64_t, uint64_t>>* reads,
+             const SrtWalkOptions& options = {});
 // Results of the last walk; false when unknown.
 bool WalkedValue(const ResourcePlan& plan, Value value, uint32_t& result);
 bool WalkedDescriptor(const ResourcePlan& plan, uint32_t source, DescriptorValue& result);
@@ -82,6 +94,21 @@ bool WalkedImageActive(const ResourcePlan& plan, uint32_t image);
 // Length of the guest load at rip if it belongs to the walker running on this thread, else 0.
 // The exception handler completes such a load as a zero read.
 uint32_t SrtWalkerLoadLength(uint64_t rip);
+// True while this thread is inside a non-faulting WalkSrt.
+bool SrtWalkerNonFaultingActive();
+// Like SrtWalkerLoadLength but nonzero only while this thread runs a non-faulting walk, and it
+// counts the skipped load. The exception handler asks this before the GPU fault handler so a
+// preparer thread never waits on a readback guard or mutates the GPU thread's caches.
+uint32_t SrtWalkerNonFaultingLoadLength(uint64_t rip);
+// How the exception handler treats a fault on this thread. NotWalker means this thread is not
+// in a non-faulting walk and the fault takes the normal GPU route. SkipLoad means the walker's
+// load at rip was counted and length bytes must be stepped over with a zero result. Fatal means
+// the thread is in a non-faulting walk but rip is not one of its guest loads, so the fault must
+// not be offered to the GPU. length is 0 unless the route is SkipLoad.
+enum class SrtFaultRoute { NotWalker, SkipLoad, Fatal };
+SrtFaultRoute SrtWalkerRouteFault(uint64_t rip, uint32_t& length);
+// Loads this thread has completed as zero. Compare before and after a walk.
+uint32_t SrtWalkerSkippedLoads();
 
 // Nonnegative affine coefficients: element zero is constant, remaining elements are
 // caller-selected leaves. Runtime range proofs must additionally exclude U32 wrap.

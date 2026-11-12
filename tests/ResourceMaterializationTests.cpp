@@ -3,11 +3,20 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "SrtWalkerTestMemory.h"
 
+#if !defined(_WIN32)
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
+
+#include <atomic>
 #include <bit>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <future>
 #include <limits>
 #include <memory>
+#include <thread>
 
 namespace {
 
@@ -1469,6 +1478,221 @@ void TestShaderCacheRecords() {
         "damaged resource plan was accepted");
 }
 
+// One page of host memory holding a sentinel DWORD that faults on any access while guarded, the
+// way a readback-watched guest page does.
+class GuardedPage {
+public:
+  static constexpr uint32_t kSentinel = 0xc0ffee11u;
+
+  GuardedPage(): m_size(SystemPageSize()) {
+#if defined(_WIN32)
+    m_memory = VirtualAlloc(nullptr, m_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+#else
+    m_memory = mmap(nullptr, m_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (m_memory == MAP_FAILED) m_memory = nullptr;
+#endif
+    Check(m_memory != nullptr, "could not map the guarded test page");
+    *static_cast<uint32_t *>(m_memory) = kSentinel;
+  }
+  ~GuardedPage() {
+#if defined(_WIN32)
+    VirtualFree(m_memory, 0, MEM_RELEASE);
+#else
+    munmap(m_memory, m_size);
+#endif
+  }
+  GuardedPage(const GuardedPage &) = delete;
+  GuardedPage &operator=(const GuardedPage &) = delete;
+
+  // Host address of the sentinel DWORD, which the SRT under test loads.
+  uint64_t Address() const { return reinterpret_cast<uint64_t>(m_memory); }
+  // Makes every access to the page fault, as a readback guard watching it would.
+  void Guard() { Protect(false); }
+  // Makes the page readable and writable again, as resolving the watch would.
+  void Open() { Protect(true); }
+
+private:
+  // The page size the host protects at, so the protection call covers exactly one page.
+  static size_t SystemPageSize() {
+#if defined(_WIN32)
+    SYSTEM_INFO system_info{};
+    GetSystemInfo(&system_info);
+    return system_info.dwPageSize;
+#else
+    return static_cast<size_t>(sysconf(_SC_PAGESIZE));
+#endif
+  }
+
+  void Protect(bool accessible) {
+#if defined(_WIN32)
+    DWORD previous = 0;
+    Check(VirtualProtect(m_memory, m_size, accessible ? PAGE_READWRITE : PAGE_NOACCESS,
+                         &previous) != 0,
+          "could not change the guarded page protection");
+#else
+    Check(mprotect(m_memory, m_size, accessible ? PROT_READ | PROT_WRITE : PROT_NONE) == 0,
+          "could not change the guarded page protection");
+#endif
+  }
+
+  size_t m_size;
+  void *m_memory = nullptr;
+};
+
+// Stands in for HandleGpuFault. Like a readback guard wait it blocks until the test releases it
+// and then lets the access through, so a walk that reaches it is visible as a call and as a
+// stall.
+struct GpuFaultStandIn {
+  static constexpr auto kMaxBlock = std::chrono::seconds(10);
+
+  std::atomic<uint32_t> calls{0};
+  std::atomic<bool> release{false};
+  GuardedPage *page = nullptr;
+
+  // On POSIX this runs inside the SIGSEGV handler. The Check failure path calls fprintf, which is
+  // not async-signal-safe. That is acceptable in a test that is about to abort anyway.
+  static bool Handle(void *userdata, uint64_t) {
+    auto &self = *static_cast<GpuFaultStandIn *>(userdata);
+    self.calls.fetch_add(1u);
+    const auto give_up = std::chrono::steady_clock::now() + kMaxBlock;
+    while (!self.release.load() && std::chrono::steady_clock::now() < give_up)
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    self.page->Open();
+    return true;
+  }
+};
+
+struct WalkOutcome {
+  bool walked = false;
+  uint32_t skipped_in_result = 0;
+  uint32_t skipped_by_counter = 0;
+  uint32_t first_word = 0;
+  bool flag_left_set = false;
+};
+
+void CheckWalkerNotRunning(const Libs::Graphics::ShaderRecompiler::IR::ResourcePlan &plan);
+
+// Walks the plan once with the given options and records what the caller would look at. It also
+// checks, on the walking thread, that the walker is no longer registered as running afterwards.
+WalkOutcome WalkOnce(const Libs::Graphics::ShaderRecompiler::IR::ResourcePlan &plan, bool non_faulting) {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  WalkOutcome outcome;
+  std::vector<uint32_t> flat;
+  const auto before = SrtWalkerSkippedLoads();
+  outcome.walked = WalkSrt(plan, SrtRuntime{}, flat, nullptr,
+                           {.non_faulting = non_faulting, .skipped_loads = &outcome.skipped_in_result});
+  outcome.skipped_by_counter = SrtWalkerSkippedLoads() - before;
+  outcome.first_word = flat.empty() ? 0u : flat[0];
+  outcome.flag_left_set = SrtWalkerNonFaultingActive();
+  CheckWalkerNotRunning(plan);
+  return outcome;
+}
+
+// Runs the walk on a thread that does not own the GPU caches under a watchdog. A walk that
+// waits on the GPU fault path never returns, so the watchdog is what fails it.
+WalkOutcome WalkOffThread(const Libs::Graphics::ShaderRecompiler::IR::ResourcePlan &plan,
+                          bool non_faulting) {
+  constexpr auto kWatchdog = std::chrono::seconds(2);
+  std::promise<WalkOutcome> promise;
+  auto result = promise.get_future();
+  std::thread worker([&] { promise.set_value(WalkOnce(plan, non_faulting)); });
+  if (result.wait_for(kWatchdog) != std::future_status::ready) {
+    std::fprintf(stderr, "ResourceMaterializationTests: failed: off-thread SRT walk did not return "
+                         "within the watchdog, it is waiting on the GPU fault path\n");
+    std::abort();
+  }
+  worker.join();
+  return result.get();
+}
+
+// Builds and compiles a plan whose one SRT read loads the DWORD at the page's address.
+Libs::Graphics::ShaderRecompiler::IR::ResourcePlan GuardedPagePlan(const GuardedPage &page) {
+  auto plan = Extract(SrtProgram(page.Address()));
+  CompileSrtWalker(plan);
+  Check(plan.srt_code != nullptr, "the guarded page SRT did not compile an x86 walker");
+  return plan;
+}
+
+// A non-faulting walk on a worker thread skips a guarded page without waiting on the GPU stand-in,
+// reports the skip and an invalid walk, and leaves the flag clear. A readable page is the baseline.
+void TestNonFaultingWalkSkipsGuardedPage() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  GuardedPage page;
+  const auto plan = GuardedPagePlan(page);
+  GpuFaultStandIn gpu;
+  gpu.page = &page;
+  FakeGuestMemory fake(nullptr, nullptr, GpuFaultStandIn::Handle, &gpu);
+
+  // Baseline differs only in the page being readable. Nothing faults, so nothing is skipped.
+  const auto readable = WalkOffThread(plan, true);
+  Check(readable.walked && readable.skipped_in_result == 0 && readable.skipped_by_counter == 0 &&
+            readable.first_word == GuardedPage::kSentinel && !readable.flag_left_set &&
+            gpu.calls.load() == 0,
+        "a non-faulting walk of a readable page was not valid, or skipped, or called the GPU");
+
+  page.Guard();
+  const auto guarded = WalkOffThread(plan, true);
+  Check(guarded.skipped_in_result == 1 && guarded.skipped_by_counter == 1,
+        "a non-faulting walk of a guarded page did not report exactly one skipped load");
+  Check(!guarded.walked, "a non-faulting walk that skipped a load was reported as valid");
+  Check(guarded.first_word != GuardedPage::kSentinel, "the skipped load returned the page data");
+  Check(!guarded.flag_left_set, "the non-faulting flag outlived its walk");
+  Check(gpu.calls.load() == 0, "a non-faulting walk offered its fault to the GPU fault handler");
+  Check(!SrtWalkerNonFaultingActive() && SrtWalkerNonFaultingLoadLength(0) == 0,
+        "the non-faulting flag leaked to the calling thread");
+}
+
+// Address of a guest load inside the plan's walker, found by its bytes mov eax,[r10]. It is a
+// valid walker rip, so the walker is only "not running" if the thread forgot it.
+uint64_t WalkerLoadAddress(const Libs::Graphics::ShaderRecompiler::IR::ResourcePlan &plan) {
+  const auto *code = reinterpret_cast<const uint8_t *>(plan.srt_code->getCode());
+  const size_t size = plan.srt_code->getSize();
+  for (size_t offset = 0; offset + 3 <= size; ++offset)
+    if (code[offset] == 0x41u && code[offset + 1] == 0x8bu && code[offset + 2] == 0x02u)
+      return reinterpret_cast<uint64_t>(code + offset);
+  Check(false, "no guest load was found in the walker code");
+  return 0;
+}
+
+// After a walk on this thread the walker must no longer count as running, so a later fault at
+// one of its loads is not claimed. The baseline shows the address really is a walker load.
+void CheckWalkerNotRunning(const Libs::Graphics::ShaderRecompiler::IR::ResourcePlan &plan) {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  const auto rip = WalkerLoadAddress(plan);
+  Check(rip - reinterpret_cast<uint64_t>(plan.srt_code->getCode()) < plan.srt_code->getSize(),
+        "the walker load address is outside the walker code");
+  Check(SrtWalkerLoadLength(rip) == 0, "the running walker was not restored after the walk");
+}
+
+// A default walk of a guarded page, which is what the GPU thread does, offers the fault to the
+// GPU stand-in first and retries the load once it resolves the page. Nothing is skipped.
+void TestDefaultWalkStillOffersFaultToGpu() {
+  GuardedPage page;
+  const auto plan = GuardedPagePlan(page);
+  GpuFaultStandIn gpu;
+  gpu.page = &page;
+  gpu.release = true;
+  FakeGuestMemory fake(nullptr, nullptr, GpuFaultStandIn::Handle, &gpu);
+  page.Guard();
+
+  // The GPU-thread behaviour: the fault is resolved by the GPU handler and the load retries.
+  const auto outcome = WalkOnce(plan, false);
+  Check(gpu.calls.load() == 1, "a default walk did not offer its fault to the GPU fault handler");
+  Check(outcome.walked && outcome.skipped_in_result == 0 && outcome.skipped_by_counter == 0 &&
+            outcome.first_word == GuardedPage::kSentinel,
+        "a default walk did not retry the load after the GPU handler resolved the page");
+}
+
+// A thread that never walked starts with the non-faulting flag clear. This does not prove the
+// flag is thread local, because nothing here sets it on one thread and reads it on another.
+void TestFreshThreadStartsWithFlagClear() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  bool other_thread_active = true;
+  std::thread other([&] { other_thread_active = SrtWalkerNonFaultingActive(); });
+  other.join();
+  Check(!other_thread_active, "a fresh thread started with the non-faulting flag set");
+}
+
 } // namespace
 
 namespace Common {
@@ -1504,6 +1728,9 @@ int main() {
   for (const bool atomic64 : {false, true}) TestUnreachedImageIgnoresSharedDescriptor(atomic64);
   for (const bool mixed : {false, true}) TestIndirectImageSamplerClasses(mixed);
   TestShaderCacheRecords();
+  TestNonFaultingWalkSkipsGuardedPage();
+  TestDefaultWalkStillOffersFaultToGpu();
+  TestFreshThreadStartsWithFlagClear();
   std::puts("ResourceMaterializationTests: all cases passed");
   return 0;
 }

@@ -166,7 +166,37 @@ const uint8_t* Scratch(const ResourcePlan& plan) {
 	return reinterpret_cast<const uint8_t*>(plan.srt_scratch.data());
 }
 
-thread_local const Xbyak::CodeGenerator* t_running_walker = nullptr;
+// The exception handler reads these on the faulting thread, inside a Windows vectored handler or
+// a Linux or macOS signal handler. That is safe because they are executable-local TLS,
+// constant-initialised, with no lazy allocation. On macOS the walker thread has already touched
+// them inside WalkSrt. constinit makes the compiler reject any change that would need dynamic
+// initialisation, so they must stay trivially initialised.
+constinit thread_local const Xbyak::CodeGenerator* t_running_walker = nullptr;
+// Set only by WalkSrt for a walk that must never wait on or mutate GPU state.
+constinit thread_local bool t_non_faulting_walk = false;
+// Loads completed as zero on this thread by the handler. Never reset, callers compare snapshots.
+constinit thread_local uint32_t t_skipped_loads = 0;
+
+// Publishes the running walker and the non-faulting flag for one walk and restores both previous
+// values on every exit, so neither can outlive the walk that set it.
+class WalkScope {
+public:
+	WalkScope(const Xbyak::CodeGenerator* walker, bool non_faulting):
+	    m_previous_walker(t_running_walker), m_previous_non_faulting(t_non_faulting_walk) {
+		t_running_walker   = walker;
+		t_non_faulting_walk = t_non_faulting_walk || non_faulting;
+	}
+	~WalkScope() {
+		t_running_walker    = m_previous_walker;
+		t_non_faulting_walk = m_previous_non_faulting;
+	}
+	WalkScope(const WalkScope&)            = delete;
+	WalkScope& operator=(const WalkScope&) = delete;
+
+private:
+	const Xbyak::CodeGenerator* m_previous_walker;
+	bool                        m_previous_non_faulting;
+};
 
 // Every guest load is mov eax, [r10] (41 8b 02), so a fault completes it as a zero read.
 void LoadGuest(Xbyak::CodeGenerator& code, const Xbyak::RegExp& address) {
@@ -1371,14 +1401,23 @@ void CompileSrtWalker(ResourcePlan& plan, std::span<const Value> values) {
 }
 
 bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<uint32_t>& flat,
-             std::vector<std::pair<uint64_t, uint64_t>>* reads) {
+             std::vector<std::pair<uint64_t, uint64_t>>* reads, const SrtWalkOptions& options) {
+	if (options.skipped_loads != nullptr) *options.skipped_loads = 0u;
 	if (plan.srt_code == nullptr || runtime.user_data.size() < plan.srt_user_data) return false;
 	flat.assign(plan.srt_reads.size(), 0u);
 	using Walker = const uint64_t* KYTY_SYSV_ABI (*)(const uint32_t*, uint32_t*, uint64_t*, uint64_t);
-	t_running_walker = plan.srt_code.get();
-	const auto* end = plan.srt_code->getCode<Walker>()(runtime.user_data.data(), flat.data(),
-	                                                     plan.srt_scratch.data(), runtime.shader_base);
-	t_running_walker = nullptr;
+	const uint32_t skipped_before = t_skipped_loads;
+	const uint64_t* end           = nullptr;
+	{
+		const WalkScope scope(plan.srt_code.get(), options.non_faulting);
+		end = plan.srt_code->getCode<Walker>()(runtime.user_data.data(), flat.data(),
+		                                       plan.srt_scratch.data(), runtime.shader_base);
+	}
+	const uint32_t skipped = t_skipped_loads - skipped_before;
+	if (options.skipped_loads != nullptr) *options.skipped_loads = skipped;
+	// A skipped load read as zero, so whatever the walk derived from it is a guess. Failing the
+	// walk keeps callers that never look at the count from recording it.
+	if (skipped != 0u) return false;
 	if (end == nullptr) return false;
 	if (reads != nullptr) {
 		for (auto* read = plan.srt_scratch.data() + plan.srt_captures / 8u; read != end; ++read)
@@ -1436,6 +1475,28 @@ uint32_t SrtWalkerLoadLength(uint64_t rip) {
 		return 0;
 	const auto* code = reinterpret_cast<const uint8_t*>(rip);
 	return code[0] == 0x41u && code[1] == 0x8bu && code[2] == 0x02u ? 3 : 0;
+}
+
+bool SrtWalkerNonFaultingActive() {
+	return t_non_faulting_walk;
+}
+
+uint32_t SrtWalkerNonFaultingLoadLength(uint64_t rip) {
+	if (!t_non_faulting_walk) return 0;
+	const auto length = SrtWalkerLoadLength(rip);
+	if (length != 0u) ++t_skipped_loads;
+	return length;
+}
+
+SrtFaultRoute SrtWalkerRouteFault(uint64_t rip, uint32_t& length) {
+	length = 0;
+	if (!t_non_faulting_walk) return SrtFaultRoute::NotWalker;
+	length = SrtWalkerNonFaultingLoadLength(rip);
+	return length != 0u ? SrtFaultRoute::SkipLoad : SrtFaultRoute::Fatal;
+}
+
+uint32_t SrtWalkerSkippedLoads() {
+	return t_skipped_loads;
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

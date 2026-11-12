@@ -22,11 +22,21 @@
 
 // Serves SRT walker loads from fake guest addresses: a walker load that faults completes with
 // the test reader's DWORD, or with zero like the emulator when the reader fails or is null.
+//
+// It routes a fault in the same order as the emulator's exception handler. A non-faulting walk
+// skips the load and never reaches the optional GPU fault stand-in. Any other walk offers the
+// fault to the stand-in first, and a true answer retries the load, like HandleGpuFault does
+// after resolving a watched page. The stand-in is process wide so it also serves walks run on
+// other threads.
 class FakeGuestMemory {
 public:
+  using GpuFaultStandIn = bool (*)(void *userdata, uint64_t fault_address);
+
   explicit FakeGuestMemory(Libs::Graphics::ShaderRecompiler::IR::SrtMemoryReader reader = nullptr,
-                           void *userdata = nullptr) {
+                           void *userdata = nullptr, GpuFaultStandIn gpu_fault = nullptr,
+                           void *gpu_userdata = nullptr) {
     Current() = {reader, userdata};
+    GpuHook() = {gpu_fault, gpu_userdata};
 #if defined(__linux__) || defined(__APPLE__)
     struct sigaction action {};
     action.sa_sigaction = Handle;
@@ -45,6 +55,7 @@ public:
     RemoveVectoredExceptionHandler(m_handler);
 #endif
     Current() = {};
+    GpuHook() = {};
   }
   FakeGuestMemory(const FakeGuestMemory &) = delete;
   FakeGuestMemory &operator=(const FakeGuestMemory &) = delete;
@@ -60,6 +71,30 @@ private:
     const auto [reader, userdata] = Current();
     return reader != nullptr && reader(userdata, address, {&word, 1}) ? word : 0u;
   }
+  using Hook = std::pair<GpuFaultStandIn, void *>;
+  static Hook &GpuHook() {
+    static Hook hook;
+    return hook;
+  }
+  struct Resolution {
+    uint32_t length = 0; // Bytes to step over, zero when the load retries.
+    uint32_t value = 0;  // What the skipped load reads.
+  };
+  // Decides one faulting walker load the way the emulator's handler does.
+  static Resolution Resolve(uint64_t rip, uint64_t fault_address, uint64_t load_address) {
+    using namespace Libs::Graphics::ShaderRecompiler::IR;
+    // The same routing decision the emulator's handler calls. Only the NotWalker case differs,
+    // where the stand-in plays HandleGpuFault.
+    uint32_t routed_length = 0;
+    const auto route = SrtWalkerRouteFault(rip, routed_length);
+    if (route == SrtFaultRoute::Fatal) std::abort();
+    if (route == SrtFaultRoute::SkipLoad) return {routed_length, 0u};
+    const auto [gpu_fault, gpu_userdata] = GpuHook();
+    if (gpu_fault != nullptr && gpu_fault(gpu_userdata, fault_address)) return {};
+    const auto length = SrtWalkerLoadLength(rip);
+    if (length == 0) std::abort();
+    return {length, Read(load_address)};
+  }
 #if defined(__linux__) || defined(__APPLE__)
 #if defined(__APPLE__)
   // macOS raises SIGBUS for some protection faults and SIGSEGV for others.
@@ -67,7 +102,7 @@ private:
 #else
   static constexpr int kSignals[] = {SIGSEGV};
 #endif
-  static void Handle(int, siginfo_t *, void *context) {
+  static void Handle(int, siginfo_t *signal_info, void *context) {
     auto *native = static_cast<ucontext_t *>(context);
 #if defined(__APPLE__)
     auto &rip = native->uc_mcontext->__ss.__rip;
@@ -78,20 +113,26 @@ private:
     auto &rax = native->uc_mcontext.gregs[REG_RAX];
     const auto r10 = native->uc_mcontext.gregs[REG_R10];
 #endif
-    const auto length = Libs::Graphics::ShaderRecompiler::IR::SrtWalkerLoadLength(rip);
-    if (length == 0) std::abort();
-    rax = Read(r10);
-    rip += length;
+    const auto resolution =
+        Resolve(rip, reinterpret_cast<uint64_t>(signal_info->si_addr), r10);
+    if (resolution.length == 0) return;
+    rax = resolution.value;
+    rip += resolution.length;
   }
   struct sigaction m_previous[std::size(kSignals)] {};
 #elif defined(_WIN32)
   static LONG CALLBACK Handle(EXCEPTION_POINTERS *info) {
     auto &context = *info->ContextRecord;
-    const auto length = Libs::Graphics::ShaderRecompiler::IR::SrtWalkerLoadLength(context.Rip);
-    if (info->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || length == 0)
+    // Checked first because routing a fault has side effects, it counts a skipped load.
+    if (info->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION ||
+        Libs::Graphics::ShaderRecompiler::IR::SrtWalkerLoadLength(context.Rip) == 0)
       return EXCEPTION_CONTINUE_SEARCH;
-    context.Rax = Read(context.R10);
-    context.Rip += length;
+    const auto resolution =
+        Resolve(context.Rip, info->ExceptionRecord->ExceptionInformation[1], context.R10);
+    if (resolution.length != 0) {
+      context.Rax = resolution.value;
+      context.Rip += resolution.length;
+    }
     return EXCEPTION_CONTINUE_EXECUTION;
   }
   void *m_handler = nullptr;
