@@ -495,7 +495,24 @@ void Report::SetGenerationFinal(ShaderStoreGenerationReport final_figures) {
 	m_generation_final  = std::move(final_figures);
 }
 
+void Report::SetScanDifferentialSource(std::function<ScanDifferentialReport()> source) {
+	std::lock_guard lock(m_scan_differential_mutex);
+	m_scan_differential_source = std::move(source);
+	m_scan_differential_final.reset();
+}
+
+void Report::SetScanDifferentialFinal(ScanDifferentialReport final_figures) {
+	std::lock_guard lock(m_scan_differential_mutex);
+	m_scan_differential_source = nullptr;
+	m_scan_differential_final  = std::move(final_figures);
+}
+
 void Report::Reset() {
+	{
+		std::lock_guard lock(m_scan_differential_mutex);
+		m_scan_differential_source = nullptr;
+		m_scan_differential_final.reset();
+	}
 	{
 		std::lock_guard lock(m_generation_mutex);
 		m_generation_inactive.reset();
@@ -1168,6 +1185,68 @@ nlohmann::json GenerationToJson(const ShaderStoreGenerationReport& block, int64_
 	return json;
 }
 
+// Writes one class of the scan differential as its certain and uncertain halves.
+nlohmann::json ScanCountToJson(const ScanOutcomeCount& count) {
+	return {{"certain", count.certain}, {"uncertain", count.uncertain}};
+}
+
+// Writes one example of a dispatch the scan got wrong, with the hashes as fixed width hex.
+nlohmann::json ScanSampleToJson(const ScanDifferentialSample& sample) {
+	return {{"kind", sample.kind},
+	        {"queue", sample.queue},
+	        {"seq", sample.seq},
+	        {"program", Hex(sample.program)},
+	        {"scanned_key", Hex(sample.scanned_key)},
+	        {"executed_key", Hex(sample.executed_key)}};
+}
+
+// Writes the scan columns of one queue, with the causes of uncertainty as an object by name.
+nlohmann::json ScanQueueToJson(const ScanQueueReport& queue) {
+	nlohmann::json causes = nlohmann::json::object();
+	for (const auto& [name, count]: queue.uncertain_cleared_by) {
+		causes[name] = count;
+	}
+	return {{"queue", queue.queue},
+	        {"submissions", queue.submissions},
+	        {"cp_dispatches", queue.cp_dispatches},
+	        {"dispatches", queue.dispatches},
+	        {"uncertain", queue.uncertain},
+	        {"branch_mode1", queue.branch_mode1},
+	        {"branch_mode2", queue.branch_mode2},
+	        {"branch_mode2_empty_else", queue.branch_mode2_empty_else},
+	        {"uncertain_cleared_by", causes},
+	        {"ib_revisit_doubts", queue.ib_revisit_doubts},
+	        {"bad_packets", queue.bad_packets},
+	        {"scan_allocations", queue.scan_allocations},
+	        {"scan_p50_us", queue.scan_p50_us},
+	        {"scan_p99_us", queue.scan_p99_us},
+	        {"scan_max_us", queue.scan_max_us}};
+}
+
+// The whole scan_differential block. mismatch_rate is what the G0 gate reads.
+nlohmann::json ScanDifferentialToJson(const ScanDifferentialReport& block) {
+	nlohmann::json samples = nlohmann::json::array();
+	for (const auto& sample: block.samples) {
+		samples.push_back(ScanSampleToJson(sample));
+	}
+	nlohmann::json queues = nlohmann::json::array();
+	for (const auto& queue: block.queues) {
+		queues.push_back(ScanQueueToJson(queue));
+	}
+	const auto& totals = block.totals;
+	return {{"cp_dispatches", totals.CpDispatches()},
+	        {"matched", ScanCountToJson(totals.matched)},
+	        {"key_mismatch", ScanCountToJson(totals.key_mismatch)},
+	        {"missing", ScanCountToJson(totals.missing)},
+	        {"extra", ScanCountToJson(totals.extra)},
+	        {"mismatch_rate", totals.MismatchRate()},
+	        {"mismatch_rate_certain", totals.CertainMismatchRate()},
+	        {"untracked_cp_dispatches", block.untracked_cp_dispatches},
+	        {"open_submissions", block.open_submissions},
+	        {"samples", samples},
+	        {"queues", queues}};
+}
+
 // The guest audio underruns with each one's time from the run start. count includes the ones that
 // came past the capacity and have no time.
 nlohmann::json AudioUnderrunsToJson(const AudioUnderruns& underruns, int64_t epoch_ns) {
@@ -1373,6 +1452,18 @@ std::string Report::ToJson(const Metadata& metadata, uint64_t audio_holds, doubl
 		}
 	}
 
+	// The scan differential block exists only when the flag registered a source or final figures. The
+	// source is called with its lock held, so the owner cannot destroy what it reads meanwhile.
+	std::optional<nlohmann::json> scan_differential;
+	{
+		std::lock_guard lock(m_scan_differential_mutex);
+		if (m_scan_differential_source) {
+			scan_differential = ScanDifferentialToJson(m_scan_differential_source());
+		} else if (m_scan_differential_final) {
+			scan_differential = ScanDifferentialToJson(*m_scan_differential_final);
+		}
+	}
+
 	// Read once, so the two blocks that come from it agree.
 	const auto machine = ReadMachineInfo();
 
@@ -1421,6 +1512,9 @@ std::string Report::ToJson(const Metadata& metadata, uint64_t audio_holds, doubl
 	};
 	if (generation) {
 		report["shader_store_generation"] = std::move(*generation);
+	}
+	if (scan_differential) {
+		report["scan_differential"] = std::move(*scan_differential);
 	}
 	// The title id is not filtered, so bytes that are not UTF-8 are replaced instead of throwing.
 	return report.dump(JSON_INDENT, ' ', false, nlohmann::json::error_handler_t::replace);

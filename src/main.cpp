@@ -74,6 +74,9 @@ static void PrintUsage() {
 	         "                                       outside their mask, which builds faster (experimental).\n");
 	::printf("  --structured-jump-tables             Compile shader jump tables as structured control\n"
 	         "                                       flow, which builds faster (experimental).\n");
+	::printf("  --scan-differential                  Scan every command list as it is submitted and compare\n"
+	         "                                       the scan with what the GPU runs, into the first-run\n"
+	         "                                       report. Slows the submitting thread; measurement only.\n");
 	::printf("  --tessellation                      Draw tessellation patches; skipped by default.\n");
 	::printf("  --occlusion-queries                  Count occlusion query samples on the GPU.\n");
 	::printf("  --audio-compile-hold                 Pause game audio while a long pipeline compile\n"
@@ -259,6 +262,7 @@ static constexpr Flag FLAGS[] = {
     {"--single-compare-record-guard", &ConfigOptions::single_compare_record_guard},
     {"--elide-exec-selects", &ConfigOptions::elide_exec_selects},
     {"--structured-jump-tables", &ConfigOptions::structured_jump_tables},
+    {"--scan-differential", &ConfigOptions::scan_differential},
     {"--tessellation", &ConfigOptions::tessellation_enabled},
     {"--occlusion-queries", &ConfigOptions::occlusion_queries_enabled},
     {"--audio-compile-hold", &ConfigOptions::audio_compile_hold_enabled},

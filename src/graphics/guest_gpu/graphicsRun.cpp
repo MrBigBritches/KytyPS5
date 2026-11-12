@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/debugCounters.h"
+#include "common/emulatorConfig.h"
 #include "common/firstRunReport.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -9,6 +10,7 @@
 #include "common/threads.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
+#include "graphics/guest_gpu/command_processor/scanDifferential.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/renderer/debug.h"
@@ -40,6 +42,16 @@ static thread_local GuestGpu*     g_gpu_state         = nullptr;
 GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	m_gfx_cp = std::make_unique<CommandProcessor>(renderer, 0);
+	// Built before the thread starts, so the thread and every enqueuer see it from their first use.
+	m_scan_differential = ScanDifferential::Create(
+	    Config::ScanDifferentialEnabled(), QueueCount,
+	    [](uint64_t address, void* destination, uint64_t bytes) {
+		    return LibKernel::Memory::TryReadBacking(address, destination, bytes);
+	    });
+	if (m_scan_differential) {
+		Common::FirstRunReport::Global().SetScanDifferentialSource(
+		    [this] { return m_scan_differential->Snapshot(); });
+	}
 	m_thread = std::jthread(ThreadRun, this);
 }
 
@@ -60,6 +72,10 @@ void GuestGpu::Shutdown() {
 	}
 	if (m_thread.joinable()) {
 		m_thread.join();
+	}
+	// The report may be written after this object is gone, so it keeps the final figures.
+	if (m_scan_differential) {
+		Common::FirstRunReport::Global().SetScanDifferentialFinal(m_scan_differential->Snapshot());
 	}
 	m_shutdown_complete = true;
 }
@@ -382,6 +398,20 @@ void CommandProcessor::DmaData(uint8_t dst_sel, uint64_t dst_address_or_offset, 
 void GuestGpu::Enqueue(Submission submission) {
 	// Stamped before the lock, so the enqueue time does not include waiting for it.
 	submission.report = Common::FirstRunReport::SubmissionStamp::New(submission.queue_id);
+	// Scanned before the queue lock is taken, so the walk does not hold up the GPU thread's selection.
+	// The order lock stays held to the end of the function, past the push, to keep scan order the same as
+	// queue order. It is declared before the queue lock, so it is released after it.
+	std::unique_lock<std::mutex> scan_order;
+	if (m_scan_differential) {
+		scan_order = std::unique_lock(m_scan_order_mutex);
+		if (submission.type == SubmissionType::Commands) {
+			submission.scan_seq =
+			    m_scan_differential->ScanSubmission(submission.queue_id, submission.commands);
+		} else if (submission.type == SubmissionType::SuspendPoint) {
+			// The processor resets its compute state at a suspend point, and the shadow follows.
+			m_scan_differential->ResetShadow(submission.queue_id);
+		}
+	}
 	Common::LockGuard lock(m_queue_mutex);
 	EXIT_IF(!m_accepting);
 	m_queues[submission.queue_id].push_back(std::move(submission));
@@ -514,8 +544,14 @@ bool GuestGpu::Process(Submission& submission) {
 
 	switch (submission.type) {
 		case SubmissionType::Commands:
+			m_scan_queue = submission.queue_id;
+			m_scan_seq   = submission.scan_seq;
 			complete =
 			    cp.Process(submission.execution, submission.commands) == Pm4ProcessResult::Complete;
+			m_scan_seq = 0;
+			if (m_scan_differential && complete && submission.scan_seq != 0) {
+				m_scan_differential->FinishSubmission(submission.queue_id, submission.scan_seq);
+			}
 			if (submission.execution.MadeProgress()) {
 				const CommandScheduler::TriggerScope trigger(
 				    m_renderer.GetCommandScheduler(), CommandScheduler::ResolveTrigger::SliceEnd);
@@ -874,9 +910,21 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 	}
 }
 
+void GuestGpu::NoteCpDispatch(const HW::CsStageRegisters& cs, uint32_t initiator,
+                              bool async_queue) {
+	// Nothing is compared with the flag off, or for work that came from outside a scanned submission.
+	if (!m_scan_differential || m_scan_seq == 0) {
+		return;
+	}
+	m_scan_differential->OnCpDispatch(m_scan_queue, m_scan_seq, cs, initiator, async_queue);
+}
+
 void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y,
                                       uint32_t thread_group_z, uint32_t mode) {
 	m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
+	if (g_gpu_state != nullptr) {
+		g_gpu_state->NoteCpDispatch(m_sh_ctx.GetCs().cs_regs, mode, IsAsyncComputeQueue());
+	}
 	m_renderer.GetRenderExecutor().DispatchDirect(CurrentBuffer(), thread_group_x, thread_group_y,
 	                                              thread_group_z, mode, IsAsyncComputeQueue());
 }
@@ -894,6 +942,9 @@ void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 		return;
 	}
 	m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
+	if (g_gpu_state != nullptr) {
+		g_gpu_state->NoteCpDispatch(m_sh_ctx.GetCs().cs_regs, mode, IsAsyncComputeQueue());
+	}
 	m_renderer.GetRenderExecutor().DispatchIndirect(CurrentBuffer(), args_addr, mode,
 	                                                IsAsyncComputeQueue());
 }

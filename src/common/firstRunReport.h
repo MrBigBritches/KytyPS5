@@ -576,6 +576,92 @@ struct SubmitLeadSummary {
 	double   max_ms = 0.0;
 };
 
+/// How many dispatches landed in one class of the scan differential, split by whether the scan could
+/// vouch for the program of the dispatch it was compared with.
+struct ScanOutcomeCount {
+	uint64_t certain   = 0;
+	uint64_t uncertain = 0;
+
+	/// Both halves.
+	[[nodiscard]] uint64_t Total() const { return certain + uncertain; }
+};
+
+/// The classes of the scan differential, over every submission. The first three count dispatches the
+/// command processor ran. Extra counts scanned records that no executed dispatch matched, so it is not
+/// part of the dispatches.
+struct ScanOutcomeTotals {
+	ScanOutcomeCount matched;
+	ScanOutcomeCount key_mismatch;
+	ScanOutcomeCount missing;
+	ScanOutcomeCount extra;
+
+	/// The dispatches the command processor ran and the differential compared.
+	[[nodiscard]] uint64_t CpDispatches() const {
+		return matched.Total() + key_mismatch.Total() + missing.Total();
+	}
+	/// The share of those dispatches the scan got wrong, which is key_mismatch and missing together. 0
+	/// when there were none. This is what the G0 gate reads.
+	[[nodiscard]] double MismatchRate() const {
+		const auto total = CpDispatches();
+		return total == 0 ? 0.0
+		                  : static_cast<double>(key_mismatch.Total() + missing.Total()) /
+		                        static_cast<double>(total);
+	}
+	/// The same share counting only dispatches whose scanned program was certain.
+	[[nodiscard]] double CertainMismatchRate() const {
+		const auto total = matched.certain + key_mismatch.certain + missing.certain;
+		return total == 0 ? 0.0
+		                  : static_cast<double>(key_mismatch.certain + missing.certain) /
+		                        static_cast<double>(total);
+	}
+};
+
+/// One dispatch the scan got wrong, kept as an example. kind is "key_mismatch" or "missing", and
+/// scanned_key is 0 for a missing one.
+struct ScanDifferentialSample {
+	std::string kind;
+	uint32_t    queue        = 0;
+	uint64_t    seq          = 0;
+	uint64_t    program      = 0;
+	uint64_t    scanned_key  = 0;
+	uint64_t    executed_key = 0;
+};
+
+/// What the scan differential saw on one queue. The scan columns come from the scanner's own counts.
+struct ScanQueueReport {
+	uint32_t queue                   = 0;
+	uint64_t submissions             = 0;
+	uint64_t cp_dispatches           = 0;
+	uint64_t dispatches              = 0;
+	uint64_t uncertain               = 0;
+	uint64_t branch_mode1            = 0;
+	uint64_t branch_mode2            = 0;
+	uint64_t branch_mode2_empty_else = 0;
+	uint64_t ib_revisit_doubts       = 0;
+	uint64_t bad_packets             = 0;
+	uint64_t scan_allocations        = 0;
+	uint64_t scan_p50_us             = 0;
+	uint64_t scan_p99_us             = 0;
+	uint64_t scan_max_us             = 0;
+	/// How many times each cause made the program uncertain, by the cause's name.
+	std::vector<std::pair<std::string, uint64_t>> uncertain_cleared_by;
+};
+
+/// The report's view of --scan-differential, as plain numbers since this library cannot see the scanner.
+struct ScanDifferentialReport {
+	ScanOutcomeTotals totals;
+	/// Dispatches the command processor ran that had no scan record of their submission at all.
+	uint64_t                             untracked_cp_dispatches = 0;
+	/// Scanned submissions the command processor had not finished, as when one was still blocked at
+	/// shutdown. Their unmatched records are not counted as extra.
+	uint64_t                             open_submissions        = 0;
+	std::vector<ScanDifferentialSample>  samples;
+	std::vector<ScanQueueReport>         queues;
+};
+
+/// The most mismatch and missing examples the scan differential keeps.
+inline constexpr size_t SCAN_DIFFERENTIAL_SAMPLE_LIMIT = 8;
+
 /// Figures worked out from the raw records, kept apart from JSON so tests can read them.
 struct Summary {
 	double                                                   blocked_graphics_ms = 0.0;
@@ -770,6 +856,15 @@ public:
 	/// the writer sees either the source or the final figures and never a source that is gone.
 	void SetGenerationFinal(ShaderStoreGenerationReport final_figures);
 
+	/// Registers the function the writer calls for the scan_differential block. With no source and no
+	/// final figures the report has no such block, which is how a run without --scan-differential looks.
+	/// The writer holds the scan differential lock while it calls, so the owner replaces the source with
+	/// SetScanDifferentialFinal before what the function reads is destroyed. The function must not call
+	/// back into these functions.
+	void SetScanDifferentialSource(std::function<ScanDifferentialReport()> source);
+	/// Stores the final figures and removes the source, in one step under the lock.
+	void SetScanDifferentialFinal(ScanDifferentialReport final_figures);
+
 private:
 	// Moves the pause being merged to the finished ones when it belongs to another flip. Caller
 	// holds the lock.
@@ -789,6 +884,11 @@ private:
 	std::optional<std::string>                   m_generation_inactive;
 	std::function<ShaderStoreGenerationReport()> m_generation_source;
 	std::optional<ShaderStoreGenerationReport>   m_generation_final;
+
+	// Guards the two scan differential members. It is taken on its own, never with m_mutex held.
+	mutable std::mutex                           m_scan_differential_mutex;
+	std::function<ScanDifferentialReport()>      m_scan_differential_source;
+	std::optional<ScanDifferentialReport>        m_scan_differential_final;
 
 	mutable std::mutex           m_mutex;
 	Phase                        m_phase = Phase::Play;

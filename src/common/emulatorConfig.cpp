@@ -197,6 +197,10 @@ bool StructuredJumpTablesEnabled() {
 	return g_config->structured_jump_tables;
 }
 
+bool ScanDifferentialEnabled() {
+	return g_config->scan_differential;
+}
+
 LogDirection GetPrintfDirection() {
 	return g_config->printf_direction;
 }

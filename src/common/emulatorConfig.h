@@ -86,6 +86,9 @@ struct ConfigOptions {
 	bool                   elide_exec_selects          = false;
 	// Opts in to compiling S_SETPC_B64 jump tables as structured control flow.
 	bool                   structured_jump_tables      = false;
+	// Opts in to scanning every submission as it is enqueued and comparing the scan with what the
+	// command processor runs, for the first-run report. A measurement mode that slows the enqueuing thread.
+	bool                   scan_differential           = false;
 	LogDirection           shader_log_direction        = LogDirection::Silent;
 	std::filesystem::path  shader_log_folder           = "_Shaders";
 	bool                   command_buffer_dump_enabled = false;
@@ -213,6 +216,8 @@ bool SingleCompareRecordGuardEnabled();
 bool ElideExecSelectsEnabled();
 // True when jump tables should be compiled as structured control flow.
 bool StructuredJumpTablesEnabled();
+// True when every submission should be scanned and compared with what the command processor runs.
+bool ScanDifferentialEnabled();
 
 LogDirection          GetPrintfDirection();
 std::filesystem::path GetPrintfOutputFile();

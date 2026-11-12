@@ -305,15 +305,6 @@ uint64_t ProgramStateHash(const HW::CsStageRegisters& cs) {
 	return XXH3_64bits(words, sizeof(words));
 }
 
-// Hashes what decides a dispatch's static key, which is its program state and how it is launched.
-uint64_t KeyHash(const HW::CsStageRegisters& cs, bool thread_dimensions, bool async_queue) {
-	const uint64_t words[] = {
-	    ProgramStateHash(cs),
-	    static_cast<uint64_t>(thread_dimensions) | (static_cast<uint64_t>(async_queue) << 1u),
-	};
-	return XXH3_64bits(words, sizeof(words));
-}
-
 // Turns the counts of a direct dispatch into group counts, as the runtime derives them.
 void FillWorkgroupCounts(ScannedDispatch& dispatch, const uint32_t* counts) {
 	const auto& cs = dispatch.regs.cs_regs;
@@ -364,7 +355,7 @@ void RecordDispatch(Walk& walk, uint32_t initiator, const uint32_t* counts, uint
 	}
 	const bool thread_dimensions =
 	    (initiator & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
-	const uint64_t key_hash = KeyHash(regs.cs_regs, thread_dimensions, walk.async_queue);
+	const uint64_t key_hash = ComputeDispatchKeyHash(regs.cs_regs, thread_dimensions, walk.async_queue);
 	bool           probe    = false;
 	if (SkippedByCache(walk, key_hash, probe)) {
 		return;
@@ -807,6 +798,15 @@ WalkEnd WalkBuffer(Walk& walk, std::span<const uint32_t> buffer, uint32_t depth,
 }
 
 } // namespace
+
+uint64_t ComputeDispatchKeyHash(const HW::CsStageRegisters& cs, bool thread_dimensions,
+                                bool async_queue) {
+	const uint64_t words[] = {
+	    ProgramStateHash(cs),
+	    static_cast<uint64_t>(thread_dimensions) | (static_cast<uint64_t>(async_queue) << 1u),
+	};
+	return XXH3_64bits(words, sizeof(words));
+}
 
 void SubmitScanner::Scan(std::span<const uint32_t> commands, uint32_t queue, bool async_queue,
                          CsShadow& shadow, std::vector<ScannedDispatch>& dispatches,

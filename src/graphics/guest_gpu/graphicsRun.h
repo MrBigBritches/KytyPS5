@@ -21,6 +21,7 @@
 namespace Libs::Graphics {
 
 class RenderContext;
+class ScanDifferential;
 
 class GuestGpu final {
 public:
@@ -65,6 +66,9 @@ private:
 		// to the queue, so its times stay those of the first enqueue. Its id is NO_SUBMISSION
 		// with the report off.
 		Common::FirstRunReport::SubmissionStamp report;
+		// The sequence number --scan-differential gave the submission's scan, or 0 when it was not
+		// scanned. Kept when a blocked submission goes back to the queue.
+		uint64_t scan_seq = 0;
 	};
 
 	void              Enqueue(Submission submission);
@@ -72,6 +76,8 @@ private:
 	bool              Process(Submission& submission);
 	static void       ThreadRun(void* data);
 	CommandProcessor& GetProcessor(uint32_t queue_id);
+	// Reports a dispatch the command processor is about to run to --scan-differential. GPU thread only.
+	void NoteCpDispatch(const HW::CsStageRegisters& cs, uint32_t initiator, bool async_queue);
 
 	RenderContext&                                 m_renderer;
 	Common::Mutex                                  m_queue_mutex;
@@ -97,6 +103,18 @@ private:
 	std::atomic_int m_done_num = 0;
 	// Suspend points the GPU thread has processed, for the first-run report. GPU thread only.
 	int64_t m_gpu_flip = 0;
+	// Null unless --scan-differential is on, and then every use is behind a null check, so a run without
+	// the flag does nothing more for it.
+	std::unique_ptr<ScanDifferential> m_scan_differential;
+	// With the flag on, held in Enqueue from before the scan or shadow reset until after the push to the
+	// queue, so the scans run in the order the submissions queue. A SuspendPoint and the command lists
+	// around it can come from different game threads, and a reset scanned out of order would leave the
+	// shadow with the wrong registers. The lock order is this mutex, then m_queue_mutex.
+	std::mutex m_scan_order_mutex;
+	// The queue and scan sequence of the submission the GPU thread is processing, which the command
+	// processor reports its dispatches under. GPU thread only. A sequence of 0 means none.
+	uint32_t        m_scan_queue = 0;
+	uint64_t        m_scan_seq   = 0;
 	std::jthread    m_thread;
 
 	friend class CommandProcessor;

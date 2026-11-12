@@ -124,6 +124,13 @@ enum class UncertainCause : uint8_t {
 	Count,
 };
 
+/// Hashes what decides a dispatch's static key, which is the program address and every register that
+/// decides its module, and how the dispatch is launched. The user data is left out. The scanner and the
+/// command processor both call this, so a difference between their keys is a difference in their register
+/// state and never in how they hash it.
+[[nodiscard]] uint64_t ComputeDispatchKeyHash(const HW::CsStageRegisters& cs, bool thread_dimensions,
+                                              bool async_queue);
+
 /// The compute shader registers as the walk has seen them. It is the per-queue, persistent twin of the
 /// command processor's compute state, so it is reset where the processor resets (a flip suspend point
 /// and the dispatch reset packet) and nowhere else.
