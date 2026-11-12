@@ -776,6 +776,75 @@ void TestResumeKeepsStampAndCountsOnce() {
         "submissions were not counted by the flip counter they began under");
 }
 
+// The lead of a compile comes from the submission that holds it, not from the newest one. Submission
+// 2 is enqueued later than 1, began while 1 was blocked, and 1 then resumes and compiles. The newest
+// stamp would give a negative lead here, and the current stamp gives the first submission's lead.
+// The same compile in a run with only submission 1 is the baseline for the number.
+void TestSubmitLeadUsesContainingSubmission() {
+  Report baseline;
+  baseline.BeginSubmission({.id = 1, .enqueued_ns = 1000 * kMs, .picked_ns = 1100 * kMs}, true);
+  baseline.AddCompile(Kind::Compute, 9, 0, 5.0, Thread::Gpu, 1300 * kMs);
+
+  Report report;
+  report.BeginSubmission({.id = 1, .enqueued_ns = 1000 * kMs, .picked_ns = 1100 * kMs}, true);
+  report.BeginSubmission({.id = 2, .enqueued_ns = 5000 * kMs, .picked_ns = 5100 * kMs}, true);
+  report.BeginSubmission({.id = 1, .enqueued_ns = 1000 * kMs, .picked_ns = 1100 * kMs}, false);
+  report.AddCompile(Kind::Compute, 9, 0, 5.0, Thread::Gpu, 1300 * kMs);
+
+  const auto leads = report.Summarize().submit_leads;
+  Check(leads.n == 1 && Near(leads.p50_ms, 300.0) && Near(leads.max_ms, 300.0),
+        "the lead was not taken from the containing submission");
+  Check(leads.n == baseline.Summarize().submit_leads.n &&
+            Near(leads.p50_ms, baseline.Summarize().submit_leads.p50_ms),
+        "a second submission changed the lead");
+  const auto json = Compact(report.ToJson({}, 0, 1.0, 0.0));
+  Check(json.find("\"submit_lead_summary\":{\"max_ms\":300.0,\"n\":1,\"p10_ms\":300.0,\"p50_ms\":300.0,"
+                  "\"p90_ms\":300.0}") != std::string::npos,
+        "the file lacks the submit lead summary");
+}
+
+// The summary counts only inline compute compiles of guest shaders in a submission in play, and its
+// percentiles are nearest rank. Twelve leads 10 to 120 ms are added out of order, so only a sort
+// puts them right, and p10 and p90 land on fractional ranks (1.2 and 10.8), which rounding down
+// would move. The excluded rows carry a lead of 9999 ms, so any that leaked in would show in max
+// and n. The graphics, tiler and PSSR rows each test one filter. The worker, no-start, warm-up
+// and between rows are regression cover, since the submission test alone already leaves them out.
+void TestSubmitLeadSummary() {
+  constexpr int64_t kHugeLeadMs = 9999;
+  Report            report;
+  const auto        empty = nlohmann::json::parse(report.ToJson({}, 0, 1.0, 0.0));
+  Check(report.Summarize().submit_leads.n == 0 && empty.contains("submit_lead_summary") &&
+            empty["submit_lead_summary"] == nlohmann::json({{"n", 0}}),
+        "an empty report did not write exactly n 0");
+  report.BeginSubmission({.id = 1, .enqueued_ns = 0}, true);
+  for (const int64_t lead_ms: {70, 20, 120, 10, 90, 50, 110, 30, 100, 60, 40, 80}) {
+    report.AddCompile(Kind::Compute, 1, 0, 1.0, Thread::Gpu, lead_ms * kMs);
+  }
+  // A guest id that shares the helpers' tag bits must still count. Its 60 ms lead keeps the
+  // nearest-rank percentiles of the 13 leads at 20, 60 and 110.
+  constexpr uint64_t kTagLookalikeId = 0xFFFF0000DEADBEEFull;
+  report.AddCompile(Kind::Compute, kTagLookalikeId, 0, 1.0, Thread::Gpu, 60 * kMs);
+  report.AddCompile(Kind::Graphics, 2, 3, 1.0, Thread::Gpu, kHugeLeadMs * kMs);  // Not compute.
+  report.AddCompile(Kind::Compute, Common::FirstRunReport::HELPER_ID_TILER, 0, 1.0, Thread::Gpu,
+                    kHugeLeadMs * kMs); // A helper pipeline.
+  report.AddCompile(Kind::Compute, Common::FirstRunReport::HELPER_ID_PSSR, 0, 1.0, Thread::Gpu,
+                    kHugeLeadMs * kMs); // Another helper.
+  report.AddCompile(Kind::Compute, 4, 0, 1.0, Thread::Worker, kHugeLeadMs * kMs); // A worker.
+  report.AddCompile(Kind::Compute, 5, 0, 1.0, Thread::Gpu);                       // No start.
+  report.SetPhase(Phase::Boot);
+  report.AddCompile(Kind::Compute, 6, 0, 1.0, Thread::Gpu, kHugeLeadMs * kMs); // Warm-up.
+  report.SetPhase(Phase::Play);
+  report.EndSubmission();
+  report.AddCompile(Kind::Compute, 7, 0, 1.0, Thread::Gpu, kHugeLeadMs * kMs); // Between.
+  const auto leads = report.Summarize().submit_leads;
+  Check(leads.n == 13, "the lead count includes a row it should not or misses one");
+  Check(Near(leads.p10_ms, 20.0) && Near(leads.p50_ms, 60.0) && Near(leads.p90_ms, 110.0) &&
+            Near(leads.max_ms, 120.0),
+        "a lead percentile is not the nearest rank");
+  report.Reset();
+  Check(report.Summarize().submit_leads.n == 0, "Reset kept the leads");
+}
+
 // The fragment of the file with the counts, with the values asserted, not only the key.
 void TestSubmissionCountsInJson() {
   Report report;
@@ -1877,6 +1946,8 @@ int main() {
   TestScopesRespectTheFlag();
   TestCompileRowsKeepSubmission();
   TestResumeKeepsStampAndCountsOnce();
+  TestSubmitLeadUsesContainingSubmission();
+  TestSubmitLeadSummary();
   TestSubmissionCountsInJson();
   TestScopesCarrySubmission();
   TestScopeIsInert();

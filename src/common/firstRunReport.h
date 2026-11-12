@@ -62,6 +62,12 @@ inline constexpr uint64_t HELPER_ID_TILER = 0xFFFF000100000000ull;
 inline constexpr uint64_t HELPER_ID_BLIT  = 0xFFFF000200000000ull;
 inline constexpr uint64_t HELPER_ID_PSSR  = 0xFFFF000300000000ull;
 
+/// True for the id of a pipeline the renderer builds for itself, which no guest shader caused.
+/// The match is exact so a hashed guest id that shares only the tag bits still counts as a guest.
+[[nodiscard]] constexpr bool IsHelperId(uint64_t id) noexcept {
+	return id == HELPER_ID_TILER || id == HELPER_ID_BLIT || id == HELPER_ID_PSSR;
+}
+
 namespace Detail {
 inline std::atomic<bool> g_report_enabled {false};
 inline std::atomic<bool> g_cold_enabled {false};
@@ -550,6 +556,19 @@ struct Metadata {
 	bool                                       partial = false;
 };
 
+/// How far ahead of the GPU thread's inline compute compiles of guest shaders their submission was
+/// enqueued. Helper pipelines are left out. Each lead is a compile row's visible_ms, so it is
+/// measured from the enqueue of the submission that holds the dispatch, never from a later one.
+/// It bounds how much time a helper process has to prepare a module before the dispatch needs it. Percentiles are nearest rank, and all figures
+/// are 0 when n is 0.
+struct SubmitLeadSummary {
+	uint32_t n      = 0;
+	double   p10_ms = 0.0;
+	double   p50_ms = 0.0;
+	double   p90_ms = 0.0;
+	double   max_ms = 0.0;
+};
+
 /// Figures worked out from the raw records, kept apart from JSON so tests can read them.
 struct Summary {
 	double                                                   blocked_graphics_ms = 0.0;
@@ -613,6 +632,8 @@ struct Summary {
 	uint32_t                                                 warm_waited_count = 0;
 	double                                                   warm_waited_ms = 0.0;
 	uint32_t                                                 warm_waited_over_hold_threshold = 0;
+	// Lead of the inline compute compiles in play, which the JSON key submit_lead_summary shows.
+	SubmitLeadSummary                                        submit_leads;
 };
 
 /// The raw records of one run. Thread safe, and it never reads a clock, so tests drive it with

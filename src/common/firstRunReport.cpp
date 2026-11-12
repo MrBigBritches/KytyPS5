@@ -591,6 +591,49 @@ size_t PauseBucket(double ms) {
 	return bucket;
 }
 
+// Percentiles are whole numbers out of this scale.
+constexpr uint32_t PERCENT_SCALE = 100;
+
+// Percentiles that the submit lead summary reports.
+constexpr uint32_t SUBMIT_LEAD_P10 = 10;
+constexpr uint32_t SUBMIT_LEAD_P50 = 50;
+constexpr uint32_t SUBMIT_LEAD_P90 = 90;
+
+// The nearest-rank percentile of an ascending list that is not empty. The rank is the smallest
+// 1-based position that covers the percentile of the samples, so p50 of four values is the second.
+// The rank is clamped to the list, so a percentile above 100 reads the last value.
+double NearestRank(const std::vector<double>& ascending, uint32_t percentile) {
+	const size_t count = ascending.size();
+	const size_t rank  = (count * percentile + PERCENT_SCALE - 1) / PERCENT_SCALE;
+	return ascending[std::clamp<size_t>(rank, 1, count) - 1];
+}
+
+// Summarizes the lead of the compute compiles of guest shaders that ran inside a submission in
+// play. The lead is the row's visible_ms, which AddCompile took from the stamp of the submission
+// being processed at the time, so a later submission cannot change it. AddCompile gives only
+// GPU-thread rows in play a submission, so the submission test also leaves out worker and warm-up
+// rows. The renderer's own helper pipelines are left out by id, since no guest dispatch waits on them.
+SubmitLeadSummary SummarizeSubmitLeads(const std::vector<CompileEntry>& compiles) {
+	std::vector<double> leads;
+	for (const auto& compile: compiles) {
+		if (compile.kind == Kind::Compute && compile.submission != NO_SUBMISSION &&
+		    !IsHelperId(compile.id)) {
+			leads.push_back(compile.visible_ms);
+		}
+	}
+	SubmitLeadSummary summary;
+	if (leads.empty()) {
+		return summary;
+	}
+	std::ranges::sort(leads);
+	summary.n      = static_cast<uint32_t>(leads.size());
+	summary.p10_ms = NearestRank(leads, SUBMIT_LEAD_P10);
+	summary.p50_ms = NearestRank(leads, SUBMIT_LEAD_P50);
+	summary.p90_ms = NearestRank(leads, SUBMIT_LEAD_P90);
+	summary.max_ms = leads.back();
+	return summary;
+}
+
 } // namespace
 
 void Report::CopyDeferredLocked(Summary& summary) const {
@@ -631,6 +674,7 @@ Summary Report::Summarize() const {
 	summary.sampled_after_skip_by_target = m_sampled_after_skip;
 	summary.refusals                     = m_refusals;
 	CopyDeferredLocked(summary);
+	summary.submit_leads = SummarizeSubmitLeads(m_compiles);
 
 	summary.worst_translate = m_translates;
 	std::ranges::stable_sort(summary.worst_translate,
@@ -723,6 +767,19 @@ nlohmann::json PlayToJson(const Summary& summary) {
 	        {"translate_ms", Round3(summary.translate_ms)},
 	        {"translate_gpu_graphics_ms", Round3(summary.translate_gpu_graphics_ms)},
 	        {"worst_translate", worst}};
+}
+
+// Writes the submit lead summary. With no samples only n is written, since a zero percentile would
+// read as a real lead of zero.
+nlohmann::json SubmitLeadsToJson(const SubmitLeadSummary& leads) {
+	if (leads.n == 0) {
+		return {{"n", 0}};
+	}
+	return {{"n", leads.n},
+	        {"p10_ms", Round3(leads.p10_ms)},
+	        {"p50_ms", Round3(leads.p50_ms)},
+	        {"p90_ms", Round3(leads.p90_ms)},
+	        {"max_ms", Round3(leads.max_ms)}};
 }
 
 nlohmann::json PausesToJson(const Summary& summary) {
@@ -1298,6 +1355,7 @@ std::string Report::ToJson(const Metadata& metadata, uint64_t audio_holds, doubl
 	    {"graphics_pipeline_library",
 	     PipelineLibraryToJson(library, LibraryStats(), LibraryPipelines())},
 	    {"play", PlayToJson(summary)},
+	    {"submit_lead_summary", SubmitLeadsToJson(summary.submit_leads)},
 	    {"pauses", PausesToJson(summary)},
 	    {"compiles", compile_rows},
 	    {"ready", ready_rows},
