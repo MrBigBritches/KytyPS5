@@ -676,6 +676,16 @@ add_executable(shader_store_scan_tests EXCLUDE_FROM_ALL
 target_link_libraries(shader_store_scan_tests common fmt::fmt xxhash)
 target_include_directories(shader_store_scan_tests PRIVATE ${inc_headers})
 
+# The submit-time PM4 walk. It reads buffers through a reader the test supplies, so it links only the
+# walk and the register decoder.
+add_executable(submit_scan_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/SubmitScanTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/csRegisters.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/command_processor/submitScan.cpp"
+)
+target_link_libraries(submit_scan_tests common fmt::fmt xxhash)
+target_include_directories(submit_scan_tests PRIVATE ${inc_headers})
+
 # The predictor rules, the header slots and the module id need no device and no translated program.
 add_executable(shader_store_predictor_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ShaderStorePredictorTests.cpp"
@@ -1026,6 +1036,7 @@ if(BUILD_TESTING)
 	add_test(NAME rtc COMMAND $<TARGET_FILE:rtc_tests>)
 	add_test(NAME shader_recompiler_compute COMMAND $<TARGET_FILE:shader_recompiler_compute_tests>)
 	add_test(NAME shader_store_scan COMMAND $<TARGET_FILE:shader_store_scan_tests>)
+	add_test(NAME submit_scan COMMAND $<TARGET_FILE:submit_scan_tests>)
 	add_test(NAME shader_store_predictor COMMAND $<TARGET_FILE:shader_store_predictor_tests>)
 	add_test(NAME shader_store_keys COMMAND $<TARGET_FILE:shader_store_keys_tests>)
 	add_test(NAME shader_store_record COMMAND $<TARGET_FILE:shader_store_record_tests>)
@@ -1175,6 +1186,7 @@ if(BUILD_TESTING)
 		sync_on_address_tests
 		shader_recompiler_compute_tests
 		shader_store_scan_tests
+		submit_scan_tests
 		shader_store_predictor_tests
 		shader_store_keys_tests
 		shader_store_record_tests
