@@ -90,6 +90,12 @@ constexpr std::chrono::milliseconds AT_ONCE_LIMIT {200};
 constexpr int FRAMES_AFTER_WARMUP = 7;
 /// How long the connect retry test lets a connect keep trying, far longer than the test needs.
 constexpr std::chrono::milliseconds CONNECT_RETRY_LIMIT {5000};
+/// The deadline of the write timeout test, how much sooner a clock may see it pass, and how long
+/// the test waits before it interrupts a write that ignored its deadline. A timeout must never come
+/// before its deadline, so no early margin is allowed.
+constexpr std::chrono::milliseconds WRITE_DEADLINE {300};
+constexpr std::chrono::milliseconds WRITE_EARLY {0};
+constexpr std::chrono::milliseconds WRITE_GUARD {5000};
 
 // A request with every field set to a value of its own, and every flag true, since each defaults to
 // false and a flag the frame lost would come back false.
@@ -840,6 +846,88 @@ void TestStopWakesBlockedWrite() {
 	CHECK(write_prompt && !wrote);
 }
 
+// Writes a large payload with a deadline on a pair, with or without a reader draining the other
+// end. A write that does not return within the guard is interrupted, so a write that ignored its
+// deadline fails the test rather than hanging it. Returns the status and whether the write ended no
+// sooner than its deadline.
+std::pair<StreamWriteStatus, bool> WriteWithDeadline(bool drained) {
+	auto pair = CreateStreamPipePair();
+	CHECK(pair.has_value());
+	if (!pair) {
+		return {StreamWriteStatus::Failed, false};
+	}
+	auto&       writer = pair->first;
+	auto&       peer   = pair->second;
+	const auto  big    = LargePayload(4);
+	std::thread reader;
+	if (drained) {
+		reader = std::thread([&] {
+			std::vector<uint8_t> sink(LARGE_PAYLOAD_BYTES);
+			for (size_t got = 0; got < big.size();) {
+				const size_t read = peer.ReadSome(sink);
+				if (read == 0) {
+					return;
+				}
+				got += read;
+			}
+		});
+	}
+	const auto deadline = std::chrono::steady_clock::now() + WRITE_DEADLINE;
+	auto       write =
+	    std::async(std::launch::async, [&] { return writer.WriteAllBy(big, deadline); });
+	const bool returned = write.wait_for(WRITE_GUARD) == std::future_status::ready;
+	if (!returned) {
+		writer.Interrupt();
+	}
+	CHECK(returned);
+	const auto status   = write.get();
+	const bool on_time  = std::chrono::steady_clock::now() >= deadline - WRITE_EARLY;
+	if (reader.joinable()) {
+		peer.Interrupt();
+		reader.join();
+	}
+	return {status, on_time};
+}
+
+// A write to a pipe nobody reads gives up at its deadline with TimedOut, not sooner. The baseline
+// is the same write with a reader draining the other end, which writes every byte, so the timeout
+// comes from the full pipe and not from the size. A write that ignored its deadline would block
+// until the guard interrupts it and then report Failed.
+void TestWriteTimesOutWhenNobodyReads() {
+	const auto [stalled, stalled_on_time] = WriteWithDeadline(false);
+	CHECK(stalled == StreamWriteStatus::TimedOut && stalled_on_time);
+	CHECK(WriteWithDeadline(true).first == StreamWriteStatus::Written);
+}
+
+// Many short writes to a pipe that stays full each time out, and none reports it before its
+// deadline. A system wait counts its timeout from the last clock tick, so a single long wait seldom
+// shows an early wake, while short ones of every length up to a few ticks do. The first write fills
+// the pipe, so each later one waits its whole deadline. On the machine this was written on, system
+// waits never woke early, so taking out WriteAllBy's second wait did not fail this test there. It
+// is kept for machines whose clock ticks are coarse enough to wake early. A write that gives up
+// early by design does fail it.
+void TestWriteTimeoutIsNeverEarly() {
+	constexpr int MAX_SHORT_DEADLINE_MS = 40;
+	auto          pair                  = CreateStreamPipePair();
+	CHECK(pair.has_value());
+	if (!pair) {
+		return;
+	}
+	auto&      writer = pair->first;
+	const auto big    = LargePayload(5);
+	int        early  = 0;
+	int        timed  = 0;
+	for (int milliseconds = 1; milliseconds <= MAX_SHORT_DEADLINE_MS; milliseconds++) {
+		const auto deadline =
+		    std::chrono::steady_clock::now() + std::chrono::milliseconds(milliseconds);
+		const auto status = writer.WriteAllBy(big, deadline);
+		timed += status == StreamWriteStatus::TimedOut ? 1 : 0;
+		early += std::chrono::steady_clock::now() < deadline ? 1 : 0;
+	}
+	CHECK(timed == MAX_SHORT_DEADLINE_MS);
+	CHECK(early == 0);
+}
+
 // Each end of a pair sees this process at the other end, the client asking about the server and the
 // server about the client. The baseline is another id, which neither end takes, and an end that is
 // not open takes none. Both ends are this process, so this cannot tell which end's id the system
@@ -1001,6 +1089,8 @@ int main() {
 	TestClientLeftBeforeAccept();
 	TestStopWakesBlockedRead();
 	TestStopWakesBlockedWrite();
+	TestWriteTimesOutWhenNobodyReads();
+	TestWriteTimeoutIsNeverEarly();
 	TestPeerProcessOfEachEnd();
 	TestConnectRetriesWhileBusy();
 	TestStreamModeNeedsPipeName();

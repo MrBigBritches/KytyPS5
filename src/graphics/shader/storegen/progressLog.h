@@ -26,7 +26,18 @@ enum class ProgressKind : uint8_t {
 	Drop,       ///< `drop <rank> <hash> <reason>`, when a program's candidates are given up.
 	Prediction, ///< `prediction <hash> <outcome> <candidates>`, once a program's prediction is
 	            ///< over.
+	Done,       ///< `done <seq> <status>`, a Stream worker's end of one request. Its `start` line
+	            ///< is a Start with the seq where the rank is.
+	Priority,   ///< `priority <name>`, a Stream worker's first line, the class it runs at.
 	Summary,    ///< `summary key=value ...`, the last line of a run. Keep it the last kind.
+};
+
+/// How a Stream worker answered a request, as a `done` line says it.
+enum class ProgressDoneStatus : uint8_t {
+	Ok,      ///< `ok`
+	Calls,   ///< `calls`, the program makes GPU-selected calls.
+	Failed,  ///< `failed`
+	Dropped, ///< `dropped`, the worker gave the request up while it stopped.
 };
 
 /// What came of a program's prediction, as a `prediction` line says it.
@@ -53,7 +64,9 @@ static_assert(ProgressKind::Predict < ProgressKind::Order &&
                   ProgressKind::Order < ProgressKind::Start &&
                   ProgressKind::Start < ProgressKind::Drop &&
                   ProgressKind::Drop < ProgressKind::Prediction &&
-                  ProgressKind::Prediction < ProgressKind::Summary,
+                  ProgressKind::Prediction < ProgressKind::Done &&
+                  ProgressKind::Done < ProgressKind::Priority &&
+                  ProgressKind::Priority < ProgressKind::Summary,
               "Summary must be the last kind, since it sizes the counts");
 
 /// Why a `drop` line was written.
@@ -82,6 +95,10 @@ struct ProgressLine {
 	uint32_t actual_push    = 0;
 	/// Drop with PushStartHead only, the id the runtime computes for the dropped head.
 	uint64_t module_id = 0;
+	/// Done only, how the request was answered. Its seq is in rank_or_count.
+	ProgressDoneStatus done_status = ProgressDoneStatus::Ok;
+	/// Priority only, the class name the worker reported.
+	std::string priority;
 	/// Summary only. `exit=` and the rest of the fields in the order they were written, as text.
 	int                                              exit_code = 0;
 	std::vector<std::pair<std::string, std::string>> fields;
@@ -91,8 +108,8 @@ struct ProgressLine {
 
 /// Reads one complete line, without its newline.
 /// @return nothing when the line is not one the worker writes: an unknown word, a missing or extra
-///         field, a number that is not a number, a hash that is not 16 hex digits, or a reason that
-///         is not one of the worker's.
+///         field, a number that is not a number, a hash that is not 16 hex digits, or a reason or
+///         done status that is not one of the worker's.
 [[nodiscard]] std::optional<ProgressLine> ParseProgressLine(std::string_view line);
 
 /// The longest line a reader holds while it waits for the newline. The worker's longest line is the

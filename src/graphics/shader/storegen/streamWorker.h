@@ -22,12 +22,6 @@
 // emulator.
 namespace Libs::Graphics::StoreGen {
 
-/// How many threads translate and compile at once. The pre-scan's gains are bound by how many
-/// modules are ready when the game asks for them, and the prototype measured 35.0, 21.7 and 20.4 s
-/// of LEGO compute stalls with 1, 2 and 3 workers, so three keep most of the gain while the child
-/// runs below normal priority.
-constexpr uint32_t STREAM_TRANSLATION_THREADS = 3;
-
 /// How long the worker tries to connect to its pipe. The parent creates the listener before it
 /// starts the child, so a long wait means the parent is gone or stuck.
 constexpr std::chrono::milliseconds STREAM_CONNECT_TIMEOUT {5000};

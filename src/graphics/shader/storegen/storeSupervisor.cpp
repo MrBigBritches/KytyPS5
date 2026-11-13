@@ -66,6 +66,8 @@ const char* KindName(ProgressKind kind) {
 		case ProgressKind::Start: return "start";
 		case ProgressKind::Drop: return "drop";
 		case ProgressKind::Prediction: return "prediction";
+		case ProgressKind::Done: return "done";
+		case ProgressKind::Priority: return "priority";
 		case ProgressKind::Summary: return "summary";
 	}
 	return "";

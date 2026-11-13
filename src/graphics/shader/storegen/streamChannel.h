@@ -81,6 +81,14 @@ private:
 
 struct StreamConnectAttempt;
 
+/// How a write with a deadline ended.
+enum class StreamWriteStatus : uint8_t {
+	Written,  ///< Every byte was written.
+	Failed,   ///< The other end closed, a write failed, or this end was interrupted or is not open.
+	TimedOut, ///< The deadline passed first. Some of the bytes may be in the pipe, so the stream is
+	          ///< out of step and the caller ends it.
+};
+
 /// One end of a connected stream pipe. Moving is allowed and copying is not. One thread may read
 /// while another writes, but two threads must not read, or write, at the same time.
 ///
@@ -104,6 +112,15 @@ public:
 	/// @return false when the other end has closed, a write failed, this end was interrupted, or
 	///         this end is not open. Some of the bytes may have been written by then.
 	[[nodiscard]] bool WriteAll(std::span<const uint8_t> bytes);
+
+	/// Writes every byte as WriteAll does, but stops waiting for room at the deadline. A reader that
+	/// stopped reading leaves the pipe full, and this is how a writer is not held by it for ever.
+	/// On Windows the pending write is cancelled at the deadline and waited for, and on POSIX each
+	/// write waits in poll for at most the time left. A timeout is never reported before the
+	/// deadline has passed on the steady clock. An interrupt still ends it at once.
+	/// @param deadline when to give up, or time_point::max() to wait as long as WriteAll does.
+	[[nodiscard]] StreamWriteStatus WriteAllBy(std::span<const uint8_t>              bytes,
+	                                           std::chrono::steady_clock::time_point deadline);
 
 	/// Wakes any read or write blocked on this end, and makes every later one fail at once. It
 	/// cannot be undone, and it may be called from any thread, any number of times. A read or write

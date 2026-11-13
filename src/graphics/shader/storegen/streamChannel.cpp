@@ -154,6 +154,11 @@ bool StreamPipe::IsOpen() const {
 	return m_impl != nullptr;
 }
 
+bool StreamPipe::WriteAll(std::span<const uint8_t> bytes) {
+	return WriteAllBy(bytes, std::chrono::steady_clock::time_point::max()) ==
+	       StreamWriteStatus::Written;
+}
+
 void StreamPipe::Close() {
 	m_impl.reset();
 }
@@ -333,39 +338,73 @@ std::unique_ptr<StreamPipeListener::Impl> CreatePipeAt(const std::string& name,
 	return impl;
 }
 
-// Starts an overlapped read or write with start, then waits for it or for the stop event. The
-// stop event is checked before the I/O is issued too, so a stopped pipe stays stopped even for an
-// I/O that would complete at once. A stop cancels the I/O, and the cancelled I/O is still waited
-// for, since the system writes to the OVERLAPPED until it ends. An I/O that completed before the
-// cancel keeps its bytes. Returns how many bytes moved, or nothing on a failure, a close of the
-// other end, or a stop.
-template <class Start>
-std::optional<DWORD> RunIo(HANDLE pipe, HANDLE io_event, HANDLE stop_event, Start start) {
-	if (WaitForSingleObject(stop_event, 0) == WAIT_OBJECT_0) {
-		return std::nullopt;
-	}
-	OVERLAPPED overlapped {};
-	overlapped.hEvent = io_event;
-	if (start(overlapped) == FALSE && GetLastError() != ERROR_IO_PENDING) {
-		return std::nullopt;
-	}
-	const HANDLE events[] = {io_event, stop_event};
-	// The I/O event comes first, so an I/O that completed together with a stop is taken as done.
-	if (WaitForMultipleObjects(2, events, FALSE, INFINITE) != WAIT_OBJECT_0) {
-		CancelIoEx(pipe, &overlapped);
-	}
-	DWORD moved = 0;
-	if (GetOverlappedResult(pipe, &overlapped, &moved, TRUE) == FALSE) {
-		return std::nullopt;
-	}
-	return moved;
-}
+/// How one overlapped I/O ended.
+struct IoResult {
+	/// How many bytes moved, or nothing on a failure, a close of the other end, a stop or a
+	/// timeout.
+	std::optional<DWORD> moved;
+	/// Whether it was cancelled because its wait ran out.
+	bool timed_out = false;
+};
 
 // A timeout as WaitForSingleObject takes it. A negative one does not wait, and one too long for a
 // DWORD waits as long as a DWORD allows short of INFINITE.
 DWORD WaitMilliseconds(std::chrono::milliseconds timeout) {
 	constexpr auto longest = static_cast<long long>(INFINITE - 1);
 	return static_cast<DWORD>(std::clamp<long long>(timeout.count(), 0, longest));
+}
+
+// The wait left until a deadline, rounded up to whole milliseconds. The largest time point means
+// no deadline.
+DWORD WaitUntil(std::chrono::steady_clock::time_point deadline) {
+	if (deadline == std::chrono::steady_clock::time_point::max()) {
+		return INFINITE;
+	}
+	return WaitMilliseconds(std::chrono::ceil<std::chrono::milliseconds>(
+	    deadline - std::chrono::steady_clock::now()));
+}
+
+// Waits for the I/O event or the stop event until the deadline. A system wait times its timeout
+// from the last clock tick, so it can end up to a tick before the deadline on the steady clock. A
+// timeout that came early is waited out again, so a caller that compares the deadline with the
+// time after a timeout always finds it passed. The I/O event comes first, so an I/O that completed
+// together with a stop is taken as done.
+DWORD WaitForIoUntil(HANDLE io_event, HANDLE stop_event,
+                     std::chrono::steady_clock::time_point deadline) {
+	const HANDLE events[] = {io_event, stop_event};
+	for (;;) {
+		const DWORD waited = WaitForMultipleObjects(2, events, FALSE, WaitUntil(deadline));
+		if (waited != WAIT_TIMEOUT || std::chrono::steady_clock::now() >= deadline) {
+			return waited;
+		}
+	}
+}
+
+// Starts an overlapped read or write with start, then waits for it or for the stop event until the
+// deadline. The stop event is checked before the I/O is issued too, so a stopped pipe stays stopped
+// even for an I/O that would complete at once. A stop or a timeout cancels the I/O, and the
+// cancelled I/O is still waited for, since the system writes to the OVERLAPPED until it ends. An
+// I/O that completed before the cancel keeps its bytes.
+template <class Start>
+IoResult RunIo(HANDLE pipe, HANDLE io_event, HANDLE stop_event,
+               std::chrono::steady_clock::time_point deadline, Start start) {
+	if (WaitForSingleObject(stop_event, 0) == WAIT_OBJECT_0) {
+		return {};
+	}
+	OVERLAPPED overlapped {};
+	overlapped.hEvent = io_event;
+	if (start(overlapped) == FALSE && GetLastError() != ERROR_IO_PENDING) {
+		return {};
+	}
+	const DWORD waited = WaitForIoUntil(io_event, stop_event, deadline);
+	if (waited != WAIT_OBJECT_0) {
+		CancelIoEx(pipe, &overlapped);
+	}
+	DWORD moved = 0;
+	if (GetOverlappedResult(pipe, &overlapped, &moved, TRUE) == FALSE) {
+		return {.moved = std::nullopt, .timed_out = waited == WAIT_TIMEOUT};
+	}
+	return {.moved = moved, .timed_out = false};
 }
 
 /// How a wait for a client ended.
@@ -431,11 +470,13 @@ size_t StreamPipe::ReadSome(std::span<uint8_t> into) {
 	// A read that succeeds with no bytes is a zero length write by the other end, which this
 	// protocol never makes, so it is read past rather than taken for a close.
 	for (;;) {
+		constexpr auto no_deadline = std::chrono::steady_clock::time_point::max();
+		const auto     read_one    = [&](OVERLAPPED& overlapped) {
+			return ReadFile(m_impl->pipe.value, into.data(), want, nullptr, &overlapped);
+		};
 		const auto got = RunIo(m_impl->pipe.value, m_impl->read_event.value,
-		                       m_impl->stop_event.value, [&](OVERLAPPED& overlapped) {
-			                       return ReadFile(m_impl->pipe.value, into.data(), want, nullptr,
-			                                       &overlapped);
-		                       });
+		                       m_impl->stop_event.value, no_deadline, read_one)
+		                     .moved;
 		if (!got) {
 			return 0;
 		}
@@ -445,23 +486,28 @@ size_t StreamPipe::ReadSome(std::span<uint8_t> into) {
 	}
 }
 
-bool StreamPipe::WriteAll(std::span<const uint8_t> bytes) {
+StreamWriteStatus StreamPipe::WriteAllBy(std::span<const uint8_t>              bytes,
+                                         std::chrono::steady_clock::time_point deadline) {
 	if (!m_impl) {
-		return false;
+		return StreamWriteStatus::Failed;
 	}
 	while (!bytes.empty()) {
 		const auto want = static_cast<DWORD>(std::min(bytes.size(), MAX_IO_BYTES));
 		const auto put  = RunIo(m_impl->pipe.value, m_impl->write_event.value,
-		                        m_impl->stop_event.value, [&](OVERLAPPED& overlapped) {
+		                        m_impl->stop_event.value, deadline,
+		                        [&](OVERLAPPED& overlapped) {
                                    return WriteFile(m_impl->pipe.value, bytes.data(), want,
                                                     nullptr, &overlapped);
                                });
-		if (!put || *put == 0) {
-			return false;
+		if (put.timed_out) {
+			return StreamWriteStatus::TimedOut;
 		}
-		bytes = bytes.subspan(*put);
+		if (!put.moved || *put.moved == 0) {
+			return StreamWriteStatus::Failed;
+		}
+		bytes = bytes.subspan(*put.moved);
 	}
-	return true;
+	return StreamWriteStatus::Written;
 }
 
 void StreamPipe::Interrupt() {
@@ -659,6 +705,16 @@ int PollMilliseconds(std::chrono::milliseconds timeout) {
 	return static_cast<int>(std::clamp<long long>(timeout.count(), 0, INT_MAX));
 }
 
+// The poll timeout left until a deadline, rounded up so a wait never ends just short of it. The
+// largest time point means no deadline, which poll takes as -1.
+int PollUntil(std::chrono::steady_clock::time_point deadline) {
+	if (deadline == std::chrono::steady_clock::time_point::max()) {
+		return -1;
+	}
+	return PollMilliseconds(std::chrono::ceil<std::chrono::milliseconds>(
+	    deadline - std::chrono::steady_clock::now()));
+}
+
 } // namespace
 
 struct StreamPipe::Impl {
@@ -702,25 +758,43 @@ size_t StreamPipe::ReadSome(std::span<uint8_t> into) {
 	return 0;
 }
 
-bool StreamPipe::WriteAll(std::span<const uint8_t> bytes) {
+StreamWriteStatus StreamPipe::WriteAllBy(std::span<const uint8_t>              bytes,
+                                         std::chrono::steady_clock::time_point deadline) {
 	if (!m_impl) {
-		return false;
+		return StreamWriteStatus::Failed;
 	}
 	while (!bytes.empty()) {
 		if (m_impl->interrupted.load(std::memory_order_acquire)) {
-			return false;
+			return StreamWriteStatus::Failed;
+		}
+		// Waits for room, so the send below never blocks past the deadline. A shutdown by Interrupt
+		// or a closed peer wakes the poll, and the send then fails.
+		pollfd room {.fd = m_impl->fd.value, .events = POLLOUT, .revents = 0};
+		const int ready = ::poll(&room, 1, PollUntil(deadline));
+		if (ready < 0 && errno == EINTR) {
+			continue;
+		}
+		// A poll that timed out a little early is waited out again, as on Windows.
+		if (ready == 0 && std::chrono::steady_clock::now() < deadline) {
+			continue;
+		}
+		if (ready == 0) {
+			return StreamWriteStatus::TimedOut;
+		}
+		if (ready < 0) {
+			return StreamWriteStatus::Failed;
 		}
 		const ssize_t put = ::send(m_impl->fd.value, bytes.data(),
-		                           std::min(bytes.size(), MAX_IO_BYTES), SEND_FLAGS);
-		if (put < 0 && errno == EINTR) {
+		                           std::min(bytes.size(), MAX_IO_BYTES), SEND_FLAGS | MSG_DONTWAIT);
+		if (put < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) {
 			continue;
 		}
 		if (put <= 0) {
-			return false;
+			return StreamWriteStatus::Failed;
 		}
 		bytes = bytes.subspan(static_cast<size_t>(put));
 	}
-	return true;
+	return StreamWriteStatus::Written;
 }
 
 void StreamPipe::Interrupt() {

@@ -803,6 +803,36 @@ add_executable(shader_store_supervisor_tests EXCLUDE_FROM_ALL
 target_link_libraries(shader_store_supervisor_tests common fmt::fmt xbyak::xbyak xxhash libzstd_static)
 target_include_directories(shader_store_supervisor_tests PRIVATE ${inc_headers})
 
+# The supervisor of a Stream worker. It starts this test binary as a fake worker that crashes or
+# hangs on demand, so it links no recompiler and needs no device. The generator's supervisor and
+# what it needs are linked for WorkerProgramPath, and the typed IR for its module records.
+add_executable(shader_store_stream_supervisor_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ShaderStoreStreamSupervisorTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/storegen/streamSupervisor.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/storegen/streamProtocol.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/storegen/streamChannel.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/storegen/storeSupervisor.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/storegen/frameTailer.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/storegen/progressLog.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/storegen/storeWorkerFormat.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/shaderStoreRecord.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/gpu_format.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/Block.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/Program.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/Type.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/Value.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/opcodes/ValueOpcodes.cpp"
+)
+target_link_libraries(shader_store_stream_supervisor_tests common Vulkan::Headers fmt::fmt xbyak::xbyak xxhash libzstd_static)
+target_include_directories(shader_store_stream_supervisor_tests PRIVATE ${inc_headers})
+if (KYTY_CLANG_CL)
+	# The worker's exit codes in shaderStoreWorker.h bring in the recompiler headers, with the
+	# deprecated codecvt use the stream tests silence too.
+	target_compile_options(shader_store_stream_supervisor_tests PRIVATE -Wno-deprecated-declarations)
+endif()
+
 # The decisions of the drain that takes generated modules into the pipeline cache. They need no
 # graphics device, so this target links only the planner.
 add_executable(generated_drain_planner_tests EXCLUDE_FROM_ALL
@@ -1125,6 +1155,9 @@ if(BUILD_TESTING)
 	add_test(NAME shader_store_stream COMMAND $<TARGET_FILE:shader_store_stream_tests>)
 	add_test(NAME shader_store_progress_log COMMAND $<TARGET_FILE:shader_store_progress_log_tests>)
 	add_test(NAME shader_store_supervisor COMMAND $<TARGET_FILE:shader_store_supervisor_tests>)
+	add_test(NAME shader_store_stream_supervisor COMMAND $<TARGET_FILE:shader_store_stream_supervisor_tests>)
+	# A child that is never ended or a Stop that waits shows up as a hang, which the watchdog ends.
+	set_tests_properties(shader_store_stream_supervisor PROPERTIES TIMEOUT 300)
 	add_test(NAME generated_drain_planner COMMAND $<TARGET_FILE:generated_drain_planner_tests>)
 	add_test(NAME generation_miss_classifier COMMAND $<TARGET_FILE:generation_miss_classifier_tests>)
 	add_test(NAME shader_store_eboot_source COMMAND $<TARGET_FILE:shader_store_eboot_source_tests>)
@@ -1286,6 +1319,7 @@ if(BUILD_TESTING)
 		shader_store_stream_tests
 		shader_store_progress_log_tests
 		shader_store_supervisor_tests
+		shader_store_stream_supervisor_tests
 		generated_drain_planner_tests
 		generation_miss_classifier_tests
 		shader_store_eboot_source_tests

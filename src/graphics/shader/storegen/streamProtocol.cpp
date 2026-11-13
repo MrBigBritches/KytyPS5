@@ -236,18 +236,23 @@ StreamHeaderParse ParseStreamFrameHeader(std::span<const uint8_t> bytes) {
 }
 
 bool EncodeStreamRequest(const StreamRequest& request, std::vector<uint8_t>& frame) {
+	return EncodeStreamRequest(request, request.code, frame);
+}
+
+bool EncodeStreamRequest(const StreamRequest& request, std::span<const uint8_t> code,
+                         std::vector<uint8_t>& frame) {
 	frame.clear();
-	const uint64_t payload_bytes = static_cast<uint64_t>(RequestFixedBytes()) + request.code.size() +
+	const uint64_t payload_bytes = static_cast<uint64_t>(RequestFixedBytes()) + code.size() +
 	                               request.specialization.size();
 	if (payload_bytes > MAX_STREAM_PAYLOAD_BYTES) {
 		return false;
 	}
 	BeginFrame(frame, StreamFrameKind::Request, static_cast<uint32_t>(payload_bytes));
 	FieldWriter write {frame};
-	BlobLengths lengths {static_cast<uint32_t>(request.code.size()),
+	BlobLengths lengths {static_cast<uint32_t>(code.size()),
 	                     static_cast<uint32_t>(request.specialization.size())};
 	VisitRequestFixed(write, request, lengths);
-	AppendBytes(frame, request.code.data(), request.code.size());
+	AppendBytes(frame, code.data(), code.size());
 	AppendBytes(frame, request.specialization.data(), request.specialization.size());
 	return true;
 }

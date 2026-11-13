@@ -28,6 +28,13 @@ constexpr size_t STREAM_FRAME_HEADER_BYTES =
 /// a reader allocate gigabytes.
 constexpr uint32_t MAX_STREAM_PAYLOAD_BYTES = 32u * 1024u * 1024u;
 
+/// How many threads a Stream worker translates and compiles on at once. The pre-scan's gains are
+/// bound by how many modules are ready when the game asks for them, and the prototype measured
+/// 35.0, 21.7 and 20.4 s of LEGO compute stalls with 1, 2 and 3 workers, so three keep most of the
+/// gain while the child runs below normal priority. It lives with the protocol so the supervisor
+/// can size its cap from it without the worker's recompiler headers.
+constexpr uint32_t STREAM_TRANSLATION_THREADS = 3;
+
 /// What a frame carries, which is its header's kind byte.
 enum class StreamFrameKind : uint8_t {
 	Request  = 1, ///< A StreamRequest, from the supervisor to the worker.
@@ -112,6 +119,12 @@ struct StreamResponse {
 /// caller that keeps it allocates only when a frame is larger than any before.
 /// @return false when the payload would be over MAX_STREAM_PAYLOAD_BYTES, and frame is then empty.
 [[nodiscard]] bool EncodeStreamRequest(const StreamRequest& request, std::vector<uint8_t>& frame);
+
+/// Writes a request as EncodeStreamRequest does, with code in place of request.code, which is not
+/// read. The bytes are the same as for a request that holds that code. The supervisor keeps a
+/// program's code once and shares it between the program's requests, so it passes it here.
+[[nodiscard]] bool EncodeStreamRequest(const StreamRequest& request, std::span<const uint8_t> code,
+                                       std::vector<uint8_t>& frame);
 
 /// Whether EncodeStreamResponse would take a response, which is when its payload fits under
 /// MAX_STREAM_PAYLOAD_BYTES and it carries a payload only with the Ok status. It copies nothing, so

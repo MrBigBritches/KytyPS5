@@ -677,6 +677,26 @@ void TestPollToEndStopsWithoutProgress() {
 	CHECK(moving_calls == 4 && moving_found == 8);
 }
 
+// The Stream worker's two lines parse to their fields, and a wrong status or word count does not.
+// Before the stream supervisor both were malformed, so the baseline is a line of each with one
+// word wrong. Different seqs and statuses keep a parser that fixed either from passing.
+void TestDoneAndPriorityLines() {
+	constexpr uint64_t CALLS_SEQ   = 7;
+	constexpr uint64_t DROPPED_SEQ = 9;
+	const auto         done        = ParseProgressLine("done 7 calls");
+	CHECK(done && done->kind == ProgressKind::Done && done->rank_or_count == CALLS_SEQ &&
+	      done->done_status == ProgressDoneStatus::Calls);
+	const auto dropped = ParseProgressLine("done 9 dropped");
+	CHECK(dropped && dropped->rank_or_count == DROPPED_SEQ &&
+	      dropped->done_status == ProgressDoneStatus::Dropped);
+	const auto priority = ParseProgressLine("priority below_normal");
+	CHECK(priority && priority->kind == ProgressKind::Priority &&
+	      priority->priority == "below_normal");
+	CHECK(!ParseProgressLine("done 7 maybe") && !ParseProgressLine("done 7") &&
+	      !ParseProgressLine("done x ok") && !ParseProgressLine("priority") &&
+	      !ParseProgressLine("priority a b"));
+}
+
 } // namespace
 
 int main() {
@@ -695,6 +715,7 @@ int main() {
 	TestPollToEndCatchesUp();
 	TestShrunkLogIsReadAgain();
 	TestPollToEndStopsWithoutProgress();
+	TestDoneAndPriorityLines();
 	if (g_failures == 0) {
 		std::puts("Shader store progress log tests passed");
 	}

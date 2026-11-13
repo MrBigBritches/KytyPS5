@@ -162,6 +162,51 @@ std::optional<ProgressLine> ParsePrediction(const std::vector<std::string_view>&
 	return line;
 }
 
+// The status a `done` line names, or nothing for a word the Stream worker does not write.
+std::optional<ProgressDoneStatus> ParseDoneStatus(std::string_view word) {
+	if (word == "ok") {
+		return ProgressDoneStatus::Ok;
+	}
+	if (word == "calls") {
+		return ProgressDoneStatus::Calls;
+	}
+	if (word == "failed") {
+		return ProgressDoneStatus::Failed;
+	}
+	if (word == "dropped") {
+		return ProgressDoneStatus::Dropped;
+	}
+	return std::nullopt;
+}
+
+std::optional<ProgressLine> ParseDone(const std::vector<std::string_view>& words) {
+	// done <seq> <status>
+	constexpr size_t WORD_COUNT = 3;
+	if (words.size() != WORD_COUNT) {
+		return std::nullopt;
+	}
+	ProgressLine line;
+	line.kind         = ProgressKind::Done;
+	const auto status = ParseDoneStatus(words[2]);
+	if (!status || !ParseNumber(words[1], line.rank_or_count)) {
+		return std::nullopt;
+	}
+	line.done_status = *status;
+	return line;
+}
+
+std::optional<ProgressLine> ParsePriority(const std::vector<std::string_view>& words) {
+	// priority <name>, where the name is one word such as below_normal or nice_10
+	constexpr size_t WORD_COUNT = 2;
+	if (words.size() != WORD_COUNT || words[1].empty()) {
+		return std::nullopt;
+	}
+	ProgressLine line;
+	line.kind     = ProgressKind::Priority;
+	line.priority = std::string(words[1]);
+	return line;
+}
+
 } // namespace
 
 std::optional<ProgressLine> ParseProgressLine(std::string_view line) {
@@ -184,6 +229,12 @@ std::optional<ProgressLine> ParseProgressLine(std::string_view line) {
 	}
 	if (kind == "prediction") {
 		return ParsePrediction(words);
+	}
+	if (kind == "done") {
+		return ParseDone(words);
+	}
+	if (kind == "priority") {
+		return ParsePriority(words);
 	}
 	if (kind == "summary") {
 		return ParseSummary(words);
@@ -252,6 +303,10 @@ void ProgressLogReader::TakeLine(std::string_view line, ProgressClock::time_poin
 		case ProgressKind::Drop: m_drops.push_back(*parsed); break;
 		case ProgressKind::Order: m_order = parsed; break;
 		case ProgressKind::Summary: m_summary = parsed; break;
+		// A Stream worker's lines, which the generator's supervisor only counts. The stream
+		// supervisor reads them itself, for the requests it has open.
+		case ProgressKind::Done:
+		case ProgressKind::Priority: break;
 		case ProgressKind::Prediction: {
 			// The latest row of a program wins, and it keeps the place of the first.
 			const ProgressPrediction row {parsed->hash, parsed->outcome, parsed->rank_or_count};
