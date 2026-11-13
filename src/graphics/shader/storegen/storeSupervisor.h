@@ -278,6 +278,19 @@ StaleCleanup RemoveStaleGenerationFiles(const std::filesystem::path& folder, std
                                         const std::function<bool(uint32_t)>&         is_running,
                                         const std::function<void(std::string_view)>& log);
 
+/// The removal RemoveStaleGenerationFiles does, for any naming. A file in the folder itself goes
+/// when pid_of finds a process id in its whole name, the id is not current_pid, is_running says it
+/// is not running, and it is a regular file that is not a symlink. Each removal and each failure
+/// is logged by name, after `who` and a colon. The pre-scan's helper files use it too.
+/// @param pid_of reads the process id from a file name, or nothing for a name that is not one of
+///               the caller's files.
+StaleCleanup
+RemoveDeadProcessFiles(const std::filesystem::path& folder, uint32_t current_pid,
+                       const std::function<std::optional<uint32_t>(std::string_view)>& pid_of,
+                       const std::function<bool(uint32_t)>&                            is_running,
+                       const std::function<void(std::string_view)>&                    log,
+                       std::string_view                                                who);
+
 /// Whether a file name is one of the temporary or helper names of a run of this title, and the
 /// process id in it. The whole name has to match, so `<title>.generated`, another title that this
 /// one is a prefix of, a non numeric id and any other suffix do not.

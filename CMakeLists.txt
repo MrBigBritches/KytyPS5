@@ -933,6 +933,8 @@ endif()
 
 # The prescan's preparer over real programs. Its in-process transport runs the Stream worker's own
 # answers here, so this links the whole recompiler like the stream worker test, and still no device.
+# Its supervised tests start this binary as a fake helper, and its smoke test starts the real
+# emulator in its worker mode, so the emulator is built first.
 add_executable(prescan_preparer_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/PrescanPreparerTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/prescanPreparer.cpp"
@@ -947,6 +949,9 @@ add_executable(prescan_preparer_tests EXCLUDE_FROM_ALL
 )
 target_link_libraries(prescan_preparer_tests common Vulkan::Headers fmt::fmt xxhash xbyak::xbyak spirv-tools-opt spirv-tools libzstd_static)
 target_include_directories(prescan_preparer_tests PRIVATE ${inc_headers})
+add_dependencies(prescan_preparer_tests kyty_emulator)
+target_compile_definitions(prescan_preparer_tests PRIVATE
+	KYTY_EMULATOR_PATH="$<TARGET_FILE:kyty_emulator>")
 if (KYTY_CLANG_CL)
 	# The recompiler headers bring in the deprecated codecvt use the stream worker test silences too.
 	target_compile_options(prescan_preparer_tests PRIVATE -Wno-deprecated-declarations)

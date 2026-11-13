@@ -64078,10 +64078,11 @@ void CheckPrescanDrainsFirst(VulkanHarness &vulkan, GuestGpu &gpu,
   std::printf("[gpu]     %-32s ok\n", name);
 }
 
-// The generator and the preparer post from their own threads while the GPU thread drains. Every
-// post is counted, and once stopped every shader module handle made is either destroyed or held by
-// an adopted module, so no handle leaks and none is destroyed twice. The mutation is to post the
-// prescan's modules through the generator's intake state, which the two threads then share.
+// The generator and the preparer post from their own threads while the GPU thread drains. It
+// catches a post that is lost while the other producer posts, and a shader module handle that leaks
+// or is destroyed twice, since once stopped every handle made must be either destroyed or held by
+// an adopted module. It cannot catch the two producers sharing one intake state. The shared
+// decoded_keys set would race then, and a race that leaves no wrong count needs ThreadSanitizer.
 void CheckPrescanTwoProducers(VulkanHarness &vulkan, GuestGpu &gpu,
                               const std::vector<DecodedModuleRecord> &records) {
   constexpr const char *name = "PrescanTwoProducers";

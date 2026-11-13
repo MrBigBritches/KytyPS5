@@ -4,6 +4,7 @@
 // and the dispatch the builder must refuse. Each check that proves a behaviour has a baseline that
 // differs only in that behaviour, as the comments say.
 #include "graphics/guest_gpu/command_processor/prescanDispatchInputs.h"
+#include "graphics/shader/recompiler/ir/Serialize.h"
 #include "graphics/shader/storegen/computeTranslation.h"
 
 #include <array>
@@ -90,12 +91,50 @@ void TestIndirectThreadDimensionsRefused() {
 	CHECK(info_of(false, true).has_value());
 }
 
+// The header the pre-scan's helper gets is written by EncodeHostHeader, and PipelineCache now
+// writes its store's header with it too. Its bytes must be the ones PipelineCache wrote before,
+// which is the stamp, the jump table flag, the profile and the shared memory limit through IoAll,
+// so a store written by an earlier build still matches. And DecodeHostHeader must read back every
+// value. Each value differs from its default, so a decoder that gave defaults fails, and fields
+// written in another order fail both checks. The mutation is to write the profile before the jump
+// table flag.
+void TestHostHeaderRoundTrips() {
+	constexpr uint64_t STAMP        = 0x1122334455667788ull;
+	constexpr uint32_t CLOCK_PERIOD = 41;
+	constexpr uint32_t SHARED_BYTES = 65536;
+	StoreGen::HostValues host;
+	host.structured_jump_tables         = true;
+	host.profile.native_float_min_max   = true;
+	host.profile.device_clock_period_ps = CLOCK_PERIOD;
+	host.profile.elide_exec_selects     = true;
+	host.max_shared_bytes               = SHARED_BYTES;
+	const auto bytes = StoreGen::EncodeHostHeader(host, STAMP);
+
+	ShaderRecompiler::IR::Writer earlier;
+	auto                         stamp       = STAMP;
+	auto                         jump_tables = host.structured_jump_tables;
+	auto                         profile     = host.profile;
+	auto                         shared      = host.max_shared_bytes;
+	ShaderRecompiler::IR::IoAll(earlier, stamp, jump_tables, profile, shared);
+	CHECK(bytes == earlier.bytes);
+
+	const auto decoded = StoreGen::DecodeHostHeader(bytes);
+	CHECK(decoded.has_value());
+	if (decoded) {
+		CHECK(decoded->structured_jump_tables && decoded->max_shared_bytes == SHARED_BYTES);
+		CHECK(decoded->profile.native_float_min_max && decoded->profile.elide_exec_selects);
+		CHECK(decoded->profile.device_clock_period_ps == CLOCK_PERIOD);
+		CHECK(!decoded->profile.maintenance8 && !decoded->profile.select_guarded_loads);
+	}
+}
+
 } // namespace
 
 int main() {
 	TestWorkgroupCountsReachInfo();
 	TestIndirectAddressReachesInfo();
 	TestIndirectThreadDimensionsRefused();
+	TestHostHeaderRoundTrips();
 	if (g_failures != 0) {
 		std::fprintf(stderr, "ComputeTranslationTests: %d checks failed\n", g_failures);
 		return 1;

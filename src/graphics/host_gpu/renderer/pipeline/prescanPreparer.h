@@ -112,6 +112,8 @@ struct PrescanPreparerCounters {
 	uint64_t forgotten = 0;
 	/// Whether the preparer stopped on an error.
 	bool failed = false;
+	/// Whether the helper's lane turned off for the session, which turned the prescan off with it.
+	bool lane_off = false;
 	/// The state's own counts.
 	PrescanCounters state;
 };
@@ -152,9 +154,14 @@ struct PrescanPreparerConfig {
 /// its answer is checked against the preparer's own static key before the sink gets it.
 ///
 /// Blamed and NeverRetry answers retire the program and are never retried here or in this process.
-/// LaneOff, QueueFull, Stopped and Dropped only skip the snapshot, and the GPU thread compiles the
-/// module when the game needs it. A Compile refused for now or dropped is forgotten by the variant
-/// tracker, so the same specialization is sent again by a later snapshot.
+/// QueueFull, Stopped and Dropped only skip the snapshot, and the GPU thread compiles the module
+/// when the game needs it. A Compile refused for now or dropped is forgotten by the variant
+/// tracker, so the same specialization is sent again by a later snapshot. LaneOff skips the
+/// snapshot too, and since the lane stays off for the session it also turns the prescan off. The
+/// preparer sets the hand-off's preparer_stopped and admits nothing more. Once the pass is out of
+/// the snapshot's preparation it stops the transport, which delivers every outcome still on its
+/// way, takes those outcomes, and gives back every snapshot it still holds, so each admission gets
+/// exactly one outcome. Then its thread ends, so no dispatch is admitted only to be refused again.
 ///
 /// Every call into the transport is made by the preparer's thread, or by the caller of RunOnce,
 /// and Stop stops the transport only after that thread is joined, so no two transport calls ever
@@ -174,12 +181,13 @@ public:
 	void Start();
 	/// Stops the thread, joins it, and only then stops the transport, so the transport is never
 	/// called from two threads at once. Outstanding requests complete as Dropped and are discarded.
-	/// Any thread but the transport's may call it, any number of times.
+	/// It sets the hand-off's preparer_stopped first. Any thread but the transport's may call it,
+	/// any number of times.
 	void Stop();
 	/// Does one pass on the calling thread, for a test that drives the preparer without its thread.
 	/// An error thrown by a pass propagates. The snapshots the pass was preparing are given back to
 	/// the state first, while snapshots already waiting for a plan keep their admissions until the
-	/// plan's outcome comes.
+	/// plan's outcome comes. Once the helper's lane turned the prescan off, a pass does nothing.
 	/// @return whether the pass found any work.
 	bool RunOnce();
 

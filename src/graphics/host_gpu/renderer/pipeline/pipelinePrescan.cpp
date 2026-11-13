@@ -1,3 +1,4 @@
+#include "common/childProcess.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "graphics/host_gpu/renderer/pipeline/generationState.h"
@@ -6,7 +7,10 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "kernel/memory.h"
 
+#include <optional>
 #include <span>
+#include <string>
+#include <string_view>
 #include <utility>
 
 // The pipeline cache's side of the submit-time compute prescan. It makes the preparer with the host
@@ -23,6 +27,26 @@ namespace {
 bool ReadPrescanMemory(void* /*userdata*/, uint64_t address, std::span<uint32_t> values) {
 	return !values.empty() &&
 	       LibKernel::Memory::TryReadBacking(address, values.data(), values.size_bytes());
+}
+
+// The transport of a real run, the Stream worker in a child process. Its request file and progress
+// log go in a directory no other user can write to, under this process's id, so two emulators
+// never share a log and a crash is never blamed on the other's request. The prescan runs without a
+// shader store too, so there is no store directory to put them next to. The files that dead runs
+// left there are removed first.
+// Returns nothing when there is no such directory.
+std::optional<StoreGen::PrescanTransportFactory> HelperTransportFactory() {
+	const auto directory = StoreGen::PrescanHelperDirectory();
+	if (!directory) {
+		return std::nullopt;
+	}
+	const uint32_t pid = Common::CurrentProcessId();
+	(void)StoreGen::RemoveStalePrescanFiles(
+	    *directory, pid, &Common::ProcessIsRunning,
+	    [](std::string_view line) { Log::WriteToConsoleAndLog(std::string(line) + "\n"); });
+	StoreGen::StreamSupervisorConfig config;
+	config.files_base = StoreGen::PrescanHelperFilesBase(*directory, pid);
+	return StoreGen::SupervisorPrescanTransportFactory(std::move(config));
 }
 
 } // namespace
@@ -50,6 +74,15 @@ PipelineCache::MakePrescanConfig(StoreGen::PrescanTransportFactory make_transpor
 void PipelineCache::EnablePrescan(StoreGen::PrescanTransportFactory make_transport) {
 	if (m_prescan != nullptr) {
 		return;
+	}
+	if (!make_transport) {
+		auto helper = HelperTransportFactory();
+		if (!helper) {
+			Log::WriteToConsoleAndLog("Prescan: there is no private directory for the helper's "
+			                          "files, so the prescan is off\n");
+			return;
+		}
+		make_transport = std::move(*helper);
 	}
 	// The intake exists only with a generation state. Its report is not registered here, since the
 	// generator did not run.

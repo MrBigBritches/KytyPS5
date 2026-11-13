@@ -49,6 +49,17 @@ std::optional<HostValues> DecodeHostHeader(std::span<const uint8_t> bytes) {
 	return host;
 }
 
+std::vector<uint8_t> EncodeHostHeader(const HostValues& host, uint64_t build_stamp) {
+	// Copies, because Io takes its values by reference.
+	auto       stamp       = build_stamp;
+	auto       jump_tables = host.structured_jump_tables;
+	auto       profile     = host.profile;
+	auto       shared      = host.max_shared_bytes;
+	IR::Writer writer;
+	IR::IoAll(writer, stamp, jump_tables, profile, shared);
+	return std::move(writer.bytes);
+}
+
 TranslationSetup::TranslationSetup(const ShaderComputeInputInfo& info, uint32_t user_data_count,
                                    uint64_t code_hash, const HostValues& host)
     : m_info(info), m_user_data(user_data_count, 0u) {

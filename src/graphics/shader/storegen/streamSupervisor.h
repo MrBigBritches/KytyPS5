@@ -21,7 +21,7 @@
 // When the child crashes or hangs it finds the requests that were running from the progress log,
 // blames one only when it was the only one that can explain the failure, and sends the rest to a
 // new child. After too many failures the lane is off for the session. It needs no graphics device.
-// The pre-scan wires it in C11, and nothing calls it before that.
+// The pre-scan reaches it through SupervisorPrescanTransport.
 namespace Libs::Graphics::StoreGen {
 
 /// How many requests one child may have sent and unanswered. One per translation thread keeps them
@@ -68,8 +68,10 @@ constexpr const char* STREAM_PIPE_TAG = "prescan";
 /// What became of a request that Submit queued.
 enum class StreamOutcome : uint8_t {
 	Answered, ///< The child answered. The response says how.
-	Blamed,   ///< The child died while this request was the only one that could explain it, so it
-	          ///< is never sent again in this session.
+	Blamed,   ///< Never sent again in this session, for one of two reasons. The child died while
+	          ///< this request was the only one that could explain it, or the request was still
+	          ///< waiting when another with the same key, or a Compile of the same program, was
+	          ///< blamed, and the sweep after that blame took it.
 	Dropped,  ///< Given up unanswered, by Stop or because the lane turned off.
 };
 
@@ -230,6 +232,17 @@ struct StreamSupervisorConfig {
 	std::function<void(const StreamResponse&)> after_reply_read;
 };
 
+/// The files a supervisor writes under its files_base. The child's text output goes to the progress
+/// log's path with `.out` added, as RedirectWorkerOutputTo writes it.
+struct StreamSupervisorFiles {
+	std::filesystem::path request;
+	std::filesystem::path progress;
+	std::filesystem::path output;
+};
+
+/// The files of a supervisor made with this files_base, as absolute paths.
+[[nodiscard]] StreamSupervisorFiles StreamSupervisorFilesOf(const std::filesystem::path& files_base);
+
 /// The key a blamed request is kept under. It is the kind, the code hash, the user data count and
 /// the specialization, and leaves out the registers and the dispatch size on purpose. A program
 /// that crashed the child would likely crash it again under other registers, and each crash spends
@@ -270,17 +283,19 @@ struct StreamSpawnProgress {
 /// line and no `done` line was running. After a crash every running request is a candidate for
 /// the blame, and after a hang only the running requests that were overdue are. When exactly one
 /// is, it is blamed. It completes as Blamed and its key goes into a never_retry set for the
-/// session, with its program's key when it is a Compile. Other running requests become suspects,
-/// and so do all of them when several are candidates. The new child gets the suspects one at a
-/// time, so a request is blamed only when it fails while it is the only one that can explain the
-/// failure. Every other request unanswered by the dead child, including one that has a `done` line
-/// and no answer, is sent again. A bad frame from a child that is still alive is no crash and
-/// blames nothing. It turns the lane off, since the next child would send the same. A bad frame
-/// from a child that had died by the close is a crash, which the death explains. A write that
-/// times out ends the child as a hang no earlier than the deadline it waited for, so the request
-/// that set that deadline counts as overdue. The exit code of a child the
-/// supervisor ended itself is never counted. After max_restarts failures the next one turns the
-/// lane off for the session, and every waiting and future request is Dropped or refused.
+/// session, with its program's key when it is a Compile. A sweep then completes as Blamed every
+/// waiting request that the blame now keeps out, by its key or its program, so none of them starts
+/// a new child only to be refused. Other running requests become suspects, and so do all of them
+/// when several are candidates. The new child gets the suspects one at a time, so a request is
+/// blamed only when it fails while it is the only one that can explain the failure. Every other
+/// request unanswered by the dead child, including one that has a `done` line and no answer, is
+/// sent again. A bad frame from a child that is still alive is no crash and blames nothing. It
+/// turns the lane off, since the next child would send the same. A bad frame from a child that had
+/// died by the close is a crash, which the death explains. A write that times out ends the child
+/// as a hang no earlier than the deadline it waited for, so the request that set that deadline
+/// counts as overdue. The exit code of a child the supervisor ended itself is never counted. After
+/// max_restarts failures the next one turns the lane off for the session, and every waiting and
+/// future request is Dropped or refused.
 ///
 /// Stop is prompt with a hung child. It never waits for the child to close the pipe, since on
 /// Windows the child closes it only after it has joined its threads.

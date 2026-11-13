@@ -234,13 +234,26 @@ StaleCleanup RemoveStaleGenerationFiles(const fs::path& folder, std::string_view
                                         uint32_t                                     current_pid,
                                         const std::function<bool(uint32_t)>&         is_running,
                                         const std::function<void(std::string_view)>& log) {
-	StaleCleanup    result;
-	std::error_code error;
+	return RemoveDeadProcessFiles(
+	    folder, current_pid,
+	    [title](std::string_view name) { return StaleFilePid(name, title); }, is_running, log,
+	    "Shader store generation");
+}
+
+StaleCleanup
+RemoveDeadProcessFiles(const fs::path& folder, uint32_t current_pid,
+                       const std::function<std::optional<uint32_t>(std::string_view)>& pid_of,
+                       const std::function<bool(uint32_t)>&                            is_running,
+                       const std::function<void(std::string_view)>&                    log,
+                       std::string_view                                                who) {
+	StaleCleanup      result;
+	std::error_code   error;
+	const std::string prefix = std::string(who) + ": ";
 	// A plain directory_iterator reads the folder itself and never descends, so a matching name in
 	// a subfolder is out of reach.
 	for (fs::directory_iterator it(folder, error), end; !error && it != end; it.increment(error)) {
 		const auto name = Utf8FromPath(it->path().filename());
-		const auto pid  = StaleFilePid(name, title);
+		const auto pid  = pid_of(name);
 		if (!pid || *pid == current_pid || is_running(*pid)) {
 			continue;
 		}
@@ -255,12 +268,12 @@ StaleCleanup RemoveStaleGenerationFiles(const fs::path& folder, std::string_view
 		if (fs::remove(it->path(), remove_error) && !remove_error) {
 			result.removed++;
 			if (log) {
-				log("Shader store generation: removed the stale file " + name);
+				log(prefix + "removed the stale file " + name);
 			}
 		} else {
 			result.failed++;
 			if (log) {
-				log("Shader store generation: could not remove the stale file " + name + ", " +
+				log(prefix + "could not remove the stale file " + name + ", " +
 				    remove_error.message());
 			}
 		}

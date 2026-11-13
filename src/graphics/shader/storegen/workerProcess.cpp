@@ -11,13 +11,10 @@
 
 namespace Libs::Graphics::StoreGen {
 
-namespace {
-
-// Appends what the process prints to the file next to the progress log. The file is opened once
-// first, because a failed freopen closes the stream it was given, so a file that cannot be opened
-// leaves the streams as they are and the worker still works.
-// Append, since a restarted worker writes to the same file and an earlier crash's text matters.
-void RedirectOutputTo(const std::string& progress_path) {
+// The file is opened once first, because a failed freopen closes the stream it was given, so a
+// file that cannot be opened leaves the streams as they are and the worker still works. It appends,
+// since a restarted worker writes to the same file and an earlier crash's text matters.
+void RedirectWorkerOutputTo(const std::string& progress_path) {
 	const auto text_path = PathFromUtf8(progress_path + ".out");
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	const auto native = text_path.wstring();
@@ -39,15 +36,13 @@ void RedirectOutputTo(const std::string& progress_path) {
 #endif
 }
 
-} // namespace
-
 int RunShaderStoreWorkerProcess(const std::filesystem::path& request_file) {
 	const auto request = ReadWorkerRequestFile(request_file);
 	if (!request) {
 		return WORKER_EXIT_BAD_REQUEST;
 	}
 	Common::DisableCrashUi();
-	RedirectOutputTo(request->progress_path);
+	RedirectWorkerOutputTo(request->progress_path);
 	Common::ChildProcess::EnterChildMode(request->parent_pid);
 	return RunShaderStoreWorker(*request).exit_code;
 }

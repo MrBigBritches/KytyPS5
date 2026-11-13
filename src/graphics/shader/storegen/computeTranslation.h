@@ -31,6 +31,13 @@ struct HostValues {
 /// @return nothing when the bytes are not exactly one header or a flag byte is not 0 or 1.
 [[nodiscard]] std::optional<HostValues> DecodeHostHeader(std::span<const uint8_t> bytes);
 
+/// Writes a store header, the build stamp and then the host values, which DecodeHostHeader reads
+/// back. PipelineCache writes its store's header with it, and the pre-scan writes the header its
+/// helper gets with it, so the two can never be laid out differently.
+/// @param host        the host values translation depends on.
+/// @param build_stamp the build's stamp. The helper skips it, so the pre-scan passes 0.
+[[nodiscard]] std::vector<uint8_t> EncodeHostHeader(const HostValues& host, uint64_t build_stamp);
+
 /// The translation options of one compute program, set as the runtime sets them for a compute
 /// program. The user data is zeroed, since translation reads only how many registers there are. The
 /// options point into this object and into `host`, so this object stays where it is and `host`

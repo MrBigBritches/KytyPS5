@@ -11,6 +11,7 @@
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/ir/Serialize.h"
 #include "graphics/shader/shaderStoreRecord.h"
+#include "graphics/shader/storegen/computeTranslation.h"
 #include "graphics/shader/storegen/ebootSource.h"
 #include "graphics/shader/storegen/storeGenerationGate.h"
 #include "graphics/shader/storegen/storeSupervisor.h"
@@ -45,12 +46,13 @@ std::vector<uint8_t> StoreHeader(const GraphicContext& graphics) {
 	if (stamp == 0) {
 		return {};
 	}
-	Writer header;
 	// The jump-table mode changes recompiler output, so a store written in the other mode
-	// is discarded.
-	IoAll(header, stamp, Config::StructuredJumpTablesEnabled(), SpirvProfile(graphics),
-	      graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize);
-	return std::move(header.bytes);
+	// is discarded. The pre-scan's helper reads the same values through the same encoder.
+	return StoreGen::EncodeHostHeader(
+	    {.structured_jump_tables = Config::StructuredJumpTablesEnabled(),
+	     .profile                = SpirvProfile(graphics),
+	     .max_shared_bytes = graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize},
+	    stamp);
 }
 
 // Why --generate-shader-store cannot run for this store, or nothing when it can.

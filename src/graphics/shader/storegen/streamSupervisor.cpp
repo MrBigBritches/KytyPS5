@@ -193,6 +193,15 @@ double StreamRttHistogram::UpperBoundOf(size_t bucket) {
 	return static_cast<double>(FINE_LIMIT_MS + (bucket - FINE_LIMIT_MS + 1) * COARSE_WIDTH_MS);
 }
 
+StreamSupervisorFiles StreamSupervisorFilesOf(const fs::path& files_base) {
+	const auto base     = fs::absolute(files_base);
+	auto       progress = fs::path(base).concat(".progress");
+	auto       output   = fs::path(progress).concat(".out");
+	return {.request  = fs::path(base).concat(".request"),
+	        .progress = std::move(progress),
+	        .output   = std::move(output)};
+}
+
 uint64_t StreamRetryKey(const StreamRequest& request) {
 	// The fixed fields are copied one by one into bytes, so no padding is hashed.
 	std::array<uint8_t, sizeof(uint8_t) + sizeof(uint64_t) + sizeof(uint32_t)> head {};
@@ -298,10 +307,12 @@ struct StreamSupervisor::Impl {
 	StreamSupervisorConfig config;
 	fs::path               progress_path;
 	fs::path               request_path;
+	fs::path               output_path;
 	WorkerRequest          request;
 
 	// Shared by the owner, the reader, Submit and Stop.
-	mutable std::mutex           mutex;
+	mutable std::mutex mutex;
+	// Only the owner thread waits on it. The reader, Submit and Stop notify it.
 	std::condition_variable      wake;
 	std::deque<Entry>            pending;
 	std::vector<Entry>           outstanding;
@@ -341,9 +352,10 @@ struct StreamSupervisor::Impl {
 };
 
 StreamSupervisor::Impl::Impl(StreamSupervisorConfig supplied): config(std::move(supplied)) {
-	const auto base = fs::absolute(config.files_base);
-	progress_path   = fs::path(base).concat(".progress");
-	request_path    = fs::path(base).concat(".request");
+	const auto files = StreamSupervisorFilesOf(config.files_base);
+	progress_path    = files.progress;
+	request_path     = files.request;
+	output_path      = files.output;
 	if (config.program.empty()) {
 		config.program = WorkerProgramPath();
 	}
@@ -484,8 +496,7 @@ bool StreamSupervisor::Impl::StartChild(const std::string& pipe_name) {
 	if (first_spawn) {
 		// The files of an earlier session under the same name explain nothing about this one.
 		std::error_code ignored;
-		const auto out_path = fs::path(progress_path).concat(".out");
-		for (const auto& stale: {progress_path, request_path, out_path}) {
+		for (const auto& stale: {progress_path, request_path, output_path}) {
 			fs::remove(stale, ignored);
 		}
 		first_spawn = false;
@@ -595,7 +606,6 @@ std::optional<Clock::time_point> StreamSupervisor::Impl::SendWhatFits() {
 		}
 		break;
 	}
-	wake.notify_all();
 	for (auto& completion: unsent) {
 		Complete(std::move(completion));
 	}

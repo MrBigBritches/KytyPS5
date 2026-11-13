@@ -159,6 +159,10 @@ struct PrescanHandoff {
 	/// it before it drains and then waits for it to change, so a bump that lands during the drain
 	/// is never missed. See WakePreparer.
 	std::atomic<uint32_t> wake_epoch {0};
+	/// Set by the preparer, with release, once the prescan is off for the rest of the run, because
+	/// the helper's lane turned off, the preparer failed or it was stopped. Nothing drains the ring
+	/// after that, so the scanner reads it with acquire once per submission and skips the walk.
+	std::atomic<bool> preparer_stopped {false};
 	// A counter that took a lock would let a producer wait on the preparer, which the hand-off
 	// forbids. This checks the counter only. Whether a platform's notify_one takes a lock of its
 	// own is not checked here.

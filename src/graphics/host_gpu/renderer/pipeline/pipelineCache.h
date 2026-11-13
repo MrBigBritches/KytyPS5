@@ -428,11 +428,14 @@ public:
 	[[nodiscard]] uint32_t WarmInlineDuringPause() const noexcept { return m_warm_inline_during_pause; }
 
 	// Starts the submit-time prescan's preparer, its hand-off and its own warm set, with the
-	// transport the factory makes. The host values come from this device and Config, as the runtime
-	// translates with them. Modules it builds enter the generated intake, which is made if the
-	// generator did not make it. Calling it again does nothing. Nothing calls it yet, since the
-	// scanner that fills the hand-off is wired later.
-	void EnablePrescan(StoreGen::PrescanTransportFactory make_transport);
+	// transport the factory makes. With no factory it is the Stream worker in a child process
+	// behind a StreamSupervisor, which is what a real run uses, and tests pass the in-process one.
+	// The prescan then stays off when no private directory for the helper's files can be had.
+	// The host values come from this device and Config, as the runtime translates with them.
+	// Modules it builds enter the generated intake, which is made if the generator did not make it.
+	// Calling it again does nothing. Nothing calls it yet, since the scanner that fills the
+	// hand-off is wired later.
+	void EnablePrescan(StoreGen::PrescanTransportFactory make_transport = {});
 	// The hand-off the scanner pushes into, or null without the prescan. It lives as long as the
 	// cache, and the scanner must be joined before StopPrescan.
 	[[nodiscard]] PrescanHandoff* PrescanInbox() noexcept { return m_prescan_handoff.get(); }

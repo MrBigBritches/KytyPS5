@@ -190,6 +190,7 @@ struct PrescanPreparer::Impl {
 	void ThreadMain();
 	void Loop();
 	void Fail(const char* what) noexcept;
+	void TurnOff();
 	void Stop();
 	void OnComplete(StreamCompletion&& completion) noexcept;
 	void Publish();
@@ -216,6 +217,7 @@ struct PrescanPreparer::Impl {
 	void Adopt(const PendingRequest& request, std::span<const uint8_t> payload);
 
 	bool PrepareReady();
+	void SettleAfterLaneOff();
 	void DropReady();
 	void PrepareSnapshot(const Snapshot& snapshot);
 	void RequestPlan(PlanEntry& entry, const Snapshot& snapshot, AdmissionGuard& guard);
@@ -279,7 +281,11 @@ PrescanPreparer::Impl::Impl(PrescanHandoff& shared, PrescanPreparerConfig suppli
 
 // One pass. The ring goes first and whole, so every item is answered before any is prepared. The
 // answers go before the preparation, so snapshots whose plan just came are prepared in this pass.
+// Once the helper's lane is off nothing could be sent, so a pass does nothing.
 bool PrescanPreparer::Impl::RunOnce() {
+	if (counters.lane_off) {
+		return false;
+	}
 	if (completion_lost.load(std::memory_order_acquire)) {
 		throw std::runtime_error("an answer from the helper could not be queued");
 	}
@@ -314,12 +320,13 @@ void PrescanPreparer::Impl::ThreadMain() {
 }
 
 // The epoch is read before the pass, so a bump that lands while the pass drains makes the wait
-// return at once, and no work is left behind.
+// return at once, and no work is left behind. A pass that turned the prescan off ends the thread,
+// since no later pass would do anything.
 void PrescanPreparer::Impl::Loop() {
 	while (!stopping.load(std::memory_order_acquire)) {
 		const uint32_t seen = handoff.wake_epoch.load(std::memory_order_acquire);
 		(void)RunOnce();
-		if (stopping.load(std::memory_order_acquire)) {
+		if (stopping.load(std::memory_order_acquire) || counters.lane_off) {
 			return;
 		}
 		handoff.wake_epoch.wait(seen, std::memory_order_acquire);
@@ -331,6 +338,7 @@ void PrescanPreparer::Impl::Loop() {
 // from the preparer's own thread, which is the only one that calls it.
 void PrescanPreparer::Impl::Fail(const char* what) noexcept {
 	counters.failed = true;
+	handoff.preparer_stopped.store(true, std::memory_order_release);
 	try {
 		Log::WriteToConsoleAndLog(fmt::format(
 		    "Prescan: the preparer stopped on an error, so the prescan is off: {}\n", what));
@@ -346,11 +354,27 @@ void PrescanPreparer::Impl::Fail(const char* what) noexcept {
 	}
 }
 
+// The helper's lane is off for the session, so every later send would be refused. Without this
+// each dispatch would be admitted, refused and given back with NoteDropped, over and over, while
+// the scanner kept filling the ring. The scanner is told through the hand-off. It runs inside a
+// send, so it only marks the prescan off, and PrepareReady settles what is held once the send's
+// caller is done with its plan entry.
+void PrescanPreparer::Impl::TurnOff() {
+	if (counters.lane_off) {
+		return;
+	}
+	counters.lane_off = true;
+	handoff.preparer_stopped.store(true, std::memory_order_release);
+	Log::WriteToConsoleAndLog(
+	    "Prescan: the helper is off for this session, so the prescan is off\n");
+}
+
 // The thread is joined before the transport is stopped, so the transport never runs Stop beside a
 // Submit from the preparer. Stopping it completes what it holds as Dropped, which nothing reads.
 void PrescanPreparer::Impl::Stop() {
 	std::lock_guard lock(stop_mutex);
 	stopping.store(true, std::memory_order_release);
+	handoff.preparer_stopped.store(true, std::memory_order_release);
 	WakePreparer(handoff);
 	if (thread.joinable()) {
 		thread.join();
@@ -520,7 +544,8 @@ void PrescanPreparer::Impl::DropIdlePlans() {
 }
 
 // Frees what a unit that will never be prepared again holds. An idle entry goes whole, and one with
-// snapshots in hand gives up its code, which those snapshots never send.
+// snapshots in hand gives up its code, which those snapshots never send. The entry may be erased
+// here, so a caller must not use its own reference to the entry after this returns.
 void PrescanPreparer::Impl::ReleaseUnit(uint64_t unit) {
 	const auto found = plans.find(unit);
 	if (found == plans.end()) {
@@ -692,16 +717,21 @@ void PrescanPreparer::Impl::Adopt(const PendingRequest& request, std::span<const
 }
 
 // Prepares the posted snapshots. When one throws, the rest still hold open admissions, so they are
-// given back before the error goes on.
+// given back before the error goes on. A send that found the lane off stops the loop, and the
+// prescan is settled once the loop is out of every snapshot's preparation. The settle is inside
+// the try, so a drain that throws still gives back what it had not reached.
 bool PrescanPreparer::Impl::PrepareReady() {
 	if (ready.empty()) {
 		return false;
 	}
 	try {
-		while (!ready.empty()) {
+		while (!ready.empty() && !counters.lane_off) {
 			const Snapshot snapshot = ready.front();
 			ready.pop_front();
 			PrepareSnapshot(snapshot);
+		}
+		if (counters.lane_off) {
+			SettleAfterLaneOff();
 		}
 	} catch (...) {
 		DropReady();
@@ -710,7 +740,23 @@ bool PrescanPreparer::Impl::PrepareReady() {
 	return true;
 }
 
-// Gives every snapshot still in the ready queue back to the state, after an error stopped the pass.
+// Gives every snapshot the prescan still holds its one outcome, once the lane is off. The
+// supervisor marks its lane off before it hands the Dropped outcomes over, so a send can see
+// LaneOff while outcomes of requests already sent are still on their way. Stopping the transport
+// joins whatever delivers them, so every outcome is queued by the time it returns, and the drain
+// then gives each snapshot that waited for a plan its outcome. Snapshots the drain moves to the
+// ready queue, and the ones the loop never reached, are given back last. It runs between
+// snapshots, never inside one's preparation, since the drain may free a plan entry that a
+// preparation still holds. The preparer's Stop stops the transport again later, which then does
+// nothing.
+void PrescanPreparer::Impl::SettleAfterLaneOff() {
+	transport->Stop();
+	(void)DrainCompletions();
+	DropReady();
+}
+
+// Gives every snapshot still in the ready queue back to the state, after an error stopped the pass
+// or the lane turned off.
 void PrescanPreparer::Impl::DropReady() {
 	for (const auto& snapshot: ready) {
 		if (const auto found = plans.find(snapshot.admission.unit); found != plans.end()) {
@@ -898,7 +944,8 @@ StreamRequest PrescanPreparer::Impl::MakeRequest(const PlanEntry& entry, const P
 
 // The pending entry is made before the send, since the outcome may arrive before Submit returns,
 // and it is taken back when Submit throws. A Compile refused for now is forgotten, so a later
-// snapshot sends it again.
+// snapshot sends it again. A lane that is off turns the prescan off, and the caller still treats
+// that refusal as one for now, so the snapshot in hand is given back.
 StreamSubmitStatus PrescanPreparer::Impl::Send(StreamRequest request, const PlanEntry& entry,
                                                uint64_t unit, const PrescanSpec* spec) {
 	const uint64_t tag  = next_tag++;
@@ -923,6 +970,9 @@ StreamSubmitStatus PrescanPreparer::Impl::Send(StreamRequest request, const Plan
 	if (spec != nullptr && !never) {
 		state.Forget(unit, *spec);
 		counters.forgotten++;
+	}
+	if (result.status == StreamSubmitStatus::LaneOff) {
+		TurnOff();
 	}
 	return result.status;
 }

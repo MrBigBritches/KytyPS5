@@ -28,13 +28,12 @@ inline constexpr std::chrono::milliseconds GPU_STALL_AUDIO_HOLD_THRESHOLD {250};
 /// prescan causes have no call sites yet. They are PrescanInFlight, for a request still in the
 /// helper, the three PrescanNeverPosted causes and PrescanRefused, and they are reserved for the
 /// GPU thread's compile of a module the prescan did not deliver, so the report's schema does not
-/// change when they get sites. Other is a gate value that must stay 0 in a finished run. WarmInlinePaused and
-/// GeneratedInlinePaused are causes of their own and not subsets, so the causes add up to the total
-/// held time. The cost of the pause is their sum, and the generator's misses are GeneratedInline
-/// plus GeneratedInlinePaused. LibraryOnce is reserved and
-/// has no site, because a wait for a library sits inside the graphics compile's Scope and is charged
-/// to that, so a gate must not read it. Other must stay the last value, since the count derives
-/// from it.
+/// change when they get sites. Other is a gate value that must stay 0 in a finished run.
+/// WarmInlinePaused and GeneratedInlinePaused are causes of their own and not subsets, so the
+/// causes add up to the total held time. The cost of the pause is their sum, and the generator's
+/// misses are GeneratedInline plus GeneratedInlinePaused. LibraryOnce is reserved and has no site,
+/// because a wait for a library sits inside the graphics compile's Scope and is charged to that,
+/// so a gate must not read it. Other must stay the last value, since the count derives from it.
 enum class HoldCause : uint8_t {
 	RequiredGraphics,
 	RequiredCompute,
