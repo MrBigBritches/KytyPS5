@@ -71,6 +71,12 @@ $ArmTable = [ordered]@{
 $ArmTable["gen-w3"] = @{ Flags = @($ArmTable["gen"].Flags + @("--warm-workers", "3")); Ready = $true }
 $ArmTable["gen-w2"] = @{ Flags = @($ArmTable["gen"].Flags + @("--warm-workers", "2")); Ready = $true }
 
+# The gen arm with the submit-time compute prescan on, so it differs from gen in one flag only.
+$ArmTable["gen-prescan"] = @{
+    Flags = @($ArmTable["gen"].Flags + @("--prescan-compute-builds"))
+    Ready = $true
+}
+
 # "all" turns on every strategy, so it is Ready only once every strategy arm is, and its flags are
 # theirs together. The depth-only arm is left out, because it is the default skip rule with a
 # stricter gate. Both flags can be on at once, and then depth-only wins, so "all" would measure the

@@ -78,6 +78,10 @@ static void PrintUsage() {
 	         "                                       the scan with what the GPU runs, into the first-run\n"
 	         "                                       report. Slows the submitting thread and keeps one 4 MB\n"
 	         "                                       scan arena; measurement only.\n");
+	::printf("  --prescan-compute-builds             Read each command list as the game submits\n"
+	         "                                       it and build the compute shaders it is about\n"
+	         "                                       to run in a helper process (experimental).\n"
+	         "                                       Results persist only with --shader-cache.\n");
 	::printf("  --tessellation                      Draw tessellation patches; skipped by default.\n");
 	::printf("  --occlusion-queries                  Count occlusion query samples on the GPU.\n");
 	::printf("  --audio-compile-hold                 Pause game audio while a long pipeline compile\n"
@@ -264,6 +268,7 @@ static constexpr Flag FLAGS[] = {
     {"--elide-exec-selects", &ConfigOptions::elide_exec_selects},
     {"--structured-jump-tables", &ConfigOptions::structured_jump_tables},
     {"--scan-differential", &ConfigOptions::scan_differential},
+    {"--prescan-compute-builds", &ConfigOptions::prescan_compute_builds},
     {"--tessellation", &ConfigOptions::tessellation_enabled},
     {"--occlusion-queries", &ConfigOptions::occlusion_queries_enabled},
     {"--audio-compile-hold", &ConfigOptions::audio_compile_hold_enabled},

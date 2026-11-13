@@ -89,6 +89,10 @@ struct ConfigOptions {
 	// Opts in to scanning every submission as it is enqueued and comparing the scan with what the
 	// command processor runs, for the first-run report. A measurement mode that slows the enqueuing thread.
 	bool                   scan_differential           = false;
+	// Opts in to reading each command list as the game submits it and building the compute
+	// shaders it is about to run in a helper process. Results persist only with
+	// shader_cache_enabled.
+	bool                   prescan_compute_builds      = false;
 	LogDirection           shader_log_direction        = LogDirection::Silent;
 	std::filesystem::path  shader_log_folder           = "_Shaders";
 	bool                   command_buffer_dump_enabled = false;
@@ -218,6 +222,8 @@ bool ElideExecSelectsEnabled();
 bool StructuredJumpTablesEnabled();
 // True when every submission should be scanned and compared with what the command processor runs.
 bool ScanDifferentialEnabled();
+// True when the compute shaders of each submitted command list should be built ahead in a helper.
+bool PrescanComputeBuildsEnabled();
 
 LogDirection          GetPrintfDirection();
 std::filesystem::path GetPrintfOutputFile();

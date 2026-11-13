@@ -31,7 +31,9 @@ struct GuestGpuTestAccess;
 
 class GuestGpu final {
 public:
-	/// Makes the GPU thread with the default options, which is the emulator without any option.
+	/// Makes the GPU thread with default-made options, which ignore the Config, so a GPU made this
+	/// way never runs the prescan even with --prescan-compute-builds. A real run goes through
+	/// RenderContext::InitializeGpu, which passes GuestGpuOptions::FromConfig().
 	explicit GuestGpu(RenderContext& renderer);
 	/// Makes the GPU thread with the given options. The submit-time prescan, when the options turn it
 	/// on, is started here on the main thread before the GPU thread, after the shader store's warm-up.

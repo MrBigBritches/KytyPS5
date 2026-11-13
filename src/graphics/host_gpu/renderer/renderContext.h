@@ -41,8 +41,8 @@ public:
 	KYTY_CLASS_NO_COPY(RenderContext);
 
 	[[nodiscard]] GraphicContext&           GetGraphics() const noexcept { return m_graphics; }
-	/// Makes the guest GPU and its thread with the default options, which is the emulator without any
-	/// option.
+	/// Makes the guest GPU and its thread with the options the Config gives, which is what the
+	/// emulator runs with. GuestGpuOptions::FromConfig says which fields that sets.
 	void                                    InitializeGpu(VideoOut::VideoOutDriver* video_out);
 	/// Makes the guest GPU and its thread with the given options. Call it on the main thread, after
 	/// this context was made, since the prescan the options may start must follow the warm-up.

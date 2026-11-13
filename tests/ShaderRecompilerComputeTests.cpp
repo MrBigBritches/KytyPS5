@@ -2913,6 +2913,41 @@ void CheckSpirvProfileElideExecSelectsOption() {
   std::printf("[host]    %-32s ok\n", name);
 }
 
+// Whether a GPU's options equal a default-made value in everything but the prescan switch. The
+// fields are listed by hand, so a field added to GuestGpuOptions must be added here too.
+bool PrescanOptionsOtherwiseDefault(const GuestGpuOptions &options) {
+  const GuestGpuOptions defaults;
+  return !options.prescan_transport && !options.prescan_reader &&
+         options.prescan_lag_bound == defaults.prescan_lag_bound &&
+         options.defer_scanner_start_for_test == defaults.defer_scanner_start_for_test;
+}
+
+// --prescan-compute-builds is off in a default Config and on once a Config that sets it is loaded,
+// both through the getter and through the options a real run's GPU is made with. The baseline is
+// the same Config loaded without the option, so a getter or a FromConfig that always answers on, or
+// one that reads another field, cannot pass. FromConfig must leave every other field at its
+// default, so a real run gets the helper process and the backing reader, never a test's. The Config
+// is put back afterwards, so later checks start with the option off.
+void CheckPrescanFlagOption() {
+  constexpr const char *name = "PrescanFlagOption";
+  Config::Load({.printf_direction = Config::LogDirection::Silent});
+  const bool off = Config::PrescanComputeBuildsEnabled();
+  const auto off_options = GuestGpuOptions::FromConfig();
+  Config::Load({.prescan_compute_builds = true,
+                .printf_direction = Config::LogDirection::Silent});
+  const bool on = Config::PrescanComputeBuildsEnabled();
+  const auto on_options = GuestGpuOptions::FromConfig();
+  Config::Load({.printf_direction = Config::LogDirection::Silent});
+  Require(name, "option", !off && on,
+          "the option did not turn the Config flag on, or it was on without the option");
+  Require(name, "options", !off_options.prescan_compute_builds && on_options.prescan_compute_builds,
+          "FromConfig did not follow the option");
+  Require(name, "other options",
+          PrescanOptionsOtherwiseDefault(off_options) && PrescanOptionsOtherwiseDefault(on_options),
+          "FromConfig set a field other than prescan_compute_builds");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 struct BdaMapping {
   uint64_t guest_base = 0;
   u32 backing_offset = 0;
@@ -66574,6 +66609,67 @@ void CheckPrescanSingleProducer(VulkanHarness &vulkan) {
   std::printf("[gpu]     %-32s ok\n", name);
 }
 
+// The baseline's half of CheckPrescanFlagOffBuildsNothing. The GPU made without options attached a
+// scanner on the helper process, and the scanner's thread ran. A scanner that was made but never
+// started is not Finished after Stop, so Finished after Shutdown shows the thread ran. The report's
+// child block is there only with the helper process, so it shows a real run's transport, and its
+// spawns of 0 show that no child was started, since nothing was submitted.
+void CheckPrescanFlagOnRuns(RenderContext &context, const char *name) {
+  auto &cache = context.GetPipelineCache();
+  auto &gpu = context.GetGpu();
+  auto *scanner = GuestGpuTestAccess::Scanner(gpu);
+  Require(name, "on attaches a scanner",
+          cache.Prescan() != nullptr && cache.PrescanInbox() != nullptr && scanner != nullptr &&
+              GuestGpuTestAccess::PrescanEnabledHere(gpu),
+          "with the option on, a GPU made without options attached no prescan");
+  const auto live = GlobalPrescanBlock();
+  Require(name, "on uses the helper process",
+          live.contains("child") && BlockCount(live, "/child/spawns", 0),
+          "the prescan did not use the helper process, or started a child with nothing submitted");
+  gpu.Shutdown();
+  Require(name, "the scanner thread ran", scanner->Finished(),
+          "the scanner was made but its thread never ran");
+  context.ShutdownGpu();
+}
+
+// A GPU made without options, as the emulator makes it, builds nothing of the prescan when the
+// Config has --prescan-compute-builds off. Nothing also passes if that path never read the option,
+// so the baseline loads the same Config with only the option on, and its GPU must run the prescan.
+// The mutations are to invert the option in FromConfig, which fails the off arm, and to make
+// InitializeGpu without options pass default-made options, which fails the baseline. Both arms
+// set the option, so inverting its default is caught by CheckPrescanFlagOption instead.
+//
+// The baseline is the production path, so it uses the real %TEMP%\kyty_prescan directory, as
+// CheckPrescanChildReport does. It starts no child and leaves no file of its own. Without such a
+// directory the prescan stays off, so the baseline is skipped with a note. The Config is put back
+// afterwards, so later checks start with the option off.
+void CheckPrescanFlagOffBuildsNothing(VulkanHarness &vulkan) {
+  constexpr const char *name = "PrescanFlagOffBuildsNothing";
+  auto &report = Common::FirstRunReport::Global();
+  for (const bool flag : {false, true}) {
+    if (flag && !StoreGen::PrescanHelperDirectory()) {
+      std::printf("[gpu]     %-32s baseline skipped, no private directory for the helper's files\n",
+                  name);
+      continue;
+    }
+    report.Reset();
+    Config::Load({.prescan_compute_builds = flag,
+                  .printf_direction = Config::LogDirection::Silent});
+    RenderContext context(vulkan.RuntimeContext(), std::filesystem::path{});
+    context.InitializeGpu(nullptr);
+    if (flag) {
+      CheckPrescanFlagOnRuns(context, name);
+      continue;
+    }
+    CheckPrescanGuestGpuWiringOff(context, name);
+    context.ShutdownGpu();
+  }
+  Config::Load({.printf_direction = Config::LogDirection::Silent});
+  // The baseline's cache registered its figures with the report, which later checks start without.
+  report.Reset();
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
 // Without a shader store the preparer's sink passes no record bytes, so the GPU thread never frees them
 // at adoption. The sink is taken from the preparer's settings and called by hand, and the module it
 // posts waits in the intake, since nothing drains it. No bytes also pass if nothing was posted, so one
@@ -66718,6 +66814,7 @@ void CheckPrescanGuestGpu(VulkanHarness &vulkan) {
   CheckPrescanSuspendPointResets(vulkan);
   CheckPrescanShutdownOrder(vulkan);
   CheckPrescanSingleProducer(vulkan);
+  CheckPrescanFlagOffBuildsNothing(vulkan);
   CheckDispatchDepthSeen(vulkan);
   const auto store = PrescanStorePath("gpu_record");
   {
@@ -74445,6 +74542,7 @@ int main(int argc, char **argv) {
   CheckSpirvProfileSingleCompareRecordGuardOption();
   CheckSpirvProfileElideExecSelectsBytes();
   CheckSpirvProfileElideExecSelectsOption();
+  CheckPrescanFlagOption();
   if (argc == 2 && std::strcmp(argv[1], "--elide-exec-selects-only") == 0) {
     VulkanHarness vulkan;
     for (const auto &test : ExecDiffCases()) RunCase(&vulkan, test);

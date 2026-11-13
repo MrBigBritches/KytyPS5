@@ -54,6 +54,13 @@ bool ReadBackingForPrescan(uint64_t address, void* destination, uint64_t bytes) 
 
 } // namespace
 
+// Defined here and not in the options header, so that header stays free of the Config.
+GuestGpuOptions GuestGpuOptions::FromConfig() {
+	GuestGpuOptions options;
+	options.prescan_compute_builds = Config::PrescanComputeBuildsEnabled();
+	return options;
+}
+
 GuestGpu::GuestGpu(RenderContext& renderer): GuestGpu(renderer, GuestGpuOptions {}) {}
 
 GuestGpu::GuestGpu(RenderContext& renderer, const GuestGpuOptions& options): m_renderer(renderer) {

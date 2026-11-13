@@ -32,6 +32,12 @@ struct GuestGpuOptions {
 	/// Leaves the scanner made but not started, so a test can let the GPU thread begin a list before
 	/// the scanner reaches it. GuestGpuTestAccess starts it.
 	bool defer_scanner_start_for_test = false;
+
+	/// The options a real run uses, read from the Config. Only prescan_compute_builds comes from
+	/// it, from --prescan-compute-builds, and every other field keeps its default, so the prescan
+	/// runs with the helper process and the backing reader. With the option off it equals a
+	/// default-made value. The Config must be initialized.
+	[[nodiscard]] static GuestGpuOptions FromConfig();
 };
 
 } // namespace Libs::Graphics

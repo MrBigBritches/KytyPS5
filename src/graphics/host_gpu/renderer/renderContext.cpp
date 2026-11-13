@@ -41,7 +41,7 @@ RenderContext::~RenderContext() {
 }
 
 void RenderContext::InitializeGpu(VideoOut::VideoOutDriver* video_out) {
-	InitializeGpu(video_out, GuestGpuOptions {});
+	InitializeGpu(video_out, GuestGpuOptions::FromConfig());
 }
 
 void RenderContext::InitializeGpu(VideoOut::VideoOutDriver* video_out, const GuestGpuOptions& options) {

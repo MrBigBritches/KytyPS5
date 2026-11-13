@@ -201,6 +201,10 @@ bool ScanDifferentialEnabled() {
 	return g_config->scan_differential;
 }
 
+bool PrescanComputeBuildsEnabled() {
+	return g_config->prescan_compute_builds;
+}
+
 LogDirection GetPrintfDirection() {
 	return g_config->printf_direction;
 }
