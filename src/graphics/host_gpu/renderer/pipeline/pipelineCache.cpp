@@ -436,6 +436,10 @@ ShaderModule& PipelineCache::CompileModule(Program& program, const ProgramKey& k
 template <typename InputInfo>
 const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputInfo& input_info,
                                               uint32_t& push_data_cursor) {
+	// A compute lookup forgets the last inline compile it noted, so a hit never inherits a note.
+	if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+		ResetInlineCompute();
+	}
 	// Modules that the shader store generator made are taken in first, so a lookup finds what is
 	// there. Without generation the first test fails. With it and nothing posted the second does,
 	// so the cost of an empty inbox is one relaxed load. The GPU thread test is last, since it is
@@ -497,6 +501,9 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 			module = cached.FindModule<false>(runtime, push_data_cursor);
 		}
 		if (module != nullptr) return bind(*module);
+	}
+	if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+		NoteInlineComputeMiss();
 	}
 
 	// Everything from here to the driver's pipeline compile is translation, SPIR-V emission and
@@ -566,6 +573,7 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	                               push_data_cursor);
 	if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 		NoteGeneratedMiss(params.hash, compiled.id, entry->second.call_source != nullptr, false);
+		NoteInlineComputeModule(compiled.id);
 	}
 	return bind(compiled);
 }
@@ -1982,10 +1990,15 @@ PipelineCache::Pipeline& PipelineCache::GetComputePipeline(const ShaderComputeIn
 
 	{
 		// A compile on the GPU command thread stops all guest rendering, so guest audio may wait
-		// for it. One on any other thread leaves the game running and must not hold audio.
+		// for it. One on any other thread leaves the game running and must not hold audio. The cause
+		// is picked before the Scope opens, from lock-free reads only, so the GPU thread never waits
+		// on the prescan to name it.
 		std::optional<Common::GpuStall::Scope> stall;
 		if (GuestGpu::IsGpuThread()) {
-			stall.emplace(Common::GpuStall::HoldCause::RequiredCompute);
+			stall.emplace(InlineComputeCause(module.id));
+			if (m_inline_scope_hook) {
+				m_inline_scope_hook();
+			}
 		}
 		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::PipelinesCreated,
 		                                         Common::DebugCounters::Counter::PipelineCreateNs,

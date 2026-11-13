@@ -692,6 +692,42 @@ void TestFeedbackPackingKeepsEveryLowBitPattern() {
 	}
 }
 
+// Two units that share a slot of the in-flight table. A is marked, B is marked over it, and clearing
+// A then leaves B marked, since a unit clears only its own mark. A is no longer marked once B took
+// the slot, which is the false negative the table allows and never a false positive. The baselines
+// are each unit reading its own mark right after it was marked, and B reading clear after its own
+// Clear, so a table that marked nothing or never cleared fails. Unit 0 means no unit, so marking it
+// leaves the unit in slot 0 alone and reads as not marked. The table is a separate instance from the
+// scanner's answer table, so an answer published for the same key does not read as in flight, and a
+// unit marked does not read as an answer. The mutations are to clear without the key check, and
+// clearing A wipes B, and to let unit 0 through, which replaces the unit in slot 0 and is caught.
+void TestInFlightTableCollision() {
+	auto           handoff = std::make_unique<PrescanHandoff>();
+	auto&          table   = handoff->in_flight;
+	const uint64_t unit_a  = KEY;
+	const uint64_t unit_b  = KEY + (uint64_t {1} << 40u);
+	CHECK(!table.Contains(unit_a) && !table.Contains(unit_b));
+	table.Mark(unit_a);
+	CHECK(table.Contains(unit_a) && !table.Contains(unit_b));
+	table.Mark(unit_b);
+	CHECK(table.Contains(unit_b) && !table.Contains(unit_a));
+	table.Clear(unit_a);
+	CHECK(table.Contains(unit_b));
+	table.Clear(unit_b);
+	CHECK(!table.Contains(unit_b));
+
+	const uint64_t slot_zero_unit = uint64_t {1} << 40u;
+	table.Mark(slot_zero_unit);
+	table.Mark(0);
+	CHECK(!table.Contains(0) && table.Contains(slot_zero_unit));
+	table.Clear(0);
+	CHECK(table.Contains(slot_zero_unit));
+
+	handoff->feedback.Publish(OTHER_KEY, PrescanFeedback::Answer::Settled);
+	CHECK(!table.Contains(OTHER_KEY));
+	CHECK(handoff->feedback.Read(slot_zero_unit) == PrescanFeedback::Answer::None);
+}
+
 // The ring's producer slot goes to the first claim only, and stays taken. The first claim is the
 // baseline, so a claim that always fails is caught there, and the third shows the second's refusal is
 // not a one-off. The mutations are to return true always, and to test without storing, and both let
@@ -775,6 +811,7 @@ int main() {
 	TestFullRingCountedByState();
 	TestFeedbackKeysDoNotMix();
 	TestFeedbackPackingKeepsEveryLowBitPattern();
+	TestInFlightTableCollision();
 	TestProducerClaimedOnce();
 	if (g_failures != 0) {
 		std::fprintf(stderr, "%d check(s) failed\n", g_failures);

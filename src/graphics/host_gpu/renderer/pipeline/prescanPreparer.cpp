@@ -79,25 +79,84 @@ struct PlanEntry {
 	uint64_t last_used = 0;
 };
 
-// One request's share of the work the prescan_running underrun tag counts. It lives in the request's
-// pending entry, from just before the send until the outcome is handled, the send is refused or
-// throws, or the entries are cleared by a stop, a failure or the end of the thread. A request the
-// supervisor sends again to a respawned helper keeps its entry, so it stays counted. It is move-only
-// so the unit follows the entry and a moved-from token gives nothing back. Whether it counts follows
-// the report being on, as for every PrescanRunningScope. It is the one place a request's life is
-// tracked, so a per-unit in-flight count for hold causes belongs here too, and that one must not be
-// gated on the report, since hold causes are always recorded.
-class PendingWork {
+// How many requests each unit has outstanding, kept so the hand-off's in-flight table marks a unit
+// while any of its requests is out and clears it only when the last one is done. A unit can have a
+// Plan and Compiles of several specializations out at once. Every new request marks its unit again,
+// which costs one relaxed store and puts back a unit that another unit sharing its slot replaced in
+// the meantime. Only the preparer thread, or the thread that joined it, may call it, since the
+// counts are plain.
+class InFlightUnits {
 public:
-	PendingWork() = default;
-	~PendingWork() = default;
-	PendingWork(PendingWork&&) noexcept            = default;
-	PendingWork& operator=(PendingWork&&) noexcept = default;
-	PendingWork(const PendingWork&)                = delete;
-	PendingWork& operator=(const PendingWork&)     = delete;
+	// Writes the marks into `table`, which the hand-off owns and which outlives the preparer.
+	explicit InFlightUnits(PrescanInFlightTable& table): m_table(table) {}
+
+	// Counts one more request of `unit` and marks the unit.
+	void Add(uint64_t unit) {
+		m_counts[unit]++;
+		m_table.Mark(unit);
+	}
+	// Counts one request of `unit` as done, and clears the unit when it was the last.
+	void Release(uint64_t unit) noexcept {
+		const auto found = m_counts.find(unit);
+		if (found == m_counts.end()) {
+			return;
+		}
+		if (--found->second == 0) {
+			m_counts.erase(found);
+			m_table.Clear(unit);
+		}
+	}
 
 private:
+	PrescanInFlightTable&                  m_table;
+	std::unordered_map<uint64_t, uint32_t> m_counts;
+};
+
+// One request's share of the work the prescan_running underrun tag counts, and of its unit's
+// in-flight count. It lives in the request's pending entry, from just before the send until the
+// outcome is handled, the send is refused or throws, or the entries are cleared by a stop, a failure
+// or the end of the thread. A request the supervisor sends again to a respawned helper keeps its
+// entry, so it stays counted. It is move-only so both shares follow the entry and a moved-from token
+// gives nothing back. The underrun share counts only while the report is on, as for every
+// PrescanRunningScope. The in-flight share always counts, since hold causes are always recorded.
+class PendingWork {
+public:
+	// Counts toward the underrun tag only, with no unit in flight.
+	PendingWork() = default;
+	// Counts toward the underrun tag and counts one request of `unit` in `units`, which marks it.
+	PendingWork(InFlightUnits& units, uint64_t unit): m_units(&units), m_unit(unit) {
+		units.Add(unit);
+	}
+	// Gives both shares back, the unit's only if this token still holds it.
+	~PendingWork() { ReleaseUnit(); }
+	// Takes both shares from `other`, which then gives nothing back.
+	PendingWork(PendingWork&& other) noexcept
+	    : m_running(std::move(other.m_running)), m_units(std::exchange(other.m_units, nullptr)),
+	      m_unit(other.m_unit) {}
+	// Gives this token's shares back, then takes both of `other`'s, which then gives nothing back.
+	PendingWork& operator=(PendingWork&& other) noexcept {
+		if (this != &other) {
+			ReleaseUnit();
+			m_running = std::move(other.m_running);
+			m_units   = std::exchange(other.m_units, nullptr);
+			m_unit    = other.m_unit;
+		}
+		return *this;
+	}
+	PendingWork(const PendingWork&)            = delete;
+	PendingWork& operator=(const PendingWork&) = delete;
+
+private:
+	// Gives the unit's share back once. A moved-from token holds no count, so it gives nothing.
+	void ReleaseUnit() noexcept {
+		if (m_units != nullptr) {
+			std::exchange(m_units, nullptr)->Release(m_unit);
+		}
+	}
+
 	Common::FirstRunReport::PrescanRunningScope m_running;
+	InFlightUnits*                              m_units = nullptr;
+	uint64_t                                    m_unit  = 0;
 };
 
 // A request whose outcome has not come yet, with what checking that outcome needs. A Compile keeps
@@ -278,6 +337,8 @@ struct PrescanPreparer::Impl {
 	// The preparer's own.
 	std::unordered_map<uint64_t, PlanEntry>                      plans;
 	std::unordered_map<uint64_t, std::weak_ptr<const std::vector<uint8_t>>> shared_code;
+	// Declared before the pending entries, whose tokens give their counts back to it when they go.
+	InFlightUnits                                                in_flight_units;
 	std::unordered_map<uint64_t, PendingRequest>                 pending;
 	std::unordered_set<uint64_t>                                 blocked_units;
 	std::unordered_map<uint64_t, uint32_t>                       untaken_by_unit;
@@ -299,7 +360,7 @@ struct PrescanPreparer::Impl {
 };
 
 PrescanPreparer::Impl::Impl(PrescanHandoff& shared, PrescanPreparerConfig supplied)
-    : handoff(shared), config(std::move(supplied)), state(shared) {
+    : handoff(shared), config(std::move(supplied)), state(shared), in_flight_units(shared.in_flight) {
 	if (!config.make_transport || !config.lookup || !config.sink) {
 		throw std::invalid_argument("PrescanPreparer needs a transport factory, a lookup and a sink");
 	}
@@ -662,7 +723,8 @@ bool PrescanPreparer::Impl::DrainCompletions() {
 
 // Matches an outcome to its request by tag, since it may have come before Submit returned, counts
 // how it ended and hands it on by kind. The request's work token moves into the local copy, so the
-// request stays counted until its outcome is handled, from the helper's answer to the end of this.
+// request stays counted, and its unit in flight, until its outcome is handled, from the helper's
+// answer to the end of this.
 void PrescanPreparer::Impl::HandleCompletion(StreamCompletion&& completion) {
 	const auto found = pending.find(completion.tag);
 	if (found == pending.end()) {
@@ -1042,9 +1104,10 @@ StreamRequest PrescanPreparer::Impl::MakeRequest(const PlanEntry& entry, const P
 
 // The pending entry is made before the send, since the outcome may arrive before Submit returns,
 // and it is taken back when Submit throws. Its work token counts the request for the underrun tag
-// from that moment, and erasing the entry gives it back. A Compile refused for now is forgotten, so
-// a later snapshot sends it again. A lane that is off turns the prescan off, and the caller still
-// treats that refusal as one for now, so the snapshot in hand is given back.
+// and marks its unit in flight from that moment, for a Plan and a Compile alike, and erasing the
+// entry gives both back. A Compile refused for now is forgotten, so a later snapshot sends it
+// again. A lane that is off turns the prescan off, and the caller still treats that refusal as one
+// for now, so the snapshot in hand is given back.
 StreamSubmitStatus PrescanPreparer::Impl::Send(StreamRequest request, const PlanEntry& entry,
                                                uint64_t unit, const PrescanSpec* spec) {
 	const uint64_t tag  = next_tag++;
@@ -1052,7 +1115,7 @@ StreamSubmitStatus PrescanPreparer::Impl::Send(StreamRequest request, const Plan
 	pending.emplace(tag, PendingRequest {kind, unit, entry.code_hash, entry.user_data_count,
 	                                     entry.static_state,
 	                                     spec != nullptr ? std::optional(*spec) : std::nullopt,
-	                                     PendingWork {}});
+	                                     PendingWork {in_flight_units, unit}});
 	StoreGen::StreamSubmitResult result;
 	try {
 		result = transport->Submit(std::move(request), entry.code, tag);

@@ -1413,6 +1413,23 @@ struct PipelineCacheTestAccess {
   static void SetPrescanSampleHook(PipelineCache &cache, std::function<void()> hook) {
     cache.m_prescan_sample_hook = std::move(hook);
   }
+  // Sets the hooks on the GPU thread's own compute compile, one just after the in-flight check at
+  // the lookup's miss and one inside the pipeline compile's Scope. Set them before the lookup.
+  static void SetInlineMissHook(PipelineCache &cache, std::function<void()> hook) {
+    cache.m_inline_miss_hook = std::move(hook);
+  }
+  static void SetInlineScopeHook(PipelineCache &cache, std::function<void()> hook) {
+    cache.m_inline_scope_hook = std::move(hook);
+  }
+  // The unit the GPU thread noted at the miss, and whether the preparer had it in flight then. Read
+  // them from the miss hook, since the note is forgotten once the compile's cause is picked.
+  static uint64_t InlineComputeUnit(const PipelineCache &cache) { return cache.m_inline_compute_unit; }
+  static bool InlineComputeInFlight(const PipelineCache &cache) { return cache.m_inline_compute_in_flight; }
+  // The user-data count and static key of the lookup in progress, which a miss hook reads to see what
+  // the unit was made from.
+  static std::pair<uint32_t, std::vector<uint32_t>> LookupUnitFields(const PipelineCache &cache) {
+    return {cache.m_lookup_key.user_data_count, cache.m_lookup_key.static_state};
+  }
   // Posts a record as the preparer's sink does, with its plan hash changed, which stands for a
   // prescan module whose plan is not its program's.
   static void PostPrescanChanged(PipelineCache &cache, DecodedModuleRecord &&record) {
@@ -63809,9 +63826,9 @@ bool WaitForPrescan(const std::function<bool()> &condition) {
   return true;
 }
 
-// Hands the preparer the dispatch GeneratedLookup makes, as the scanner would, and wakes it.
-void PushPrescanDispatch(PipelineCache &cache, u32 stride) {
-  const auto &code = GeneratedCheckCode();
+// Hands the preparer the dispatch GeneratedLookup makes, of `code` in place of the generated checks'
+// program, as the scanner would, and wakes it.
+void PushPrescanDispatchOf(PipelineCache &cache, u32 stride, const std::vector<u32> &code) {
   PrescanItem item;
   item.inputs.cs_regs.data_addr = reinterpret_cast<uint64_t>(code.data());
   item.inputs.cs_regs.num_thread_x = 1;
@@ -63830,6 +63847,11 @@ void PushPrescanDispatch(PipelineCache &cache, u32 stride) {
   Require("PrescanIntake", "the ring takes the dispatch", inbox->ring.TryPush(item),
           "the prescan's ring refused a dispatch");
   WakePreparer(*inbox);
+}
+
+// Hands the preparer the dispatch GeneratedLookup makes, as the scanner would, and wakes it.
+void PushPrescanDispatch(PipelineCache &cache, u32 stride) {
+  PushPrescanDispatchOf(cache, stride, GeneratedCheckCode());
 }
 
 // Runs GeneratedLookup on the GPU thread and waits for it no longer than the limit. A lookup that
@@ -64255,6 +64277,229 @@ void CheckPrescanInlineTake(VulkanHarness &vulkan, GuestGpu &gpu,
           "the build the GPU thread ran in its own Scope was counted as overlapping a stop or a hold");
   cache.StopBuilds();
   std::printf("[gpu]     %-32s ok\n", name);
+}
+
+// The cases of CheckPrescanInFlightCause, by what the preparer has outstanding when the GPU thread
+// compiles the generated checks' program itself. NoDispatch has nothing. SameUnitHeld has that
+// program's Compile held in the transport. OtherUnitHeld has the Compile of another program held,
+// one whose unit shares the in-flight table's slot. ReleasedAtMiss holds the same Compile at the
+// miss and has it answered and handled before the Scope opens. SentAfterMiss sends and holds it
+// only after the miss. StaleNote holds the same Compile and makes the missing lookup with no
+// pipeline compile after it, as a lookup whose dispatch never reaches one does. It then makes the
+// lookup again, a hit, and only that one goes on to the pipeline compile.
+enum class InFlightCase { NoDispatch, SameUnitHeld, OtherUnitHeld, ReleasedAtMiss, SentAfterMiss, StaleNote };
+
+// What one case of CheckPrescanInFlightCause saw. The user-data count, static key and unit are the
+// GPU thread's at the miss. The flags say whether the table held the unit at the miss and just
+// before the Scope, and whether it held the unit the case expects the preparer to mark before the
+// lookup. The counts are the holds charged to each cause, the stops charged to PrescanInFlight by the
+// check at the miss alone, and the modules compiled inline.
+struct InFlightSeen {
+  uint32_t user_data_count = 0;
+  std::vector<uint32_t> static_state;
+  uint64_t unit = 0;
+  bool marked_at_miss = false;
+  bool marked_at_scope = false;
+  bool expected_unit_marked = false;
+  bool held = false;
+  uint64_t in_flight_holds = 0;
+  uint64_t required_holds = 0;
+  uint64_t at_miss_only = 0;
+  uint64_t compiled = 0;
+};
+
+// Has the preparer send the Compile of a dispatch of `code` with the generated checks' inputs, and
+// waits until the transport holds it.
+void SendHeldPrescanCompile(PipelineCache &cache, StoreGen::InProcessPrescanTransport &transport,
+                            const std::vector<u32> &code) {
+  PushPrescanDispatchOf(cache, GENERATED_STRIDE_A, code);
+  Require("PrescanInFlightCause", "the compile is held", WaitForPrescan([&] { return transport.Held() == 1; }),
+          "the preparer never sent the held Compile");
+}
+
+// The miss hook of CheckPrescanInFlightCause, on the GPU thread between the miss and the Scope. It
+// reads what the miss noted, then changes what the preparer has outstanding as the case says, and
+// records whether the table holds the unit just before the Scope opens. The held answer is released
+// from a thread of its own, since the in-process transport translates on the releasing thread.
+void NoteInFlightMiss(PipelineCache &cache, StoreGen::InProcessPrescanTransport &transport,
+                      InFlightCase which, InFlightSeen &seen) {
+  std::tie(seen.user_data_count, seen.static_state) = PipelineCacheTestAccess::LookupUnitFields(cache);
+  seen.unit = PipelineCacheTestAccess::InlineComputeUnit(cache);
+  seen.marked_at_miss = PipelineCacheTestAccess::InlineComputeInFlight(cache);
+  const auto &table = cache.PrescanInbox()->in_flight;
+  if (which == InFlightCase::ReleasedAtMiss) {
+    std::thread([&transport] { transport.ReleaseHeld(); }).join();
+    Require("PrescanInFlightCause", "the answer is handled before the Scope",
+            WaitForPrescan([&] { return !table.Contains(seen.unit); }),
+            "the preparer did not handle the released answer and clear the unit");
+  } else if (which == InFlightCase::SentAfterMiss) {
+    SendHeldPrescanCompile(cache, transport, GeneratedCheckCode());
+  }
+  seen.marked_at_scope = table.Contains(seen.unit);
+}
+
+// The GPU thread's part of one case. Every case makes the lookup and its pipeline compile, and
+// StaleNote makes a lookup without the pipeline compile before them.
+void RunInFlightLookups(GuestGpu &gpu, PipelineCache &cache, InFlightCase which) {
+  ShaderComputeInputInfo input{};
+  gpu.SendCommandSync([&] {
+    if (which == InFlightCase::StaleNote) GeneratedLookup(cache, GENERATED_STRIDE_A, input);
+    GeneratedLookup(cache, GENERATED_STRIDE_A, input);
+    (void)cache.GetComputePipeline(input);
+  });
+}
+
+// Runs one case. The transport holds every Compile, so the lookup on the GPU thread misses and
+// compiles the module itself, and its pipeline compile opens the Scope whose cause is under test.
+// Holding is on with no threshold, and the Scope hook starts an audio thread and waits until it is
+// held, so every case's Scope reaches a hold, which is charged to the Scope's cause when it ends.
+// `marked_unit` is the unit the case expects the preparer to have marked before the lookup, or 0.
+InFlightSeen RunInFlightCase(VulkanHarness &vulkan, GuestGpu &gpu, InFlightCase which,
+                             const std::vector<u32> &held_code, uint64_t marked_unit) {
+  using Common::GpuStall::HoldCause;
+  PipelineCache cache(vulkan.RuntimeContext(), nullptr);
+  PipelineCacheTestAccess::EnableWarmCompute(cache);
+  PipelineCacheTestAccess::SetPrescanTweak(
+      cache, [](PrescanPreparerConfig &config) { config.read_memory = ReadHostForPrescan; });
+  StoreGen::InProcessPrescanTransport *transport = nullptr;
+  cache.EnablePrescan(StoreGen::InProcessPrescanTransportFactory(&transport));
+  transport->SetHoldCompiles(true);
+  InFlightSeen seen;
+  if (which != InFlightCase::NoDispatch && which != InFlightCase::SentAfterMiss) {
+    SendHeldPrescanCompile(cache, *transport, held_code);
+  }
+  seen.expected_unit_marked = cache.PrescanInbox()->in_flight.Contains(marked_unit);
+  PrescanAudioProbe audio;
+  PipelineCacheTestAccess::SetInlineScopeHook(cache, [&audio] { audio.HoldDuringScope(); });
+  PipelineCacheTestAccess::SetInlineMissHook(cache, [&] { NoteInFlightMiss(cache, *transport, which, seen); });
+  const auto before = Common::GpuStall::Breakdown();
+  const auto compiled_before = ShadersCompiledSoFar();
+  Common::GpuStall::Configure(true, std::chrono::milliseconds(0));
+  RunInFlightLookups(gpu, cache, which);
+  if (audio.thread.joinable()) audio.thread.join();
+  Common::GpuStall::Configure(false);
+  const auto after = Common::GpuStall::Breakdown();
+  const auto count = [&](HoldCause cause) {
+    const auto index = static_cast<size_t>(cause);
+    return after.cause_count[index] - before.cause_count[index];
+  };
+  seen.held = audio.held;
+  seen.in_flight_holds = count(HoldCause::PrescanInFlight);
+  seen.required_holds = count(HoldCause::RequiredCompute);
+  seen.at_miss_only = cache.PrescanInFlightAtMissOnly();
+  seen.compiled = ShadersCompiledSoFar() - compiled_before;
+  cache.StopBuilds();
+  return seen;
+}
+
+// Requires one case's outcome. The module was compiled inline exactly once and its Scope held the
+// audio thread, the table held the unit at the miss and before the Scope as the case set it up, the
+// one hold went to PrescanInFlight or to RequiredCompute as expected, and the stops charged by the
+// check at the miss alone are `at_miss_only`.
+void RequireInFlightCase(const char *label, const InFlightSeen &seen, bool at_miss, bool at_scope,
+                         bool in_flight, uint64_t at_miss_only = 0) {
+  constexpr const char *name = "PrescanInFlightCause";
+  const std::string prefix = std::string(label) + ": ";
+  Require(name, label, seen.held && seen.compiled == 1,
+          prefix + "the inline compile did not run once, or its Scope did not hold the audio thread");
+  Require(name, label, seen.marked_at_miss == at_miss && seen.marked_at_scope == at_scope,
+          prefix + "the in-flight table did not hold the unit at the miss and the Scope as set up");
+  Require(name, label,
+          seen.in_flight_holds == (in_flight ? 1u : 0u) && seen.required_holds == (in_flight ? 0u : 1u),
+          prefix + "the hold was charged to the wrong cause");
+  Require(name, label, seen.at_miss_only == at_miss_only,
+          prefix + "the stops charged by the check at the miss alone were not counted as such");
+}
+
+// A copy of the generated checks' program with another value in its v_mov literal, which changes its
+// code hash and so its unit, picked so that the unit falls in the in-flight table's slot of `unit`
+// without being `unit`. The static key and user-data count are the GPU thread's, which the preparer
+// makes the same from the same inputs.
+std::vector<u32> SlotSharingProgram(const InFlightSeen &key, uint64_t unit) {
+  constexpr size_t LITERAL_WORD = 1;
+  constexpr u32 GENERATED_LITERAL = 0x71u;
+  constexpr u32 FIRST_LITERAL = 0x100;
+  constexpr u32 SEARCH_LIMIT = 1u << 24u;
+  constexpr uint64_t SLOT_MASK = PRESCAN_FEEDBACK_SLOTS - 1;
+  auto code = GeneratedCheckCode();
+  Require("PrescanInFlightCause", "the literal word", code[LITERAL_WORD] == GENERATED_LITERAL,
+          "the generated checks' program no longer has its v_mov literal in its second word");
+  for (u32 literal = FIRST_LITERAL; literal < FIRST_LITERAL + SEARCH_LIMIT; literal++) {
+    code[LITERAL_WORD] = literal;
+    const auto candidate = PrescanUnitKey(XXH3_64bits(code.data(), code.size() * sizeof(u32)),
+                                          key.user_data_count, key.static_state);
+    if (candidate != unit && ((candidate ^ unit) & SLOT_MASK) == 0) return code;
+  }
+  Require("PrescanInFlightCause", "a slot sharer", false, "no literal gave a unit in the same slot");
+  return {};
+}
+
+// The program SlotSharingProgram picked, kept for the rest of the run, since the shader map and the
+// preparer hold its address.
+const std::vector<u32> &MapSlotSharingProgram(const InFlightSeen &key, uint64_t unit) {
+  static std::vector<u32> code;
+  if (code.empty()) {
+    code = SlotSharingProgram(key, unit);
+    ShaderMapUserData(reinterpret_cast<uint64_t>(code.data()),
+                      {.type = Prospero::ShaderBinaryType::kCs,
+                       .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
+  }
+  return code;
+}
+
+// The GPU thread's own compile of a compute module is charged to PrescanInFlight while the preparer
+// has a request out for the module's unit, and to RequiredCompute otherwise. The cause is picked
+// before the Scope opens, from the table the preparer marks, with no wait. Every case runs the same
+// lookup and pipeline compile on the GPU thread with the same audio probe, so they differ only in
+// what the preparer has outstanding. NoDispatch is the baseline with the prescan on and nothing out,
+// which gives RequiredCompute, and the test's unit made from the GPU thread's key equals the one the
+// GPU thread noted. SameUnitHeld gives PrescanInFlight, and the preparer marked the unit through its
+// real path from a dispatch, so the GPU thread's unit and the preparer's agree end to end.
+// OtherUnitHeld has another program's Compile out, whose real mark sits in the GPU unit's slot, and
+// gives RequiredCompute. ReleasedAtMiss is marked at the miss only and SentAfterMiss at the Scope
+// only, and both give PrescanInFlight, so each of the two checks is needed. Only ReleasedAtMiss
+// counts as charged by the miss alone. StaleNote differs from SameUnitHeld only in the earlier
+// lookup that compiled the module without its pipeline compile, and gives RequiredCompute, since
+// the hit that leads to the compile clears that lookup's note.
+// The mutations, each with what it does:
+// Keying the check on the preparer being alive charges NoDispatch to PrescanInFlight.
+// Making Contains always false sends SameUnitHeld to RequiredCompute.
+// Making the GPU side's unit with another user-data count sends SameUnitHeld to RequiredCompute.
+// Asking whether the table is empty charges OtherUnitHeld to PrescanInFlight.
+// Asking whether any request is pending charges OtherUnitHeld to PrescanInFlight.
+// Asking whether the unit's slot is taken whatever its key charges OtherUnitHeld to PrescanInFlight.
+// Keeping only the check when the Scope opens sends ReleasedAtMiss to RequiredCompute.
+// Keeping only the check at the miss sends SentAfterMiss to RequiredCompute.
+// Never counting a stop charged by the miss alone leaves ReleasedAtMiss's count at 0.
+// Dropping the clear at the top of a compute lookup charges StaleNote to PrescanInFlight.
+void CheckPrescanInFlightCause(VulkanHarness &vulkan, GuestGpu &gpu) {
+  Common::DebugCounters::SetEnabled(true);
+  const auto none = RunInFlightCase(vulkan, gpu, InFlightCase::NoDispatch, {}, 0);
+  RequireInFlightCase("no request out", none, false, false, false);
+  const auto &own = GeneratedCheckCode();
+  const uint64_t own_unit = PrescanUnitKey(XXH3_64bits(own.data(), own.size() * sizeof(u32)),
+                                           none.user_data_count, none.static_state);
+  Require("PrescanInFlightCause", "the unit", none.unit != 0 && none.unit == own_unit,
+          "the GPU thread's unit is not the one made from its key and the program's code");
+  const auto same = RunInFlightCase(vulkan, gpu, InFlightCase::SameUnitHeld, own, own_unit);
+  RequireInFlightCase("the same unit held", same, true, true, true);
+  Require("PrescanInFlightCause", "the preparer's mark", same.expected_unit_marked,
+          "the preparer did not mark the unit the GPU thread looks up");
+  const auto &other = MapSlotSharingProgram(none, own_unit);
+  const uint64_t other_unit = PrescanUnitKey(XXH3_64bits(other.data(), other.size() * sizeof(u32)),
+                                             none.user_data_count, none.static_state);
+  const auto shared = RunInFlightCase(vulkan, gpu, InFlightCase::OtherUnitHeld, other, other_unit);
+  Require("PrescanInFlightCause", "the sharer's mark", shared.expected_unit_marked,
+          "the other program's held Compile did not mark its unit in the GPU unit's slot");
+  RequireInFlightCase("another unit held in the same slot", shared, false, false, false);
+  const auto released = RunInFlightCase(vulkan, gpu, InFlightCase::ReleasedAtMiss, own, own_unit);
+  RequireInFlightCase("answered after the miss", released, true, false, true, 1);
+  const auto late = RunInFlightCase(vulkan, gpu, InFlightCase::SentAfterMiss, {}, 0);
+  RequireInFlightCase("sent after the miss", late, false, true, true);
+  const auto stale = RunInFlightCase(vulkan, gpu, InFlightCase::StaleNote, own, own_unit);
+  RequireInFlightCase("a note from an earlier lookup", stale, true, true, false);
+  Common::DebugCounters::SetEnabled(false);
+  std::printf("[gpu]     %-32s ok\n", "PrescanInFlightCause");
 }
 
 // A prescan module with a bad plan is refused by the prescan's own planner and leaves the
@@ -64812,6 +65057,7 @@ void CheckPrescanIntake(VulkanHarness &vulkan) {
       CheckPrescanScopeAtSample(vulkan, gpu, records);
       CheckPrescanRunningWorkerOnly(vulkan, gpu, records);
       CheckPrescanInlineTake(vulkan, gpu, records);
+      CheckPrescanInFlightCause(vulkan, gpu);
       CheckPrescanPlannerSeparate(vulkan, gpu, records);
       CheckPrescanDrainsFirst(vulkan, gpu, records);
       CheckPrescanTwoProducers(vulkan, gpu, records);

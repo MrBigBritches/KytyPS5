@@ -24,9 +24,12 @@ inline constexpr std::chrono::milliseconds GPU_STALL_AUDIO_HOLD_THRESHOLD {250};
 
 /// Why the GPU command thread was stopped, so a hold of guest audio can be blamed on one thing.
 /// PrescanWaited and PrescanQueued are charged by the warm takes of prescan modules, a wait for a
-/// worker's build and a build the GPU thread ran itself because it was still queued. The other
-/// prescan causes have no call sites yet. They are PrescanInFlight, for a request still in the
-/// helper, the three PrescanNeverPosted causes and PrescanRefused, and they are reserved for the
+/// worker's build and a build the GPU thread ran itself because it was still queued.
+/// PrescanInFlight is charged by the GPU thread's own pipeline compile of a compute module whose
+/// unit the prescan's helper still had a Plan or Compile for, at the lookup's miss or when the
+/// compile's Scope opens. A request for another specialization of the same unit counts, and so
+/// does the time between the helper answering and the preparer handling the answer. The three
+/// PrescanNeverPosted causes and PrescanRefused have no call sites yet. They are reserved for the
 /// GPU thread's compile of a module the prescan did not deliver, so the report's schema does not
 /// change when they get sites. Other is a gate value that must stay 0 in a finished run.
 /// WarmInlinePaused and GeneratedInlinePaused are causes of their own and not subsets, so the

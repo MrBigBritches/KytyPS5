@@ -148,12 +148,44 @@ private:
 	std::array<std::atomic<uint64_t>, PRESCAN_FEEDBACK_SLOTS> m_slots {};
 };
 
+/// The program units the preparer has a Plan or a Compile outstanding for, so the GPU thread can
+/// tell, without waiting or locking, that a compute module it has to compile itself was still in
+/// the helper. A unit is a program with its user-data count and static key, see PrescanUnitKey, so
+/// a request for another specialization of the same unit counts too. A unit is marked from just
+/// before its first request is sent until the preparer has handled the outcome of its last one,
+/// which includes the time between the helper answering and the preparer reading the answer. Only
+/// the preparer writes it and any thread may read it. It is direct mapped like the answer table it
+/// is built on, so a unit marked into a taken slot replaces the one there, which can only make a
+/// reader miss a unit and charge the stop to RequiredCompute. The preparer marks a unit again at
+/// each new request, which puts back a unit that was replaced.
+class PrescanInFlightTable {
+public:
+	/// Marks `unit` as having a request outstanding. Unit 0 means no unit and is ignored. Only the
+	/// preparer may call it.
+	void Mark(uint64_t unit) noexcept { m_slots.Publish(unit, PrescanFeedback::Answer::Busy); }
+	/// Clears `unit`, and leaves a different unit that took its slot alone. Only the preparer may
+	/// call it.
+	void Clear(uint64_t unit) noexcept { m_slots.Publish(unit, PrescanFeedback::Answer::None); }
+	/// Whether `unit` is marked. It never waits, so the GPU thread may ask while it is stopped.
+	[[nodiscard]] bool Contains(uint64_t unit) const noexcept {
+		return m_slots.Read(unit) != PrescanFeedback::Answer::None;
+	}
+
+private:
+	// Its own instance, since the scanner reads the answer table by dispatch key and a unit marked
+	// there would read as an answer to a dispatch.
+	PrescanFeedback m_slots;
+};
+
 /// Everything the scanner thread and the preparer thread share. The scanner is the ring's one
 /// producer, which TryClaimProducer enforces, and the preparer its one consumer and the answer
 /// table's one writer. The owner keeps it alive until both threads are joined.
 struct PrescanHandoff {
 	Common::SpscRing<PrescanItem, PRESCAN_RING_CAPACITY> ring;
 	PrescanFeedback                                      feedback;
+	/// The units the preparer has a request outstanding for. The preparer writes it and the GPU
+	/// thread reads it when it compiles a compute module itself, to pick the stop's hold cause.
+	PrescanInFlightTable in_flight;
 	/// Bumped by everything that gives the preparer work, which is the scanner after it pushed,
 	/// the helper's completion callback after it queued an answer, and shutdown. The preparer reads
 	/// it before it drains and then waits for it to change, so a bump that lands during the drain

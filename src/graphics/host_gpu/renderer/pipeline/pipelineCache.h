@@ -469,6 +469,12 @@ public:
 	void StopPrescan();
 	// What the prescan's pipeline builds did so far. Any thread.
 	[[nodiscard]] PrescanBuildStats PrescanBuilds() const;
+	// How many of the GPU thread's own compute compiles were charged to PrescanInFlight only because
+	// the unit was in flight at the lookup's miss, the helper having answered before the Scope
+	// opened. Any thread.
+	[[nodiscard]] uint64_t PrescanInFlightAtMissOnly() const noexcept {
+		return m_in_flight_at_miss_only.load(std::memory_order_relaxed);
+	}
 
 private:
 	friend struct PipelineCacheTestAccess;
@@ -638,6 +644,24 @@ private:
 	// the Scope flag, so a test can open a Scope at the one moment the read order decides. Set before
 	// EnablePrescan and never changed after. Empty in production.
 	std::function<void()> m_prescan_sample_hook;
+	// The compute module the GPU thread last compiled itself with the prescan on, kept from the
+	// lookup's miss until its pipeline's Scope opens so that stop can be charged to PrescanInFlight.
+	// The unit is the module's prescan unit and the flag says whether the preparer had it in flight
+	// at the miss. Only the GPU thread notes them, and every compute lookup clears them, as does
+	// picking the cause. A lookup whose dispatch never reaches a pipeline compile leaves its note
+	// until the next compute lookup, and the id check keeps it from naming another module.
+	uint64_t m_inline_compute_id        = 0;
+	uint64_t m_inline_compute_unit      = 0;
+	bool     m_inline_compute_in_flight = false;
+	// How many GPU-thread compiles were charged to PrescanInFlight by the check at the miss alone,
+	// with the unit no longer in flight when the Scope opened. Written by the GPU thread, read by
+	// anyone.
+	std::atomic<uint64_t> m_in_flight_at_miss_only {0};
+	// Test hooks on the GPU thread's own compute compile with the prescan on. The miss hook runs just
+	// after the in-flight check at the lookup's miss and before translation, and the Scope hook runs
+	// inside the pipeline compile's Scope. Set before the lookup. Empty in production.
+	std::function<void()> m_inline_miss_hook;
+	std::function<void()> m_inline_scope_hook;
 
 	template <typename InputInfo>
 	const ShaderModule* GetProgram(const ShaderParams& params, InputInfo& input_info,
@@ -778,6 +802,28 @@ private:
 	// the prescan, whose seed covers what was taken in before it started, and nothing once the
 	// preparer stopped. Only the thread that owns the program cache calls it.
 	void NoteKnownModule(const ProgramKey& key, const ShaderModule& module);
+	// Forgets the inline compute compile noted so far. Called at the top of every compute lookup,
+	// hits included, and once the compile's cause is picked. Inline, since it runs on every lookup.
+	void ResetInlineCompute() noexcept {
+		m_inline_compute_id        = 0;
+		m_inline_compute_unit      = 0;
+		m_inline_compute_in_flight = false;
+	}
+	// pipelinePrescan.cpp. Notes, at a compute lookup's miss on the GPU thread, the prescan unit of
+	// the program in m_lookup_key and whether the preparer has it in flight. Translation may take
+	// hundreds of ms outside any Scope, and the helper may answer meanwhile, so the answer at the
+	// miss counts as well as the one when the Scope opens. It does nothing without the prescan or on
+	// another thread.
+	void NoteInlineComputeMiss();
+	// Keeps the id of the module a noted miss compiled, for InlineComputeCause.
+	void NoteInlineComputeModule(uint64_t module_id) noexcept;
+	// The hold cause of the GPU thread's pipeline compile of `module_id`, picked before its Scope
+	// opens with lock-free reads only. It is PrescanInFlight when the module is the one the last
+	// noted miss compiled and the preparer had its unit in flight at the miss or has it now, and
+	// RequiredCompute otherwise. The table is kept by unit, so a request for another specialization
+	// of the same unit counts too. A stop charged by the check at the miss alone is counted in
+	// m_in_flight_at_miss_only. It forgets the note.
+	[[nodiscard]] Common::GpuStall::HoldCause InlineComputeCause(uint64_t module_id) noexcept;
 	// pipelineGeneration.cpp. Makes the module of a prescan record on the preparer's thread and posts
 	// it, as PostGeneratedModule does for the generator. The record's bytes, as the helper encoded
 	// them, travel with the module so its first use can store them without encoding them again. Empty

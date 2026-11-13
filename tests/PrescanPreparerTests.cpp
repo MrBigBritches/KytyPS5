@@ -16,6 +16,7 @@
 #include "common/firstRunReport.h"
 #include "graphics/host_gpu/renderer/pipeline/prescanPreparer.h"
 #include "graphics/shader/moduleId.h"
+#include "graphics/shader/shaderCompiler.h"
 #include "graphics/shader/storegen/prescanTransport.h"
 #include "graphics/shader/storegen/shaderStoreWorker.h"
 #include "graphics/shader/storegen/storeWorkerFormat.h"
@@ -1421,6 +1422,90 @@ void TestPrescanRunningClearedAtThreadExit() {
 	std::puts("PrescanRunningClearedAtThreadExit ok");
 }
 
+// ---- The in-flight table the GPU thread reads for PrescanInFlight. ----
+
+// The unit the preparer keys an item's requests by, made from the same fields and functions. That it
+// really is the preparer's unit is shown by the table, which is marked under it.
+uint64_t UnitOf(const Program& program, const PrescanItem& item) {
+	const auto            info = MakePrescanInputInfo(item.inputs, SCRATCH_DWORDS, DEVICE);
+	std::vector<uint32_t> static_state;
+	if (info) {
+		BuildStageStaticKey(*info, static_state);
+	}
+	const auto bytes = program.code.size() * sizeof(uint32_t);
+	return PrescanUnitKey(XXH3_64bits(program.code.data(), bytes), item.user_data_count, static_state);
+}
+
+// A held Plan marks its unit, and Stop clears it. The baseline is the table before the send, which
+// is clear, so a unit that reads as marked whatever happened fails. The mutations are to mark only
+// for a Compile, and the held Plan leaves the unit clear, and to drop the Clear, and Stop leaves it.
+void CheckPlanMarksUnit(const Program& program) {
+	Script     script {.plans_held = 1};
+	Harness    harness(ScriptedFactory(script));
+	const auto item  = ItemFor(program, Descriptor(STRIDE_A, DstSel(4, 5, 6, 7)), KEY);
+	const auto unit  = UnitOf(program, item);
+	auto&      table = harness.handoff->in_flight;
+	harness.Map(program);
+	CHECK(!table.Contains(unit));
+	harness.Push(item);
+	harness.Drive();
+	CHECK(script.plan_attempts == 1 && script.compile_attempts == 0 && table.Contains(unit));
+	harness.preparer->Stop();
+	CHECK(!table.Contains(unit));
+}
+
+// Compiles of two specializations of one unit are held. The unit is marked while either is out, and
+// another unit of the same program, which differs only in its thread count, is never marked, so a
+// table that answered yes to every key fails. Answering the first leaves the unit marked, since the
+// second is still out, and answering the second clears it. A third held one is cleared by Stop,
+// which leaves no pass to handle it, so only the clear of the pending entries there can do it. The
+// mutations are to clear on every request done, and the unit reads clear after the first answer, to
+// let a moved-from token give its count back, which clears it early the same way, to drop the Clear,
+// and the unit stays marked after the second answer, and to drop the clear in Stop, which leaves the
+// third marked.
+void CheckCompilesMarkUnit(const Program& program) {
+	constexpr uint32_t HELD_COMPILES = 3;
+	constexpr uint32_t THIRD_STRIDE  = 32;
+	Script             script {.compiles_held = HELD_COMPILES};
+	Harness            harness(ScriptedFactory(script));
+	const auto         item = ItemFor(program, Descriptor(STRIDE_A, DstSel(4, 5, 6, 7)), KEY);
+	auto               other_item = item;
+	other_item.inputs.cs_regs.num_thread_x = OTHER_UNIT_THREADS;
+	const auto unit       = UnitOf(program, item);
+	const auto other_unit = UnitOf(program, other_item);
+	auto&      table      = harness.handoff->in_flight;
+	harness.Map(program);
+	harness.Push(item);
+	harness.Drive();
+	CHECK(script.compile_attempts == 1 && table.Contains(unit) && !table.Contains(other_unit));
+	harness.Push(ItemFor(program, Descriptor(STRIDE_B, DstSel(4, 5, 6, 7)), KEY));
+	harness.Drive();
+	CHECK(script.compile_attempts == 2 && table.Contains(unit));
+	script.answer_first_held();
+	harness.Drive();
+	CHECK(harness.adopted.size() == 1 && table.Contains(unit));
+	script.answer_first_held();
+	harness.Drive();
+	CHECK(harness.adopted.size() == 2 && !table.Contains(unit));
+	harness.Push(ItemFor(program, Descriptor(THIRD_STRIDE, DstSel(4, 5, 6, 7)), KEY));
+	harness.Drive();
+	CHECK(script.compile_attempts == 3 && table.Contains(unit));
+	harness.preparer->Stop();
+	CHECK(!table.Contains(unit));
+}
+
+// The in-flight table holds a unit from its first request's send until the last one's outcome is
+// handled, for a Plan and a Compile alike, and is clear after Stop. The table is not tied to the
+// report, which stays off here, since hold causes are always recorded. The mutation of gating it on
+// the report leaves every unit clear.
+void TestInFlightMarkedWhileSent() {
+	const auto program = DirectProgram(MUBUF_STORE_DWORD);
+	CHECK(!Common::FirstRunReport::Enabled());
+	CheckPlanMarksUnit(program);
+	CheckCompilesMarkUnit(program);
+	std::puts("InFlightMarkedWhileSent ok");
+}
+
 // What a supervised run of three dispatches ended with.
 struct SupervisedRun {
 	PrescanPreparerCounters counters;
@@ -1768,6 +1853,7 @@ int main(int argc, char** argv) {
 	TestPassCountsAsPrescanWork();
 	TestPrescanRunningCountsHeldCompile();
 	TestPrescanRunningClearedAtThreadExit();
+	TestInFlightMarkedWhileSent();
 	TestSupervisedHelperOutcomes();
 	TestSupervisedLaneOff();
 	TestSupervisedStopIsFinal();

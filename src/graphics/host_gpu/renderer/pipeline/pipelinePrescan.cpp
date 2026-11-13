@@ -1,6 +1,7 @@
 #include "common/childProcess.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
+#include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/renderer/pipeline/generationState.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/prescanPreparer.h"
@@ -156,6 +157,44 @@ void PipelineCache::StopPrescan() {
 	if (m_prescan != nullptr) {
 		m_prescan->Stop();
 	}
+}
+
+// The hand-off is tested first, so a run without the prescan pays one null test. The unit is made
+// by the one function the preparer makes it with, from the fields of the key the lookup missed.
+void PipelineCache::NoteInlineComputeMiss() {
+	if (m_prescan_handoff == nullptr || !GuestGpu::IsGpuThread()) {
+		return;
+	}
+	m_inline_compute_unit = PrescanUnitKey(m_lookup_key.hash, m_lookup_key.user_data_count,
+	                                       m_lookup_key.static_state);
+	m_inline_compute_in_flight = m_prescan_handoff->in_flight.Contains(m_inline_compute_unit);
+	if (m_inline_miss_hook) {
+		m_inline_miss_hook();
+	}
+}
+
+// Only a miss that was noted has a unit, so a compile on another thread keeps no id.
+void PipelineCache::NoteInlineComputeModule(uint64_t module_id) noexcept {
+	if (m_inline_compute_unit != 0) {
+		m_inline_compute_id = module_id;
+	}
+}
+
+// The id check keeps the note of one lookup from naming another module's compile, such as one whose
+// lookup missed but whose pipeline was already made. Both reads are relaxed loads of the table, so
+// the GPU thread never waits on the preparer. The table is read even when the miss already said in
+// flight, so a stop the miss alone accounts for can be counted apart.
+Common::GpuStall::HoldCause PipelineCache::InlineComputeCause(uint64_t module_id) noexcept {
+	const bool noted = m_prescan_handoff != nullptr && m_inline_compute_unit != 0 &&
+	                   module_id == m_inline_compute_id;
+	const bool at_scope = noted && m_prescan_handoff->in_flight.Contains(m_inline_compute_unit);
+	const bool at_miss  = noted && m_inline_compute_in_flight;
+	if (at_miss && !at_scope) {
+		m_in_flight_at_miss_only.fetch_add(1, std::memory_order_relaxed);
+	}
+	ResetInlineCompute();
+	return at_miss || at_scope ? Common::GpuStall::HoldCause::PrescanInFlight
+	                           : Common::GpuStall::HoldCause::RequiredCompute;
 }
 
 } // namespace Libs::Graphics
