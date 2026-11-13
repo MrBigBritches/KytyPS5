@@ -5,7 +5,6 @@
 // TestDropMarksShadowUncertain in SubmitScanTests, and here across two queues.
 #include "common/firstRunReport.h"
 #include "graphics/guest_gpu/command_processor/prescanScanner.h"
-#include "graphics/guest_gpu/command_processor/scanDifferential.h"
 #include "graphics/guest_gpu/command_processor/scanJobQueue.h"
 #include "graphics/guest_gpu/command_processor/submitScan.h"
 #include "graphics/guest_gpu/pm4.h"

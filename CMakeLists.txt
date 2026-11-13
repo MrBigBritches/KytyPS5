@@ -729,13 +729,11 @@ target_link_libraries(prescan_handoff_tests common fmt::fmt xxhash)
 target_include_directories(prescan_handoff_tests PRIVATE ${inc_headers})
 
 # The prescan's scanner thread. It reads through a reader the test supplies and posts to a hand-off the
-# test drains, so it links only the walk, the register decoder and the scanner. The differential gives
-# the report its names for the causes of doubt.
+# test drains, so it links only the walk, the register decoder and the scanner.
 add_executable(prescan_scanner_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/PrescanScannerTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/csRegisters.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/command_processor/submitScan.cpp"
-	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/command_processor/scanDifferential.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/command_processor/prescanScanner.cpp"
 )
 target_link_libraries(prescan_scanner_tests common fmt::fmt xxhash)

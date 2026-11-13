@@ -128,6 +128,9 @@ enum class UncertainCause : uint8_t {
 	Count,
 };
 
+/// The name the report gives a cause of uncertainty.
+[[nodiscard]] const char* UncertainCauseName(UncertainCause cause);
+
 /// Hashes what decides a dispatch's static key, which is the program address and every register that
 /// decides its module, and how the dispatch is launched. The user data is left out. The scanner and the
 /// command processor both call this, so a difference between their keys is a difference in their register

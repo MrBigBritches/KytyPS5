@@ -147,23 +147,6 @@ uint64_t ScanTimeHistogram::Percentile(double fraction) const {
 	return m_max;
 }
 
-const char* UncertainCauseName(UncertainCause cause) {
-	switch (cause) {
-		case UncertainCause::CondExecRegion: return "cond_exec_region";
-		case UncertainCause::Branch: return "branch";
-		case UncertainCause::Predicated: return "predicated";
-		case UncertainCause::TimeCap: return "time_cap";
-		case UncertainCause::BudgetCut: return "budget_cut";
-		case UncertainCause::UnreadableBuffer: return "unreadable_buffer";
-		case UncertainCause::DepthLimited: return "depth_limited";
-		case UncertainCause::Revisited: return "revisited";
-		case UncertainCause::BadPacket: return "bad_packet";
-		case UncertainCause::UnreadableRegisterList: return "unreadable_register_list";
-		case UncertainCause::Count: break;
-	}
-	return "unknown";
-}
-
 std::unique_ptr<ScanDifferential> ScanDifferential::Create(bool enabled, uint32_t queue_count,
                                                            ScanMemoryReader reader,
                                                            ScanLimits limits) {

@@ -668,6 +668,23 @@ WalkEnd WalkBuffer(Walk& walk, std::span<const uint32_t> buffer, uint32_t depth,
 
 } // namespace
 
+const char* UncertainCauseName(UncertainCause cause) {
+	switch (cause) {
+		case UncertainCause::CondExecRegion: return "cond_exec_region";
+		case UncertainCause::Branch: return "branch";
+		case UncertainCause::Predicated: return "predicated";
+		case UncertainCause::TimeCap: return "time_cap";
+		case UncertainCause::BudgetCut: return "budget_cut";
+		case UncertainCause::UnreadableBuffer: return "unreadable_buffer";
+		case UncertainCause::DepthLimited: return "depth_limited";
+		case UncertainCause::Revisited: return "revisited";
+		case UncertainCause::BadPacket: return "bad_packet";
+		case UncertainCause::UnreadableRegisterList: return "unreadable_register_list";
+		case UncertainCause::Count: break;
+	}
+	return "unknown";
+}
+
 uint64_t ComputeDispatchKeyHash(const HW::CsStageRegisters& cs, bool thread_dimensions,
                                 bool async_queue) {
 	const uint64_t words[] = {

@@ -190,9 +190,6 @@ private:
 	std::vector<Common::FirstRunReport::ScanDifferentialSample> m_samples;
 };
 
-/// The name the report gives a cause of uncertainty.
-[[nodiscard]] const char* UncertainCauseName(UncertainCause cause);
-
 } // namespace Libs::Graphics
 
 #endif // GRAPHICS_GUEST_GPU_COMMAND_PROCESSOR_SCAN_DIFFERENTIAL_H

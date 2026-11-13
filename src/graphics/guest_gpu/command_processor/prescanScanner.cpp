@@ -3,7 +3,7 @@
 #include "common/firstRunReport.h"
 #include "common/logging/log.h"
 #include "common/threadPriority.h"
-#include "graphics/guest_gpu/command_processor/scanDifferential.h"
+#include "graphics/guest_gpu/command_processor/submitScan.h"
 #include "graphics/host_gpu/renderer/pipeline/prescanHandoff.h"
 #include "graphics/host_gpu/renderer/pipeline/prescanVariants.h"
 
