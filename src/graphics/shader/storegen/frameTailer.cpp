@@ -157,18 +157,22 @@ bool FileTailPoller::ReadNewBytes() {
 	if (m_tailer.IsFinal() || size <= m_offset || !file.Seek(m_offset)) {
 		return true;
 	}
-	const uint64_t       stop = m_offset + std::min<uint64_t>(size - m_offset, m_max_poll_bytes);
-	std::vector<uint8_t> chunk(POLL_READ_CHUNK_BYTES);
+	const uint64_t stop = m_offset + std::min<uint64_t>(size - m_offset, m_max_poll_bytes);
+	// Sized on the first poll that has bytes to read and kept, so later polls do not allocate and
+	// zero a megabyte each. Only the bytes a read returned are ever fed.
+	if (m_chunk.empty()) {
+		m_chunk.resize(POLL_READ_CHUNK_BYTES);
+	}
 	while (m_offset < stop) {
-		const auto want = static_cast<uint32_t>(std::min<uint64_t>(stop - m_offset, chunk.size()));
+		const auto want = static_cast<uint32_t>(std::min<uint64_t>(stop - m_offset, m_chunk.size()));
 		uint32_t   got  = 0;
-		file.Read(chunk.data(), want, &got);
+		file.Read(m_chunk.data(), want, &got);
 		// A read that gives nothing is the end of the file, like a file that is missing. It must
 		// not say that more is coming, or a poller after the child's exit would never finish.
 		if (got == 0) {
 			return true;
 		}
-		m_tailer.Feed(std::span<const uint8_t>(chunk).first(got));
+		m_tailer.Feed(std::span<const uint8_t>(m_chunk).first(got));
 		m_offset += got;
 	}
 	return m_offset >= size;

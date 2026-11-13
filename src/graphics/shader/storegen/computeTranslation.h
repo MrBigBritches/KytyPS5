@@ -5,6 +5,7 @@
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/shader.h"
 #include "graphics/shader/storegen/computeStaticKey.h"
+#include "graphics/shader/storegen/prescanInputs.h"
 
 #include <array>
 #include <cstdint>
@@ -47,25 +48,6 @@ private:
 	ShaderComputeInputInfo           m_info;
 	std::vector<uint32_t>            m_user_data;
 	ShaderRecompiler::CompileOptions m_options;
-};
-
-/// What the runtime takes from one compute dispatch besides the shader map, as a submit scan saw
-/// it. PrescanInputsOf in the command processor's prescanDispatchInputs.h fills it from a
-/// ScannedDispatch. The caller fills every field.
-struct PrescanDispatchInputs {
-	/// The compute registers at the dispatch. Their wave size must be the dispatch initiator's, as
-	/// the command processor writes it into the registers before it dispatches.
-	HW::CsStageRegisters cs_regs;
-	/// Whether the dispatch is on an async compute queue.
-	bool async_compute;
-	/// Whether the initiator asks for thread dimensions rather than group counts.
-	bool thread_dimensions;
-	/// Whether the dispatch came from an indirect packet.
-	bool indirect;
-	/// The group counts of a direct dispatch, already rounded up from threads as the runtime does.
-	std::array<uint32_t, 3> workgroup_counts;
-	/// The address of an indirect dispatch's arguments, 0 for a direct one.
-	uint64_t indirect_args_address;
 };
 
 /// Builds the compute input info the runtime would build for a scanned dispatch, without a device.

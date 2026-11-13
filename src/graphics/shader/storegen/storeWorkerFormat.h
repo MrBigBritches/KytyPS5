@@ -20,6 +20,10 @@ namespace Libs::Graphics::StoreGen {
 enum class WorkerMode : uint8_t {
 	Generate, ///< Generate the records into the output file.
 	Verify,   ///< Exit at once with WORKER_EXIT_UP_TO_DATE when the finished file is current.
+	/// Serve StreamRequest frames from a pipe, as streamProtocol.h describes them. A request file
+	/// does not decode with this mode yet, because the worker has no Stream loop, and a build that
+	/// took it would run the request as Generate.
+	Stream,
 };
 
 /// The version of the worker's rules, which are the prediction, the candidate order and the record

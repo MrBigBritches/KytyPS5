@@ -4,6 +4,7 @@
 // and the dispatch the builder must refuse. Each check that proves a behaviour has a baseline that
 // differs only in that behaviour, as the comments say.
 #include "graphics/guest_gpu/command_processor/prescanDispatchInputs.h"
+#include "graphics/shader/storegen/computeTranslation.h"
 
 #include <array>
 #include <cstdint>

@@ -2,7 +2,7 @@
 #define GRAPHICS_GUEST_GPU_COMMAND_PROCESSOR_PRESCAN_DISPATCH_INPUTS_H
 
 #include "graphics/guest_gpu/command_processor/submitScan.h"
-#include "graphics/shader/storegen/computeTranslation.h"
+#include "graphics/shader/storegen/prescanInputs.h"
 
 // The adapter from what the submit scanner records to what the pre-scan's input info is built from.
 // It lives on the command processor's side so the shader store code needs no scanner header.

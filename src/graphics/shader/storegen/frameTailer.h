@@ -219,6 +219,8 @@ private:
 	uint64_t              m_max_poll_bytes = MAX_POLL_READ_BYTES;
 	uint64_t              m_offset         = 0;
 	uint32_t              m_rewinds        = 0;
+	/// The buffer a poll reads the file into, kept between polls so a poll does not allocate it.
+	std::vector<uint8_t> m_chunk;
 };
 
 } // namespace Libs::Graphics::StoreGen

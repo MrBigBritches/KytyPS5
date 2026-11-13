@@ -769,6 +769,23 @@ add_executable(shader_store_tailer_tests EXCLUDE_FROM_ALL
 target_link_libraries(shader_store_tailer_tests common fmt::fmt xbyak::xbyak xxhash libzstd_static)
 target_include_directories(shader_store_tailer_tests PRIVATE ${inc_headers})
 
+# The frames of the Stream worker mode and the pipe they travel through. The pipes are made inside
+# the test, so it starts no worker, links no recompiler and needs no device. The request format is
+# linked for the Stream mode's refusal.
+add_executable(shader_store_stream_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ShaderStoreStreamTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/storegen/streamProtocol.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/storegen/streamChannel.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/storegen/storeWorkerFormat.cpp"
+)
+target_link_libraries(shader_store_stream_tests common Vulkan::Headers fmt::fmt xxhash xbyak::xbyak)
+target_include_directories(shader_store_stream_tests PRIVATE ${inc_headers})
+if (KYTY_CLANG_CL)
+	# The request format's serializer brings in the recompiler headers, with the deprecated codecvt
+	# use the translation test silences too.
+	target_compile_options(shader_store_stream_tests PRIVATE -Wno-deprecated-declarations)
+endif()
+
 # The supervisor of a store worker. It starts this test binary as a fake worker, so it links no
 # recompiler and needs no device.
 add_executable(shader_store_supervisor_tests EXCLUDE_FROM_ALL
@@ -1080,6 +1097,7 @@ if(BUILD_TESTING)
 	add_test(NAME shader_store_keys COMMAND $<TARGET_FILE:shader_store_keys_tests>)
 	add_test(NAME shader_store_record COMMAND $<TARGET_FILE:shader_store_record_tests>)
 	add_test(NAME shader_store_tailer COMMAND $<TARGET_FILE:shader_store_tailer_tests>)
+	add_test(NAME shader_store_stream COMMAND $<TARGET_FILE:shader_store_stream_tests>)
 	add_test(NAME shader_store_progress_log COMMAND $<TARGET_FILE:shader_store_progress_log_tests>)
 	add_test(NAME shader_store_supervisor COMMAND $<TARGET_FILE:shader_store_supervisor_tests>)
 	add_test(NAME generated_drain_planner COMMAND $<TARGET_FILE:generated_drain_planner_tests>)
@@ -1237,6 +1255,7 @@ if(BUILD_TESTING)
 		shader_store_keys_tests
 		shader_store_record_tests
 		shader_store_tailer_tests
+		shader_store_stream_tests
 		shader_store_progress_log_tests
 		shader_store_supervisor_tests
 		generated_drain_planner_tests

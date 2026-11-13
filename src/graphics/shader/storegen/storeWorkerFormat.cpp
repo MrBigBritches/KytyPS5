@@ -47,7 +47,8 @@ std::optional<WorkerRequest> DecodeWorkerRequest(std::span<const uint8_t> bytes)
 	          request.output_path, request.progress_path, request.generated_path, request.kept,
 	          request.start_rank, request.skip_hashes, request.failed_hashes, request.parent_pid,
 	          request.mode, request.generator_version, request.expected_order);
-	// A mode byte is checked after the read, since an enum read takes any value.
+	// A mode byte is checked after the read, since an enum read takes any value. Stream is left out
+	// until the worker has a loop for it, so no build runs a Stream request as Generate.
 	const bool known_mode =
 	    request.mode == WorkerMode::Generate || request.mode == WorkerMode::Verify;
 	if (!reader.ok || !reader.bytes.empty() || !known_mode) {
