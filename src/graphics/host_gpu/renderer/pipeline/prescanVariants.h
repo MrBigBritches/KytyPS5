@@ -138,6 +138,12 @@ public:
 	/// How many programs reached the cap.
 	[[nodiscard]] uint64_t CappedUnits() const { return m_capped; }
 
+	/// Whether `unit` was retired, which a Capped gate answer does not tell apart from the cap.
+	[[nodiscard]] bool IsRetired(uint64_t unit) const {
+		const auto found = m_units.find(unit);
+		return found != m_units.end() && found->second.retired;
+	}
+
 	/// How many programs are settled now. It walks every program, so it is meant for the end-of-run
 	/// report and not for each dispatch.
 	[[nodiscard]] uint64_t SettledUnits() const {

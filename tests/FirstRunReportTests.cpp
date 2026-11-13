@@ -2479,6 +2479,7 @@ std::vector<PrescanCacheFieldCase> PrescanPreparerOutcomeCases() {
 	        CACHE_COUNT("/preparer/taken_dropped", preparer.taken_dropped),
 	        CACHE_COUNT("/preparer/plans_dropped", preparer.plans_dropped),
 	        CACHE_COUNT("/preparer/forgotten", preparer.forgotten),
+	        CACHE_COUNT("/preparer/verdicts_evicted", preparer.verdicts_evicted),
 	        CACHE_FLAG("/preparer/failed", preparer.failed),
 	        CACHE_FLAG("/preparer/lane_off", preparer.lane_off)};
 }

@@ -809,6 +809,7 @@ struct PrescanPreparerReport {
 	uint64_t taken_dropped    = 0;
 	uint64_t plans_dropped    = 0;
 	uint64_t forgotten        = 0;
+	uint64_t verdicts_evicted = 0;
 	bool     failed           = false;
 	bool     lane_off         = false;
 };

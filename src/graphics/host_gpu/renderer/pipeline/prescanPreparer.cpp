@@ -95,7 +95,10 @@ public:
 		m_counts[unit]++;
 		m_table.Mark(unit);
 	}
-	// Counts one request of `unit` as done, and clears the unit when it was the last.
+	// Counts one request of `unit` as done, and clears the unit when it was the last. Every verdict
+	// the request's outcome gave is published before this, and the fence keeps those stores ahead
+	// of the clear. A GPU thread that reads the unit as clear and then fences with acquire is sure
+	// to see them, and never takes a unit the helper just finished for one it never saw.
 	void Release(uint64_t unit) noexcept {
 		const auto found = m_counts.find(unit);
 		if (found == m_counts.end()) {
@@ -103,6 +106,7 @@ public:
 		}
 		if (--found->second == 0) {
 			m_counts.erase(found);
+			std::atomic_thread_fence(std::memory_order_release);
 			m_table.Clear(unit);
 		}
 	}
@@ -265,6 +269,21 @@ bool IsIdle(const PlanEntry& entry) {
 	       entry.queued == 0;
 }
 
+// The verdict a gate's answer gives its unit. Busy gives none, since the unit's snapshot in hand
+// will decide. The gate answers a retired unit Capped too, and that unit reads Retired, which puts
+// its verdict back after another unit pushed it out. A plan that failed or a Plan refused for good
+// retires a unit without blocking it, so the blocked paths would never put that one back.
+PrescanUnitVerdict VerdictOfGate(Gate gate, bool retired) {
+	switch (gate) {
+		case Gate::Post: return PrescanUnitVerdict::Admitted;
+		case Gate::Capped:
+			return retired ? PrescanUnitVerdict::Retired : PrescanUnitVerdict::Capped;
+		case Gate::Settled: return PrescanUnitVerdict::Settled;
+		case Gate::Busy: break;
+	}
+	return PrescanUnitVerdict::None;
+}
+
 } // namespace
 
 struct PrescanPreparer::Impl {
@@ -278,6 +297,7 @@ struct PrescanPreparer::Impl {
 	void Stop();
 	void OnComplete(StreamCompletion&& completion) noexcept;
 	void Publish();
+	void PublishVerdict(uint64_t unit, PrescanUnitVerdict verdict) noexcept;
 
 	bool DrainNotes();
 	void NoteModule(const ModuleNote& note);
@@ -307,7 +327,7 @@ struct PrescanPreparer::Impl {
 	void DropReady();
 	void PrepareSnapshot(const Snapshot& snapshot);
 	void RequestPlan(PlanEntry& entry, const Snapshot& snapshot, AdmissionGuard& guard);
-	bool CopyCode(PlanEntry& entry, const PrescanItem& item);
+	bool CopyCode(PlanEntry& entry, const PrescanItem& item, uint64_t unit);
 	void Specialize(PlanEntry& entry, const Snapshot& snapshot, AdmissionGuard& guard);
 	bool Materialize(PlanEntry& entry, const PrescanItem& item, PrescanSpec& spec, bool& heap_image);
 	void CountOutcome(Outcome outcome);
@@ -486,11 +506,13 @@ void PrescanPreparer::Impl::TurnOff() {
 // a normal Stop the thread's end has already cleared the pending entries before the transport
 // stops. The clear here is for a preparer whose thread never ran, as when a test drives it with
 // RunOnce. Its entries would otherwise hold up the underrun tag, since the preparer outlives
-// StopPrescan.
+// StopPrescan. The hand-off's stop flag goes first. The thread that sees `stopping` then sees it
+// too, so every in-flight mark the thread clears on its way out comes after the flag, and a GPU
+// thread that finds a unit clear finds the prescan stopped.
 void PrescanPreparer::Impl::Stop() {
 	std::lock_guard lock(stop_mutex);
-	stopping.store(true, std::memory_order_release);
 	handoff.preparer_stopped.store(true, std::memory_order_release);
+	stopping.store(true, std::memory_order_release);
 	WakePreparer(handoff);
 	if (thread.joinable()) {
 		thread.join();
@@ -518,6 +540,16 @@ void PrescanPreparer::Impl::Publish() {
 	copy.state = state.Counters();
 	std::lock_guard lock(published_mutex);
 	published = std::move(copy);
+}
+
+// Records the preparer's latest decision about a unit for the GPU thread, and counts a verdict that
+// pushed another unit's out. It is written whether or not the report is on, like the in-flight
+// table. Some paths write nothing on purpose and leave the unit's previous verdict. A Busy gate
+// means the unit already has a snapshot in hand. A Known outcome adds nothing to what the unit's
+// earlier snapshots decided. A snapshot parked for its plan, or one whose plan came and is queued
+// again, is still Admitted. Snapshots given back by DropReady, Fail or Stop were never decided.
+void PrescanPreparer::Impl::PublishVerdict(uint64_t unit, PrescanUnitVerdict verdict) noexcept {
+	counters.verdicts_evicted += handoff.verdicts.Publish(unit, verdict) ? 1 : 0;
 }
 
 // Takes the GPU thread's reports on the modules it used.
@@ -608,15 +640,19 @@ void PrescanPreparer::Impl::AdmitItem(PrescanItem item) {
 		// Settled makes the scanner send only the probes of this key.
 		counters.backed_off++;
 		handoff.feedback.Publish(item.key_hash, PrescanFeedback::Answer::Settled);
+		PublishVerdict(unit, PrescanUnitVerdict::BackedOff);
 		return;
 	}
 	const auto admission = state.Admit(item, static_state);
+	PublishVerdict(unit, VerdictOfGate(admission.gate, state.Variants().IsRetired(unit)));
 	if (admission.gate != Gate::Post) {
 		return;
 	}
 	AdmissionGuard guard(state, admission);
 	if (blocked_units.contains(unit)) {
+		// Block wrote Retired already. Writing it again puts it back if another unit pushed it out.
 		counters.blocked++;
+		PublishVerdict(unit, PrescanUnitVerdict::Retired);
 		guard.Retire();
 		ReleaseUnit(unit);
 		return;
@@ -701,10 +737,11 @@ void PrescanPreparer::Impl::ReleaseUnit(uint64_t unit) {
 	found->second.code.reset();
 }
 
-// Marks a unit whose Compile was blamed or refused for good, so its later snapshots are retired
-// before they send anything.
+// Marks a unit whose Compile was blamed, had calls or was refused for good, so its later snapshots
+// are retired before they send anything.
 void PrescanPreparer::Impl::Block(uint64_t unit) {
 	blocked_units.insert(unit);
+	PublishVerdict(unit, PrescanUnitVerdict::Retired);
 	ReleaseUnit(unit);
 }
 
@@ -724,7 +761,10 @@ bool PrescanPreparer::Impl::DrainCompletions() {
 // Matches an outcome to its request by tag, since it may have come before Submit returned, counts
 // how it ended and hands it on by kind. The request's work token moves into the local copy, so the
 // request stays counted, and its unit in flight, until its outcome is handled, from the helper's
-// answer to the end of this.
+// answer to the end of this. When the sink throws, the token clears the unit while the error
+// unwinds, before Fail sets the hand-off's stop flag. A GPU thread can then find the unit clear
+// and the prescan still running for the few microseconds between, which is accepted, since it
+// only gives one miss the cause of a running prescan.
 void PrescanPreparer::Impl::HandleCompletion(StreamCompletion&& completion) {
 	const auto found = pending.find(completion.tag);
 	if (found == pending.end()) {
@@ -742,7 +782,9 @@ void PrescanPreparer::Impl::HandleCompletion(StreamCompletion&& completion) {
 }
 
 // Settles a Plan's outcome. The snapshots that waited go on to be prepared, back to the state, or
-// are retired, and a retired program's entry is freed.
+// are retired, and a retired program's entry is freed. A plan that came writes no verdict, since
+// the snapshots it lets on decide. An entry with its Plan out is never idle, so it is never dropped
+// and the early return is not reached.
 void PrescanPreparer::Impl::HandlePlanOutcome(const PendingRequest&   request,
                                               const StreamCompletion& completion) {
 	const auto found = plans.find(request.unit);
@@ -751,6 +793,10 @@ void PrescanPreparer::Impl::HandlePlanOutcome(const PendingRequest&   request,
 	}
 	auto&      entry   = found->second;
 	const auto verdict = JudgePlan(request, completion, entry);
+	if (verdict != PlanVerdict::Ready) {
+		PublishVerdict(request.unit, verdict == PlanVerdict::Retry ? PrescanUnitVerdict::Deferred
+		                                                           : PrescanUnitVerdict::Retired);
+	}
 	entry.plan_state =
 	    verdict == PlanVerdict::Ready ? PlanEntry::Plan::Ready : PlanEntry::Plan::None;
 	FinishWaiting(entry, verdict);
@@ -817,6 +863,7 @@ void PrescanPreparer::Impl::HandleCompileOutcome(const PendingRequest& request,
 		return;
 	}
 	if (completion.outcome == StreamOutcome::Dropped) {
+		PublishVerdict(request.unit, PrescanUnitVerdict::Deferred);
 		ForgetSpec(request);
 		return;
 	}
@@ -829,12 +876,17 @@ void PrescanPreparer::Impl::HandleCompileOutcome(const PendingRequest& request,
 			return;
 		case StreamStatus::Dropped:
 			counters.dropped++;
+			PublishVerdict(request.unit, PrescanUnitVerdict::Deferred);
 			ForgetSpec(request);
 			return;
-		case StreamStatus::Failed: counters.compile_failed++; return;
+		case StreamStatus::Failed:
+			counters.compile_failed++;
+			PublishVerdict(request.unit, PrescanUnitVerdict::CompileFailed);
+			return;
 	}
 	if (response.static_state != request.static_state) {
 		counters.key_mismatch++;
+		PublishVerdict(request.unit, PrescanUnitVerdict::CompileFailed);
 		return;
 	}
 	Adopt(request, std::move(response.payload));
@@ -849,17 +901,20 @@ void PrescanPreparer::Impl::ForgetSpec(const PendingRequest& request) {
 }
 
 // Decodes the record and hands it to the sink with its bytes, which makes its shader module on this
-// thread. The module counts as unused until the GPU thread reports it.
+// thread. The module counts as unused until the GPU thread reports it. The unit reads Built only
+// once the sink took the module, since a sink that throws installed nothing.
 void PrescanPreparer::Impl::Adopt(const PendingRequest& request, std::vector<uint8_t>&& payload) {
 	auto record = DecodeCompiled(payload, request);
 	if (!record) {
 		counters.decode_failed++;
+		PublishVerdict(request.unit, PrescanUnitVerdict::CompileFailed);
 		return;
 	}
 	untaken_by_unit[request.unit]++;
 	unit_of_module[record->id] = request.unit;
 	counters.adopted++;
 	config.sink(std::move(*record), std::move(payload));
+	PublishVerdict(request.unit, PrescanUnitVerdict::Built);
 }
 
 // Prepares the posted snapshots. When one throws, the rest still hold open admissions, so they are
@@ -915,7 +970,9 @@ void PrescanPreparer::Impl::DropReady() {
 
 // Prepares one posted snapshot. A blocked program is retired first, which catches a snapshot that
 // was admitted before the outcome that blocked it was read. Otherwise the snapshot waits for its
-// program's plan, asks for it, or is specialized against it.
+// program's plan, asks for it, or is specialized against it. The snapshot's own queued count keeps
+// its entry from being dropped, so the return for a missing entry is not reached and writes no
+// verdict.
 void PrescanPreparer::Impl::PrepareSnapshot(const Snapshot& snapshot) {
 	AdmissionGuard guard(state, snapshot.admission);
 	const uint64_t unit  = snapshot.admission.unit;
@@ -925,7 +982,9 @@ void PrescanPreparer::Impl::PrepareSnapshot(const Snapshot& snapshot) {
 		found->second.last_used = pass;
 	}
 	if (blocked_units.contains(unit)) {
+		// Block wrote Retired already. Writing it again puts it back if another unit pushed it out.
 		counters.blocked++;
+		PublishVerdict(unit, PrescanUnitVerdict::Retired);
 		guard.Retire();
 		ReleaseUnit(unit);
 		return;
@@ -946,13 +1005,13 @@ void PrescanPreparer::Impl::PrepareSnapshot(const Snapshot& snapshot) {
 
 // Sends the program's Plan, after copying its code the first time. The snapshot waits for the plan
 // only once the send was queued. A refusal for now gives it back to the state through the guard,
-// and a refusal for good retires the program.
+// and a refusal for good retires the program. Send writes the verdict of either refusal.
 void PrescanPreparer::Impl::RequestPlan(PlanEntry& entry, const Snapshot& snapshot,
                                         AdmissionGuard& guard) {
-	if (entry.code == nullptr && !CopyCode(entry, snapshot.item)) {
+	const uint64_t unit = snapshot.admission.unit;
+	if (entry.code == nullptr && !CopyCode(entry, snapshot.item, unit)) {
 		return;
 	}
-	const uint64_t unit = snapshot.admission.unit;
 	const auto status = Send(MakeRequest(entry, snapshot.item, StreamRequestKind::Plan), entry, unit);
 	if (status == StreamSubmitStatus::Queued) {
 		entry.plan_state = PlanEntry::Plan::Requested;
@@ -968,8 +1027,9 @@ void PrescanPreparer::Impl::RequestPlan(PlanEntry& entry, const Snapshot& snapsh
 
 // Copies the program's code through the never-faulting reader, and checks it still hashes as the
 // shader map says, since the game may have put another program at the address since the scan. Code
-// another unit of the same program still holds is shared instead of copied again.
-bool PrescanPreparer::Impl::CopyCode(PlanEntry& entry, const PrescanItem& item) {
+// another unit of the same program still holds is shared instead of copied again. A failure is the
+// verdict of `unit`, the unit the entry belongs to.
+bool PrescanPreparer::Impl::CopyCode(PlanEntry& entry, const PrescanItem& item, uint64_t unit) {
 	if (const auto found = shared_code.find(entry.code_hash); found != shared_code.end()) {
 		if (auto code = found->second.lock(); code != nullptr && code->size() == entry.code_size_bytes) {
 			entry.code = std::move(code);
@@ -980,10 +1040,12 @@ bool PrescanPreparer::Impl::CopyCode(PlanEntry& entry, const PrescanItem& item) 
 	if (config.read_memory == nullptr ||
 	    !config.read_memory(nullptr, item.program_address, std::span<uint32_t>(words))) {
 		counters.code_unreadable++;
+		PublishVerdict(unit, PrescanUnitVerdict::CodeUnreadable);
 		return false;
 	}
 	if (XXH3_64bits(words.data(), entry.code_size_bytes) != entry.code_hash) {
 		counters.code_changed++;
+		PublishVerdict(unit, PrescanUnitVerdict::CodeChanged);
 		return false;
 	}
 	auto bytes = std::make_shared<std::vector<uint8_t>>(entry.code_size_bytes);
@@ -1000,22 +1062,27 @@ bool PrescanPreparer::Impl::CopyCode(PlanEntry& entry, const PrescanItem& item) 
 // the specialization and sends a new one as a Compile. A new one whose module the cache already has
 // is recorded as built, so later snapshots that give it count towards settling, and it is not sent,
 // since the drain would refuse the answer as a duplicate. The admission's outcome is the snapshot
-// either way, so the skip neither leaves the unit in flight nor counts as a refusal.
+// either way, so the skip neither leaves the unit in flight nor counts as a refusal. A Known
+// outcome writes no verdict, since it adds nothing to what the unit's earlier snapshots decided.
 void PrescanPreparer::Impl::Specialize(PlanEntry& entry, const Snapshot& snapshot,
                                        AdmissionGuard& guard) {
+	const uint64_t unit = snapshot.admission.unit;
 	if (snapshot.item.inputs.indirect && ReadsGroupCounts(entry.plan)) {
 		counters.indirect_args_unknown++;
+		PublishVerdict(unit, PrescanUnitVerdict::IndirectArgs);
 		guard.Reject();
 		return;
 	}
 	PrescanSpec spec;
 	bool        heap_image = false;
 	if (!Materialize(entry, snapshot.item, spec, heap_image)) {
+		PublishVerdict(unit, PrescanUnitVerdict::Rejected);
 		guard.Reject();
 		return;
 	}
 	if (const auto invalid = FindInvalidDescriptor(entry.plan, spec)) {
 		counters.invalid[static_cast<size_t>(*invalid)]++;
+		PublishVerdict(unit, PrescanUnitVerdict::Rejected);
 		guard.Reject();
 		return;
 	}
@@ -1027,6 +1094,7 @@ void PrescanPreparer::Impl::Specialize(PlanEntry& entry, const Snapshot& snapsho
 	counters.heap_image_variants += heap_image ? 1 : 0;
 	if (IsKnown(entry, spec)) {
 		counters.known_skipped++;
+		PublishVerdict(unit, PrescanUnitVerdict::Built);
 		return;
 	}
 	SendCompile(entry, snapshot, spec);
@@ -1074,11 +1142,13 @@ void PrescanPreparer::Impl::CountOutcome(Outcome outcome) {
 }
 
 // Sends a new specialization as a Compile. A refusal for good blocks the program, and a refusal for
-// now is forgotten in Send. Code a released unit gave up is copied again first.
+// now is forgotten in Send. Code a released unit gave up is copied again first. That copy is only a
+// guard. Only ReleaseUnit drops an entry's code, and every unit it releases is blocked or retired,
+// so none of its snapshots reaches a Compile, and the copy here never runs today.
 void PrescanPreparer::Impl::SendCompile(PlanEntry& entry, const Snapshot& snapshot,
                                         const PrescanSpec& spec) {
 	const uint64_t unit = snapshot.admission.unit;
-	if (entry.code == nullptr && !CopyCode(entry, snapshot.item)) {
+	if (entry.code == nullptr && !CopyCode(entry, snapshot.item, unit)) {
 		state.Forget(unit, spec);
 		counters.forgotten++;
 		return;
@@ -1107,7 +1177,12 @@ StreamRequest PrescanPreparer::Impl::MakeRequest(const PlanEntry& entry, const P
 // and marks its unit in flight from that moment, for a Plan and a Compile alike, and erasing the
 // entry gives both back. A Compile refused for now is forgotten, so a later snapshot sends it
 // again. A lane that is off turns the prescan off, and the caller still treats that refusal as one
-// for now, so the snapshot in hand is given back.
+// for now, so the snapshot in hand is given back. A refusal's verdict, and the stop flag of a lane
+// that is off, are written before the entry is erased, since erasing it may clear the unit's
+// in-flight mark, and a GPU thread that sees the unit clear must find both. When Submit throws,
+// the entry goes before Fail sets the stop flag, and a GPU thread can find the unit clear and the
+// prescan still running for the few microseconds between. That is accepted, since it only gives
+// one miss the cause of a running prescan.
 StreamSubmitStatus PrescanPreparer::Impl::Send(StreamRequest request, const PlanEntry& entry,
                                                uint64_t unit, const PrescanSpec* spec) {
 	const uint64_t tag  = next_tag++;
@@ -1127,15 +1202,16 @@ StreamSubmitStatus PrescanPreparer::Impl::Send(StreamRequest request, const Plan
 		(kind == StreamRequestKind::Plan ? counters.plan_requests : counters.compile_requests)++;
 		return result.status;
 	}
-	pending.erase(tag);
 	const bool never = result.status == StreamSubmitStatus::NeverRetry;
+	PublishVerdict(unit, never ? PrescanUnitVerdict::Retired : PrescanUnitVerdict::Deferred);
+	if (result.status == StreamSubmitStatus::LaneOff) {
+		TurnOff();
+	}
+	pending.erase(tag);
 	(never ? counters.never_retry : counters.refused_sends)++;
 	if (spec != nullptr && !never) {
 		state.Forget(unit, *spec);
 		counters.forgotten++;
-	}
-	if (result.status == StreamSubmitStatus::LaneOff) {
-		TurnOff();
 	}
 	return result.status;
 }
@@ -1247,6 +1323,7 @@ void CopyOutcomeCounts(const PrescanPreparerCounters&                counters,
 	report.taken_dropped    = counters.taken_dropped;
 	report.plans_dropped    = counters.plans_dropped;
 	report.forgotten        = counters.forgotten;
+	report.verdicts_evicted = counters.verdicts_evicted;
 	report.failed           = counters.failed;
 	report.lane_off         = counters.lane_off;
 }

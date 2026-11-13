@@ -139,6 +139,11 @@ struct PrescanPreparerCounters {
 	/// Specializations forgotten after a send refused for now or a dropped Compile, so they can be
 	/// sent again.
 	uint64_t forgotten = 0;
+	/// Verdicts that pushed another unit's verdict out of its slot in the hand-off's verdict table.
+	/// The GPU thread then reads the pushed-out unit as one the prescan never saw. It counts each
+	/// push, not each unit lost, so two units that keep taking one slot from each other count every
+	/// time.
+	uint64_t verdicts_evicted = 0;
 	/// Whether the preparer stopped on an error.
 	bool failed = false;
 	/// Whether the helper's lane turned off for the session, which turned the prescan off with it.

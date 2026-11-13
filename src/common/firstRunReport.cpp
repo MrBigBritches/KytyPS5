@@ -1454,6 +1454,7 @@ nlohmann::json PrescanPreparerToJson(const PrescanPreparerReport& preparer) {
 	                            {"taken_dropped", preparer.taken_dropped},
 	                            {"plans_dropped", preparer.plans_dropped},
 	                            {"forgotten", preparer.forgotten},
+	                            {"verdicts_evicted", preparer.verdicts_evicted},
 	                            {"failed", preparer.failed},
 	                            {"lane_off", preparer.lane_off}});
 	return json;

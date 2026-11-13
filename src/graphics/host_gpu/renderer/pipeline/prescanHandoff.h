@@ -164,7 +164,11 @@ public:
 	/// preparer may call it.
 	void Mark(uint64_t unit) noexcept { m_slots.Publish(unit, PrescanFeedback::Answer::Busy); }
 	/// Clears `unit`, and leaves a different unit that took its slot alone. Only the preparer may
-	/// call it.
+	/// call it. The preparer's InFlightUnits::Release puts a release fence before it, which also
+	/// publishes the verdicts the unit's outcomes wrote, so a reader that sees the unit clear and
+	/// then fences with acquire finds them. That fence must stay. A unit that drops out because
+	/// another unit's Mark replaced it is not ordered that way, and a reader may then see an older
+	/// verdict, which only costs one miss its cause.
 	void Clear(uint64_t unit) noexcept { m_slots.Publish(unit, PrescanFeedback::Answer::None); }
 	/// Whether `unit` is marked. It never waits, so the GPU thread may ask while it is stopped.
 	[[nodiscard]] bool Contains(uint64_t unit) const noexcept {
@@ -175,6 +179,143 @@ private:
 	// Its own instance, since the scanner reads the answer table by dispatch key and a unit marked
 	// there would read as an answer to a dispatch.
 	PrescanFeedback m_slots;
+};
+
+/// What the preparer last decided about a program unit, for the GPU thread to read when it has to
+/// compile a compute module itself. It is per unit, not per specialization, so it may describe
+/// another specialization of the unit than the one the GPU thread is building.
+enum class PrescanUnitVerdict : uint8_t {
+	/// No verdict, because the preparer never decided anything about the unit or another unit that
+	/// shares its slot replaced it. It is never written.
+	None = 0,
+	/// The gate posted a snapshot of the unit and nothing was decided about it since.
+	Admitted,
+	/// A request was refused for now, including by a helper whose lane turned off, or the helper
+	/// dropped it, so a later dispatch of the unit may be sent again.
+	Deferred,
+	/// A module of the unit reached the cache, or the cache already had it.
+	Built,
+	/// A snapshot's walk faulted or failed, or gave a descriptor the helper would crash on.
+	Rejected,
+	/// An indirect dispatch whose plan reads the group counts, which the scan cannot know.
+	IndirectArgs,
+	/// The unit can never be prepared. Its plan failed, was blamed or echoed another static key, it
+	/// has calls, or a request was refused for good.
+	Retired,
+	/// The helper failed the Compile, or its answer had another static key or did not decode.
+	CompileFailed,
+	/// The unit reached its variant cap.
+	Capped,
+	/// The unit gave nothing new for so long that only its probes are posted.
+	Settled,
+	/// The unit's modules went unused, so only its probes are prepared.
+	BackedOff,
+	/// The program's code could not be read.
+	CodeUnreadable,
+	/// The program's code no longer hashed as the shader map says. Keep it last, or move
+	/// PRESCAN_UNIT_VERDICT_LAST to whatever is added after it.
+	CodeChanged,
+};
+/// The highest verdict, which the table's slot must have room for.
+inline constexpr PrescanUnitVerdict PRESCAN_UNIT_VERDICT_LAST = PrescanUnitVerdict::CodeChanged;
+
+/// Whether a verdict only throttles the unit, which says less than a refusal does.
+[[nodiscard]] constexpr bool IsThrottleVerdict(PrescanUnitVerdict verdict) noexcept {
+	return verdict == PrescanUnitVerdict::Capped || verdict == PrescanUnitVerdict::Settled ||
+	       verdict == PrescanUnitVerdict::BackedOff;
+}
+
+/// Whether `next` replaces `current` as a unit's verdict. None is never written. Admitted only
+/// goes over None, so a second post of a built unit still reads Built. Retired is final. A throttle
+/// only goes over None, Admitted, Deferred or Built, so it never hides why the unit was refused.
+/// Anything else replaces, since the verdict is the preparer's latest decision.
+[[nodiscard]] constexpr bool VerdictReplaces(PrescanUnitVerdict current,
+                                             PrescanUnitVerdict next) noexcept {
+	if (next == PrescanUnitVerdict::None || current == PrescanUnitVerdict::Retired) {
+		return false;
+	}
+	if (next == PrescanUnitVerdict::Admitted) {
+		return current == PrescanUnitVerdict::None;
+	}
+	if (IsThrottleVerdict(next)) {
+		return current == PrescanUnitVerdict::None || current == PrescanUnitVerdict::Admitted ||
+		       current == PrescanUnitVerdict::Deferred || current == PrescanUnitVerdict::Built;
+	}
+	return true;
+}
+
+/// Whether a verdict may push another unit's verdict out of a shared slot. A post or a throttle
+/// says too little about its unit to cost another unit what the table knows about it.
+[[nodiscard]] constexpr bool VerdictMayEvict(PrescanUnitVerdict verdict) noexcept {
+	return verdict != PrescanUnitVerdict::Admitted && !IsThrottleVerdict(verdict);
+}
+
+/// The preparer's latest verdict on each program unit, so the GPU thread can tell, without waiting
+/// or locking, whether the prescan ever saw a unit it has to compile itself, and what became of it.
+/// Only the preparer writes it and any thread may read it. Its slots map units as the in-flight
+/// table's do. Like that table, most verdicts written into a slot another unit holds replace the
+/// one there, which can only make a reader take the replaced unit for one the prescan never saw.
+/// Admitted and the throttles are the exception. They only take an empty slot or their unit's own.
+class PrescanUnitVerdicts {
+public:
+	/// Records `verdict` for `unit` when VerdictReplaces lets it replace the unit's own. Unit 0
+	/// means no unit and is ignored, as is None. A verdict that VerdictMayEvict refuses is only
+	/// written into an empty slot or one the unit already holds, so it never pushes out what
+	/// another unit's verdict says. Only the preparer may call it.
+	/// @return whether another unit's verdict was pushed out of the slot.
+	bool Publish(uint64_t unit, PrescanUnitVerdict verdict) noexcept {
+		if (unit == 0 || verdict == PrescanUnitVerdict::None) {
+			return false;
+		}
+		auto& slot = m_slots[unit & SLOT_MASK];
+		// The preparer is the one writer, so nothing can change the slot between the load and the
+		// store. Relaxed is enough for the word, which carries the unit and its code together. The
+		// preparer orders a verdict before the in-flight mark it then clears with a release fence.
+		const uint64_t word    = slot.load(std::memory_order_relaxed);
+		const bool     owned   = Matches(word, unit);
+		const bool     evicts  = word != 0 && !owned;
+		const auto     current = owned ? CodeOf(word) : PrescanUnitVerdict::None;
+		if ((evicts && !VerdictMayEvict(verdict)) || !VerdictReplaces(current, verdict)) {
+			return false;
+		}
+		slot.store((unit & ~CODE_MASK) | static_cast<uint64_t>(verdict), std::memory_order_relaxed);
+		return evicts;
+	}
+
+	/// The verdict last recorded for `unit`, or None when its slot holds no verdict of it. Any
+	/// thread may call it, and it never waits.
+	[[nodiscard]] PrescanUnitVerdict Read(uint64_t unit) const noexcept {
+		if (unit == 0) {
+			return PrescanUnitVerdict::None;
+		}
+		const uint64_t word = m_slots[unit & SLOT_MASK].load(std::memory_order_relaxed);
+		return Matches(word, unit) ? CodeOf(word) : PrescanUnitVerdict::None;
+	}
+
+private:
+	// The code sits in the unit's four lowest bits. Units that share a slot already agree on every
+	// bit the slot index uses, which includes those four, so dropping them never makes two units
+	// look alike.
+	static constexpr uint64_t CODE_MASK = 0xF;
+	static constexpr uint64_t SLOT_MASK = PRESCAN_FEEDBACK_SLOTS - 1;
+	static_assert(std::has_single_bit(PRESCAN_FEEDBACK_SLOTS) && SLOT_MASK >= CODE_MASK,
+	              "the slot index must cover the bits the code replaces");
+	static_assert(static_cast<uint64_t>(PRESCAN_UNIT_VERDICT_LAST) <= CODE_MASK,
+	              "every verdict must fit in the code bits");
+	// A slot that took a lock would let the preparer hold the GPU thread up at a miss.
+	static_assert(std::atomic<uint64_t>::is_always_lock_free,
+	              "the verdict table must be lock-free");
+
+	// Whether a slot's word belongs to `unit`.
+	static constexpr bool Matches(uint64_t word, uint64_t unit) noexcept {
+		return (word & ~CODE_MASK) == (unit & ~CODE_MASK);
+	}
+	// The verdict a slot's word holds.
+	static constexpr PrescanUnitVerdict CodeOf(uint64_t word) noexcept {
+		return static_cast<PrescanUnitVerdict>(word & CODE_MASK);
+	}
+
+	std::array<std::atomic<uint64_t>, PRESCAN_FEEDBACK_SLOTS> m_slots {};
 };
 
 /// Everything the scanner thread and the preparer thread share. The scanner is the ring's one
@@ -195,6 +336,10 @@ struct PrescanHandoff {
 	/// the helper's lane turned off, the preparer failed or it was stopped. Nothing drains the ring
 	/// after that, so the scanner reads it with acquire once per submission and skips the walk.
 	std::atomic<bool> preparer_stopped {false};
+	/// The preparer's latest verdict on each unit. The preparer writes it whether or not the report
+	/// is on, and the GPU thread reads it when it compiles a compute module itself. It starts on a
+	/// cache line of its own, so the GPU thread's reads never share one with the wake word.
+	alignas(Common::SPSC_FALSE_SHARING_BYTES) PrescanUnitVerdicts verdicts;
 
 	/// Claims the ring's one producer slot for a scanner. The ring has one producer, so only the first
 	/// caller gets it, and it is never given back, so a later GuestGpu on the same cache attaches no

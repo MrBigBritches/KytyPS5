@@ -305,6 +305,9 @@ struct Script {
 	// When set, an answered Plan carries these plan bytes in place of the translated program's,
 	// so a test can give the preparer a plan no test program translates to.
 	std::optional<std::vector<uint8_t>> plan_payload;
+	// When set, a scripted Compile that is answered carries these bytes in place of its record, so
+	// a test can give the preparer a record that does not decode.
+	std::optional<std::vector<uint8_t>> compile_payload;
 	// The first plans_held Plans are queued and left unanswered, whatever plan_submit says, and Stop
 	// completes them as Dropped, as the supervisor does with what it still holds.
 	uint32_t plans_held = 0;
@@ -395,6 +398,9 @@ private:
 		}
 		if (plan && m_script.plan_payload) {
 			response.payload = *m_script.plan_payload;
+		}
+		if (!plan && scripted && m_script.compile_payload) {
+			response.payload = *m_script.compile_payload;
 		}
 	}
 
@@ -841,11 +847,17 @@ void TestStoppedTakesNoReports() {
 	std::puts("StoppedTakesNoReports ok");
 }
 
+// The unit the preparer keys an item's requests by. Defined with the in-flight tests.
+uint64_t UnitOf(const Program& program, const PrescanItem& item);
+
 // What one scripted case of a test ended with.
 struct CaseResult {
 	Script                  script;
 	PrescanPreparerCounters counters;
 	size_t                  adopted = 0;
+	// The verdict and the in-flight mark of the last item's unit, read before the preparer stops.
+	PrescanUnitVerdict verdict   = PrescanUnitVerdict::None;
+	bool               in_flight = false;
 };
 
 // Runs the script over the given items, one drive each, and keeps what it ended with.
@@ -857,7 +869,9 @@ CaseResult RunScripted(Script script, const Program& program,
 		harness.Push(item);
 		harness.Drive();
 	}
-	return {script, harness.Counters(), harness.adopted.size()};
+	const uint64_t unit = items.empty() ? 0 : UnitOf(program, items.back());
+	return {script, harness.Counters(), harness.adopted.size(),
+	        harness.handoff->verdicts.Read(unit), harness.handoff->in_flight.Contains(unit)};
 }
 
 // A blamed Plan retires the program, so a second dispatch of it sends nothing, and nothing is
@@ -1515,6 +1529,778 @@ void TestInFlightMarkedWhileSent() {
 	std::puts("InFlightMarkedWhileSent ok");
 }
 
+// ---- The verdicts the GPU thread reads at a miss. ----
+
+using Verdict = PrescanUnitVerdict;
+
+// How many verdicts there are, None included.
+constexpr size_t VERDICT_COUNT = static_cast<size_t>(PRESCAN_UNIT_VERDICT_LAST) + 1;
+// Whether each verdict replaces another as a unit's own, written out by hand from the rules so the
+// check does not restate VerdictReplaces. The row is the current verdict and the column the next,
+// both in the enum's order, which is None, Admitted, Deferred, Built, Rejected, IndirectArgs,
+// Retired, CompileFailed, Capped, Settled, BackedOff, CodeUnreadable and CodeChanged.
+constexpr std::array<std::string_view, VERDICT_COUNT> VERDICT_REPLACES {
+    "0111111111111", // None
+    "0011111111111", // Admitted
+    "0011111111111", // Deferred
+    "0011111111111", // Built
+    "0011111100011", // Rejected
+    "0011111100011", // IndirectArgs
+    "0000000000000", // Retired
+    "0011111100011", // CompileFailed
+    "0011111100011", // Capped
+    "0011111100011", // Settled
+    "0011111100011", // BackedOff
+    "0011111100011", // CodeUnreadable
+    "0011111100011", // CodeChanged
+};
+// What FirstReplaceMismatch gives when the rule and the table agree on every pair.
+constexpr size_t NO_REPLACE_MISMATCH = VERDICT_COUNT * VERDICT_COUNT;
+
+// The first pair the rule and the table disagree on, as the row times VERDICT_COUNT plus the
+// column. A row of the wrong length disagrees at its start, so a verdict added without its row and
+// column fails too.
+constexpr size_t FirstReplaceMismatch() {
+	for (size_t current = 0; current < VERDICT_COUNT; ++current) {
+		if (VERDICT_REPLACES[current].size() != VERDICT_COUNT) {
+			return current * VERDICT_COUNT;
+		}
+		for (size_t next = 0; next < VERDICT_COUNT; ++next) {
+			const bool expected = VERDICT_REPLACES[current][next] == '1';
+			const bool actual =
+			    VerdictReplaces(static_cast<Verdict>(current), static_cast<Verdict>(next));
+			if (actual != expected) {
+				return current * VERDICT_COUNT + next;
+			}
+		}
+	}
+	return NO_REPLACE_MISMATCH;
+}
+
+// Every pair of verdicts follows the replace rules, which the compiler checks against the table
+// above, so a changed rule fails the build. A rule that agreed with the table by chance on the
+// pairs a few runtime cases reach is ruled out, since every pair is checked. The mutations are to
+// let Settled replace Rejected and to let Admitted replace Built, and either fails the build.
+void TestVerdictReplaceRules() {
+	static_assert(FirstReplaceMismatch() == NO_REPLACE_MISMATCH,
+	              "VerdictReplaces disagrees with VERDICT_REPLACES");
+	std::puts("VerdictReplaceRules ok");
+}
+
+// Units for the table's own test. Their low bits are not 0, so a match that kept the code bits
+// would miss them. The sharer is in the first one's slot, the other one in another slot, and the
+// zero-slot unit in slot 0, where key 0 would land.
+constexpr uint64_t VERDICT_UNIT       = 0x0123456789ABC005ull;
+constexpr uint64_t VERDICT_SHARER     = VERDICT_UNIT + PRESCAN_FEEDBACK_SLOTS;
+constexpr uint64_t VERDICT_OTHER_SLOT = VERDICT_UNIT + PRESCAN_FEEDBACK_SLOTS / 2;
+constexpr uint64_t VERDICT_ZERO_SLOT  = 0x0FEDCBA987654000ull;
+
+// The table alone. A verdict reads back for its unit, and one in another slot, the baseline of an
+// eviction, leaves it alone. A post of a unit sharing the slot pushes nothing out, while any other
+// verdict of it replaces the first unit's and reports that. Rewriting a unit's own verdict is not
+// an eviction. None is never written, Retired stays, and key 0 is ignored, so it never takes slot
+// 0 from the unit there. A table that ignored every write, or matched with the code bits kept,
+// fails the first read-back. The mutations are Matches without the mask, Publish without the
+// VerdictReplaces call, an Admitted that evicts, and Publish without the check for key 0.
+void TestUnitVerdictTable() {
+	const auto table = std::make_unique<PrescanUnitVerdicts>();
+	CHECK(table->Read(VERDICT_UNIT) == Verdict::None);
+	CHECK(!table->Publish(VERDICT_UNIT, Verdict::Built) &&
+	      table->Read(VERDICT_UNIT) == Verdict::Built);
+	CHECK(!table->Publish(VERDICT_OTHER_SLOT, Verdict::Rejected));
+	CHECK(table->Read(VERDICT_UNIT) == Verdict::Built &&
+	      table->Read(VERDICT_OTHER_SLOT) == Verdict::Rejected);
+	CHECK(!table->Publish(VERDICT_SHARER, Verdict::Admitted));
+	CHECK(table->Read(VERDICT_UNIT) == Verdict::Built &&
+	      table->Read(VERDICT_SHARER) == Verdict::None);
+	CHECK(table->Publish(VERDICT_SHARER, Verdict::Deferred));
+	CHECK(table->Read(VERDICT_UNIT) == Verdict::None &&
+	      table->Read(VERDICT_SHARER) == Verdict::Deferred);
+	CHECK(!table->Publish(VERDICT_SHARER, Verdict::Built) &&
+	      table->Read(VERDICT_SHARER) == Verdict::Built);
+	CHECK(!table->Publish(VERDICT_SHARER, Verdict::None) &&
+	      table->Read(VERDICT_SHARER) == Verdict::Built);
+	CHECK(!table->Publish(VERDICT_OTHER_SLOT, Verdict::Retired));
+	CHECK(!table->Publish(VERDICT_OTHER_SLOT, Verdict::Built) &&
+	      table->Read(VERDICT_OTHER_SLOT) == Verdict::Retired);
+	CHECK(!table->Publish(VERDICT_ZERO_SLOT, Verdict::Built));
+	CHECK(!table->Publish(0, Verdict::Rejected));
+	CHECK(table->Read(0) == Verdict::None && table->Read(VERDICT_ZERO_SLOT) == Verdict::Built);
+	std::puts("UnitVerdictTable ok");
+}
+
+// One scripted case of TestVerdictFollowsOutcome. Its name says whether it scripts the Plan or the
+// Compile, and `path` is the counter that shows the case took its own branch.
+struct VerdictRow {
+	const char*                         name;
+	Script                              script;
+	Verdict                             verdict;
+	uint64_t PrescanPreparerCounters::* path;
+};
+
+// The plain run, which is every row's baseline, and every Plan outcome and Plan refusal.
+std::vector<VerdictRow> PlanVerdictRows() {
+	using C = PrescanPreparerCounters;
+	return {
+	    {"baseline built", Script {}, Verdict::Built, &C::adopted},
+	    {"Plan blamed", {.plan_outcome = StreamOutcome::Blamed}, Verdict::Retired, &C::blamed},
+	    {"Plan dropped outcome", {.plan_outcome = StreamOutcome::Dropped}, Verdict::Deferred,
+	     &C::dropped},
+	    {"Plan dropped status", {.plan_status = StreamStatus::Dropped}, Verdict::Deferred,
+	     &C::dropped},
+	    {"Plan has calls", {.plan_status = StreamStatus::HasCalls}, Verdict::Retired,
+	     &C::has_calls},
+	    {"Plan failed", {.plan_status = StreamStatus::Failed}, Verdict::Retired, &C::plan_failed},
+	    {"Plan key mismatch", {.corrupt_plan_key = true}, Verdict::Retired, &C::key_mismatch},
+	    {"Plan never retry", {.plan_submit = StreamSubmitStatus::NeverRetry}, Verdict::Retired,
+	     &C::never_retry},
+	    {"Plan queue full", {.plan_submit = StreamSubmitStatus::QueueFull}, Verdict::Deferred,
+	     &C::refused_sends},
+	    {"Plan lane off", {.plan_submit = StreamSubmitStatus::LaneOff}, Verdict::Deferred,
+	     &C::refused_sends},
+	};
+}
+
+// Every Compile outcome and Compile refusal. An empty record is one that does not decode.
+std::vector<VerdictRow> CompileVerdictRows() {
+	using C = PrescanPreparerCounters;
+	return {
+	    {"Compile blamed", {.compile_outcome = StreamOutcome::Blamed}, Verdict::Retired,
+	     &C::blamed},
+	    {"Compile dropped outcome", {.compile_outcome = StreamOutcome::Dropped}, Verdict::Deferred,
+	     &C::dropped},
+	    {"Compile dropped status", {.compile_status = StreamStatus::Dropped}, Verdict::Deferred,
+	     &C::dropped},
+	    {"Compile has calls", {.compile_status = StreamStatus::HasCalls}, Verdict::Retired,
+	     &C::has_calls},
+	    {"Compile failed", {.compile_status = StreamStatus::Failed}, Verdict::CompileFailed,
+	     &C::compile_failed},
+	    {"Compile key mismatch", {.corrupt_compile_key = true}, Verdict::CompileFailed,
+	     &C::key_mismatch},
+	    {"Compile decode failed", {.compile_payload = std::vector<uint8_t> {}},
+	     Verdict::CompileFailed, &C::decode_failed},
+	    {"Compile never retry", {.compile_submit = StreamSubmitStatus::NeverRetry},
+	     Verdict::Retired, &C::never_retry},
+	    {"Compile queue full", {.compile_submit = StreamSubmitStatus::QueueFull}, Verdict::Deferred,
+	     &C::refused_sends},
+	    {"Compile lane off", {.compile_submit = StreamSubmitStatus::LaneOff}, Verdict::Deferred,
+	     &C::refused_sends},
+	};
+}
+
+// Runs each row over one dispatch, and checks the verdict its unit ends with and that the row took
+// its own branch, which its counter shows once. Every row's outcome was handled, so its unit must
+// no longer be in flight.
+void CheckVerdictRows(const std::vector<VerdictRow>& rows, const Program& program,
+                      const PrescanItem& item) {
+	for (const auto& row: rows) {
+		const auto result = RunScripted(row.script, program, {item});
+		const bool ok =
+		    result.verdict == row.verdict && result.counters.*row.path == 1 && !result.in_flight;
+		if (!ok) {
+			std::fprintf(stderr, "verdict row '%s' read %u\n", row.name,
+			             static_cast<unsigned>(result.verdict));
+		}
+		CHECK(ok);
+	}
+}
+
+// A Plan the helper still holds leaves its unit Admitted and in flight, against the baseline row,
+// which is Built and clear. A second post of a built unit gives a Known snapshot, which writes no
+// verdict, so the unit stays Built. Both dispatches must be posted, or a second one answered Busy
+// would keep Built for another reason. The mutations are to drop the write at the gate's post,
+// which leaves the held unit None, and to let Admitted replace Built, which leaves the twice-posted
+// unit Admitted.
+void CheckAdmittedVerdicts(const Program& program, const PrescanItem& item) {
+	const auto held = RunScripted({.plans_held = 1}, program, {item});
+	CHECK(held.script.plan_attempts == 1 && held.in_flight && held.verdict == Verdict::Admitted);
+	const auto twice = RunScripted({}, program, {item, item});
+	CHECK(twice.counters.state.posted == 2 && twice.counters.known_variants == 1);
+	CHECK(twice.adopted == 1 && twice.verdict == Verdict::Built);
+}
+
+// Each Plan and Compile outcome and refusal leaves the verdict its rule names. Every row differs
+// from the baseline row, a plain built run, only in its script. A verdict can come from more than
+// one branch, so each row also checks its branch's counter. Dropping a row's write leaves it
+// Admitted, except for the Compile never-retry row, which Send and Block both write Retired. That
+// row survives either write alone, and each of those writes is caught by other rows, Send's by the
+// Plan never-retry row and Block's by the Compile blamed and has-calls rows. The mutations are to
+// drop each write in the Plan and Compile outcomes, in Block, in Adopt and in Send.
+void TestVerdictFollowsOutcome() {
+	const auto program = DirectProgram(MUBUF_STORE_DWORD);
+	const auto item    = ItemFor(program, Descriptor(STRIDE_A, DstSel(4, 5, 6, 7)), KEY);
+	CheckVerdictRows(PlanVerdictRows(), program, item);
+	CheckVerdictRows(CompileVerdictRows(), program, item);
+	CheckAdmittedVerdicts(program, item);
+	std::puts("VerdictFollowsOutcome ok");
+}
+
+// A new variant whose module the cache already has reads Built with no Compile sent. Built also
+// comes from an adopted module, so the transport holds Compiles. The baseline seeds the key of the
+// program's other variant, which differs only in the key, sends its Compile and stays Admitted
+// while it is held. The mutation is to drop the write at the known skip, and the seeded run reads
+// Admitted.
+void TestVerdictBuiltWhenKnown() {
+	const auto program = DirectProgram(MUBUF_STORE_DWORD);
+	const auto built   = RecordSkipKey(BuiltRecord(program, STRIDE_A));
+	const auto other   = RecordSkipKey(BuiltRecord(program, STRIDE_B));
+	const auto item    = ItemFor(program, Descriptor(STRIDE_A, DstSel(4, 5, 6, 7)), KEY);
+	for (const uint64_t seed: {other, built}) {
+		const bool known = seed == built;
+		Script     script {.compiles_held = 1};
+		Harness    harness(ScriptedFactory(script), {}, {}, std::vector<uint64_t> {seed});
+		harness.Map(program);
+		harness.Push(item);
+		harness.Drive();
+		CHECK(script.compile_attempts == (known ? 0u : 1u));
+		CHECK(harness.Counters().known_skipped == (known ? 1u : 0u));
+		CHECK(harness.handoff->verdicts.Read(UnitOf(program, item)) ==
+		      (known ? Verdict::Built : Verdict::Admitted));
+	}
+	std::puts("VerdictBuiltWhenKnown ok");
+}
+
+// A reader that never reads, as one would for a program whose code is not mapped.
+bool ReadNothing(void* /*userdata*/, uint64_t /*address*/, std::span<uint32_t> /*values*/) {
+	return false;
+}
+
+// A formatted buffer with a reserved destination select reads Rejected, and its twin with a valid
+// select, the only difference, stays Admitted while its Compile is held. The refusal's counter must
+// show, so a Rejected from the walk would not pass. The mutation is to drop the write after the
+// descriptor check, and the reserved run reads Admitted.
+void CheckInvalidDescriptorVerdict() {
+	const auto program = DirectProgram(MUBUF_STORE_FORMAT_X);
+	for (const bool reserved: {false, true}) {
+		Harness harness;
+		harness.Map(program);
+		harness.transport->SetHoldCompiles(true);
+		const auto select = reserved ? DstSel(2, 5, 6, 7) : DstSel(4, 5, 6, 7);
+		const auto item   = ItemFor(program, Descriptor(STRIDE_A, select), KEY);
+		harness.Push(item);
+		harness.Drive();
+		const auto counters = harness.Counters();
+		CHECK(counters.invalid[static_cast<size_t>(DescriptorInvalid::ReservedDstSel)] ==
+		      (reserved ? 1u : 0u));
+		CHECK(harness.handoff->verdicts.Read(UnitOf(program, item)) ==
+		      (reserved ? Verdict::Rejected : Verdict::Admitted));
+	}
+}
+
+// A walk that faults on a guarded page reads Rejected, and the same page left readable, the only
+// difference, stays Admitted while its Compile is held. The fault's counter must show, so a
+// Rejected from the descriptor check would not pass. The mutation is to drop the write after the
+// walk, and the guarded run reads Admitted.
+void CheckSrtFaultVerdict() {
+	const FakeGuestMemory memory;
+	const auto            program = SrtProgram();
+	for (const bool guarded: {false, true}) {
+		ProtectedPage page;
+		const auto    descriptor = Descriptor(STRIDE_A, DstSel(4, 5, 6, 7));
+		std::copy(descriptor.begin(), descriptor.end(), page.Words());
+		const uint64_t                            address = page.Address();
+		const std::array<uint32_t, POINTER_SGPRS> pointer {static_cast<uint32_t>(address),
+		                                                   static_cast<uint32_t>(address >> 32u)};
+		Harness harness;
+		harness.Map(program);
+		harness.transport->SetHoldCompiles(true);
+		if (guarded) {
+			page.Guard();
+		}
+		const auto item = ItemFor(program, pointer, KEY);
+		harness.Push(item);
+		harness.Drive();
+		CHECK(harness.Counters().srt_faults == (guarded ? 1u : 0u));
+		CHECK(harness.handoff->verdicts.Read(UnitOf(program, item)) ==
+		      (guarded ? Verdict::Rejected : Verdict::Admitted));
+	}
+}
+
+// A reader that cannot read the program's code reads CodeUnreadable, and code that changed after
+// it was mapped reads CodeChanged. Each baseline is the same run with the code read as mapped,
+// which is built. The changed code is the program with one bit flipped after its hash was taken,
+// and the unit is the one of the mapped code. The mutations are to drop either write in CopyCode,
+// and its run still reads the post's Admitted.
+void CheckCodeVerdicts() {
+	constexpr uint32_t CHANGED_BIT = 1;
+	for (const bool unreadable: {false, true}) {
+		const auto program = DirectProgram(MUBUF_STORE_DWORD);
+		Harness    harness({}, {}, {}, {}, unreadable ? ReadNothing : ReadHost);
+		harness.Map(program);
+		const auto item = ItemFor(program, Descriptor(STRIDE_A, DstSel(4, 5, 6, 7)), KEY);
+		harness.Push(item);
+		harness.Drive();
+		CHECK(harness.Counters().code_unreadable == (unreadable ? 1u : 0u));
+		CHECK(harness.handoff->verdicts.Read(UnitOf(program, item)) ==
+		      (unreadable ? Verdict::CodeUnreadable : Verdict::Built));
+	}
+	for (const bool changed: {false, true}) {
+		auto    program = DirectProgram(MUBUF_STORE_DWORD);
+		Harness harness;
+		harness.Map(program);
+		const auto item = ItemFor(program, Descriptor(STRIDE_A, DstSel(4, 5, 6, 7)), KEY);
+		const auto unit = UnitOf(program, item);
+		if (changed) {
+			program.code[0] ^= CHANGED_BIT;
+		}
+		harness.Push(item);
+		harness.Drive();
+		CHECK(harness.Counters().code_changed == (changed ? 1u : 0u));
+		CHECK(harness.handoff->verdicts.Read(unit) ==
+		      (changed ? Verdict::CodeChanged : Verdict::Built));
+	}
+}
+
+// The snapshots the preparer refuses before it sends a Compile, and the programs whose code it
+// cannot copy, each read their own verdict.
+void TestVerdictRejectedSnapshots() {
+	CheckInvalidDescriptorVerdict();
+	CheckSrtFaultVerdict();
+	CheckCodeVerdicts();
+	std::puts("VerdictRejectedSnapshots ok");
+}
+
+// A stride of its own for each of a unit's variants, so each specializes apart.
+uint32_t NthStride(uint32_t index) {
+	return STRIDE_A << index;
+}
+
+// After PRESCAN_UNTAKEN_LIMIT modules built and none taken, the next dispatch reads BackedOff. The
+// baseline reports one module taken, the only difference, and its next dispatch is built. The
+// mutation is to drop the write at the back-off, and that dispatch's unit stays Built.
+void CheckBackedOffVerdict(const Program& program) {
+	for (const bool one_taken: {true, false}) {
+		Harness harness;
+		harness.Map(program);
+		for (uint32_t index = 0; index < PRESCAN_UNTAKEN_LIMIT; ++index) {
+			harness.Push(ItemFor(program, Descriptor(NthStride(index), DstSel(4, 5, 6, 7)), KEY));
+			harness.Drive();
+		}
+		CHECK(harness.adopted.size() == PRESCAN_UNTAKEN_LIMIT);
+		if (one_taken) {
+			harness.preparer->NoteTaken(harness.adopted[0].id);
+		}
+		const auto next_stride = NthStride(PRESCAN_UNTAKEN_LIMIT);
+		const auto next = ItemFor(program, Descriptor(next_stride, DstSel(4, 5, 6, 7)), OTHER_KEY);
+		harness.Push(next);
+		harness.Drive();
+		CHECK(harness.Counters().backed_off == (one_taken ? 0u : 1u));
+		CHECK(harness.handoff->verdicts.Read(UnitOf(program, next)) ==
+		      (one_taken ? Verdict::Built : Verdict::BackedOff));
+	}
+}
+
+// Dispatches one item `to_settle` times, which leaves its unit at PRESCAN_STALE_LIMIT snapshots
+// that gave nothing new, and once more when `settle` is set, which the gate answers Settled.
+// Returns the unit's verdict, after checking whether the gate settled.
+Verdict SettledRunVerdict(const Program& program, const PrescanItem& item, uint32_t to_settle,
+                          bool settle) {
+	Harness harness;
+	harness.Map(program);
+	for (uint32_t index = 0; index < to_settle + (settle ? 1u : 0u); ++index) {
+		harness.Push(item);
+		harness.Drive();
+	}
+	CHECK(harness.Counters().state.settled == (settle ? 1u : 0u));
+	return harness.handoff->verdicts.Read(UnitOf(program, item));
+}
+
+// A settled gate reads Settled over Built, and never over Rejected. A built unit settles after one
+// new snapshot and PRESCAN_STALE_LIMIT known ones. A unit whose every snapshot is refused for a
+// reserved destination select settles after PRESCAN_STALE_LIMIT refusals. Each baseline is the
+// same run one dispatch short of the gate, which reads Built or Rejected. The settled runs must
+// reach the gate, so a Rejected that stayed because the gate never answered would not pass. The
+// mutations are to drop the write at the settled gate, and the built unit stays Built, and to let
+// Settled replace Rejected, and the refused unit reads Settled.
+void CheckSettledVerdicts() {
+	const auto built   = DirectProgram(MUBUF_STORE_DWORD);
+	const auto refused = DirectProgram(MUBUF_STORE_FORMAT_X);
+	const auto built_item   = ItemFor(built, Descriptor(STRIDE_A, DstSel(4, 5, 6, 7)), KEY);
+	const auto refused_item = ItemFor(refused, Descriptor(STRIDE_A, DstSel(2, 5, 6, 7)), KEY);
+	for (const bool settle: {false, true}) {
+		CHECK(SettledRunVerdict(built, built_item, 1 + PRESCAN_STALE_LIMIT, settle) ==
+		      (settle ? Verdict::Settled : Verdict::Built));
+		CHECK(SettledRunVerdict(refused, refused_item, PRESCAN_STALE_LIMIT, settle) ==
+		      Verdict::Rejected);
+	}
+}
+
+// A unit at its variant cap reads Capped at its next dispatch. The Compiles are held, so no module
+// is adopted and the back-off never answers first, and the unit stays Admitted up to the cap, which
+// is the baseline. The mutation is to drop the write at the capped gate, and the unit stays
+// Admitted.
+void CheckCappedVerdict(const Program& program) {
+	for (const bool capped: {false, true}) {
+		Script  script {.compiles_held = PRESCAN_VARIANT_CAP};
+		Harness harness(ScriptedFactory(script));
+		harness.Map(program);
+		PrescanItem item;
+		for (uint32_t index = 0; index < PRESCAN_VARIANT_CAP + (capped ? 1u : 0u); ++index) {
+			item = ItemFor(program, Descriptor(NthStride(index), DstSel(4, 5, 6, 7)), KEY);
+			harness.Push(item);
+			harness.Drive();
+		}
+		const auto counters = harness.Counters();
+		CHECK(counters.variant_modules == PRESCAN_VARIANT_CAP);
+		CHECK(counters.state.capped == (capped ? 1u : 0u));
+		CHECK(harness.handoff->verdicts.Read(UnitOf(program, item)) ==
+		      (capped ? Verdict::Capped : Verdict::Admitted));
+	}
+}
+
+// The throttles each read their own verdict, and never hide a refusal.
+void TestVerdictThrottles() {
+	const auto program = DirectProgram(MUBUF_STORE_DWORD);
+	CheckBackedOffVerdict(program);
+	CheckSettledVerdicts();
+	CheckCappedVerdict(program);
+	std::puts("VerdictThrottles ok");
+}
+
+// Any address for an indirect dispatch's arguments. Nothing here reads it.
+constexpr uint64_t INDIRECT_ARGS_ADDRESS = 0x20000;
+
+// The bytes of a hand-built plan whose one descriptor source is indirect and reads the group count
+// on `axis`, or reads none when it is UINT32_MAX. Its resource tracking is left incomplete, so a
+// snapshot that gets past the indirect check fails its walk at once.
+std::vector<uint8_t> IndirectPlanBytes(uint32_t axis) {
+	namespace IR = ShaderRecompiler::IR;
+	IR::ResourcePlan       plan;
+	IR::DescriptorSource   source;
+	plan.stage = ShaderType::Compute;
+	source.indirect_descriptor.emplace();
+	source.indirect_descriptor->workgroup_axis = axis;
+	plan.descriptor_sources.push_back(std::move(source));
+	return IR::SaveResourcePlan(plan);
+}
+
+// An indirect dispatch whose plan reads the group counts reads IndirectArgs. No test program
+// translates to such a plan, so the helper's Plan answer carries a hand-built one. The baseline is
+// the same plan reading no axis, which differs only in that and gets past the indirect check to a
+// walk that fails, so it reads Rejected. Each run must count its own branch, so a Rejected or an
+// Admitted from a run that never reached the check does not pass. The mutation is to drop the write
+// at the indirect check, and the run that reads the counts stays Admitted.
+void TestVerdictIndirectArgs() {
+	const auto program = DirectProgram(MUBUF_STORE_DWORD);
+	auto       item    = ItemFor(program, Descriptor(STRIDE_A, DstSel(4, 5, 6, 7)), KEY);
+	item.inputs.indirect              = true;
+	item.inputs.indirect_args_address = INDIRECT_ARGS_ADDRESS;
+	for (const uint32_t axis: {UINT32_MAX, 0u}) {
+		const bool reads  = axis != UINT32_MAX;
+		const auto result = RunScripted({.plan_payload = IndirectPlanBytes(axis)}, program, {item});
+		CHECK(result.script.plan_attempts == 1 && result.script.compile_attempts == 0);
+		CHECK(result.counters.indirect_args_unknown == (reads ? 1u : 0u));
+		CHECK(result.counters.materialize_failed == (reads ? 0u : 1u));
+		CHECK(result.verdict == (reads ? Verdict::IndirectArgs : Verdict::Rejected));
+	}
+	std::puts("VerdictIndirectArgs ok");
+}
+
+// The verdicts are written whether or not the report is on, since the GPU thread picks a miss's
+// cause either way. The baseline is the same built run with the report on. The mutation is to write
+// verdicts only while the report is on, and the run with it off reads None.
+void TestVerdictsWithReportOff() {
+	const auto program = DirectProgram(MUBUF_STORE_DWORD);
+	const auto item    = ItemFor(program, Descriptor(STRIDE_A, DstSel(4, 5, 6, 7)), KEY);
+	CHECK(!Common::FirstRunReport::Enabled());
+	for (const bool report: {true, false}) {
+		std::optional<ReportOn> on;
+		if (report) {
+			on.emplace();
+		}
+		const auto result = RunScripted({}, program, {item});
+		CHECK(Common::FirstRunReport::Enabled() == report);
+		CHECK(result.adopted == 1 && result.verdict == Verdict::Built);
+	}
+	std::puts("VerdictsWithReportOff ok");
+}
+
+// Thread counts of one program, `unit` and `sharer` with units in one slot of the verdict table,
+// and `elsewhere` with a unit in another slot than unit's.
+struct SlotThreads {
+	uint32_t unit      = 0;
+	uint32_t sharer    = 0;
+	uint32_t elsewhere = 0;
+};
+
+// One dispatch of the program with the given thread count, which is part of its unit.
+PrescanItem ThreadsItem(const Program& program, uint32_t threads, uint32_t stride, uint64_t key) {
+	auto item = ItemFor(program, Descriptor(stride, DstSel(4, 5, 6, 7)), key);
+	item.inputs.cs_regs.num_thread_x = threads;
+	return item;
+}
+
+// The verdict table's slot of the program's unit with the given thread count.
+uint64_t SlotOfThreads(const Program& program, uint32_t threads) {
+	const uint64_t unit = UnitOf(program, ThreadsItem(program, threads, STRIDE_A, KEY));
+	return unit & (PRESCAN_FEEDBACK_SLOTS - 1);
+}
+
+// Finds the counts by trying them in turn. A unit is a hash, so the counts are the same on every
+// run, and among this many counts two share one of the table's slots all but certainly.
+SlotThreads FindSlotThreads(const Program& program) {
+	constexpr uint32_t                     MAX_THREADS = 1024;
+	SlotThreads                            found;
+	std::unordered_map<uint64_t, uint32_t> first_in_slot;
+	for (uint32_t threads = 1; threads <= MAX_THREADS && found.sharer == 0; ++threads) {
+		const auto slot              = SlotOfThreads(program, threads);
+		const auto [entry, inserted] = first_in_slot.emplace(slot, threads);
+		if (!inserted) {
+			found = {entry->second, threads, 0};
+		}
+	}
+	const auto unit_slot = SlotOfThreads(program, found.unit);
+	for (uint32_t threads = 1; threads <= MAX_THREADS && found.elsewhere == 0; ++threads) {
+		if (found.unit != 0 && SlotOfThreads(program, threads) != unit_slot) {
+			found.elsewhere = threads;
+		}
+	}
+	CHECK(found.sharer != 0 && found.elsewhere != 0);
+	CHECK(UnitOf(program, ThreadsItem(program, found.unit, STRIDE_A, KEY)) !=
+	      UnitOf(program, ThreadsItem(program, found.sharer, STRIDE_A, KEY)));
+	return found;
+}
+
+// A verdict written into a slot another unit holds pushes that unit's out, and the preparer counts
+// it. Unit A is built, then a unit B of the same slot is posted with its Plan held, which writes
+// nothing, since a post never evicts. A stays Built and nothing is counted. B's Plan is then
+// dropped, and B's Deferred replaces A's Built, which is counted once. The baseline takes B from
+// another slot, the only difference, and counts nothing. The mutations are to drop the count in
+// PublishVerdict, which counts none, and to let Admitted evict, which counts one too early.
+void TestVerdictEvictionCounted() {
+	const auto program  = DirectProgram(MUBUF_STORE_DWORD);
+	const auto threads  = FindSlotThreads(program);
+	const auto first    = ThreadsItem(program, threads.unit, STRIDE_A, KEY);
+	const auto unit     = UnitOf(program, first);
+	for (const bool shared: {false, true}) {
+		const auto other_threads = shared ? threads.sharer : threads.elsewhere;
+		const auto second        = ThreadsItem(program, other_threads, STRIDE_A, OTHER_KEY);
+		const auto other         = UnitOf(program, second);
+		Script     script;
+		Harness    harness(ScriptedFactory(script));
+		const auto& verdicts = harness.handoff->verdicts;
+		harness.Map(program);
+		harness.Push(first);
+		harness.Drive();
+		CHECK(verdicts.Read(unit) == Verdict::Built);
+		script.plans_held = 1;
+		harness.Push(second);
+		harness.Drive();
+		CHECK(script.plan_attempts == 2 && harness.Counters().verdicts_evicted == 0);
+		CHECK(verdicts.Read(unit) == Verdict::Built &&
+		      verdicts.Read(other) == (shared ? Verdict::None : Verdict::Admitted));
+		script.answer_first_held();
+		harness.Drive();
+		CHECK(harness.Counters().verdicts_evicted == (shared ? 1u : 0u));
+		CHECK(verdicts.Read(unit) == (shared ? Verdict::None : Verdict::Built) &&
+		      verdicts.Read(other) == Verdict::Deferred);
+	}
+	std::puts("VerdictEvictionCounted ok");
+}
+
+// What a run of the blocked-path test ended with.
+struct BlockedRun {
+	Verdict  verdict = Verdict::None;
+	uint64_t evicted = 0;
+	uint64_t blocked = 0;
+};
+
+// Unit A's first Compile is blamed, and unit B's Plan is refused for now in the pass that reads
+// the blame. B's Deferred pushes A's Retired out when B shares A's slot. A second dispatch of A,
+// another specialization, is admitted after that pass, or in that pass before the blame is read,
+// which retires it in AdmitItem or in PrepareSnapshot.
+BlockedRun RunBlockedPath(const Program& program, uint32_t unit_threads, uint32_t other_threads,
+                          bool same_pass) {
+	Script  script {.compile_outcome = StreamOutcome::Blamed};
+	Harness harness(ScriptedFactory(script));
+	harness.Map(program);
+	const auto first = ThreadsItem(program, unit_threads, STRIDE_A, KEY);
+	harness.Push(first);
+	(void)harness.preparer->RunOnce();
+	(void)harness.preparer->RunOnce();
+	CHECK(script.compile_attempts == 1);
+	script.plan_submit = StreamSubmitStatus::QueueFull;
+	harness.Push(ThreadsItem(program, other_threads, STRIDE_A, OTHER_KEY));
+	if (!same_pass) {
+		(void)harness.preparer->RunOnce();
+	}
+	harness.Push(ThreadsItem(program, unit_threads, STRIDE_B, KEY));
+	harness.Drive();
+	const auto counters = harness.Counters();
+	return {harness.handoff->verdicts.Read(UnitOf(program, first)), counters.verdicts_evicted,
+	        counters.blocked};
+}
+
+// A blocked unit's later dispatch writes Retired again, which puts it back after another unit
+// pushed it out. Both blocked paths are run. With B in A's slot, B pushes A out and A's blocked
+// dispatch pushes B out, two evictions, and A must read Retired at the end. The baseline takes B
+// from another slot, the only difference, and A reads Retired from Block with no eviction. A
+// Retired that was never pushed out would also pass, which the two evictions rule out. The
+// mutations are to drop the write in AdmitItem's blocked path and in PrepareSnapshot's, and A then
+// reads None.
+void TestBlockedPathsRestoreRetired() {
+	constexpr uint64_t EVICTIONS_BOTH_WAYS = 2;
+	const auto         program             = DirectProgram(MUBUF_STORE_DWORD);
+	const auto         threads             = FindSlotThreads(program);
+	for (const bool same_pass: {false, true}) {
+		for (const bool shared: {false, true}) {
+			const auto run = RunBlockedPath(program, threads.unit,
+			                                shared ? threads.sharer : threads.elsewhere, same_pass);
+			CHECK(run.verdict == Verdict::Retired && run.blocked == 1);
+			CHECK(run.evicted == (shared ? EVICTIONS_BOTH_WAYS : 0u));
+		}
+	}
+	std::puts("BlockedPathsRestoreRetired ok");
+}
+
+// A unit the gate answers Capped because the tracker retired it reads Retired, which puts its
+// verdict back after another unit pushed it out. Unit A's Plan is refused for good, which retires
+// it without blocking it. Unit B's Plan is then refused for now, and B's Deferred pushes A out when
+// B shares A's slot. A's next dispatch meets the capped gate and must read Retired again. The
+// baseline takes B from another slot, the only difference, where A reads Retired throughout with no
+// eviction. The mutation is to write Capped there, which cannot push B out, so A reads None.
+void TestRetiredUnitReadsRetired() {
+	constexpr uint64_t EVICTIONS_BOTH_WAYS = 2;
+	const auto         program             = DirectProgram(MUBUF_STORE_DWORD);
+	const auto         threads             = FindSlotThreads(program);
+	const auto         first               = ThreadsItem(program, threads.unit, STRIDE_A, KEY);
+	const auto         unit                = UnitOf(program, first);
+	for (const bool shared: {false, true}) {
+		Script      script {.plan_submit = StreamSubmitStatus::NeverRetry};
+		Harness     harness(ScriptedFactory(script));
+		const auto& verdicts = harness.handoff->verdicts;
+		harness.Map(program);
+		harness.Push(first);
+		harness.Drive();
+		CHECK(verdicts.Read(unit) == Verdict::Retired);
+		script.plan_submit = StreamSubmitStatus::QueueFull;
+		harness.Push(ThreadsItem(program, shared ? threads.sharer : threads.elsewhere, STRIDE_A,
+		                         OTHER_KEY));
+		harness.Drive();
+		CHECK(verdicts.Read(unit) == (shared ? Verdict::None : Verdict::Retired));
+		harness.Push(first);
+		harness.Drive();
+		const auto counters = harness.Counters();
+		CHECK(counters.state.capped == 1 && verdicts.Read(unit) == Verdict::Retired);
+		CHECK(counters.verdicts_evicted == (shared ? EVICTIONS_BOTH_WAYS : 0u));
+	}
+	std::puts("RetiredUnitReadsRetired ok");
+}
+
+// The throttles a unit can meet.
+enum class Throttle : uint8_t { BackedOff, Settled, Capped };
+
+// How many dispatches bring a unit to one short of the throttle.
+uint32_t DispatchesBefore(Throttle throttle) {
+	switch (throttle) {
+		case Throttle::BackedOff: return PRESCAN_UNTAKEN_LIMIT;
+		case Throttle::Settled: return 1 + PRESCAN_STALE_LIMIT;
+		case Throttle::Capped: return PRESCAN_VARIANT_CAP;
+	}
+	return 0;
+}
+
+// The verdict the throttle writes.
+Verdict VerdictOfThrottle(Throttle throttle) {
+	switch (throttle) {
+		case Throttle::BackedOff: return Verdict::BackedOff;
+		case Throttle::Settled: return Verdict::Settled;
+		case Throttle::Capped: return Verdict::Capped;
+	}
+	return Verdict::None;
+}
+
+// Whether the throttle answered a dispatch, by its own counter.
+bool ThrottleAnswered(const PrescanPreparerCounters& counters, Throttle throttle) {
+	switch (throttle) {
+		case Throttle::BackedOff: return counters.backed_off == 1;
+		case Throttle::Settled: return counters.state.settled == 1;
+		case Throttle::Capped: return counters.state.capped == 1;
+	}
+	return false;
+}
+
+// The dispatch numbered `index` of the unit with `threads`. A settle repeats one specialization,
+// while the back-off and the cap each need a new one per dispatch.
+PrescanItem ThrottleItem(const Program& program, uint32_t threads, Throttle throttle,
+                         uint32_t index) {
+	const uint32_t stride = throttle == Throttle::Settled ? STRIDE_A : NthStride(index);
+	return ThreadsItem(program, threads, stride, KEY);
+}
+
+// What a run of the throttle eviction test ended with.
+struct ThrottleRun {
+	Verdict  throttled = Verdict::None;
+	Verdict  other     = Verdict::None;
+	uint64_t evicted   = 0;
+	bool     answered  = false;
+};
+
+// Brings unit X to one dispatch short of the throttle, retires unit Y by a Plan refused for good,
+// which pushes X out when Y shares X's slot, then sends X's dispatch that the throttle answers. The
+// cap's Compiles are held, so the back-off never answers first.
+ThrottleRun RunThrottleMeetsRetired(const Program& program, const SlotThreads& threads,
+                                    Throttle throttle, bool shared) {
+	Script  script {.compiles_held = throttle == Throttle::Capped ? PRESCAN_VARIANT_CAP : 0u};
+	Harness harness(ScriptedFactory(script));
+	harness.Map(program);
+	const uint32_t before = DispatchesBefore(throttle);
+	for (uint32_t index = 0; index < before; ++index) {
+		harness.Push(ThrottleItem(program, threads.unit, throttle, index));
+		harness.Drive();
+	}
+	script.plan_submit = StreamSubmitStatus::NeverRetry;
+	const auto other   = ThreadsItem(program, shared ? threads.sharer : threads.elsewhere, STRIDE_A,
+	                                 OTHER_KEY);
+	harness.Push(other);
+	harness.Drive();
+	const auto last = ThrottleItem(program, threads.unit, throttle, before);
+	harness.Push(last);
+	harness.Drive();
+	const auto  counters = harness.Counters();
+	const auto& verdicts = harness.handoff->verdicts;
+	return {verdicts.Read(UnitOf(program, last)), verdicts.Read(UnitOf(program, other)),
+	        counters.verdicts_evicted, ThrottleAnswered(counters, throttle)};
+}
+
+// In the table alone, a throttle meets each refusal of another unit in its slot and is refused, so
+// the refusal stays. The baseline is the same throttle into an empty slot, which is written.
+void CheckThrottlesKeepRefusalsInTable() {
+	for (const auto throttle: {Verdict::Capped, Verdict::Settled, Verdict::BackedOff}) {
+		for (const auto refusal: {Verdict::Rejected, Verdict::Retired}) {
+			const auto table = std::make_unique<PrescanUnitVerdicts>();
+			CHECK(!table->Publish(VERDICT_SHARER, refusal));
+			CHECK(!table->Publish(VERDICT_UNIT, throttle));
+			CHECK(table->Read(VERDICT_SHARER) == refusal &&
+			      table->Read(VERDICT_UNIT) == Verdict::None);
+			CHECK(!table->Publish(VERDICT_OTHER_SLOT, throttle));
+			CHECK(table->Read(VERDICT_OTHER_SLOT) == throttle);
+		}
+	}
+}
+
+// A throttle never pushes another unit's verdict out of a shared slot, so it never hides a refusal.
+// The table is checked alone against Rejected and Retired. Then each throttle meets a real Retired
+// in the preparer. Unit Y's Retired pushes unit X out, which counts once, and X's dispatch that the
+// throttle answers must leave Y Retired and X with no verdict. The throttle must answer, or a
+// dispatch that never reached it would pass too. The baseline takes Y from another slot, the only
+// difference, where X reads the throttle with no eviction. The mutation is to let the throttles
+// evict, and then Y reads None with two evictions.
+void TestThrottleNeverEvicts() {
+	CheckThrottlesKeepRefusalsInTable();
+	const auto program = DirectProgram(MUBUF_STORE_DWORD);
+	const auto threads = FindSlotThreads(program);
+	for (const auto throttle: {Throttle::BackedOff, Throttle::Settled, Throttle::Capped}) {
+		for (const bool shared: {false, true}) {
+			const auto run = RunThrottleMeetsRetired(program, threads, throttle, shared);
+			CHECK(run.answered && run.other == Verdict::Retired);
+			CHECK(run.throttled == (shared ? Verdict::None : VerdictOfThrottle(throttle)));
+			CHECK(run.evicted == (shared ? 1u : 0u));
+		}
+	}
+	std::puts("ThrottleNeverEvicts ok");
+}
+
 // What a supervised run of three dispatches ended with.
 struct SupervisedRun {
 	PrescanPreparerCounters counters;
@@ -1932,7 +2718,8 @@ PrescanPreparerCounters DistinctPreparerCounters() {
 	      &counters.never_retry, &counters.blamed, &counters.dropped, &counters.compile_failed,
 	      &counters.key_mismatch, &counters.decode_failed, &counters.adopted, &counters.taken,
 	      &counters.late_duplicates, &counters.taken_dropped, &counters.plans_dropped,
-	      &counters.forgotten, &counters.state.posted, &counters.state.busy,
+	      &counters.forgotten, &counters.verdicts_evicted, &counters.state.posted,
+	      &counters.state.busy,
 	      &counters.state.capped, &counters.state.settled, &counters.state.uncertain,
 	      &counters.state.dropped_full}) {
 		*count = next++;
@@ -1986,6 +2773,7 @@ void CheckOutcomesCopied(const Common::FirstRunReport::PrescanPreparerReport& re
 	CHECK(report.late_duplicates == source.late_duplicates &&
 	      report.taken_dropped == source.taken_dropped);
 	CHECK(report.plans_dropped == source.plans_dropped && report.forgotten == source.forgotten);
+	CHECK(report.verdicts_evicted == source.verdicts_evicted);
 }
 
 // Every count of the preparer and its state reaches the report under its own name, and each
@@ -2113,6 +2901,18 @@ int main(int argc, char** argv) {
 	TestPrescanRunningCountsHeldCompile();
 	TestPrescanRunningClearedAtThreadExit();
 	TestInFlightMarkedWhileSent();
+	TestVerdictReplaceRules();
+	TestUnitVerdictTable();
+	TestVerdictFollowsOutcome();
+	TestVerdictBuiltWhenKnown();
+	TestVerdictRejectedSnapshots();
+	TestVerdictThrottles();
+	TestVerdictIndirectArgs();
+	TestVerdictsWithReportOff();
+	TestVerdictEvictionCounted();
+	TestBlockedPathsRestoreRetired();
+	TestRetiredUnitReadsRetired();
+	TestThrottleNeverEvicts();
 	TestSupervisedHelperOutcomes();
 	TestSupervisedLaneOff();
 	TestSupervisedStopIsFinal();
