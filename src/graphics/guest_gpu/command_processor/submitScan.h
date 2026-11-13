@@ -322,6 +322,11 @@ public:
 	          std::vector<ScannedDispatch>& dispatches, ScanStats& stats, ScanScratch& scratch,
 	          DispatchCache* cache = nullptr) const;
 
+	/// Changes how long each later walk may run. The prescan's scanner thread gives each job what is
+	/// left of its lag bound in place of the fixed cap. Only the thread that scans may call it, and
+	/// only between walks, since a walk reads the limits while it runs.
+	void SetTimeCap(std::chrono::microseconds time_cap) { m_limits.time_cap = time_cap; }
+
 private:
 	ScanMemoryReader m_reader;
 	ScanLimits       m_limits;

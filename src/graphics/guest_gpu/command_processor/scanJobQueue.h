@@ -464,10 +464,11 @@ private:
 /// Runs one job against its queue's shadow the way the scanner thread does. A reset marker resets the
 /// shadow. A list is walked after the shadow takes the doubt the queue left it, and a list that was
 /// copied short leaves the shadow in doubt after the walk, since the part that was cut may have changed
-/// the program.
+/// the program. A caller that keeps its own ScanScratch passes it, and the walk then uses it in place of
+/// the calling thread's own.
 inline void RunScanJob(const SubmitScanner& scanner, const ScanJob& job, bool async_queue, CsShadow& shadow,
                        std::vector<ScannedDispatch>& dispatches, ScanStats& stats,
-                       DispatchCache* cache = nullptr) {
+                       DispatchCache* cache = nullptr, ScanScratch* scratch = nullptr) {
 	if (job.kind == ScanJob::Kind::Reset) {
 		shadow.Reset();
 		return;
@@ -475,7 +476,11 @@ inline void RunScanJob(const SubmitScanner& scanner, const ScanJob& job, bool as
 	if (job.shadow_uncertain) {
 		shadow.MarkUncertain();
 	}
-	scanner.Scan(job.CommandSpan(), job.queue_id, async_queue, shadow, dispatches, stats, cache);
+	if (scratch != nullptr) {
+		scanner.Scan(job.CommandSpan(), job.queue_id, async_queue, shadow, dispatches, stats, *scratch, cache);
+	} else {
+		scanner.Scan(job.CommandSpan(), job.queue_id, async_queue, shadow, dispatches, stats, cache);
+	}
 	if (job.truncated) {
 		shadow.MarkUncertain();
 	}

@@ -728,6 +728,17 @@ add_executable(prescan_handoff_tests EXCLUDE_FROM_ALL
 target_link_libraries(prescan_handoff_tests common fmt::fmt xxhash)
 target_include_directories(prescan_handoff_tests PRIVATE ${inc_headers})
 
+# The prescan's scanner thread. It reads through a reader the test supplies and posts to a hand-off the
+# test drains, so it links only the walk, the register decoder and the scanner.
+add_executable(prescan_scanner_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/PrescanScannerTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/csRegisters.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/command_processor/submitScan.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/command_processor/prescanScanner.cpp"
+)
+target_link_libraries(prescan_scanner_tests common fmt::fmt xxhash)
+target_include_directories(prescan_scanner_tests PRIVATE ${inc_headers})
+
 # The predictor rules, the header slots and the module id need no device and no translated program.
 add_executable(shader_store_predictor_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ShaderStorePredictorTests.cpp"
@@ -1185,6 +1196,9 @@ if(BUILD_TESTING)
 	# consumer spinning shows up as a hang, which the timeout ends.
 	add_test(NAME prescan_handoff COMMAND $<TARGET_FILE:prescan_handoff_tests>)
 	set_tests_properties(prescan_handoff PROPERTIES TIMEOUT 60)
+	# A scanner thread that never wakes or never stops shows up as a hang, which the timeout ends.
+	add_test(NAME prescan_scanner COMMAND $<TARGET_FILE:prescan_scanner_tests>)
+	set_tests_properties(prescan_scanner PROPERTIES TIMEOUT 60)
 	# A preparer that never wakes or never stops shows up as a hang, which the test's watchdog ends.
 	add_test(NAME prescan_preparer COMMAND $<TARGET_FILE:prescan_preparer_tests>)
 	set_tests_properties(prescan_preparer PROPERTIES TIMEOUT 300)
@@ -1358,6 +1372,7 @@ if(BUILD_TESTING)
 		scan_differential_tests
 		prescan_tests
 		prescan_handoff_tests
+		prescan_scanner_tests
 		prescan_preparer_tests
 		compute_translation_tests
 		shader_store_predictor_tests
