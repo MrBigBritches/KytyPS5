@@ -595,6 +595,43 @@ StreamWorkerResult RunStreamWorker(const WorkerRequest& request, StreamWorkerOpt
 	return result;
 }
 
+// The worker's Handle, Plan and Compile without the cache. A Plan translates and extracts the plan,
+// and a Compile decodes the specialization and builds through the generator's path. The size cap
+// on the specialization is the worker's default, since there is no options object here.
+StreamResponse AnswerStreamRequest(const StreamRequest& request, const HostValues& host,
+                                   const ComputeKeyDevice& device) {
+	const auto prepared = PrepareRequest(request, device);
+	if (!prepared) {
+		return MakeResponse(request, StreamStatus::Failed, {});
+	}
+	const auto&      state = prepared->key.static_state;
+	TranslationSetup setup(prepared->info, prepared->key.user_data_count, prepared->key.code_hash,
+	                       host);
+	if (request.kind == StreamRequestKind::Plan) {
+		auto translated = TranslateComputeUnit(UnitOf(*prepared), setup);
+		if (!translated) {
+			return MakeResponse(request, StreamStatus::HasCalls, state);
+		}
+		auto plan = IR::SaveResourcePlan(IR::ExtractResourcePlan(translated->program));
+		return MakeResponse(request, StreamStatus::Ok, state, std::move(plan));
+	}
+	const auto specialization = request.specialization.size() <= MAX_STREAM_SPECIALIZATION_BYTES
+	                                ? DecodeSpecialization(request.specialization)
+	                                : std::nullopt;
+	if (!specialization) {
+		return MakeResponse(request, StreamStatus::Failed, state);
+	}
+	auto translated = TranslateComputeUnit(UnitOf(*prepared), setup);
+	if (!translated) {
+		return MakeResponse(request, StreamStatus::HasCalls, state);
+	}
+	auto build = CompileComputeUnit(std::move(*translated), UnitOf(*prepared), setup, *specialization);
+	if (build.status != ComputeBuildStatus::Built) {
+		return MakeResponse(request, StreamStatus::Failed, state);
+	}
+	return MakeResponse(request, StreamStatus::Ok, state, std::move(build.record));
+}
+
 std::vector<uint8_t> EncodeSpecialization(const IR::ResourceSpecialization& specialization) {
 	IR::Writer writer;
 	// A copy, because Io takes its values by reference.

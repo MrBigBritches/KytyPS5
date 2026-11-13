@@ -116,6 +116,23 @@ public:
 		auto& entry     = m_units[unit];
 		entry.in_flight = false;
 		entry.capped    = true;
+		entry.retired   = true;
+	}
+
+	/// Forgets a specialization that NoteSnapshot recorded but that was never built, because its
+	/// send was refused for now or the helper dropped it. The next snapshot that gives it is then New
+	/// again and is sent again. A program the cap closed reopens, and a retired one stays retired.
+	void Forget(uint64_t unit, const Spec& spec) {
+		const auto found = m_units.find(unit);
+		if (found == m_units.end()) {
+			return;
+		}
+		auto&      entry   = found->second;
+		const auto removed = std::erase(entry.specs, spec);
+		if (removed != 0 && entry.capped && !entry.retired && entry.specs.size() < PRESCAN_VARIANT_CAP) {
+			entry.capped = false;
+			m_capped--;
+		}
 	}
 
 	/// How many programs reached the cap.
@@ -138,6 +155,7 @@ private:
 	struct Entry {
 		bool              in_flight = false;
 		bool              capped    = false;
+		bool              retired   = false;
 		uint32_t          stale     = 0;
 		uint32_t          skipped   = 0;
 		std::vector<Spec> specs;

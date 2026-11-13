@@ -18,6 +18,7 @@
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
 #include "graphics/host_gpu/renderer/pipeline/generationState.h"
 #include "graphics/host_gpu/renderer/pipeline/graphicsLibraryCache.h"
+#include "graphics/host_gpu/renderer/pipeline/prescanPreparer.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/moduleId.h"
@@ -1651,9 +1652,17 @@ void RecordWarmTake(uint64_t id, PipelineBuildQueue::Acquired how, double stoppe
 } // namespace
 
 Common::GpuStall::HoldCause WarmTakeCause(PipelineBuildQueue::Acquired how, bool paused,
-                                          bool generated) {
+                                          WarmOrigin origin) {
 	using Common::GpuStall::HoldCause;
-	if (how == PipelineBuildQueue::Acquired::Waited) {
+	const bool waited = how == PipelineBuildQueue::Acquired::Waited;
+	// The prescan's set is never paused, so the pause says nothing about it. A build no worker had
+	// started was still queued on the prescan's lane when the GPU thread ran it. PrescanInFlight is
+	// kept for a request still in the helper, which is a different miss.
+	if (origin == WarmOrigin::Prescan) {
+		return waited ? HoldCause::PrescanWaited : HoldCause::PrescanQueued;
+	}
+	const bool generated = origin == WarmOrigin::Generated;
+	if (waited) {
 		return generated ? HoldCause::GeneratedWaited : HoldCause::WarmWaited;
 	}
 	// Generated and paused are both told apart, so neither wins. The cost of the pause is the two
@@ -1664,9 +1673,59 @@ Common::GpuStall::HoldCause WarmTakeCause(PipelineBuildQueue::Acquired how, bool
 	return paused ? HoldCause::WarmInlinePaused : HoldCause::WarmInline;
 }
 
+// The prescan's builds never wait on the pause and never take a generator row. A build that runs on
+// the GPU thread is the stop itself and not work beside it, so only a worker's build is judged.
+void PipelineCache::StartPrescanCompute(const ShaderModule& module) {
+	auto build = [this, &module](Pipeline& pipeline) {
+		const bool     on_worker     = !GuestGpu::IsGpuThread();
+		const uint64_t scopes_before = Common::GpuStall::ScopeCount();
+		const bool     active_before = Common::GpuStall::AnyScopeActive();
+		const auto     start         = std::chrono::steady_clock::now();
+		if (m_prescan_build_hook) {
+			m_prescan_build_hook();
+		}
+		CreatePipelineInternal(m_graphics, pipeline, module, m_driver_cache);
+		const auto elapsed = std::chrono::steady_clock::now() - start;
+		// Marked here because this build adds to the driver cache without a checkpoint of its own.
+		m_driver_cache_dirty.store(true, std::memory_order_relaxed);
+		m_prescan_builds.builds.fetch_add(1, std::memory_order_relaxed);
+		const bool overlapped = active_before || Common::GpuStall::AnyScopeActive() ||
+		                        Common::GpuStall::ScopeCount() != scopes_before;
+		if (on_worker && overlapped) {
+			m_prescan_builds.in_scope.fetch_add(1, std::memory_order_relaxed);
+			m_prescan_builds.in_scope_us.fetch_add(
+			    std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count(),
+			    std::memory_order_relaxed);
+		}
+	};
+	(void)m_prescan_compute->Start(module.id, std::move(build), PipelineBuildQueue::Lane::Front);
+}
+
+// in_scope_ms is the whole time of each build that overlapped a stop, not only the overlap, so it
+// is an upper bound on the contention the stop met.
+PrescanBuildStats PipelineCache::PrescanBuilds() const {
+	constexpr double MS_PER_US = 1e-3;
+	return {.builds   = m_prescan_builds.builds.load(std::memory_order_relaxed),
+	        .in_scope = m_prescan_builds.in_scope.load(std::memory_order_relaxed),
+	        .in_scope_ms =
+	            static_cast<double>(m_prescan_builds.in_scope_us.load(std::memory_order_relaxed)) *
+	            MS_PER_US};
+}
+
+WarmBuildSet<uint64_t, PipelineCache::Pipeline>* PipelineCache::WarmSetPending(uint64_t id) const {
+	if (m_prescan_compute != nullptr && m_prescan_compute->IsPending(id)) {
+		return m_prescan_compute.get();
+	}
+	if (m_warm_compute != nullptr && m_warm_compute->IsPending(id)) {
+		return m_warm_compute.get();
+	}
+	return nullptr;
+}
+
 PipelineCache::Pipeline* PipelineCache::TakeWarmCompute(const ShaderComputeInputInfo& input_info) {
-	const auto id = input_info.stage.module->id;
-	if (m_warm_compute == nullptr || !m_warm_compute->IsPending(id)) {
+	const auto id  = input_info.stage.module->id;
+	auto*      set = WarmSetPending(id);
+	if (set == nullptr) {
 		return nullptr;
 	}
 	if (graphics_debug_dump_enabled()) {
@@ -1675,17 +1734,22 @@ PipelineCache::Pipeline* PipelineCache::TakeWarmCompute(const ShaderComputeInput
 	// A finished build is just handed over. Once the warm-up is over this is the usual case, and it
 	// needs neither the stall nor a timed sample.
 	std::optional<WarmBuildSet<uint64_t, Pipeline>::Taken> taken;
-	if (m_warm_compute->IsDone(id)) {
-		taken = m_warm_compute->Take(id);
+	if (set->IsDone(id)) {
+		taken = set->Take(id);
 		EXIT_IF(!taken);
 		// The clock is read only for the report, so a run without it does exactly what it did.
 		const int64_t at_ns = Common::FirstRunReport::Enabled() ? Common::FirstRunReport::NowNs()
 		                                                        : Common::FirstRunReport::NO_TIME_NS;
 		RecordWarmTake(id, taken->how, 0.0, at_ns);
 	} else {
-		taken = TakeUnfinishedWarmCompute(id);
+		taken = TakeUnfinishedWarmCompute(id, *set);
 	}
 	EXIT_IF(!taken);
+	// The preparer backs off a program whose modules go unused, so it hears of each one taken. Its
+	// report ring has one producer, the GPU thread, so a take from any other thread is not told.
+	if (set == m_prescan_compute.get() && m_prescan != nullptr && GuestGpu::IsGpuThread()) {
+		m_prescan->NoteTaken(id);
+	}
 	auto [iter, inserted] = m_compute_pipelines.try_emplace(id, std::move(taken->result));
 	EXIT_IF(!inserted);
 	CheckpointDriverCache();
@@ -1693,11 +1757,15 @@ PipelineCache::Pipeline* PipelineCache::TakeWarmCompute(const ShaderComputeInput
 }
 
 std::optional<WarmBuildSet<uint64_t, PipelineCache::Pipeline>::Taken>
-PipelineCache::TakeUnfinishedWarmCompute(uint64_t id) {
-	// Looked up before the Scope, so no part of it counts toward a hold. The set belongs to the GPU
-	// thread, so another thread, which makes no Scope, does not read it.
+PipelineCache::TakeUnfinishedWarmCompute(uint64_t id, WarmBuildSet<uint64_t, Pipeline>& set) {
+	// Looked up before the Scope, so no part of it counts toward a hold. The id set belongs to the
+	// GPU thread, so another thread, which makes no Scope, does not read it. A prescan module is told
+	// by its set, and its id is never in m_generated_warm_ids.
 	const bool on_gpu_thread = GuestGpu::IsGpuThread();
-	const bool generated     = on_gpu_thread && m_generated_warm_ids.contains(id);
+	const auto origin        = &set == m_prescan_compute.get() ? WarmOrigin::Prescan
+	                           : on_gpu_thread && m_generated_warm_ids.contains(id)
+	                               ? WarmOrigin::Generated
+	                               : WarmOrigin::Store;
 	// Running the compile here and waiting for a worker both stop the GPU thread, so guest audio
 	// may wait for them and both count toward its longest hitch.
 	std::optional<Common::GpuStall::Scope> stall;
@@ -1710,11 +1778,11 @@ PipelineCache::TakeUnfinishedWarmCompute(uint64_t id) {
 	                                         Common::DebugCounters::Counter::PipelineCreateNs,
 	                                         Common::DebugCounters::Peak::PipelineCreateNs);
 	const auto start  = std::chrono::steady_clock::now();
-	const bool paused = m_warm_compute->Paused();
-	auto       taken  = m_warm_compute->Take(id);
+	const bool paused = set.Paused();
+	auto       taken  = set.Take(id);
 	EXIT_IF(!taken);
 	if (stall) {
-		stall->Reclassify(WarmTakeCause(taken->how, paused, generated));
+		stall->Reclassify(WarmTakeCause(taken->how, paused, origin));
 	}
 	const auto stopped_ms = std::chrono::duration<double, std::milli>(
 	                            std::chrono::steady_clock::now() - start)
@@ -1762,6 +1830,10 @@ void PipelineCache::NoteWarmComputeStop(PipelineBuildQueue::Acquired how, double
 	}
 }
 
+// The prescan's set is left running on purpose. The audio results the prescan was approved on were
+// measured with its lane exempt, and its modules are ones a scanned submission is about to use, so
+// holding them would only turn them into inline compiles on the GPU thread. Its builds that overlap
+// a stop of the GPU thread are counted in PrescanBuilds instead.
 void PipelineCache::PauseWarmBuilds() {
 	if (m_warm_compute == nullptr || m_warm_paused || !Config::BackgroundWarmUpEnabled() ||
 	    !Config::DeferredPipelineDrawsEnabled() || !Config::PauseWarmUpForDrawsEnabled()) {
@@ -1781,13 +1853,11 @@ void PipelineCache::ResumeWarmBuilds() {
 	}
 }
 
-void PipelineCache::StopWarmBuilds() {
-	if (m_warm_compute == nullptr) {
+void PipelineCache::StopWarmSet(std::unique_ptr<WarmBuildSet<uint64_t, Pipeline>>& set) {
+	if (set == nullptr) {
 		return;
 	}
-	// Stopping ends a pause, since the workers wake for the stop.
-	m_warm_paused = false;
-	auto stopped = m_warm_compute->Stop();
+	auto stopped = set->Stop();
 	if (stopped.waited_for != 0) {
 		PipelineCacheLog("Pipeline build: waiting for {} running warm-up compiles", stopped.waited_for);
 	}
@@ -1797,7 +1867,14 @@ void PipelineCache::StopWarmBuilds() {
 	for (const auto& pipeline: stopped.unadopted) {
 		DestroyPipelineObjects(m_graphics.device, pipeline);
 	}
-	m_warm_compute.reset();
+	set.reset();
+}
+
+void PipelineCache::StopWarmBuilds() {
+	// Stopping ends a pause, since the workers wake for the stop.
+	m_warm_paused = false;
+	StopWarmSet(m_prescan_compute);
+	StopWarmSet(m_warm_compute);
 }
 
 void PipelineCache::StopBuilds() {

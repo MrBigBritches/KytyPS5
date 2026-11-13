@@ -73,6 +73,20 @@ void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data) {
 	(*g_shader_map)[addr] = {mapped, hash};
 }
 
+std::optional<ShaderMapSnapshot> ShaderTryGetMapped(uint64_t addr) {
+	std::scoped_lock lock(g_shader_map_mutex);
+	if (g_shader_map == nullptr) {
+		return std::nullopt;
+	}
+	const auto found = g_shader_map->find(addr);
+	if (found == g_shader_map->end()) {
+		return std::nullopt;
+	}
+	return ShaderMapSnapshot {.code_size_bytes     = found->second.data.code_size_bytes,
+	                          .scratch_size_dwords = found->second.data.scratch_size_dwords,
+	                          .hash                = found->second.hash};
+}
+
 static ShaderMapEntry ShaderGetMappedData(uint64_t addr, const char* label) {
 	EXIT_IF(g_shader_map == nullptr);
 

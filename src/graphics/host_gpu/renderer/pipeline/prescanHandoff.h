@@ -154,7 +154,25 @@ private:
 struct PrescanHandoff {
 	Common::SpscRing<PrescanItem, PRESCAN_RING_CAPACITY> ring;
 	PrescanFeedback                                      feedback;
+	/// Bumped by everything that gives the preparer work, which is the scanner after it pushed,
+	/// the helper's completion callback after it queued an answer, and shutdown. The preparer reads
+	/// it before it drains and then waits for it to change, so a bump that lands during the drain
+	/// is never missed. See WakePreparer.
+	std::atomic<uint32_t> wake_epoch {0};
+	// A counter that took a lock would let a producer wait on the preparer, which the hand-off
+	// forbids. This checks the counter only. Whether a platform's notify_one takes a lock of its
+	// own is not checked here.
+	static_assert(std::atomic<uint32_t>::is_always_lock_free, "the wake word must be lock-free");
 };
+
+/// Tells the preparer that new work was published. The caller must publish first, with release or
+/// under a mutex the preparer takes, so the preparer that sees the new epoch also sees the work.
+/// The scanner calls it once per walked submission and not per item, since each call may enter the
+/// kernel.
+inline void WakePreparer(PrescanHandoff& handoff) noexcept {
+	handoff.wake_epoch.fetch_add(1, std::memory_order_release);
+	handoff.wake_epoch.notify_one();
+}
 
 /// What became of a dispatch the scanner offered to the preparer.
 enum class PrescanOffer : uint8_t {

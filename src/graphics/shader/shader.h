@@ -8,6 +8,7 @@
 #include "graphics/shader/shaderBindings.h"
 
 #include <array>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -342,6 +343,23 @@ struct ShaderMappedData {
 
 void ShaderInit();
 void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data);
+
+/// What a mapped shader's entry holds that a thread other than the GPU thread may use. It is only
+/// values, with no guest pointers.
+struct ShaderMapSnapshot {
+	/// The length the hash covers, as ShaderProgramSize gave it when the shader was mapped.
+	uint32_t code_size_bytes = 0;
+	/// The scratch size the runtime reads from the map, since no register carries it.
+	uint32_t scratch_size_dwords = 0;
+	/// The hash ShaderMapUserData computed over the program bytes.
+	uint64_t hash = 0;
+};
+
+/// Copies the entry of a mapped shader by value, under the map's lock. Unlike the lookup the GPU
+/// thread uses, a missing entry is an answer here and not a fatal error, so the prescan's preparer
+/// can ask about an address the game has since unmapped.
+/// @return nothing when no shader is mapped at the address, or the map does not exist yet.
+[[nodiscard]] std::optional<ShaderMapSnapshot> ShaderTryGetMapped(uint64_t addr);
 /// The length in bytes of the part of a shader binary that is hashed and translated, which is the
 /// code plus its literal buffer as sized by the footer that ends the binary. A binary without a
 /// valid footer is hashed whole, and then the result equals size.

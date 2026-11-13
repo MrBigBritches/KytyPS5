@@ -1876,9 +1876,11 @@ void TestHeldByCauseInJson() {
        {"required_graphics", "required_compute", "warm_inline", "warm_inline_paused",
         "generated_inline", "generated_inline_paused", "warm_waited", "generated_waited", "prescan_waited", "prescan_in_flight",
         "prescan_never_posted_async", "prescan_never_posted_indirect", "prescan_never_posted_deep",
-        "prescan_refused", "deferred_draw_resolve", "ineligible_draw", "library_once", "other"})
+        "prescan_refused", "deferred_draw_resolve", "ineligible_draw", "library_once", "prescan_queued",
+        "other"})
     Check(held.contains(name), name);
-  Check(held["required_graphics"] == 1.0 && held["other"] == 18.0,
+  Check(held["required_graphics"] == 1.0 &&
+            held["other"] == static_cast<double>(GS::HOLD_CAUSE_COUNT),
         "a cause was written under another cause's name");
   const auto histogram = json["audio_hold_histogram"];
   Check(histogram["count"] == 1 && histogram["max_ms"] == 30.0 && histogram["p50_bound_ms"] == 30.0 &&

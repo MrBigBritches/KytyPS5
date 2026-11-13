@@ -114,6 +114,11 @@ public:
 		m_tracker.Retire(admission.unit);
 	}
 
+	/// Forgets a specialization a snapshot of the unit recorded with NoteSnapshot that was never
+	/// built, because its send was refused for now or the helper dropped it, so a later snapshot that
+	/// gives it is sent again. It needs no open admission, since the snapshot's outcome was given.
+	void Forget(uint64_t unit, const Spec& spec) { m_tracker.Forget(unit, spec); }
+
 	/// A copy of the counts, with the ring's drops read at the time of the call.
 	[[nodiscard]] PrescanCounters Counters() const {
 		PrescanCounters counters = m_counters;

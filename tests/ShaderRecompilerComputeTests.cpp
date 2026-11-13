@@ -54,6 +54,7 @@
 #include "graphics/host_gpu/renderer/pipeline/graphicsLibraryCache.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineParts.h"
+#include "graphics/host_gpu/renderer/pipeline/prescanPreparer.h"
 #include "graphics/shader/recompiler/ir/Serialize.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/drawRecord.h"
@@ -121,6 +122,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <future>
 #include <initializer_list>
 #include <limits>
 #include <map>
@@ -1335,6 +1337,41 @@ struct PipelineCacheTestAccess {
   }
   static bool WarmDone(const PipelineCache &cache, uint64_t id) {
     return cache.m_warm_compute != nullptr && cache.m_warm_compute->IsDone(id);
+  }
+
+  // The prescan's side. Changes the preparer's settings before EnablePrescan makes it, posts a
+  // record as the preparer's sink does, and reads what the prescan's set and the drain did.
+  static void SetPrescanTweak(PipelineCache &cache, std::function<void(PrescanPreparerConfig &)> tweak) {
+    cache.m_prescan_tweak = std::move(tweak);
+  }
+  static void PostPrescanRecord(PipelineCache &cache, DecodedModuleRecord &&record) {
+    cache.PostPrescanModule(std::move(record));
+  }
+  static bool PrescanWarmDone(const PipelineCache &cache, uint64_t id) {
+    return cache.m_prescan_compute != nullptr && cache.m_prescan_compute->IsDone(id);
+  }
+  static bool PrescanWarmPaused(const PipelineCache &cache) {
+    return cache.m_prescan_compute != nullptr && cache.m_prescan_compute->Paused();
+  }
+  static bool GeneratedWarmId(const PipelineCache &cache, uint64_t id) {
+    return cache.m_generated_warm_ids.contains(id);
+  }
+  // Holds the prescan's own set back, which nothing in the cache ever does, so a take of its module
+  // runs on the GPU thread.
+  static void PausePrescanSet(PipelineCache &cache) {
+    cache.m_prescan_compute->Pause(PipelineBuildQueue::Clock::now() + std::chrono::seconds(30));
+  }
+  // Sets the hook every prescan build calls before it compiles. Set it before EnablePrescan.
+  static void SetPrescanBuildHook(PipelineCache &cache, std::function<void()> hook) {
+    cache.m_prescan_build_hook = std::move(hook);
+  }
+  // Posts a record as the preparer's sink does, with its plan hash changed, which stands for a
+  // prescan module whose plan is not its program's.
+  static void PostPrescanChanged(PipelineCache &cache, DecodedModuleRecord &&record) {
+    auto item = cache.MakeGeneratedModule(std::move(record), {.prescan = true}, cache.m_generation->prescan);
+    EXIT_IF(!item);
+    item->plan_hash ^= 1u;
+    cache.PushGenerated(std::move(*item));
   }
 
   // How many modules the program cache holds, and how many programs.
@@ -2565,30 +2602,37 @@ void CheckSubmitCadenceLogic() {
 // differs from its neighbours in one input, so a swapped branch moves at least one row. A
 // unit test cannot see whether TakeUnfinishedWarmCompute applies it with Reclassify, because that
 // needs a renderer and a GPU-thread Scope, so deleting that call is only caught by the cause
-// counters of a run.
+// counters of a run. The prescan rows each differ from a generated or store row in the origin alone,
+// so a prescan take charged to the generator's or the store's cause moves a row.
 void CheckWarmTakeCause() {
   using Common::GpuStall::HoldCause;
   using Acquired = Libs::Graphics::PipelineBuildQueue::Acquired;
+  using Origin = Libs::Graphics::WarmOrigin;
   struct Row {
     Acquired how;
     bool paused;
-    bool generated;
+    Origin origin;
     HoldCause expected;
     const char *label;
   };
   const Row rows[] = {
-      {Acquired::Waited, false, true, HoldCause::GeneratedWaited, "waited generated"},
-      {Acquired::Waited, false, false, HoldCause::WarmWaited, "waited"},
-      {Acquired::Waited, true, false, HoldCause::WarmWaited, "waited while paused"},
-      {Acquired::RanInline, false, true, HoldCause::GeneratedInline, "inline generated"},
-      {Acquired::RanInline, true, true, HoldCause::GeneratedInlinePaused, "inline generated paused"},
-      {Acquired::RanInline, true, false, HoldCause::WarmInlinePaused, "inline paused"},
-      {Acquired::AlreadyDone, false, false, HoldCause::WarmInline, "already done"},
-      {Acquired::RanInline, false, false, HoldCause::WarmInline, "inline"},
+      {Acquired::Waited, false, Origin::Generated, HoldCause::GeneratedWaited, "waited generated"},
+      {Acquired::Waited, false, Origin::Store, HoldCause::WarmWaited, "waited"},
+      {Acquired::Waited, true, Origin::Store, HoldCause::WarmWaited, "waited while paused"},
+      {Acquired::RanInline, false, Origin::Generated, HoldCause::GeneratedInline, "inline generated"},
+      {Acquired::RanInline, true, Origin::Generated, HoldCause::GeneratedInlinePaused, "inline generated paused"},
+      {Acquired::RanInline, true, Origin::Store, HoldCause::WarmInlinePaused, "inline paused"},
+      {Acquired::AlreadyDone, false, Origin::Store, HoldCause::WarmInline, "already done"},
+      {Acquired::RanInline, false, Origin::Store, HoldCause::WarmInline, "inline"},
+      {Acquired::Waited, false, Origin::Prescan, HoldCause::PrescanWaited, "waited prescan"},
+      {Acquired::Waited, true, Origin::Prescan, HoldCause::PrescanWaited, "waited prescan, flag paused"},
+      {Acquired::RanInline, false, Origin::Prescan, HoldCause::PrescanQueued, "inline prescan"},
+      {Acquired::RanInline, true, Origin::Prescan, HoldCause::PrescanQueued, "inline prescan, flag paused"},
+      {Acquired::AlreadyDone, false, Origin::Prescan, HoldCause::PrescanQueued, "already done prescan"},
   };
   for (const auto &row : rows) {
     Require("WarmTakeCause", row.label,
-            Libs::Graphics::WarmTakeCause(row.how, row.paused, row.generated) == row.expected,
+            Libs::Graphics::WarmTakeCause(row.how, row.paused, row.origin) == row.expected,
             "a warm take was charged to the wrong hold cause");
   }
   std::printf("[host]    %-32s ok\n", "WarmTakeCause");
@@ -63668,6 +63712,453 @@ void CheckGeneratedModules(VulkanHarness &vulkan) {
   std::filesystem::remove_all(dir);
 }
 
+// ---- The submit-time prescan's intake (C11b). ----
+
+// How long a prescan check waits for the preparer or a build, and how long a lookup on the GPU
+// thread may take before the check calls it a wait on the prescan.
+constexpr auto PRESCAN_WAIT_LIMIT = std::chrono::seconds(20);
+constexpr auto PRESCAN_LOOKUP_LIMIT = std::chrono::seconds(20);
+// How long a paused build is given to show it does not run.
+constexpr auto PRESCAN_SETTLE = std::chrono::milliseconds(500);
+constexpr auto PRESCAN_POLL = std::chrono::milliseconds(5);
+constexpr uint64_t PRESCAN_TEST_KEY = 0x5CA4u;
+
+// Reads host memory for the preparer, since the test programs live in host memory and not in the
+// guest's backing.
+bool ReadHostForPrescan(void * /*userdata*/, uint64_t address, std::span<uint32_t> values) {
+  std::memcpy(values.data(), reinterpret_cast<const void *>(address), values.size_bytes());
+  return true;
+}
+
+bool WaitForPrescan(const std::function<bool()> &condition) {
+  const auto until = std::chrono::steady_clock::now() + PRESCAN_WAIT_LIMIT;
+  while (!condition()) {
+    if (std::chrono::steady_clock::now() >= until) return false;
+    std::this_thread::sleep_for(PRESCAN_POLL);
+  }
+  return true;
+}
+
+// Hands the preparer the dispatch GeneratedLookup makes, as the scanner would, and wakes it.
+void PushPrescanDispatch(PipelineCache &cache, u32 stride) {
+  const auto &code = GeneratedCheckCode();
+  PrescanItem item;
+  item.inputs.cs_regs.data_addr = reinterpret_cast<uint64_t>(code.data());
+  item.inputs.cs_regs.num_thread_x = 1;
+  item.inputs.cs_regs.num_thread_y = 1;
+  item.inputs.cs_regs.num_thread_z = 1;
+  item.inputs.cs_regs.wave_size = 32;
+  item.inputs.cs_regs.user_sgpr = 4;
+  item.inputs.workgroup_counts = {1, 1, 1};
+  const ShaderBufferResource buffer{{0x10000u, stride << 16u, 64,
+      DstSel(4, 5, 6, 7) | (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u)}};
+  std::copy_n(buffer.fields, 4, item.user_data.value);
+  item.program_address = reinterpret_cast<uint64_t>(code.data());
+  item.key_hash = PRESCAN_TEST_KEY;
+  item.user_data_count = 4;
+  auto *inbox = cache.PrescanInbox();
+  Require("PrescanIntake", "the ring takes the dispatch", inbox->ring.TryPush(item),
+          "the prescan's ring refused a dispatch");
+  WakePreparer(*inbox);
+}
+
+// Runs GeneratedLookup on the GPU thread and waits for it no longer than the limit. A lookup that
+// does not return is waiting on the prescan, which no later check can recover from, so it ends the
+// run.
+void PrescanLookupWithin(GuestGpu &gpu, PipelineCache &cache, u32 stride, ShaderComputeInputInfo &input) {
+  auto done = std::async(std::launch::async, [&] {
+    gpu.SendCommandSync([&] { GeneratedLookup(cache, stride, input); });
+  });
+  if (done.wait_for(PRESCAN_LOOKUP_LIMIT) != std::future_status::ready) {
+    std::fprintf(stderr, "PrescanNeverWaits: failed: a lookup on the GPU thread waited for a "
+                         "request still in flight to the prescan's helper\n");
+    std::abort();
+  }
+}
+
+// What the drain and the preparer made of the prescan's module in CheckPrescanNeverWaits. The
+// prescan's own planner took it in, or refused the late one as a duplicate and not as a plan
+// mismatch. The preparer heard of the take or the duplicate through the GPU thread's reports, which
+// it reads on its next pass.
+void CheckPrescanNeverWaitsOutcome(const char *name, PipelineCache &cache, bool held) {
+  const auto drain = cache.GenerationStats()->prescan_drain;
+  Require(name, held ? "the late answer is dropped as a duplicate" : "the module is taken in",
+          drain.adopted == (held ? 0u : 1u) && drain.duplicates == (held ? 1u : 0u) &&
+              drain.plan_mismatch == 0 && PipelineCacheTestAccess::ModuleCount(cache) == 1,
+          "the drain did not take the answer in, or drop the late one as a duplicate");
+  WakePreparer(*cache.PrescanInbox());
+  const auto reported = [&] {
+    const auto counters = cache.Prescan()->Counters();
+    return held ? counters.late_duplicates == 1 && counters.taken == 0
+                : counters.taken == 1 && counters.late_duplicates == 0;
+  };
+  Require(name, held ? "the duplicate is reported to the preparer" : "the take is reported to the preparer",
+          WaitForPrescan(reported), "the GPU thread did not tell the preparer what became of its module");
+}
+
+// The GPU thread never waits for the prescan. With the Compile held in the transport, which stands
+// for a helper that has not answered, the lookup compiles the module itself, and the late answer is
+// then refused by the drain as a duplicate. The baseline differs only in the answer arriving
+// first. The lookup then finds the prescan's module and compiles nothing, so the prescan really
+// built the module the lookup needs. The mutations are to make the lookup wait until the preparer
+// has nothing in flight, and the held lookup never returns, so the watchdog fails the run. Delete
+// the GPU thread's NoteTaken or NoteDuplicate call, and the preparer never hears of the module.
+void CheckPrescanNeverWaits(VulkanHarness &vulkan, GuestGpu &gpu) {
+  constexpr const char *name = "PrescanNeverWaits";
+  Common::DebugCounters::SetEnabled(true);
+  for (const bool held : {false, true}) {
+    PipelineCache cache(vulkan.RuntimeContext(), nullptr);
+    PipelineCacheTestAccess::EnableWarmCompute(cache);
+    PipelineCacheTestAccess::SetPrescanTweak(
+        cache, [](PrescanPreparerConfig &config) { config.read_memory = ReadHostForPrescan; });
+    StoreGen::InProcessPrescanTransport *transport = nullptr;
+    cache.EnablePrescan(StoreGen::InProcessPrescanTransportFactory(&transport));
+    transport->SetHoldCompiles(held);
+    PushPrescanDispatch(cache, GENERATED_STRIDE_A);
+    const auto posted = [&] { return cache.GenerationStats()->pending == 1; };
+    Require(name, held ? "the compile is in flight" : "the module is posted",
+            WaitForPrescan(held ? std::function<bool()>([&] { return transport->Held() == 1; })
+                                : std::function<bool()>(posted)),
+            "the preparer did not get as far as the check needs");
+    ShaderComputeInputInfo input{};
+    const auto before = ShadersCompiledSoFar();
+    PrescanLookupWithin(gpu, cache, GENERATED_STRIDE_A, input);
+    Require(name, held ? "an in-flight module is compiled inline" : "a posted module is found",
+            input.stage.module != nullptr && ShadersCompiledSoFar() == before + (held ? 1u : 0u),
+            "the lookup did not compile exactly what the prescan had not delivered");
+    if (held) {
+      transport->ReleaseHeld();
+      Require(name, "the late answer is posted", WaitForPrescan(posted),
+              "the released answer never reached the intake");
+      PrescanLookupWithin(gpu, cache, GENERATED_STRIDE_A, input);
+    } else {
+      // The dispatch takes the module's pipeline, which the GPU thread reports to the preparer.
+      gpu.SendCommandSync([&] { (void)cache.GetComputePipeline(input); });
+    }
+    CheckPrescanNeverWaitsOutcome(name, cache, held);
+    cache.StopBuilds();
+  }
+  Common::DebugCounters::SetEnabled(false);
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
+// The three cases of CheckPrescanPauseExempt. A generated module is the baseline, and a prescan
+// module builds with a Scope held across the whole build or with none.
+enum class PrescanPauseCase { Generated, PrescanUnderScope, Prescan };
+
+// Whether the module of one pause case was built while the warm queue was held. The warm queue must
+// still be held when a prescan build is seen done, since the pause ends on its own after
+// WARM_UP_PAUSE_LIMIT, so a build that only ran once a pause of its own ran out would otherwise
+// pass too. A generated build is given a while to show it does not run.
+bool PrescanPauseCaseBuilt(PipelineCache &cache, uint64_t id, bool prescan) {
+  if (prescan) {
+    return WaitForPrescan([&] { return PipelineCacheTestAccess::PrescanWarmDone(cache, id); }) &&
+           PipelineCacheTestAccess::WarmPaused(cache) &&
+           !PipelineCacheTestAccess::PrescanWarmPaused(cache);
+  }
+  std::this_thread::sleep_for(PRESCAN_SETTLE);
+  return PipelineCacheTestAccess::WarmDone(cache, id);
+}
+
+// One case of CheckPrescanPauseExempt, with the pause for draws holding the warm queue.
+void CheckPrescanPauseCase(VulkanHarness &vulkan, GuestGpu &gpu, const DecodedModuleRecord &record,
+                           PrescanPauseCase which) {
+  constexpr const char *name = "PrescanPauseExempt";
+  const bool prescan = which != PrescanPauseCase::Generated;
+  PipelineCache cache(vulkan.RuntimeContext(), nullptr);
+  PipelineCacheTestAccess::EnableWarmCompute(cache);
+  PipelineCacheTestAccess::EnableGeneration(cache);
+  if (prescan) cache.EnablePrescan(StoreGen::InProcessPrescanTransportFactory());
+  cache.PauseWarmBuilds();
+  Require(name, "the warm queue is held", PipelineCacheTestAccess::WarmPaused(cache),
+          "the pause did not hold the warm queue");
+  std::optional<Common::GpuStall::Scope> scope;
+  if (which == PrescanPauseCase::PrescanUnderScope) scope.emplace(Common::GpuStall::HoldCause::Other);
+  if (prescan) {
+    PipelineCacheTestAccess::PostPrescanRecord(cache, DecodedModuleRecord(record));
+  } else {
+    cache.PostGeneratedModule(DecodedModuleRecord(record));
+  }
+  ShaderComputeInputInfo input{};
+  gpu.SendCommandSync([&] { GeneratedLookup(cache, GENERATED_STRIDE_A, input); });
+  Require(name, prescan ? "the prescan's module builds through the pause" : "a generated module waits",
+          PrescanPauseCaseBuilt(cache, record.id, prescan) == prescan,
+          "the pause for draws held the prescan's set, or did not hold the baseline");
+  scope.reset();
+  Require(name, "only the generator's id is a generated warm id",
+          PipelineCacheTestAccess::GeneratedWarmId(cache, record.id) == !prescan,
+          "a prescan module was charged as a generated one, or the baseline was not");
+  Require(name, "a build under a Scope is counted",
+          cache.PrescanBuilds().in_scope == (which == PrescanPauseCase::PrescanUnderScope ? 1u : 0u) &&
+              cache.PrescanBuilds().builds == (prescan ? 1u : 0u),
+          "the prescan build that overlapped a stop was not counted, or one that did not was");
+  cache.ResumeWarmBuilds();
+  cache.StopBuilds();
+}
+
+// The pause for draws holds the warm queue and never the prescan's set, which is a decision the
+// audio review asked to keep explicit. A generated module, the baseline, does not build while the
+// queue is held, and the same module posted by the prescan builds. A prescan build that runs while
+// a GpuStall Scope is active is counted, and the same build without one is not. The prescan's
+// module id stays out of m_generated_warm_ids, which the generated one enters. The mutations are
+// to pause the prescan's set too, and the prescan build stays undone. Drop the count, and the build
+// under the Scope is not counted.
+void CheckPrescanPauseExempt(VulkanHarness &vulkan, GuestGpu &gpu,
+                             const std::vector<DecodedModuleRecord> &records) {
+  Config::Load({.printf_direction = Config::LogDirection::Silent,
+                .background_warm_up_enabled = true,
+                .deferred_pipeline_draws_enabled = true,
+                .pause_warm_up_for_draws_enabled = true});
+  for (const auto which : {PrescanPauseCase::Generated, PrescanPauseCase::PrescanUnderScope,
+                           PrescanPauseCase::Prescan}) {
+    CheckPrescanPauseCase(vulkan, gpu, records[0], which);
+  }
+  Config::Load({.printf_direction = Config::LogDirection::Silent});
+  std::printf("[gpu]     %-32s ok\n", "PrescanPauseExempt");
+}
+
+// A Scope that opens and closes while a prescan build runs on a worker is counted, though none is
+// active at the build's start or end. The build's hook holds it in the middle until the test has
+// opened and closed the Scope. The baseline is the same build with no Scope, which is not counted.
+// The mutation is to judge the overlap by the Scope at the build's start alone. The build is then
+// not counted.
+void CheckPrescanOverlapMidBuild(VulkanHarness &vulkan, GuestGpu &gpu,
+                                 const std::vector<DecodedModuleRecord> &records) {
+  constexpr const char *name = "PrescanOverlapMidBuild";
+  for (const bool open_scope : {false, true}) {
+    PipelineCache cache(vulkan.RuntimeContext(), nullptr);
+    PipelineCacheTestAccess::EnableWarmCompute(cache);
+    PipelineCacheTestAccess::EnableGeneration(cache);
+    std::promise<void> entered;
+    std::promise<void> release;
+    auto entered_future = entered.get_future();
+    auto release_future = release.get_future().share();
+    PipelineCacheTestAccess::SetPrescanBuildHook(cache, [&entered, release_future] {
+      entered.set_value();
+      (void)release_future.wait_for(PRESCAN_WAIT_LIMIT);
+    });
+    cache.EnablePrescan(StoreGen::InProcessPrescanTransportFactory());
+    PipelineCacheTestAccess::PostPrescanRecord(cache, DecodedModuleRecord(records[0]));
+    ShaderComputeInputInfo input{};
+    gpu.SendCommandSync([&] { GeneratedLookup(cache, GENERATED_STRIDE_A, input); });
+    Require(name, "the build reaches its middle",
+            entered_future.wait_for(PRESCAN_WAIT_LIMIT) == std::future_status::ready,
+            "the prescan build never started");
+    if (open_scope) {
+      const Common::GpuStall::Scope scope(Common::GpuStall::HoldCause::Other);
+    }
+    release.set_value();
+    Require(name, "the build finishes",
+            WaitForPrescan([&] { return PipelineCacheTestAccess::PrescanWarmDone(cache, records[0].id); }),
+            "the prescan build never finished");
+    Require(name, open_scope ? "a Scope in the middle is counted" : "no Scope is not counted",
+            cache.PrescanBuilds().in_scope == (open_scope ? 1u : 0u) && cache.PrescanBuilds().builds == 1,
+            "a build that overlapped a Scope only in its middle was not counted, or one without was");
+    cache.StopBuilds();
+  }
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
+// The audio thread of CheckPrescanInlineTake. The prescan build's hook starts it on the GPU thread,
+// inside the take's Scope, and waits until it is held, so the hold is charged to that Scope.
+struct PrescanAudioProbe {
+  std::thread thread;
+  std::atomic<bool> held{false};
+
+  void HoldDuringScope() {
+    if (!GuestGpu::IsGpuThread() || thread.joinable()) return;
+    thread = std::thread([this] { held = Common::GpuStall::WaitWhileStalled(); });
+    const auto until = std::chrono::steady_clock::now() + PRESCAN_WAIT_LIMIT;
+    while (Common::GpuStall::WaiterCount() == 0 && std::chrono::steady_clock::now() < until) {
+      std::this_thread::yield();
+    }
+  }
+};
+
+// A prescan module whose build is still queued is run by the GPU thread inside its own Scope. That
+// stop is charged to PrescanQueued, which nothing else in the check charges, and the build is not
+// counted as work beside a stop, since it is the stop. The prescan's set is held so the take must
+// run the build. The mutations are to give the prescan's set the store's origin, and the hold is
+// charged to WarmInlinePaused. Count builds on the GPU thread too, and the inline build is counted.
+void CheckPrescanInlineTake(VulkanHarness &vulkan, GuestGpu &gpu,
+                            const std::vector<DecodedModuleRecord> &records) {
+  constexpr const char *name = "PrescanInlineTake";
+  using Common::GpuStall::HoldCause;
+  PipelineCache cache(vulkan.RuntimeContext(), nullptr);
+  PipelineCacheTestAccess::EnableWarmCompute(cache);
+  PipelineCacheTestAccess::EnableGeneration(cache);
+  PrescanAudioProbe audio;
+  PipelineCacheTestAccess::SetPrescanBuildHook(cache, [&audio] { audio.HoldDuringScope(); });
+  cache.EnablePrescan(StoreGen::InProcessPrescanTransportFactory());
+  PipelineCacheTestAccess::PausePrescanSet(cache);
+  PipelineCacheTestAccess::PostPrescanRecord(cache, DecodedModuleRecord(records[0]));
+  const auto queued = static_cast<size_t>(HoldCause::PrescanQueued);
+  const auto before = Common::GpuStall::Breakdown().cause_count[queued];
+  Common::GpuStall::Configure(true, std::chrono::milliseconds(0));
+  ShaderComputeInputInfo input{};
+  gpu.SendCommandSync([&] {
+    GeneratedLookup(cache, GENERATED_STRIDE_A, input);
+    (void)cache.GetComputePipeline(input);
+  });
+  if (audio.thread.joinable()) audio.thread.join();
+  Common::GpuStall::Configure(false);
+  Require(name, "the take is charged to PrescanQueued",
+          audio.held && Common::GpuStall::Breakdown().cause_count[queued] == before + 1,
+          "the GPU thread's run of a queued prescan build was not charged to PrescanQueued");
+  Require(name, "the inline build is not work beside a stop",
+          cache.PrescanBuilds().builds == 1 && cache.PrescanBuilds().in_scope == 0,
+          "the build the GPU thread ran in its own Scope was counted as overlapping a stop");
+  cache.StopBuilds();
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
+// A prescan module with a bad plan is refused by the prescan's own planner and leaves the
+// generator's planner free to trust the program, so the generator's good module of it is taken in.
+// The baseline is the same bad module posted by the generator, which makes the generator's planner
+// distrust the program, so its good module is refused too. The runtime makes the program first,
+// since a planner compares plans only for a program it did not make. The mutation is to judge
+// every module with the generator's planner. The good module is then refused.
+void CheckPrescanPlannerSeparate(VulkanHarness &vulkan, GuestGpu &gpu,
+                                 const std::vector<DecodedModuleRecord> &records) {
+  constexpr const char *name = "PrescanPlannerSeparate";
+  constexpr uint64_t BAD_ID_OFFSET = 7000;
+  for (const bool from_prescan : {false, true}) {
+    PipelineCache cache(vulkan.RuntimeContext(), nullptr);
+    PipelineCacheTestAccess::EnableWarmCompute(cache);
+    PipelineCacheTestAccess::EnableGeneration(cache);
+    if (from_prescan) cache.EnablePrescan(StoreGen::InProcessPrescanTransportFactory());
+    ShaderComputeInputInfo input{};
+    GeneratedLookup(cache, GENERATED_STRIDE_A, input);
+    auto bad = DecodedModuleRecord(records[1]);
+    bad.id += BAD_ID_OFFSET;
+    if (from_prescan) {
+      PipelineCacheTestAccess::PostPrescanChanged(cache, std::move(bad));
+    } else {
+      PipelineCacheTestAccess::PostChanged(cache, std::move(bad), true, false);
+    }
+    cache.PostGeneratedModule(DecodedModuleRecord(records[1]));
+    gpu.SendCommandSync([&] { GeneratedLookup(cache, GENERATED_STRIDE_A, input); });
+    const auto stats = cache.GenerationStats();
+    Require(name, from_prescan ? "the generator still trusts the program" : "a bad plan distrusts it",
+            stats && stats->drain.adopted == (from_prescan ? 1u : 0u) &&
+                stats->drain.plan_mismatch == (from_prescan ? 0u : 2u) &&
+                stats->prescan_drain.plan_mismatch == (from_prescan ? 1u : 0u),
+            "a planner judged a module of the other producer, or did not distrust a bad plan");
+    cache.StopBuilds();
+  }
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
+// A prescan module posted behind a burst of generator modules is taken in by the first drain. The
+// burst is twice the drain budget, so the first drain leaves some of it waiting, which a prescan
+// module at its back would have to wait behind. The mutation is to put prescan modules on the
+// generator's backlog. The first drain then never reaches it.
+void CheckPrescanDrainsFirst(VulkanHarness &vulkan, GuestGpu &gpu,
+                             const std::vector<DecodedModuleRecord> &records) {
+  constexpr const char *name = "PrescanDrainsFirst";
+  constexpr size_t burst = 2 * StoreGen::GENERATION_DRAIN_BUDGET;
+  constexpr uint64_t BURST_ID_OFFSET = 2000;
+  PipelineCache cache(vulkan.RuntimeContext(), nullptr);
+  PipelineCacheTestAccess::EnableWarmCompute(cache);
+  PipelineCacheTestAccess::EnableGeneration(cache);
+  cache.EnablePrescan(StoreGen::InProcessPrescanTransportFactory());
+  for (size_t index = 0; index < burst; index++) {
+    auto record = DecodedModuleRecord(records[0]);
+    record.id += BURST_ID_OFFSET + index;
+    cache.PostGeneratedModule(std::move(record));
+  }
+  PipelineCacheTestAccess::PostPrescanRecord(cache, DecodedModuleRecord(records[1]));
+  ShaderComputeInputInfo input{};
+  gpu.SendCommandSync([&] { GeneratedLookup(cache, GENERATED_STRIDE_A, input); });
+  const auto stats = cache.GenerationStats();
+  Require(name, "the prescan's module goes first",
+          stats && stats->prescan_drain.adopted == 1 && stats->drain.adopted < burst && stats->pending != 0,
+          "a prescan module waited behind generator modules, or the drain was not cut short");
+  cache.StopBuilds();
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
+// The generator and the preparer post from their own threads while the GPU thread drains. Every
+// post is counted, and once stopped every shader module handle made is either destroyed or held by
+// an adopted module, so no handle leaks and none is destroyed twice. The mutation is to post the
+// prescan's modules through the generator's intake state, which the two threads then share.
+void CheckPrescanTwoProducers(VulkanHarness &vulkan, GuestGpu &gpu,
+                              const std::vector<DecodedModuleRecord> &records) {
+  constexpr const char *name = "PrescanTwoProducers";
+  constexpr size_t per_producer = 32;
+  constexpr uint64_t GENERATED_ID_OFFSET = 3000;
+  constexpr uint64_t PRESCAN_ID_OFFSET = 5000;
+  constexpr int lookups = 4;
+  PipelineCache cache(vulkan.RuntimeContext(), nullptr);
+  PipelineCacheTestAccess::EnableWarmCompute(cache);
+  PipelineCacheTestAccess::EnableGeneration(cache);
+  cache.EnablePrescan(StoreGen::InProcessPrescanTransportFactory());
+  const auto post = [&](bool prescan) {
+    for (size_t index = 0; index < per_producer; index++) {
+      auto record = DecodedModuleRecord(records[prescan ? 1 : 0]);
+      record.id += (prescan ? PRESCAN_ID_OFFSET : GENERATED_ID_OFFSET) + index;
+      if (prescan) {
+        PipelineCacheTestAccess::PostPrescanRecord(cache, std::move(record));
+      } else {
+        cache.PostGeneratedModule(std::move(record));
+      }
+    }
+  };
+  std::thread generator([&] { post(false); });
+  std::thread preparer([&] { post(true); });
+  ShaderComputeInputInfo input{};
+  for (int lookup = 0; lookup < lookups; lookup++) {
+    gpu.SendCommandSync([&] { GeneratedLookup(cache, GENERATED_STRIDE_A, input); });
+  }
+  generator.join();
+  preparer.join();
+  gpu.SendCommandSync([&] { GeneratedLookup(cache, GENERATED_STRIDE_A, input); });
+  const auto drained = cache.GenerationStats();
+  const uint64_t adopted = drained->drain.adopted + drained->prescan_drain.adopted;
+  cache.StopBuilds();
+  const auto stopped = cache.GenerationStats();
+  Require(name, "every post is counted", stopped && stopped->posted == 2 * per_producer,
+          "a post of one producer was lost while the other posted");
+  Require(name, "every handle is accounted for",
+          stopped->handles_created == stopped->handles_destroyed + adopted,
+          "the two producers made handles that were neither destroyed nor adopted");
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
+// Captures two module records of one program, as CheckGeneratedModules does, and runs the
+// prescan's intake checks over them.
+void CheckPrescanIntake(VulkanHarness &vulkan) {
+  Config::Load({.printf_direction = Config::LogDirection::Silent});
+  const auto dir = std::filesystem::temp_directory_path() /
+                   fmt::format("kyty_prescan_intake_{}",
+                               std::chrono::steady_clock::now().time_since_epoch().count());
+  const auto store = dir / "TEST00001.shaders";
+  {
+    PipelineCache writer(vulkan.RuntimeContext(), nullptr);
+    writer.WarmUp(store);
+    ShaderComputeInputInfo input{};
+    GeneratedLookup(writer, GENERATED_STRIDE_A, input);
+    GeneratedLookup(writer, GENERATED_STRIDE_B, input);
+    writer.StopBuilds();
+  }
+  const auto records = ReadStoredModuleRecords(store);
+  Require("PrescanIntake", "two records of one program",
+          records.size() == 2 && records[0].id != records[1].id && records[0].hash == records[1].hash,
+          "the store did not hold the two modules of the program");
+  if (records.size() == 2) {
+    vulkan.WithGpuLane([&](GuestGpu &gpu) {
+      CheckPrescanNeverWaits(vulkan, gpu);
+      CheckPrescanPauseExempt(vulkan, gpu, records);
+      CheckPrescanOverlapMidBuild(vulkan, gpu, records);
+      CheckPrescanInlineTake(vulkan, gpu, records);
+      CheckPrescanPlannerSeparate(vulkan, gpu, records);
+      CheckPrescanDrainsFirst(vulkan, gpu, records);
+      CheckPrescanTwoProducers(vulkan, gpu, records);
+    });
+  }
+  std::filesystem::remove_all(dir);
+}
+
 // ---- The compute translation setup that the generator and the pre-scan share. ----
 
 // The bytes of one LDS allocation unit, which is what COMPUTE_PGM_RSRC2.LDS_SIZE counts.
@@ -71976,6 +72467,11 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--generated-modules-only") == 0) {
     VulkanHarness vulkan;
     CheckGeneratedModules(vulkan);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--prescan-intake-only") == 0) {
+    VulkanHarness vulkan;
+    CheckPrescanIntake(vulkan);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--warm-pause-only") == 0) {

@@ -39,6 +39,19 @@ struct PipelineCache::GeneratedModule {
 	StoreGen::GeneratedOrder order;
 };
 
+// What one producer of generated modules keeps while it makes them on its own thread. The generator
+// and the prescan's preparer each have one, so MakeGeneratedModule never shares a set between two
+// threads.
+struct PipelineCache::GeneratedIntake {
+	// Each module carries its program's plan. The prescan's modules do, so a drain never has to
+	// guess whether the program the plan was decoded for still exists.
+	bool always_plan = false;
+	// The program keys whose plan was decoded. Only the producer's thread touches it, and a
+	// producer with always_plan never fills it. The counters every producer adds to are atomics in
+	// the state, which two threads may add to at once.
+	std::unordered_set<ProgramKey, ProgramKeyHash> decoded_keys;
+};
+
 struct PipelineCache::GenerationState {
 	// The generator's thread fills the inbox under the mutex and sets m_has_generated, and the GPU
 	// thread clears the flag before it takes the inbox, as for the published builds. A list, so
@@ -50,16 +63,25 @@ struct PipelineCache::GenerationState {
 	// Set once, under the mutex, so that nothing is posted after the stop destroyed the inbox. It
 	// is atomic because the GPU thread reads it without the lock, when it takes a module in.
 	std::atomic<bool> stopped {false};
-	// The program keys whose plan was decoded. Only the generator's thread touches it.
-	std::unordered_set<ProgramKey, ProgramKeyHash> decoded_keys;
-	// The GPU thread's own part. A drain moves the inbox into the backlog and takes a few at a
-	// time.
+	// The producers' own states. The generator's thread uses the first and the preparer's the
+	// second.
+	GeneratedIntake generator;
+	GeneratedIntake prescan {.always_plan = true};
+	// The GPU thread's own part. A drain moves the inbox into the backlogs and takes a few at a
+	// time. Prescan modules have their own backlog, which is taken first, since the scan found them
+	// about to run and a burst of generator modules must not hold them back.
 	std::deque<GeneratedModule>     backlog;
+	std::deque<GeneratedModule>     prescan_backlog;
 	StoreGen::GeneratedDrainPlanner planner;
+	// The prescan's own planner. Each planner remembers which programs it trusts, so with one shared
+	// planner a prescan module with a bad plan would make the generator's modules of that program
+	// refused for good, and each producer's figures would hold the other's modules.
+	StoreGen::GeneratedDrainPlanner prescan_planner;
 
 	// What the drain last counted, copied under the mutex at the end of each drain so the report's
-	// writer can read it from another thread. The planner's own counters belong to the GPU thread.
+	// writer can read it from another thread. The planners' own counters belong to the GPU thread.
 	StoreGen::GeneratedDrainCounters published_drain;
+	StoreGen::GeneratedDrainCounters published_prescan_drain;
 	uint64_t                         published_backlog = 0;
 
 	// The rows of the report, all guarded by the mutex above. They live until the cache is
@@ -73,11 +95,16 @@ struct PipelineCache::GenerationState {
 	// Whether the report was given a source, which StopStoreGeneration must then replace.
 	bool report_registered = false;
 
+	// Every producer adds to these, so the handles made balance the handles destroyed once nothing
+	// waits, whoever made them.
 	std::atomic<uint64_t> posted {0};
 	std::atomic<uint64_t> created {0};
 	std::atomic<uint64_t> destroyed {0};
 	std::atomic<uint64_t> bad_plans {0};
 	std::atomic<uint64_t> undrained_at_stop {0};
+
+	// The modules both backlogs hold. GPU thread only.
+	[[nodiscard]] size_t BacklogSize() const { return backlog.size() + prescan_backlog.size(); }
 
 	// The generator, which posts into this state. It is declared last so it is destroyed first, and
 	// StopStoreGeneration stops and joins it before anything else, so nothing posts after the rest

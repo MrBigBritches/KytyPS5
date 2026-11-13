@@ -41,6 +41,10 @@ struct GeneratedOrder {
 	/// IsBackLane of the two above. The name is kept from the first rule so that the reports still
 	/// compare like for like. It means built in the Back lane.
 	bool wide_tail = false;
+	/// The module came from the submit-time prescan and not from the generator. It builds on the
+	/// prescan's own warm set, which the pause for draws never holds, and the generator's rows and
+	/// stall causes leave it out.
+	bool prescan = false;
 };
 
 } // namespace Libs::Graphics::StoreGen

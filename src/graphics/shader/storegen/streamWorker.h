@@ -2,6 +2,7 @@
 #define GRAPHICS_SHADER_STOREGEN_STREAM_WORKER_H
 
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
+#include "graphics/shader/storegen/computeTranslation.h"
 #include "graphics/shader/storegen/storeWorkerFormat.h"
 #include "graphics/shader/storegen/streamProtocol.h"
 #include "graphics/shader/storegen/streamTranslationCache.h"
@@ -139,6 +140,17 @@ private:
 
 /// Runs a Stream worker request to the end, in this process.
 StreamWorkerResult RunStreamWorker(const WorkerRequest& request, StreamWorkerOptions options = {});
+
+/// Answers one request the way a Stream worker does, on the calling thread and without the
+/// worker's translation cache, so each request translates its program afresh. The checks, the
+/// translation and the compile are the worker's own, so an answer equals the child's. The
+/// pre-scan's in-process transport uses it in tests, and it never runs in the emulator, since a
+/// recompiler EXIT here would end the process.
+/// @param request the request, with its code in request.code.
+/// @param host    the host values the worker would decode from its store header.
+/// @param device  the host subgroup size and the shared memory limit.
+[[nodiscard]] StreamResponse AnswerStreamRequest(const StreamRequest& request, const HostValues& host,
+                                                 const ComputeKeyDevice& device);
 
 /// The bytes of a specialization, as a Compile request carries it.
 [[nodiscard]] std::vector<uint8_t>

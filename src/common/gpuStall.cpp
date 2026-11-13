@@ -72,7 +72,8 @@ constexpr std::array<const char*, HOLD_CAUSE_COUNT> CAUSE_NAMES {
     "generated_waited",           "prescan_waited",      "prescan_in_flight",
     "prescan_never_posted_async", "prescan_never_posted_indirect",
     "prescan_never_posted_deep",  "prescan_refused",     "deferred_draw_resolve",
-    "ineligible_draw",            "library_once",        "other"};
+    "ineligible_draw",            "library_once",        "prescan_queued",
+    "other"};
 
 // A name missing from the table would be a null in the report, so the table must be full.
 constexpr bool AllCausesNamed() {
@@ -390,6 +391,10 @@ std::vector<HoldRecord> HoldRecords() {
 
 uint64_t ScopeCount() {
 	return g_scope_count.load(std::memory_order_relaxed);
+}
+
+bool AnyScopeActive() {
+	return g_active_scopes.load(std::memory_order_relaxed) != 0;
 }
 
 uint32_t WaiterCount() {

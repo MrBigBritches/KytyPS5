@@ -931,6 +931,27 @@ if (KYTY_CLANG_CL)
 	target_compile_options(shader_store_stream_worker_tests PRIVATE -Wno-deprecated-declarations)
 endif()
 
+# The prescan's preparer over real programs. Its in-process transport runs the Stream worker's own
+# answers here, so this links the whole recompiler like the stream worker test, and still no device.
+add_executable(prescan_preparer_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/PrescanPreparerTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/prescanPreparer.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/csRegisters.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/gpu_format.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/moduleId.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/shaderPixelParameter.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/shaderStaticKey.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/shaderStoreRecord.cpp"
+	${shader_store_worker_storegen_src}
+	${shader_store_worker_recompiler_src}
+)
+target_link_libraries(prescan_preparer_tests common Vulkan::Headers fmt::fmt xxhash xbyak::xbyak spirv-tools-opt spirv-tools libzstd_static)
+target_include_directories(prescan_preparer_tests PRIVATE ${inc_headers})
+if (KYTY_CLANG_CL)
+	# The recompiler headers bring in the deprecated codecvt use the stream worker test silences too.
+	target_compile_options(prescan_preparer_tests PRIVATE -Wno-deprecated-declarations)
+endif()
+
 # The store worker mode of the emulator binary. The test starts the real kyty_emulator through
 # ChildProcess, so it only builds the requests and eboots it sends and links no recompiler. The
 # stream pipe is linked for the Stream mode's smoke test. The emulator is built first, since the
@@ -1159,6 +1180,9 @@ if(BUILD_TESTING)
 	# consumer spinning shows up as a hang, which the timeout ends.
 	add_test(NAME prescan_handoff COMMAND $<TARGET_FILE:prescan_handoff_tests>)
 	set_tests_properties(prescan_handoff PROPERTIES TIMEOUT 60)
+	# A preparer that never wakes or never stops shows up as a hang, which the test's watchdog ends.
+	add_test(NAME prescan_preparer COMMAND $<TARGET_FILE:prescan_preparer_tests>)
+	set_tests_properties(prescan_preparer PROPERTIES TIMEOUT 300)
 	add_test(NAME compute_translation COMMAND $<TARGET_FILE:compute_translation_tests>)
 	add_test(NAME shader_store_predictor COMMAND $<TARGET_FILE:shader_store_predictor_tests>)
 	add_test(NAME shader_store_keys COMMAND $<TARGET_FILE:shader_store_keys_tests>)
@@ -1189,6 +1213,11 @@ if(BUILD_TESTING)
 	add_test(NAME shader_recompiler_prescan_setup
 	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --prescan-setup-only)
 	set_tests_properties(shader_recompiler_prescan_setup PROPERTIES TIMEOUT 120)
+	# The pre-scan's intake on the real device: the GPU thread never waits for it, and the pause for
+	# draws never holds its set.
+	add_test(NAME shader_recompiler_prescan_intake
+	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --prescan-intake-only)
+	set_tests_properties(shader_recompiler_prescan_intake PROPERTIES TIMEOUT 180)
 	add_test(NAME shader_recompiler_submit_cadence
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --submit-cadence-only)
 	add_test(NAME shader_recompiler_submit_cadence_gpu
@@ -1324,6 +1353,7 @@ if(BUILD_TESTING)
 		scan_differential_tests
 		prescan_tests
 		prescan_handoff_tests
+		prescan_preparer_tests
 		compute_translation_tests
 		shader_store_predictor_tests
 		shader_store_keys_tests

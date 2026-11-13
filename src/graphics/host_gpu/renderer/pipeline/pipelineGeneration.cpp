@@ -3,6 +3,7 @@
 #include "common/logging/log.h"
 #include "graphics/host_gpu/renderer/pipeline/generationState.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/pipeline/prescanPreparer.h"
 #include "graphics/host_gpu/renderer/pipeline/warmLane.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
@@ -88,26 +89,34 @@ void PipelineCache::StartStoreGeneration(const std::filesystem::path& store_path
 	Log::WriteToConsoleAndLog("Shader store generation: started\n");
 }
 
-// Runs on the generator's thread. It touches no cache map, only the device, which creates shader
-// modules from any thread, and the state of the intake that only this thread uses.
 std::optional<PipelineCache::GeneratedModule>
 PipelineCache::MakeGeneratedModule(DecodedModuleRecord&&           record,
                                    const StoreGen::GeneratedOrder& order) {
+	return MakeGeneratedModule(std::move(record), order, m_generation->generator);
+}
+
+// Runs on the producer's thread. It touches no cache map, only the device, which creates shader
+// modules from any thread, the producer's own intake state and the state's atomic counters.
+std::optional<PipelineCache::GeneratedModule>
+PipelineCache::MakeGeneratedModule(DecodedModuleRecord&&           record,
+                                   const StoreGen::GeneratedOrder& order, GeneratedIntake& intake) {
 	auto&           state = *m_generation;
 	GeneratedModule item;
 	item.order     = order;
 	item.plan_hash = HashPlanBytes(record.plan);
 	FillKeyFromRecord(record, item.key);
-	// The plan is decoded for the first record of a program only. Decoding it is the costly part of
-	// a record, and the same program's other records carry the same plan.
-	if (!state.decoded_keys.contains(item.key)) {
+	// The generator's plan is decoded for the first record of a program only. Decoding it is the
+	// costly part of a record, and the same program's other records carry the same plan.
+	if (intake.always_plan || !intake.decoded_keys.contains(item.key)) {
 		ShaderRecompiler::IR::ResourcePlan plan;
 		if (!ShaderRecompiler::IR::LoadResourcePlan(record.plan, plan)) {
 			state.bad_plans++;
 			return std::nullopt;
 		}
 		item.plan = std::move(plan);
-		state.decoded_keys.insert(item.key);
+		if (!intake.always_plan) {
+			intake.decoded_keys.insert(item.key);
+		}
 	}
 	// The SPIR-V is taken out first, so nothing reads the record after it is moved.
 	const auto spirv = std::move(record.spirv);
@@ -127,6 +136,18 @@ void PipelineCache::PostGeneratedModule(DecodedModuleRecord&&           record,
 		return;
 	}
 	if (auto item = MakeGeneratedModule(std::move(record), order)) {
+		PushGenerated(std::move(*item));
+	}
+}
+
+// Runs on the prescan's preparer thread, which decodes the plan and makes the shader module here so
+// the GPU thread only splices the module in. The preparer has its own intake state, so it never
+// shares one with the generator's thread.
+void PipelineCache::PostPrescanModule(DecodedModuleRecord&& record) {
+	if (m_generation == nullptr) {
+		return;
+	}
+	if (auto item = MakeGeneratedModule(std::move(record), {.prescan = true}, m_generation->prescan)) {
 		PushGenerated(std::move(*item));
 	}
 }
@@ -183,24 +204,28 @@ void PipelineCache::DrainGenerated() {
 		taken.swap(state.inbox);
 	}
 	for (auto& item: taken) {
-		state.backlog.push_back(std::move(item));
+		(item.order.prescan ? state.prescan_backlog : state.backlog).push_back(std::move(item));
 	}
 	size_t                   handled = 0;
 	std::chrono::nanoseconds oldest_wait {};
-	while (!state.backlog.empty() && budget.Allows(handled, Clock::now() - start)) {
-		auto item = std::move(state.backlog.front());
-		state.backlog.pop_front();
+	while (state.BacklogSize() != 0 && budget.Allows(handled, Clock::now() - start)) {
+		// The prescan's modules go first, so a burst of generator modules never delays one the scan
+		// found about to run.
+		auto& from = state.prescan_backlog.empty() ? state.backlog : state.prescan_backlog;
+		auto  item = std::move(from.front());
+		from.pop_front();
 		oldest_wait = std::max(
 		    oldest_wait, std::chrono::duration_cast<std::chrono::nanoseconds>(start - item.posted));
+		auto&      planner    = item.order.prescan ? state.prescan_planner : state.planner;
 		const auto item_start = Clock::now();
 		AdoptGenerated(std::move(item));
 		// The time budget cannot cut one module short, so the longest one is kept to show whether a
 		// big plan pushes a drain over it.
-		state.planner.NoteItem(Clock::now() - item_start);
+		planner.NoteItem(Clock::now() - item_start);
 		handled++;
 	}
-	// What the budget left stays in the backlog, and the next lookup goes on with it.
-	if (!state.backlog.empty()) {
+	// What the budget left stays in the backlogs, and the next lookup goes on with it.
+	if (state.BacklogSize() != 0) {
 		m_has_generated.store(true, std::memory_order_relaxed);
 	}
 	state.planner.NoteDrain(Clock::now() - start, oldest_wait);
@@ -208,49 +233,56 @@ void PipelineCache::DrainGenerated() {
 	// takes, so it costs the GPU thread no more than a post costs the generator.
 	{
 		std::scoped_lock lock(state.mutex);
-		state.published_drain   = state.planner.Counters();
-		state.published_backlog = state.backlog.size();
+		state.published_drain         = state.planner.Counters();
+		state.published_prescan_drain = state.prescan_planner.Counters();
+		state.published_backlog       = state.BacklogSize();
 	}
 }
 
-void PipelineCache::AdoptGenerated(GeneratedModule&& item) {
-	auto&                state = *m_generation;
-	StoreGen::DrainFacts facts;
-	facts.stopped = state.stopped.load(std::memory_order_relaxed) || m_warm_compute == nullptr ||
-	                m_warm_compute->Stopping();
-	facts.plan_hash                                                           = item.plan_hash;
-	Program*                                                          program = nullptr;
-	std::unordered_map<ProgramKey, Program, ProgramKeyHash>::iterator entry;
-	if (!facts.stopped) {
-		bool inserted             = false;
-		std::tie(entry, inserted) = m_program_cache.try_emplace(item.key);
-		program                   = &entry->second;
-		facts.program             = ProgramNumber(program);
-		facts.program_inserted    = inserted;
-		if (inserted) {
-			facts.plan_installed = item.plan.has_value();
-			if (item.plan) {
-				program->resource_plan = std::move(*item.plan);
-			}
-		} else {
-			facts.id_present =
-			    std::ranges::any_of(program->modules, [&](const ShaderModule& module) {
-				    return module.id == item.module.id;
-			    });
+// Finds or makes the program a module belongs to and fills in what the planner judges by. A new
+// program takes the module's plan.
+PipelineCache::Program* PipelineCache::InstallGeneratedProgram(GeneratedModule&      item,
+                                                               StoreGen::DrainFacts& facts,
+                                                               ProgramIterator&      entry) {
+	bool inserted             = false;
+	std::tie(entry, inserted) = m_program_cache.try_emplace(item.key);
+	Program* program          = &entry->second;
+	facts.program             = ProgramNumber(program);
+	facts.program_inserted    = inserted;
+	if (inserted) {
+		facts.plan_installed = item.plan.has_value();
+		if (item.plan) {
+			program->resource_plan = std::move(*item.plan);
 		}
+	} else {
+		facts.id_present = std::ranges::any_of(program->modules, [&](const ShaderModule& module) {
+			return module.id == item.module.id;
+		});
 	}
-	const auto verdict = state.planner.Judge(facts, [&] {
+	return program;
+}
+
+void PipelineCache::AdoptGenerated(GeneratedModule&& item) {
+	auto& state = *m_generation;
+	// A prescan module builds on the prescan's own set, which the pause for draws never holds, so
+	// the intake is stopped for it when that set is.
+	const auto* warm_set = item.order.prescan ? m_prescan_compute.get() : m_warm_compute.get();
+	StoreGen::DrainFacts facts;
+	facts.stopped =
+	    state.stopped.load(std::memory_order_relaxed) || warm_set == nullptr || warm_set->Stopping();
+	facts.plan_hash  = item.plan_hash;
+	Program* program = nullptr;
+	ProgramIterator entry;
+	if (!facts.stopped) {
+		program = InstallGeneratedProgram(item, facts, entry);
+	}
+	// Each producer is judged by its own planner, so neither can make the other distrust a program.
+	auto&      planner = item.order.prescan ? state.prescan_planner : state.planner;
+	const auto verdict = planner.Judge(facts, [&] {
 		return HashPlanBytes(ShaderRecompiler::IR::SaveResourcePlan(program->resource_plan));
 	});
 	switch (verdict) {
-		case StoreGen::DrainVerdict::Adopt: {
-			StoreGen::GenRow* row = NoteAdopted(item);
-			// A deque, so the address that the queued build holds stays valid.
-			program->modules.push_back(std::move(item.module));
-			// Narrow bases and wide partials go to the back lane and never delay the others.
-			StartWarmCompute(program->modules.back(), row, WarmLaneOf(item.order));
-			return;
-		}
+		case StoreGen::DrainVerdict::Adopt: TakeGeneratedIn(std::move(item), *program); return;
 		case StoreGen::DrainVerdict::DropFailedInstall:
 			// The program was made for this module and has no plan, so it goes again, as a store
 			// record whose plan cannot be loaded does.
@@ -260,6 +292,21 @@ void PipelineCache::AdoptGenerated(GeneratedModule&& item) {
 	}
 	NoteRefused(item, verdict);
 	DestroyGeneratedHandles(item);
+}
+
+// Puts an adopted module in its program and queues its build. A prescan module has no generator
+// row and builds on the prescan's set, at the front, since the scan found it about to run.
+void PipelineCache::TakeGeneratedIn(GeneratedModule&& item, Program& program) {
+	const bool        prescan = item.order.prescan;
+	StoreGen::GenRow* row     = prescan ? nullptr : NoteAdopted(item);
+	// A deque, so the address that the queued build holds stays valid.
+	program.modules.push_back(std::move(item.module));
+	if (prescan) {
+		StartPrescanCompute(program.modules.back());
+		return;
+	}
+	// Narrow bases and wide partials go to the back lane and never delay the others.
+	StartWarmCompute(program.modules.back(), row, WarmLaneOf(item.order));
 }
 
 // Adds the row of a module that was taken in, and returns it for the warm build to stamp. The row
@@ -281,6 +328,16 @@ StoreGen::GenRow* PipelineCache::NoteAdopted(const GeneratedModule& item) {
 void PipelineCache::NoteRefused(const GeneratedModule& item, StoreGen::DrainVerdict verdict) {
 	using StoreGen::DrainVerdict;
 	using StoreGen::DropVerdict;
+	// The generator's miss classes judge its own refusals, and the prescan's planner counts the
+	// prescan's. A late answer to a request the GPU thread compiled itself in the meantime ends here
+	// as a duplicate, which tells the preparer the guess was right, so it does not count towards the
+	// back-off. A plan mismatch or a stop leaves the module unused.
+	if (item.order.prescan) {
+		if (verdict == DrainVerdict::DropDuplicate && m_prescan != nullptr) {
+			m_prescan->NoteDuplicate(item.module.id);
+		}
+		return;
+	}
 	const DropVerdict named =
 	    verdict == DrainVerdict::DropDuplicate       ? DropVerdict::Duplicate
 	    : verdict == DrainVerdict::DropPlanMismatch  ? DropVerdict::PlanMismatch
@@ -320,6 +377,8 @@ void PipelineCache::CheckGeneratedPlan(Program&                                 
 }
 
 void PipelineCache::StopStoreGeneration() {
+	// The preparer posts into the intake below, so it ends first.
+	StopPrescan();
 	if (m_generation == nullptr) {
 		return;
 	}
@@ -340,10 +399,12 @@ void PipelineCache::StopStoreGeneration() {
 	for (auto& item: inbox) {
 		undrained.push_back(std::move(item));
 	}
-	for (auto& item: state.backlog) {
-		undrained.push_back(std::move(item));
+	for (auto* backlog: {&state.prescan_backlog, &state.backlog}) {
+		for (auto& item: *backlog) {
+			undrained.push_back(std::move(item));
+		}
+		backlog->clear();
 	}
-	state.backlog.clear();
 	state.undrained_at_stop += undrained.size();
 	for (auto& item: undrained) {
 		DestroyGeneratedHandles(item);
@@ -382,7 +443,7 @@ PipelineCache::BuildGenerationReport(bool final_figures) const {
 		std::scoped_lock lock(state.mutex);
 		drain = final_figures ? state.planner.Counters() : state.published_drain;
 		counts.pending =
-		    state.inbox.size() + (final_figures ? state.backlog.size() : state.published_backlog);
+		    state.inbox.size() + (final_figures ? state.BacklogSize() : state.published_backlog);
 	}
 	counts.posted            = state.posted;
 	counts.handles_created   = state.created;
@@ -408,6 +469,7 @@ std::optional<StoreGenerationStats> PipelineCache::GenerationStats() const {
 	auto&                state = *m_generation;
 	StoreGenerationStats stats;
 	stats.drain             = state.planner.Counters();
+	stats.prescan_drain     = state.prescan_planner.Counters();
 	stats.posted            = state.posted;
 	stats.handles_created   = state.created;
 	stats.handles_destroyed = state.destroyed;
@@ -420,7 +482,7 @@ std::optional<StoreGenerationStats> PipelineCache::GenerationStats() const {
 		std::scoped_lock lock(state.mutex);
 		stats.pending = state.inbox.size();
 	}
-	stats.pending += state.backlog.size();
+	stats.pending += state.BacklogSize();
 	return stats;
 }
 

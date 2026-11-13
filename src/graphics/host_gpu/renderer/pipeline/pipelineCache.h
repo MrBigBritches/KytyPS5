@@ -20,6 +20,7 @@
 #include "graphics/shader/shader.h"
 #include "graphics/shader/storegen/generatedDrainPlanner.h"
 #include "graphics/shader/storegen/generatedOrder.h"
+#include "graphics/shader/storegen/prescanTransport.h"
 
 #include <array>
 #include <atomic>
@@ -43,20 +44,32 @@
 
 namespace Libs::Graphics {
 
+/// Where the module of a warm build came from, which decides what a stop for it is charged to.
+enum class WarmOrigin : uint8_t {
+	Store,     ///< The shader store's own records, from WarmUp.
+	Generated, ///< The shader store generator.
+	Prescan,   ///< The submit-time prescan, which builds on its own warm set.
+};
+
 /// The cause a dispatch's stop for a warm-up build is charged to, once Take has said how it got the
 /// build. A build a worker had started is a wait, and one no worker had started ran on the GPU thread.
 /// Inline builds are told apart by whether the queue was paused and by whether the module is
 /// generated, and a generated module that ran inline while paused has its own cause, so neither
 /// wins. The cost of the pause is WarmInlinePaused plus GeneratedInlinePaused, and the generator's
 /// misses are GeneratedInline plus GeneratedInlinePaused. A build that was already done stops
-/// nothing and is charged like an inline one.
+/// nothing and is charged like an inline one. A prescan module is charged to PrescanWaited when a
+/// worker had it, and to PrescanQueued when the GPU thread ran it or found it done, whatever the
+/// pause, since the pause never holds the prescan's set.
 [[nodiscard]] Common::GpuStall::HoldCause WarmTakeCause(PipelineBuildQueue::Acquired how, bool paused,
-                                                        bool generated);
+                                                        WarmOrigin origin);
 
 struct GraphicContext;
 struct ShaderParams;
 class CommandBuffer;
 class GraphicsLibraryCache;
+struct PrescanHandoff;
+class PrescanPreparer;
+struct PrescanPreparerConfig;
 
 namespace ShaderRecompiler {
 struct CompileOptions;
@@ -214,6 +227,8 @@ private:
 // thread, so read them from it or after StopStoreGeneration.
 struct StoreGenerationStats {
 	StoreGen::GeneratedDrainCounters drain;
+	// What the prescan's own planner decided about the prescan's modules, which drain leaves out.
+	StoreGen::GeneratedDrainCounters prescan_drain;
 	// Modules the generator's thread posted, and the shader module handles it made and the cache
 	// destroyed, which are equal once nothing is waiting.
 	uint64_t posted            = 0;
@@ -233,6 +248,19 @@ struct StoreGenerationStats {
 // above that, so a normal resolve ends the pause first with Resume, while a resolve that never
 // comes cannot starve the warm-up for longer than this.
 inline constexpr std::chrono::seconds WARM_UP_PAUSE_LIMIT {10};
+
+// How many workers build the pipelines of the prescan's modules. The prototype measured 35.0, 21.7
+// and 20.4 s of LEGO compute stalls with 1, 2 and 3, and the audio review accepted 3 below normal.
+inline constexpr uint32_t PRESCAN_BUILD_WORKERS = 3;
+
+// What the prescan's pipeline builds did. A build overlapped a stop of the GPU thread when a
+// GpuStall Scope was active at its start or end, or one began while it ran, and it ran on a worker.
+// in_scope_ms is the whole time of those builds, so it is an upper bound on the overlap.
+struct PrescanBuildStats {
+	uint64_t builds   = 0;
+	uint64_t in_scope = 0;
+	double   in_scope_ms = 0.0;
+};
 
 // What a draw that has no pipeline yet does while the pipeline builds. A skipped draw leaves out its
 // commands, a deferred draw becomes a hole in the command stream that is recorded once the pipeline
@@ -399,6 +427,23 @@ public:
 	// reached the build either.
 	[[nodiscard]] uint32_t WarmInlineDuringPause() const noexcept { return m_warm_inline_during_pause; }
 
+	// Starts the submit-time prescan's preparer, its hand-off and its own warm set, with the
+	// transport the factory makes. The host values come from this device and Config, as the runtime
+	// translates with them. Modules it builds enter the generated intake, which is made if the
+	// generator did not make it. Calling it again does nothing. Nothing calls it yet, since the
+	// scanner that fills the hand-off is wired later.
+	void EnablePrescan(StoreGen::PrescanTransportFactory make_transport);
+	// The hand-off the scanner pushes into, or null without the prescan. It lives as long as the
+	// cache, and the scanner must be joined before StopPrescan.
+	[[nodiscard]] PrescanHandoff* PrescanInbox() noexcept { return m_prescan_handoff.get(); }
+	// The preparer, or null without the prescan.
+	[[nodiscard]] PrescanPreparer* Prescan() noexcept { return m_prescan.get(); }
+	// Stops the preparer and its transport and joins it, so nothing posts into the intake after.
+	// The preparer stays, so its counters can still be read. Calling it again does nothing.
+	void StopPrescan();
+	// What the prescan's pipeline builds did so far. Any thread.
+	[[nodiscard]] PrescanBuildStats PrescanBuilds() const;
+
 private:
 	friend struct PipelineCacheTestAccess;
 
@@ -531,12 +576,34 @@ private:
 	// without it has one pointer and one flag for it and nothing else. The inbox is filled by the
 	// generator's thread and drained by the GPU thread, like the published builds.
 	struct GeneratedModule;
+	struct GeneratedIntake;
 	struct GenerationState;
 	std::unique_ptr<GenerationState> m_generation;
 	std::atomic<bool>                m_has_generated {false};
 	// A test changes the generator's settings here, such as the program it starts and its timeouts,
 	// before WarmUp.
 	std::function<void(StoreGen::SupervisorConfig&)> m_supervisor_tweak;
+	// The submit-time prescan, all null unless EnablePrescan ran. The hand-off is declared before
+	// the preparer, which reads it until it is joined. The prescan's modules build on their own warm
+	// set, which PauseWarmBuilds never holds. The preparer posts into the generated intake, so
+	// StopStoreGeneration stops it first.
+	std::unique_ptr<PrescanHandoff>                   m_prescan_handoff;
+	std::unique_ptr<WarmBuildSet<uint64_t, Pipeline>> m_prescan_compute;
+	std::unique_ptr<PrescanPreparer>                  m_prescan;
+	// Written by the prescan's build workers, read by anyone.
+	struct PrescanBuildCounters {
+		std::atomic<uint64_t> builds {0};
+		std::atomic<uint64_t> in_scope {0};
+		std::atomic<uint64_t> in_scope_us {0};
+	};
+	PrescanBuildCounters m_prescan_builds;
+	// A test changes the preparer's settings here before EnablePrescan makes it, such as a memory
+	// reader for host memory.
+	std::function<void(PrescanPreparerConfig&)> m_prescan_tweak;
+	// A test hook every prescan build calls after it sampled the stall state and before it compiles,
+	// on whichever thread runs it, so a test can open a Scope in the middle of a build. Set before
+	// EnablePrescan and never changed after. Empty in production.
+	std::function<void()> m_prescan_build_hook;
 
 	template <typename InputInfo>
 	const ShaderModule* GetProgram(const ShaderParams& params, InputInfo& input_info,
@@ -631,19 +698,36 @@ private:
 	// whether workers build it with the rest or only when nothing else is waiting.
 	void StartWarmCompute(const ShaderModule& module, StoreGen::GenRow* row = nullptr,
 	                      PipelineBuildQueue::Lane lane = PipelineBuildQueue::Lane::Front);
+	// Starts the build of a prescan module on the prescan's warm set. Like StartWarmCompute it never
+	// stores a record, and the module's id stays out of m_generated_warm_ids, so a stop for it is
+	// charged to the prescan's causes. It counts the builds that overlapped a stop of the GPU
+	// thread.
+	void StartPrescanCompute(const ShaderModule& module);
+	// The warm set that has a build pending for the module, or null. A module is on one set only,
+	// since the prescan's modules are adopted only when their program has no module with the id.
+	[[nodiscard]] WarmBuildSet<uint64_t, Pipeline>* WarmSetPending(uint64_t id) const;
 	// Moves the module's warm-up pipeline into m_compute_pipelines, waiting for it or building it
 	// here if it is not done. Null when no warm-up build is pending for the module.
 	[[nodiscard]] Pipeline* TakeWarmCompute(const ShaderComputeInputInfo& input_info);
-	// The part of TakeWarmCompute for a build that is queued or running. It runs or waits for the
-	// build inside the stall and the timing that the GPU thread owes for that.
+	// The part of TakeWarmCompute for a build that is queued or running on `set`. It runs or waits
+	// for the build inside the stall and the timing that the GPU thread owes for that.
 	[[nodiscard]] std::optional<WarmBuildSet<uint64_t, Pipeline>::Taken>
-	TakeUnfinishedWarmCompute(uint64_t id);
+	TakeUnfinishedWarmCompute(uint64_t id, WarmBuildSet<uint64_t, Pipeline>& set);
 	// Counts and logs a warm-up compute build that stopped the GPU thread for `stopped_ms`, and says
 	// whether the queue was held when it did. Builds already done when taken stop nothing and are not
 	// counted.
 	void NoteWarmComputeStop(PipelineBuildQueue::Acquired how, double stopped_ms, bool queue_held);
-	// Stops the warm queue and destroys the pipelines it built that nobody took.
+	// Stops the warm queue and the prescan's set and destroys the pipelines they built that nobody
+	// took.
 	void StopWarmBuilds();
+	// Stops one warm set, destroys the pipelines in it that nobody took and resets it.
+	void StopWarmSet(std::unique_ptr<WarmBuildSet<uint64_t, Pipeline>>& set);
+	// The preparer's settings, taken from this device and Config.
+	[[nodiscard]] PrescanPreparerConfig
+	MakePrescanConfig(StoreGen::PrescanTransportFactory make_transport);
+	// pipelineGeneration.cpp. Makes the module of a prescan record on the preparer's thread and posts
+	// it, as PostGeneratedModule does for the generator.
+	void PostPrescanModule(DecodedModuleRecord&& record);
 
 	// Makes the state of the generated modules intake. Called once, before the generator starts.
 	void EnableStoreGeneration();
@@ -654,6 +738,10 @@ private:
 	// decoded.
 	[[nodiscard]] std::optional<GeneratedModule>
 	MakeGeneratedModule(DecodedModuleRecord&& record, const StoreGen::GeneratedOrder& order = {});
+	// The same for any producer, with that producer's own intake state.
+	[[nodiscard]] std::optional<GeneratedModule>
+	MakeGeneratedModule(DecodedModuleRecord&& record, const StoreGen::GeneratedOrder& order,
+	                    GeneratedIntake& intake);
 	// Puts a module in the inbox, or destroys it when the intake has stopped.
 	void PushGenerated(GeneratedModule&& item);
 	// Takes posted modules into the program cache and queues their builds. GPU thread only. It takes
@@ -671,9 +759,15 @@ private:
 	// The rows of generated modules, refused modules and misses, copied under the state's mutex.
 	// The report's own rows are not in it.
 	[[nodiscard]] StoreGen::GenerationRowInputs SnapshotGenerationRows() const;
-	// Takes one module in, or drops it as the planner says. Either way it leaves a row for the
-	// report.
+	// Takes one module in, or drops it as the planner says. Either way a generator module leaves a
+	// row for the report, and a prescan module is counted.
 	void AdoptGenerated(GeneratedModule&& item);
+	using ProgramIterator = std::unordered_map<ProgramKey, Program, ProgramKeyHash>::iterator;
+	// The program a module joins, made with the module's plan when it is new.
+	Program* InstallGeneratedProgram(GeneratedModule& item, StoreGen::DrainFacts& facts,
+	                                 ProgramIterator& entry);
+	// Puts an adopted module in its program and queues its build on the set of its producer.
+	void TakeGeneratedIn(GeneratedModule&& item, Program& program);
 	// Records that the runtime had to translate a compute program with generation on, for the
 	// report's classes. id is 0 for a program that the runtime skips. Any thread.
 	void NoteGeneratedMiss(uint64_t code_hash, uint64_t id, bool has_calls, bool skip_dispatch);

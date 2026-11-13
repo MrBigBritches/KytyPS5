@@ -22,9 +22,13 @@ using Clock = std::chrono::steady_clock;
 // add audible dropouts to stalls nobody notices.
 inline constexpr std::chrono::milliseconds GPU_STALL_AUDIO_HOLD_THRESHOLD {250};
 
-/// Why the GPU command thread was stopped, so a hold of guest audio can be blamed on one thing. The
-/// prescan causes have no call sites yet and exist so the report's schema does not change when they
-/// get some. Other is a gate value that must stay 0 in a finished run. WarmInlinePaused and
+/// Why the GPU command thread was stopped, so a hold of guest audio can be blamed on one thing.
+/// PrescanWaited and PrescanQueued are charged by the warm takes of prescan modules, a wait for a
+/// worker's build and a build the GPU thread ran itself because it was still queued. The other
+/// prescan causes have no call sites yet. They are PrescanInFlight, for a request still in the
+/// helper, the three PrescanNeverPosted causes and PrescanRefused, and they are reserved for the
+/// GPU thread's compile of a module the prescan did not deliver, so the report's schema does not
+/// change when they get sites. Other is a gate value that must stay 0 in a finished run. WarmInlinePaused and
 /// GeneratedInlinePaused are causes of their own and not subsets, so the causes add up to the total
 /// held time. The cost of the pause is their sum, and the generator's misses are GeneratedInline
 /// plus GeneratedInlinePaused. LibraryOnce is reserved and
@@ -49,6 +53,7 @@ enum class HoldCause : uint8_t {
 	DeferredDrawResolve,
 	IneligibleDraw,
 	LibraryOnce,
+	PrescanQueued,
 	Other,
 };
 inline constexpr size_t HOLD_CAUSE_COUNT = static_cast<size_t>(HoldCause::Other) + 1;
@@ -207,6 +212,10 @@ bool WaitWhileStalled();
 /// Scopes created since the process began, so a test can tell one scope from several. Unlike
 /// HoldCount it does not depend on a thread being held while each scope lasts.
 [[nodiscard]] uint64_t ScopeCount();
+
+/// True while any Scope exists, held long enough to hold audio or not. Work on other threads reads
+/// it with ScopeCount to tell whether it overlapped a stop of the GPU thread.
+[[nodiscard]] bool AnyScopeActive();
 
 /// Number of threads waiting in WaitWhileStalled, so tests can tell when a waiter is parked.
 [[nodiscard]] uint32_t WaiterCount();
