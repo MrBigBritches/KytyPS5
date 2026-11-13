@@ -664,6 +664,93 @@ struct ScanDifferentialReport {
 /// The most mismatch and missing examples the scan differential keeps.
 inline constexpr size_t SCAN_DIFFERENTIAL_SAMPLE_LIMIT = 8;
 
+/// One of the prescan's times, read from a histogram by powers of two and an exact maximum. A
+/// percentile is nearest rank and is the top of the bucket its rank falls in, but never above the
+/// maximum, so it is an upper bound less than twice the true figure. The exception is the last bucket,
+/// which holds every larger value and answers with the maximum. All are 0 when nothing was timed.
+struct PrescanTimeFigures {
+	uint64_t p50 = 0;
+	uint64_t p90 = 0;
+	uint64_t p99 = 0;
+	uint64_t max = 0;
+};
+
+/// What the prescan's walks counted, summed over every walk. The names are those of the scanner's
+/// own counts.
+struct PrescanScanReport {
+	uint64_t submissions              = 0;
+	uint64_t dispatches               = 0;
+	uint64_t no_shader_state          = 0;
+	uint64_t program_inherited        = 0;
+	uint64_t uncertain_program        = 0;
+	uint64_t ib_followed              = 0;
+	uint64_t ib_unreadable            = 0;
+	uint64_t ib_depth_limited         = 0;
+	uint64_t ib_revisited             = 0;
+	uint64_t budget_exhausted         = 0;
+	uint64_t bad_packets              = 0;
+	uint64_t resets                   = 0;
+	uint64_t dwords_read              = 0;
+	uint64_t dwords_max               = 0;
+	uint64_t dispatches_cached        = 0;
+	uint64_t time_capped              = 0;
+	uint64_t scan_allocations         = 0;
+	uint64_t cache_remembered_busy    = 0;
+	uint64_t depth_max                = 0;
+	uint64_t register_list_unreadable = 0;
+	uint64_t branch_mode1             = 0;
+	uint64_t branch_mode2             = 0;
+	uint64_t branch_mode2_empty_else  = 0;
+	uint64_t ib_revisit_doubts        = 0;
+	/// How many times each cause made the program uncertain, by the cause's name.
+	std::vector<std::pair<std::string, uint64_t>> uncertain_cleared_by;
+	/// How long each walk took, in microseconds.
+	PrescanTimeFigures scan_us;
+	/// Walks of 1024 microseconds or more. The histogram's buckets split at powers of two, so this is
+	/// the exact count nearest to the walks over one millisecond that it can give.
+	uint64_t scan_at_least_1024_us = 0;
+};
+
+/// What the prescan's job queue counted, and the times of the copy, the push and the wait for the
+/// scanner thread.
+struct PrescanQueueReport {
+	uint64_t pushed            = 0;
+	uint64_t dropped           = 0;
+	uint64_t dropped_no_buffer = 0;
+	uint64_t late_skipped      = 0;
+	uint64_t markers_lost      = 0;
+	uint64_t truncated         = 0;
+	uint64_t copied_dwords     = 0;
+	uint64_t peak              = 0;
+	/// The copy of each list on the submitting thread, the wait for the queue's lock included.
+	PrescanTimeFigures copy_us;
+	/// The push of each job inside the order gate, the wait for the queue's lock included.
+	PrescanTimeFigures push_us;
+	/// How old each list was when the scanner thread took it.
+	PrescanTimeFigures lag_ms;
+};
+
+/// The report's view of the prescan's scanner thread, as plain numbers since this library cannot see
+/// the scanner.
+struct PrescanScannerReport {
+	PrescanScanReport  scan;
+	PrescanQueueReport queue;
+	/// Jobs the thread finished, lists older than the lag bound it did not walk, and 1 once it stopped
+	/// because the preparer had.
+	uint64_t jobs                = 0;
+	uint64_t lag_skipped         = 0;
+	uint64_t stopped_by_preparer = 0;
+	uint64_t wakes               = 0;
+	/// The calls the walks made to the reader of guest memory, the longest, and those over a millisecond.
+	uint64_t read_calls    = 0;
+	uint64_t read_max_us   = 0;
+	uint64_t read_over_1ms = 0;
+	/// What became of the dispatches offered to the preparer.
+	uint64_t offers_posted  = 0;
+	uint64_t offers_skipped = 0;
+	uint64_t offers_dropped = 0;
+};
+
 /// Figures worked out from the raw records, kept apart from JSON so tests can read them.
 struct Summary {
 	double                                                   blocked_graphics_ms = 0.0;
@@ -867,7 +954,24 @@ public:
 	/// Stores the final figures and removes the source, in one step under the lock.
 	void SetScanDifferentialFinal(ScanDifferentialReport final_figures);
 
+	/// Registers the function the writer calls for the scanner part of the prescan block. With no
+	/// source and no final figures the report has no prescan block, which is how a run without the
+	/// prescan looks. The writer holds the prescan scan lock while it calls, so the owner replaces the
+	/// source with SetPrescanScanFinal before what the function reads is destroyed. The function must
+	/// not call back into these functions.
+	void SetPrescanScanSource(std::function<PrescanScannerReport()> source);
+	/// Stores the final figures and removes the source, in one step under the lock.
+	void SetPrescanScanFinal(PrescanScannerReport final_figures);
+	/// Whether a scanner source is registered, so a test can tell that its owner handed over before it
+	/// was destroyed without calling a source that may be gone.
+	[[nodiscard]] bool HoldsPrescanScanSource() const;
+	/// Whether final scanner figures are stored.
+	[[nodiscard]] bool HoldsPrescanScanFinal() const;
+
 private:
+	// The scanner's figures from the source or the final ones, or nothing when there are neither. The
+	// source is called with the prescan scan lock held.
+	[[nodiscard]] std::optional<PrescanScannerReport> PrescanScanFigures() const;
 	// Moves the pause being merged to the finished ones when it belongs to another flip. Caller
 	// holds the lock.
 	void FlushPendingPauseLocked(int64_t current_flip);
@@ -891,6 +995,12 @@ private:
 	mutable std::mutex                           m_scan_differential_mutex;
 	std::function<ScanDifferentialReport()>      m_scan_differential_source;
 	std::optional<ScanDifferentialReport>        m_scan_differential_final;
+
+	// Guards the two prescan scan members. It is taken on its own, never with another lock of the
+	// report held, and the source takes only the scanner's own locks, which never wait on the report.
+	mutable std::mutex                           m_prescan_scan_mutex;
+	std::function<PrescanScannerReport()>        m_prescan_scan_source;
+	std::optional<PrescanScannerReport>          m_prescan_scan_final;
 
 	mutable std::mutex           m_mutex;
 	Phase                        m_phase = Phase::Play;

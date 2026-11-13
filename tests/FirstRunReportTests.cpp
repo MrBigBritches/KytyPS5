@@ -2002,6 +2002,248 @@ void TestGenerationFinalWaitsForAWriterInTheSource() {
 	Check(handed_over && left_source, "the hand-over or the writer never finished");
 }
 
+// ---- The scanner's part of the prescan block. ----
+
+using Common::FirstRunReport::PrescanScannerReport;
+
+constexpr const char* PRESCAN_KEY = "prescan";
+
+// The prescan block of a report's JSON, or null when it has none.
+nlohmann::json PrescanBlock(const Report& report) {
+	const auto json = nlohmann::json::parse(report.ToJson({}, 0, 1.0, 0.0, {}));
+	return json.contains(PRESCAN_KEY) ? json[PRESCAN_KEY] : nlohmann::json(nullptr);
+}
+
+// A report with no scanner figures has no prescan block, which is how a run with the prescan off keeps
+// its report as it was. The baseline is the same report with a source, which has the block and differs
+// in nothing else. A final figure alone makes the block too, and Reset takes it away. A writer that
+// always wrote the block would show it in the first report.
+void TestPrescanBlockAbsentWithoutSource() {
+	Report     off;
+	const auto off_json = nlohmann::json::parse(off.ToJson({}, 0, 1.0, 0.0, {}));
+	Check(!off_json.contains(PRESCAN_KEY), "a report without a scanner had a prescan block");
+
+	Report on;
+	on.SetPrescanScanSource([] { return PrescanScannerReport {}; });
+	auto on_json = nlohmann::json::parse(on.ToJson({}, 0, 1.0, 0.0, {}));
+	Check(on_json.contains(PRESCAN_KEY), "a report with a scanner source had no prescan block");
+	on_json.erase(PRESCAN_KEY);
+	// The process peaks are read when each report is written, so they are left out of the comparison.
+	auto off_without_peaks = off_json;
+	off_without_peaks.erase("process");
+	on_json.erase("process");
+	Check(on_json == off_without_peaks, "the prescan block changed another part of the report");
+
+	Report final_only;
+	final_only.SetPrescanScanFinal({});
+	Check(!PrescanBlock(final_only).is_null(), "final scanner figures alone left no prescan block");
+	// Reset takes away a source and final figures alike.
+	on.Reset();
+	Check(PrescanBlock(on).is_null(), "Reset kept a prescan block from a source");
+	final_only.Reset();
+	Check(PrescanBlock(final_only).is_null(), "Reset kept a prescan block from final figures");
+}
+
+// One figure of the scanner's report, and where it shows in the block.
+struct PrescanFieldCase {
+	const char*                                             pointer;
+	std::function<void(PrescanScannerReport&, uint64_t)> set;
+};
+
+// Each case sets one plain figure of the report to the value it is given.
+#define PRESCAN_FIELD(pointer, member)                                                    \
+	PrescanFieldCase {                                                                    \
+		pointer, [](PrescanScannerReport& figures, uint64_t value) { figures.member = value; } \
+	}
+
+// The walks' counts and the walk time.
+std::vector<PrescanFieldCase> PrescanScanFieldCases() {
+	return {PRESCAN_FIELD("/scan/submissions", scan.submissions),
+	        PRESCAN_FIELD("/scan/dispatches", scan.dispatches),
+	        PRESCAN_FIELD("/scan/no_shader_state", scan.no_shader_state),
+	        PRESCAN_FIELD("/scan/program_inherited", scan.program_inherited),
+	        PRESCAN_FIELD("/scan/uncertain_program", scan.uncertain_program),
+	        PRESCAN_FIELD("/scan/ib_followed", scan.ib_followed),
+	        PRESCAN_FIELD("/scan/ib_unreadable", scan.ib_unreadable),
+	        PRESCAN_FIELD("/scan/ib_depth_limited", scan.ib_depth_limited),
+	        PRESCAN_FIELD("/scan/ib_revisited", scan.ib_revisited),
+	        PRESCAN_FIELD("/scan/budget_exhausted", scan.budget_exhausted),
+	        PRESCAN_FIELD("/scan/bad_packets", scan.bad_packets),
+	        PRESCAN_FIELD("/scan/resets", scan.resets),
+	        PRESCAN_FIELD("/scan/dwords_read", scan.dwords_read),
+	        PRESCAN_FIELD("/scan/dwords_max", scan.dwords_max),
+	        PRESCAN_FIELD("/scan/dispatches_cached", scan.dispatches_cached),
+	        PRESCAN_FIELD("/scan/time_capped", scan.time_capped),
+	        PRESCAN_FIELD("/scan/scan_allocations", scan.scan_allocations),
+	        PRESCAN_FIELD("/scan/cache_remembered_busy", scan.cache_remembered_busy),
+	        PRESCAN_FIELD("/scan/depth_max", scan.depth_max),
+	        PRESCAN_FIELD("/scan/register_list_unreadable", scan.register_list_unreadable),
+	        PRESCAN_FIELD("/scan/branch_mode1", scan.branch_mode1),
+	        PRESCAN_FIELD("/scan/branch_mode2", scan.branch_mode2),
+	        PRESCAN_FIELD("/scan/branch_mode2_empty_else", scan.branch_mode2_empty_else),
+	        PRESCAN_FIELD("/scan/ib_revisit_doubts", scan.ib_revisit_doubts),
+	        PRESCAN_FIELD("/scan/scan_us/p50", scan.scan_us.p50),
+	        PRESCAN_FIELD("/scan/scan_us/p90", scan.scan_us.p90),
+	        PRESCAN_FIELD("/scan/scan_us/p99", scan.scan_us.p99),
+	        PRESCAN_FIELD("/scan/scan_us/max", scan.scan_us.max),
+	        PRESCAN_FIELD("/scan/scan_at_least_1024_us", scan.scan_at_least_1024_us),
+	        {"/scan/uncertain_cleared_by/branch",
+	         [](PrescanScannerReport& figures, uint64_t value) {
+		         figures.scan.uncertain_cleared_by = {{"branch", value}};
+	         }}};
+}
+
+// The queue's counts and its three times.
+std::vector<PrescanFieldCase> PrescanQueueFieldCases() {
+	return {PRESCAN_FIELD("/queue/pushed", queue.pushed),
+	        PRESCAN_FIELD("/queue/dropped", queue.dropped),
+	        PRESCAN_FIELD("/queue/dropped_no_buffer", queue.dropped_no_buffer),
+	        PRESCAN_FIELD("/queue/late_skipped", queue.late_skipped),
+	        PRESCAN_FIELD("/queue/markers_lost", queue.markers_lost),
+	        PRESCAN_FIELD("/queue/truncated", queue.truncated),
+	        PRESCAN_FIELD("/queue/copied_dwords", queue.copied_dwords),
+	        PRESCAN_FIELD("/queue/peak", queue.peak),
+	        PRESCAN_FIELD("/queue/copy_us/p50", queue.copy_us.p50),
+	        PRESCAN_FIELD("/queue/copy_us/p90", queue.copy_us.p90),
+	        PRESCAN_FIELD("/queue/copy_us/p99", queue.copy_us.p99),
+	        PRESCAN_FIELD("/queue/copy_us/max", queue.copy_us.max),
+	        PRESCAN_FIELD("/queue/push_us/p50", queue.push_us.p50),
+	        PRESCAN_FIELD("/queue/push_us/p90", queue.push_us.p90),
+	        PRESCAN_FIELD("/queue/push_us/p99", queue.push_us.p99),
+	        PRESCAN_FIELD("/queue/push_us/max", queue.push_us.max),
+	        PRESCAN_FIELD("/queue/lag_ms/p50", queue.lag_ms.p50),
+	        PRESCAN_FIELD("/queue/lag_ms/p90", queue.lag_ms.p90),
+	        PRESCAN_FIELD("/queue/lag_ms/p99", queue.lag_ms.p99),
+	        PRESCAN_FIELD("/queue/lag_ms/max", queue.lag_ms.max)};
+}
+
+// The thread's counts, the reads and the offers.
+std::vector<PrescanFieldCase> PrescanThreadFieldCases() {
+	return {PRESCAN_FIELD("/thread/jobs", jobs),
+	        PRESCAN_FIELD("/thread/lag_skipped", lag_skipped),
+	        PRESCAN_FIELD("/thread/stopped_by_preparer", stopped_by_preparer),
+	        PRESCAN_FIELD("/thread/wakes", wakes),
+	        PRESCAN_FIELD("/reads/calls", read_calls),
+	        PRESCAN_FIELD("/reads/max_us", read_max_us),
+	        PRESCAN_FIELD("/reads/over_1ms", read_over_1ms),
+	        PRESCAN_FIELD("/offer/posted", offers_posted),
+	        PRESCAN_FIELD("/offer/skipped", offers_skipped),
+	        PRESCAN_FIELD("/offer/dropped", offers_dropped)};
+}
+
+#undef PRESCAN_FIELD
+
+// Every figure of the scanner's report has its own place in the block. Each case sets one figure of an
+// empty report to a value no other case uses, and the block then differs from the empty one in that
+// place only, so the baseline is the same block without the change. Two figures written under each
+// other's keys, or one not written, would put the value in the wrong place or nowhere.
+void TestPrescanScanFieldsRoundTrip() {
+	const auto block_of = [](const PrescanScannerReport& figures) {
+		Report report;
+		report.SetPrescanScanFinal(figures);
+		return PrescanBlock(report);
+	};
+	const auto base = block_of({});
+	Check(base.is_object() && base["scan"]["submissions"] == 0 && base["scan"]["uncertain_cleared_by"].empty() &&
+	          base["offer"]["dropped"] == 0,
+	      "the empty prescan block is not empty");
+	auto cases = PrescanScanFieldCases();
+	for (auto& more: {PrescanQueueFieldCases(), PrescanThreadFieldCases()}) {
+		cases.insert(cases.end(), more.begin(), more.end());
+	}
+	// Distinct from 0 and from one another, so a figure that took another's value shows.
+	constexpr uint64_t FIRST_VALUE = 1001;
+	for (size_t index = 0; index < cases.size(); ++index) {
+		const uint64_t       value = FIRST_VALUE + index;
+		PrescanScannerReport figures;
+		cases[index].set(figures, value);
+		auto expected                                                = base;
+		expected[nlohmann::json::json_pointer(cases[index].pointer)] = value;
+		const auto actual                                            = block_of(figures);
+		if (actual != expected || actual == base) {
+			std::fprintf(stderr, "FirstRunReportTests: the prescan figure %s is not where it belongs\n",
+			             cases[index].pointer);
+			std::abort();
+		}
+	}
+}
+
+// With a source, the writer asks it each time. A final figure replaces it at once and the source is
+// never called again, so the GPU may destroy the scanner the source reads. The baseline is the same
+// report before the final figure, which shows the source's figure.
+void TestPrescanScanFinalReplacesSource() {
+	Report           report;
+	std::atomic<int> calls {0};
+	report.SetPrescanScanSource([&calls] {
+		PrescanScannerReport figures;
+		figures.scan.submissions = 3;
+		calls++;
+		return figures;
+	});
+	Check(PrescanBlock(report)["scan"]["submissions"] == 3 && calls == 1,
+	      "the writer did not use the scanner source");
+	PrescanScannerReport final_figures;
+	final_figures.scan.submissions = 9;
+	report.SetPrescanScanFinal(final_figures);
+	Check(PrescanBlock(report)["scan"]["submissions"] == 9, "the final scanner figures were not used");
+	Check(calls == 1, "the scanner source was called after the final figures replaced it");
+}
+
+// The GPU destroys the scanner right after SetPrescanScanFinal returns. A writer that called the source
+// after that would read a destroyed object, which this test models as a flag that the source checks.
+// The baseline is the live source before the hand-over, which is called without a violation.
+void TestPrescanWriterNeverTouchesADestroyedSource() {
+	Report            report;
+	std::atomic<bool> alive {true};
+	std::atomic<int>  violations {0};
+	report.SetPrescanScanSource([&] {
+		if (!alive) violations++;
+		return PrescanScannerReport {};
+	});
+	Check(PrescanBlock(report).contains("scan") && violations == 0, "the live scanner source failed");
+	report.SetPrescanScanFinal({});
+	alive            = false;
+	const auto after = PrescanBlock(report);
+	Check(violations == 0, "the writer called a scanner source that was destroyed");
+	Check(after.contains("scan"), "the final scanner figures were not written after the source went");
+}
+
+// The writer is inside the source when the GPU hands over the final figures. The hand-over must wait
+// for the writer, because the GPU destroys the scanner right after it, and the writer must be out of
+// the source by then. The source here is slow on purpose. A writer that copied the source and called
+// it after unlocking would let the hand-over finish while it was still inside.
+void TestPrescanFinalWaitsForAWriterInTheSource() {
+	Report            report;
+	std::atomic<bool> inside {false};
+	std::atomic<bool> release {false};
+	std::atomic<bool> left_source {false};
+	report.SetPrescanScanSource([&] {
+		inside = true;
+		while (!release) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		}
+		left_source = true;
+		return PrescanScannerReport {};
+	});
+	std::thread writer([&] { (void)PrescanBlock(report); });
+	while (!inside) {
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+	}
+	std::atomic<bool> handed_over {false};
+	std::thread       owner([&] {
+        report.SetPrescanScanFinal({});
+        handed_over = true;
+    });
+	// A hand-over that did not wait would be done by now.
+	std::this_thread::sleep_for(std::chrono::milliseconds(200));
+	const bool waited = !handed_over;
+	release           = true;
+	writer.join();
+	owner.join();
+	Check(waited, "the final scanner figures were handed over while a writer was in the source");
+	Check(handed_over && left_source, "the hand-over or the writer never finished");
+}
+
 int main() {
   TestPausesMergeByFlip();
   TestPendingPauseCounts();
@@ -2052,6 +2294,11 @@ int main() {
   TestGenerationSourceThenFinal();
   TestGenerationWriterNeverTouchesADestroyedSource();
   TestGenerationFinalWaitsForAWriterInTheSource();
+  TestPrescanBlockAbsentWithoutSource();
+  TestPrescanScanFieldsRoundTrip();
+  TestPrescanScanFinalReplacesSource();
+  TestPrescanWriterNeverTouchesADestroyedSource();
+  TestPrescanFinalWaitsForAWriterInTheSource();
   std::puts("FirstRunReportTests: all cases passed");
   return 0;
 }

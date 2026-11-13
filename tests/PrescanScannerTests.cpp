@@ -3,7 +3,9 @@
 // needed. Each check that proves a behaviour has a baseline that differs only in that behaviour, as the
 // comments say. Queue overflow eviction marking the victim's queue in doubt is covered for one queue by
 // TestDropMarksShadowUncertain in SubmitScanTests, and here across two queues.
+#include "common/firstRunReport.h"
 #include "graphics/guest_gpu/command_processor/prescanScanner.h"
+#include "graphics/guest_gpu/command_processor/scanDifferential.h"
 #include "graphics/guest_gpu/command_processor/scanJobQueue.h"
 #include "graphics/guest_gpu/command_processor/submitScan.h"
 #include "graphics/guest_gpu/pm4.h"
@@ -772,6 +774,120 @@ void TestCrossQueueEvictionMarksUncertain() {
 	CHECK(AsyncDispatchUncertainAfterFills(SCAN_JOB_QUEUE_CAP - QUEUE_ONE_JOBS + 1));
 }
 
+// Stats with a value of its own in every plain count, so a count copied into another's place shows.
+PrescanScannerStats DistinctStats() {
+	PrescanScannerStats stats;
+	// Away from 0 and the small counts a default would give.
+	constexpr uint64_t  FIRST_VALUE = 101;
+	uint64_t            next        = FIRST_VALUE;
+	auto&               scan        = stats.scan;
+	for (uint64_t* count: {&scan.submissions, &scan.dispatches, &scan.no_shader_state, &scan.program_inherited,
+	                       &scan.uncertain_program, &scan.ib_followed, &scan.ib_unreadable, &scan.ib_depth_limited,
+	                       &scan.ib_revisited, &scan.budget_exhausted, &scan.bad_packets, &scan.resets,
+	                       &scan.dwords_read, &scan.dwords_max, &scan.dispatches_cached, &scan.time_capped,
+	                       &scan.scan_allocations, &scan.cache_remembered_busy, &scan.depth_max,
+	                       &scan.register_list_unreadable, &scan.branch_mode1, &scan.branch_mode2,
+	                       &scan.branch_mode2_empty_else, &scan.ib_revisit_doubts, &stats.queue.pushed,
+	                       &stats.queue.dropped, &stats.queue.dropped_no_buffer, &stats.queue.late_skipped,
+	                       &stats.queue.markers_lost, &stats.queue.truncated, &stats.queue.copied_dwords,
+	                       &stats.jobs, &stats.lag_skipped, &stats.stopped_by_preparer, &stats.wakes,
+	                       &stats.reads.calls, &stats.reads.max_us, &stats.reads.slow, &stats.offers_posted,
+	                       &stats.offers_skipped, &stats.offers_dropped}) {
+		*count = next++;
+	}
+	stats.queue.peak = next++;
+	for (auto& cause: scan.uncertain_cleared_by) {
+		cause = next++;
+	}
+	return stats;
+}
+
+// Every count reaches the report under its own name. The source stats give each count a different
+// value, so a count copied from the wrong field, or not at all, differs from its source.
+void TestReportOfStatsCopiesEachCount() {
+	const auto  stats  = DistinctStats();
+	const auto  report = PrescanReportOf(stats);
+	const auto& scan   = report.scan;
+	CHECK(scan.submissions == stats.scan.submissions && scan.dispatches == stats.scan.dispatches);
+	CHECK(scan.no_shader_state == stats.scan.no_shader_state && scan.program_inherited == stats.scan.program_inherited);
+	CHECK(scan.uncertain_program == stats.scan.uncertain_program && scan.ib_followed == stats.scan.ib_followed);
+	CHECK(scan.ib_unreadable == stats.scan.ib_unreadable && scan.ib_depth_limited == stats.scan.ib_depth_limited);
+	CHECK(scan.ib_revisited == stats.scan.ib_revisited && scan.budget_exhausted == stats.scan.budget_exhausted);
+	CHECK(scan.bad_packets == stats.scan.bad_packets && scan.resets == stats.scan.resets);
+	CHECK(scan.dwords_read == stats.scan.dwords_read && scan.dwords_max == stats.scan.dwords_max);
+	CHECK(scan.dispatches_cached == stats.scan.dispatches_cached && scan.time_capped == stats.scan.time_capped);
+	CHECK(scan.scan_allocations == stats.scan.scan_allocations &&
+	      scan.cache_remembered_busy == stats.scan.cache_remembered_busy);
+	CHECK(scan.depth_max == stats.scan.depth_max &&
+	      scan.register_list_unreadable == stats.scan.register_list_unreadable);
+	CHECK(scan.branch_mode1 == stats.scan.branch_mode1 && scan.branch_mode2 == stats.scan.branch_mode2);
+	CHECK(scan.branch_mode2_empty_else == stats.scan.branch_mode2_empty_else &&
+	      scan.ib_revisit_doubts == stats.scan.ib_revisit_doubts);
+	const auto& queue = report.queue;
+	CHECK(queue.pushed == stats.queue.pushed && queue.dropped == stats.queue.dropped);
+	CHECK(queue.dropped_no_buffer == stats.queue.dropped_no_buffer && queue.late_skipped == stats.queue.late_skipped);
+	CHECK(queue.markers_lost == stats.queue.markers_lost && queue.truncated == stats.queue.truncated);
+	CHECK(queue.copied_dwords == stats.queue.copied_dwords && queue.peak == stats.queue.peak);
+	CHECK(report.jobs == stats.jobs && report.lag_skipped == stats.lag_skipped);
+	CHECK(report.stopped_by_preparer == stats.stopped_by_preparer && report.wakes == stats.wakes);
+	CHECK(report.read_calls == stats.reads.calls && report.read_max_us == stats.reads.max_us &&
+	      report.read_over_1ms == stats.reads.slow);
+	CHECK(report.offers_posted == stats.offers_posted && report.offers_skipped == stats.offers_skipped &&
+	      report.offers_dropped == stats.offers_dropped);
+	// Each cause by its own name, so the list follows the order of UncertainCause.
+	CHECK(scan.uncertain_cleared_by.size() == stats.scan.uncertain_cleared_by.size());
+	for (size_t cause = 0; cause < scan.uncertain_cleared_by.size(); ++cause) {
+		CHECK(scan.uncertain_cleared_by[cause].first == UncertainCauseName(static_cast<UncertainCause>(cause)));
+		CHECK(scan.uncertain_cleared_by[cause].second == stats.scan.uncertain_cleared_by[cause]);
+	}
+}
+
+// Histogram buckets of the percentile test, by the values each holds.
+constexpr size_t   BUCKET_4_TO_7        = 3;
+constexpr size_t   BUCKET_8_TO_15       = 4;
+constexpr size_t   BUCKET_16_TO_31      = 5;
+constexpr size_t   BUCKET_512_TO_1023   = 10;
+constexpr size_t   BUCKET_1024_TO_2047  = 11;
+constexpr uint64_t TOP_OF_4_TO_7        = 7;
+constexpr uint64_t TOP_OF_16_TO_31      = 31;
+constexpr uint64_t TOP_OF_512_TO_1023   = 1023;
+constexpr uint64_t WALKS_IN_4_TO_7      = 50;
+constexpr uint64_t WALKS_IN_16_TO_31    = 40;
+constexpr uint64_t WALKS_IN_512_TO_1023 = 9;
+constexpr uint64_t WALKS_IN_1024_UP     = 1;
+constexpr uint64_t LONGEST_WALK_US      = 1500;
+constexpr uint64_t LAG_MAX_MS           = 9;
+constexpr uint64_t HUGE_PUSH_US         = uint64_t {1} << 40;
+
+// Each percentile is nearest rank and answers with the top of its bucket, capped at the maximum. 100
+// walks put the median in the 4 to 7 bucket, the 90th in the 16 to 31 bucket and the 99th in the 512 to
+// 1023 one, so the bucket's lower edge, or a rank one off, gives another figure. Only the one walk at
+// 1024 or more counts as long, and the 9 just under it do not, so a count that starts a bucket early
+// shows. One lag of 8 to 15 ms with a maximum of 9 shows the cap, and a push in the last bucket answers
+// with its maximum. An empty histogram gives zeros.
+void TestReportOfStatsPercentiles() {
+	PrescanScannerStats stats;
+	stats.scan_us_histogram[BUCKET_4_TO_7]       = WALKS_IN_4_TO_7;
+	stats.scan_us_histogram[BUCKET_16_TO_31]     = WALKS_IN_16_TO_31;
+	stats.scan_us_histogram[BUCKET_512_TO_1023]  = WALKS_IN_512_TO_1023;
+	stats.scan_us_histogram[BUCKET_1024_TO_2047] = WALKS_IN_1024_UP;
+	stats.scan_us_max                            = LONGEST_WALK_US;
+	stats.lag_ms_histogram[BUCKET_8_TO_15]       = 1;
+	stats.lag_ms_max                             = LAG_MAX_MS;
+	stats.push_us_histogram.back()               = 1;
+	stats.push_us_max                            = HUGE_PUSH_US;
+	const auto report = PrescanReportOf(stats);
+	const auto& scan_us = report.scan.scan_us;
+	CHECK(scan_us.p50 == TOP_OF_4_TO_7 && scan_us.p90 == TOP_OF_16_TO_31 && scan_us.p99 == TOP_OF_512_TO_1023 &&
+	      scan_us.max == LONGEST_WALK_US);
+	CHECK(report.scan.scan_at_least_1024_us == WALKS_IN_1024_UP);
+	const auto& lag = report.queue.lag_ms;
+	CHECK(lag.p50 == LAG_MAX_MS && lag.p90 == LAG_MAX_MS && lag.p99 == LAG_MAX_MS && lag.max == LAG_MAX_MS);
+	CHECK(report.queue.push_us.p50 == HUGE_PUSH_US && report.queue.push_us.max == HUGE_PUSH_US);
+	const auto& copy = report.queue.copy_us;
+	CHECK(copy.p50 == 0 && copy.p90 == 0 && copy.p99 == 0 && copy.max == 0);
+}
+
 } // namespace
 
 // Counts every allocation on the thread that makes it, for TestScannerNoAllocationAfterWarmup.
@@ -811,6 +927,8 @@ int main() {
 	TestScannerNoAllocationAfterWarmup();
 	TestNoteBeganAfterStop();
 	TestCrossQueueEvictionMarksUncertain();
+	TestReportOfStatsCopiesEachCount();
+	TestReportOfStatsPercentiles();
 	if (g_failures != 0) {
 		std::fprintf(stderr, "%d check(s) failed\n", g_failures);
 		return 1;

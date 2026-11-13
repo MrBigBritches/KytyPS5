@@ -507,11 +507,46 @@ void Report::SetScanDifferentialFinal(ScanDifferentialReport final_figures) {
 	m_scan_differential_final  = std::move(final_figures);
 }
 
+void Report::SetPrescanScanSource(std::function<PrescanScannerReport()> source) {
+	std::lock_guard lock(m_prescan_scan_mutex);
+	m_prescan_scan_source = std::move(source);
+	m_prescan_scan_final.reset();
+}
+
+void Report::SetPrescanScanFinal(PrescanScannerReport final_figures) {
+	std::lock_guard lock(m_prescan_scan_mutex);
+	m_prescan_scan_source = nullptr;
+	m_prescan_scan_final  = std::move(final_figures);
+}
+
+std::optional<PrescanScannerReport> Report::PrescanScanFigures() const {
+	std::lock_guard lock(m_prescan_scan_mutex);
+	if (m_prescan_scan_source) {
+		return m_prescan_scan_source();
+	}
+	return m_prescan_scan_final;
+}
+
+bool Report::HoldsPrescanScanSource() const {
+	std::lock_guard lock(m_prescan_scan_mutex);
+	return static_cast<bool>(m_prescan_scan_source);
+}
+
+bool Report::HoldsPrescanScanFinal() const {
+	std::lock_guard lock(m_prescan_scan_mutex);
+	return m_prescan_scan_final.has_value();
+}
+
 void Report::Reset() {
 	{
 		std::lock_guard lock(m_scan_differential_mutex);
 		m_scan_differential_source = nullptr;
 		m_scan_differential_final.reset();
+	}
+	{
+		std::lock_guard lock(m_prescan_scan_mutex);
+		m_prescan_scan_source = nullptr;
+		m_prescan_scan_final.reset();
 	}
 	{
 		std::lock_guard lock(m_generation_mutex);
@@ -1247,6 +1282,76 @@ nlohmann::json ScanDifferentialToJson(const ScanDifferentialReport& block) {
 	        {"queues", queues}};
 }
 
+// Writes one of the prescan's times as its percentiles and maximum.
+nlohmann::json PrescanTimeToJson(const PrescanTimeFigures& time) {
+	return {{"p50", time.p50}, {"p90", time.p90}, {"p99", time.p99}, {"max", time.max}};
+}
+
+// Writes what the prescan's walks counted, with the causes of uncertainty as an object by name.
+nlohmann::json PrescanScanToJson(const PrescanScanReport& scan) {
+	nlohmann::json causes = nlohmann::json::object();
+	for (const auto& [name, count]: scan.uncertain_cleared_by) {
+		causes[name] = count;
+	}
+	return {{"submissions", scan.submissions},
+	        {"dispatches", scan.dispatches},
+	        {"no_shader_state", scan.no_shader_state},
+	        {"program_inherited", scan.program_inherited},
+	        {"uncertain_program", scan.uncertain_program},
+	        {"ib_followed", scan.ib_followed},
+	        {"ib_unreadable", scan.ib_unreadable},
+	        {"ib_depth_limited", scan.ib_depth_limited},
+	        {"ib_revisited", scan.ib_revisited},
+	        {"budget_exhausted", scan.budget_exhausted},
+	        {"bad_packets", scan.bad_packets},
+	        {"resets", scan.resets},
+	        {"dwords_read", scan.dwords_read},
+	        {"dwords_max", scan.dwords_max},
+	        {"dispatches_cached", scan.dispatches_cached},
+	        {"time_capped", scan.time_capped},
+	        {"scan_allocations", scan.scan_allocations},
+	        {"cache_remembered_busy", scan.cache_remembered_busy},
+	        {"depth_max", scan.depth_max},
+	        {"register_list_unreadable", scan.register_list_unreadable},
+	        {"branch_mode1", scan.branch_mode1},
+	        {"branch_mode2", scan.branch_mode2},
+	        {"branch_mode2_empty_else", scan.branch_mode2_empty_else},
+	        {"ib_revisit_doubts", scan.ib_revisit_doubts},
+	        {"uncertain_cleared_by", causes},
+	        {"scan_us", PrescanTimeToJson(scan.scan_us)},
+	        {"scan_at_least_1024_us", scan.scan_at_least_1024_us}};
+}
+
+// Writes what the prescan's job queue counted and the times around it.
+nlohmann::json PrescanQueueToJson(const PrescanQueueReport& queue) {
+	return {{"pushed", queue.pushed},
+	        {"dropped", queue.dropped},
+	        {"dropped_no_buffer", queue.dropped_no_buffer},
+	        {"late_skipped", queue.late_skipped},
+	        {"markers_lost", queue.markers_lost},
+	        {"truncated", queue.truncated},
+	        {"copied_dwords", queue.copied_dwords},
+	        {"peak", queue.peak},
+	        {"copy_us", PrescanTimeToJson(queue.copy_us)},
+	        {"push_us", PrescanTimeToJson(queue.push_us)},
+	        {"lag_ms", PrescanTimeToJson(queue.lag_ms)}};
+}
+
+// The scanner's part of the prescan block. The preparer's figures join it as further keys.
+nlohmann::json PrescanScannerToJson(const PrescanScannerReport& block) {
+	return {{"scan", PrescanScanToJson(block.scan)},
+	        {"queue", PrescanQueueToJson(block.queue)},
+	        {"thread",
+	         {{"jobs", block.jobs},
+	          {"lag_skipped", block.lag_skipped},
+	          {"stopped_by_preparer", block.stopped_by_preparer},
+	          {"wakes", block.wakes}}},
+	        {"reads",
+	         {{"calls", block.read_calls}, {"max_us", block.read_max_us}, {"over_1ms", block.read_over_1ms}}},
+	        {"offer",
+	         {{"posted", block.offers_posted}, {"skipped", block.offers_skipped}, {"dropped", block.offers_dropped}}}};
+}
+
 // The guest audio underruns with each one's time from the run start. count includes the ones that
 // came past the capacity and have no time.
 nlohmann::json AudioUnderrunsToJson(const AudioUnderruns& underruns, int64_t epoch_ns) {
@@ -1463,6 +1568,8 @@ std::string Report::ToJson(const Metadata& metadata, uint64_t audio_holds, doubl
 			scan_differential = ScanDifferentialToJson(*m_scan_differential_final);
 		}
 	}
+	// The prescan block exists only when a scanner registered its figures.
+	const auto prescan_scan = PrescanScanFigures();
 
 	// Read once, so the two blocks that come from it agree.
 	const auto machine = ReadMachineInfo();
@@ -1515,6 +1622,9 @@ std::string Report::ToJson(const Metadata& metadata, uint64_t audio_holds, doubl
 	}
 	if (scan_differential) {
 		report["scan_differential"] = std::move(*scan_differential);
+	}
+	if (prescan_scan) {
+		report["prescan"] = PrescanScannerToJson(*prescan_scan);
 	}
 	// The title id is not filtered, so bytes that are not UTF-8 are replaced instead of throwing.
 	return report.dump(JSON_INDENT, ' ', false, nlohmann::json::error_handler_t::replace);

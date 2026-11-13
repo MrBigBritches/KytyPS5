@@ -1,14 +1,19 @@
 #include "graphics/guest_gpu/command_processor/prescanScanner.h"
 
+#include "common/firstRunReport.h"
 #include "common/logging/log.h"
 #include "common/threadPriority.h"
+#include "graphics/guest_gpu/command_processor/scanDifferential.h"
 #include "graphics/host_gpu/renderer/pipeline/prescanHandoff.h"
 #include "graphics/host_gpu/renderer/pipeline/prescanVariants.h"
 
 #include <algorithm>
 #include <bit>
+#include <cmath>
+#include <cstddef>
 #include <exception>
 #include <fmt/format.h>
+#include <numeric>
 #include <stdexcept>
 #include <utility>
 
@@ -56,7 +61,126 @@ std::chrono::microseconds CheckedTime(std::chrono::microseconds time) {
 	return time;
 }
 
+// The fractions the report asks of each time.
+constexpr double MEDIAN_FRACTION = 0.50;
+constexpr double TAIL_FRACTION   = 0.90;
+constexpr double FAR_FRACTION    = 0.99;
+
+// The report's key names the time, and a power of two keeps the count exact at a bucket edge.
+static_assert(PRESCAN_LONG_WALK_US == 1024, "the report's key scan_at_least_1024_us names the long walk time");
+
+// The nearest-rank percentile of a histogram by powers of two. Bucket n holds values from 2^(n-1) up to
+// 2^n - 1, so its top is never below the value at the rank. The last bucket holds every larger value
+// too, so it answers with the maximum, and no answer is above the maximum.
+template <size_t Buckets>
+uint64_t HistogramPercentile(const std::array<uint64_t, Buckets>& histogram, uint64_t maximum, double fraction) {
+	// A bucket's top is computed by a shift of the bucket number, which must fit in 64 bits.
+	static_assert(Buckets <= 64, "a bucket's top must fit in 64 bits");
+	const uint64_t count = std::accumulate(histogram.begin(), histogram.end(), uint64_t {0});
+	if (count == 0) {
+		return 0;
+	}
+	const auto rank = std::max<uint64_t>(1, static_cast<uint64_t>(std::ceil(fraction * static_cast<double>(count))));
+	uint64_t   seen = 0;
+	for (size_t bucket = 0; bucket + 1 < Buckets; ++bucket) {
+		seen += histogram[bucket];
+		if (seen >= rank) {
+			return std::min((uint64_t {1} << bucket) - 1, maximum);
+		}
+	}
+	return maximum;
+}
+
+// A time's percentiles and its maximum.
+template <size_t Buckets>
+Common::FirstRunReport::PrescanTimeFigures TimeFigures(const std::array<uint64_t, Buckets>& histogram,
+                                                       uint64_t                              maximum) {
+	return {.p50 = HistogramPercentile(histogram, maximum, MEDIAN_FRACTION),
+	        .p90 = HistogramPercentile(histogram, maximum, TAIL_FRACTION),
+	        .p99 = HistogramPercentile(histogram, maximum, FAR_FRACTION),
+	        .max = maximum};
+}
+
+// The walks counted in the buckets at and above the long walk time.
+uint64_t LongWalks(const PrescanHistogram& histogram) {
+	static_assert(std::bit_width(PRESCAN_LONG_WALK_US) < PRESCAN_HISTOGRAM_BUCKETS,
+	              "the long walk time must have a bucket of its own");
+	const auto first = static_cast<size_t>(std::bit_width(PRESCAN_LONG_WALK_US));
+	return std::accumulate(histogram.begin() + static_cast<std::ptrdiff_t>(first), histogram.end(), uint64_t {0});
+}
+
+// The walks' counts under the report's names, with each cause of doubt by its name.
+Common::FirstRunReport::PrescanScanReport ScanReportOf(const ScanStats& scan) {
+	Common::FirstRunReport::PrescanScanReport report;
+	report.submissions              = scan.submissions;
+	report.dispatches               = scan.dispatches;
+	report.no_shader_state          = scan.no_shader_state;
+	report.program_inherited        = scan.program_inherited;
+	report.uncertain_program        = scan.uncertain_program;
+	report.ib_followed              = scan.ib_followed;
+	report.ib_unreadable            = scan.ib_unreadable;
+	report.ib_depth_limited         = scan.ib_depth_limited;
+	report.ib_revisited             = scan.ib_revisited;
+	report.budget_exhausted         = scan.budget_exhausted;
+	report.bad_packets              = scan.bad_packets;
+	report.resets                   = scan.resets;
+	report.dwords_read              = scan.dwords_read;
+	report.dwords_max               = scan.dwords_max;
+	report.dispatches_cached        = scan.dispatches_cached;
+	report.time_capped              = scan.time_capped;
+	report.scan_allocations         = scan.scan_allocations;
+	report.cache_remembered_busy    = scan.cache_remembered_busy;
+	report.depth_max                = scan.depth_max;
+	report.register_list_unreadable = scan.register_list_unreadable;
+	report.branch_mode1             = scan.branch_mode1;
+	report.branch_mode2             = scan.branch_mode2;
+	report.branch_mode2_empty_else  = scan.branch_mode2_empty_else;
+	report.ib_revisit_doubts        = scan.ib_revisit_doubts;
+	for (size_t cause = 0; cause < scan.uncertain_cleared_by.size(); ++cause) {
+		report.uncertain_cleared_by.emplace_back(UncertainCauseName(static_cast<UncertainCause>(cause)),
+		                                         scan.uncertain_cleared_by[cause]);
+	}
+	return report;
+}
+
+// The queue's counts, with the copy, push and lag times.
+Common::FirstRunReport::PrescanQueueReport QueueReportOf(const PrescanScannerStats& stats) {
+	const auto&                                queue = stats.queue;
+	Common::FirstRunReport::PrescanQueueReport report;
+	report.pushed            = queue.pushed;
+	report.dropped           = queue.dropped;
+	report.dropped_no_buffer = queue.dropped_no_buffer;
+	report.late_skipped      = queue.late_skipped;
+	report.markers_lost      = queue.markers_lost;
+	report.truncated         = queue.truncated;
+	report.copied_dwords     = queue.copied_dwords;
+	report.peak              = queue.peak;
+	report.copy_us           = TimeFigures(queue.copy_us_histogram, queue.copy_us_max);
+	report.push_us           = TimeFigures(stats.push_us_histogram, stats.push_us_max);
+	report.lag_ms            = TimeFigures(stats.lag_ms_histogram, stats.lag_ms_max);
+	return report;
+}
+
 } // namespace
+
+Common::FirstRunReport::PrescanScannerReport PrescanReportOf(const PrescanScannerStats& stats) {
+	Common::FirstRunReport::PrescanScannerReport report;
+	report.scan                       = ScanReportOf(stats.scan);
+	report.scan.scan_us               = TimeFigures(stats.scan_us_histogram, stats.scan_us_max);
+	report.scan.scan_at_least_1024_us = LongWalks(stats.scan_us_histogram);
+	report.queue                      = QueueReportOf(stats);
+	report.jobs                       = stats.jobs;
+	report.lag_skipped                = stats.lag_skipped;
+	report.stopped_by_preparer        = stats.stopped_by_preparer;
+	report.wakes                      = stats.wakes;
+	report.read_calls                 = stats.reads.calls;
+	report.read_max_us                = stats.reads.max_us;
+	report.read_over_1ms              = stats.reads.slow;
+	report.offers_posted              = stats.offers_posted;
+	report.offers_skipped             = stats.offers_skipped;
+	report.offers_dropped             = stats.offers_dropped;
+	return report;
+}
 
 bool ChunkedScanRead(const ScanMemoryReader& inner, uint64_t address, void* destination, uint64_t bytes,
                      const std::atomic<bool>* stop, ScanReadTiming* timing) {
@@ -125,8 +249,10 @@ uint64_t PrescanScanner::Push(ScanJob job, double copy_us) {
 	const uint64_t seq      = m_queue.Push(std::move(job), copy_us);
 	const uint64_t micros   = WholeUnits<std::chrono::microseconds>(Clock::now() - start);
 	const size_t   bucket   = std::min<size_t>(std::bit_width(micros), PRESCAN_HISTOGRAM_BUCKETS - 1);
-	m_push_us_histogram[bucket].fetch_add(1, std::memory_order_relaxed);
+	// The maximum is raised before the count is published with release. A reader that sees the count
+	// with acquire then sees a maximum at least this large, so no counted push lies above the maximum.
 	RaiseMax(m_push_us_max, micros);
+	m_push_us_histogram[bucket].fetch_add(1, std::memory_order_release);
 	return seq;
 }
 
@@ -167,11 +293,12 @@ PrescanScannerStats PrescanScanner::Stats() const {
 		stats = m_stats;
 	}
 	// The queue's lock is taken apart from the stats lock, so the two are never nested.
-	stats.queue       = m_queue.Stats();
-	stats.push_us_max = m_push_us_max.load(std::memory_order_relaxed);
+	stats.queue = m_queue.Stats();
+	// The counts first and with acquire, then the maximum, so it covers every push counted here.
 	for (size_t bucket = 0; bucket < PRESCAN_HISTOGRAM_BUCKETS; ++bucket) {
-		stats.push_us_histogram[bucket] = m_push_us_histogram[bucket].load(std::memory_order_relaxed);
+		stats.push_us_histogram[bucket] = m_push_us_histogram[bucket].load(std::memory_order_acquire);
 	}
+	stats.push_us_max = m_push_us_max.load(std::memory_order_relaxed);
 	return stats;
 }
 

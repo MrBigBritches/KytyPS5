@@ -75,6 +75,13 @@ GuestGpu::GuestGpu(RenderContext& renderer, const GuestGpuOptions& options): m_r
 		    [this] { return m_scan_differential->Snapshot(); });
 	}
 	m_thread = std::jthread(ThreadRun, this);
+	// Registered last, so every step that can fail the constructor has already run, and a throw from any
+	// of them leaves the report without a source that reads this object. Lists submitted before this are
+	// still counted, since the figures are totals.
+	if (m_prescan_scanner != nullptr) {
+		Common::FirstRunReport::Global().SetPrescanScanSource(
+		    [this] { return PrescanReportOf(m_prescan_scanner->Stats()); });
+	}
 }
 
 GuestGpu::~GuestGpu() {
@@ -139,6 +146,10 @@ void GuestGpu::Shutdown() {
 	// The report may be written after this object is gone, so it keeps the final figures.
 	if (m_scan_differential) {
 		Common::FirstRunReport::Global().SetScanDifferentialFinal(m_scan_differential->Snapshot());
+	}
+	// The scanner and the GPU thread are joined, so these figures are the whole run's.
+	if (m_prescan_scanner != nullptr) {
+		Common::FirstRunReport::Global().SetPrescanScanFinal(PrescanReportOf(m_prescan_scanner->Stats()));
 	}
 	m_shutdown_complete = true;
 }

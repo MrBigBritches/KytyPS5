@@ -21,6 +21,12 @@
 // It never takes a lock a submitting thread or the GPU thread waits on for long, never reads guest
 // memory except through a reader that cannot fault, and allocates nothing once its storage has grown
 // to the largest job.
+
+// Only named as a return type here, so the report's header stays out of every file that includes this.
+namespace Common::FirstRunReport {
+struct PrescanScannerReport;
+} // namespace Common::FirstRunReport
+
 namespace Libs::Graphics {
 
 // The hand-off lives with the pipeline cache. Only a reference is kept here, so this header does not
@@ -104,6 +110,15 @@ struct PrescanScannerStats {
 	/// The calls the walks made to the inner reader.
 	ScanReadTiming reads;
 };
+
+/// Walks this long or longer are counted apart in the report. It is a power of two, so the count is
+/// exact from the histogram, whose buckets split at powers of two.
+inline constexpr uint64_t PRESCAN_LONG_WALK_US = 1024;
+
+/// The first-run report's view of the scanner's figures. Each histogram becomes nearest-rank
+/// percentiles. A bucket spans a factor of two, so each percentile is the top of the bucket its rank
+/// falls in, capped at the exact maximum, which makes it an upper bound.
+[[nodiscard]] Common::FirstRunReport::PrescanScannerReport PrescanReportOf(const PrescanScannerStats& stats);
 
 /// Runs the scanner thread and owns everything it uses. The hand-off belongs to the caller and must
 /// outlive this. Submitting threads call PrepareCommands or PrepareReset outside the order gate and

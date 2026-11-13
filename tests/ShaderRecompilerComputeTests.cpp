@@ -71,6 +71,7 @@
 #include <vulkan/vulkan_format_traits.hpp>
 #include <fstream>
 #include <iterator>
+#include <nlohmann/json.hpp>
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window/vulkanValidation.h"
 #include "graphics/presentation/window/windowInternal.h"
@@ -65558,15 +65559,48 @@ void CheckPrescanGuestGpuWiringOff(RenderContext &context, const char *name) {
           "with the prescan off the GPU made a preparer, a hand-off, a scanner or the intake");
 }
 
+// The scanner's submissions in the prescan block of the process-wide report, or nothing when it has no
+// prescan block.
+std::optional<uint64_t> PrescanReportSubmissions() {
+  const auto json = nlohmann::json::parse(Common::FirstRunReport::Global().ToJson({}, 0, 1.0, 0.0, {}));
+  const nlohmann::json::json_pointer pointer("/prescan/scan/submissions");
+  if (!json.contains(pointer)) return std::nullopt;
+  return json.at(pointer).get<uint64_t>();
+}
+
+// The report's prescan block shows the scanner's walks while the GPU runs and keeps them after it is
+// destroyed. The baseline is the off arm, whose report has no prescan block. Here submissions, jobs
+// and pushes are all N, so this proves the GPU registered its figures, and the report tests prove
+// which count lands under which key. The mutation is to register no source, which leaves the running
+// report without the block.
+//
+// Shutdown hands the report final figures in place of the source while the scanner still exists, so a
+// missing hand-over shows as a source still held, before anything is destroyed. The baseline is the
+// running GPU, which holds a source and no final figures. The mutation is to drop SetPrescanScanFinal.
+void CheckPrescanReportHandOver(RenderContext &context, GuestGpu &gpu, const char *name) {
+  auto &report = Common::FirstRunReport::Global();
+  Require(name, "the running report has the walks", PrescanReportSubmissions() == PRESCAN_GPU_LISTS,
+          "the report's prescan block did not show the scanner's walks while the GPU ran");
+  Require(name, "a running GPU is a source", report.HoldsPrescanScanSource() && !report.HoldsPrescanScanFinal(),
+          "the running GPU's report did not hold the scanner source alone");
+  gpu.Shutdown();
+  Require(name, "shutdown hands over", !report.HoldsPrescanScanSource() && report.HoldsPrescanScanFinal(),
+          "after Shutdown the report still held the scanner source, or no final figures");
+  context.ShutdownGpu();
+  Require(name, "the final report keeps the walks", PrescanReportSubmissions() == PRESCAN_GPU_LISTS,
+          "the report's prescan block lost the scanner's walks after the GPU was destroyed");
+}
+
 // Each list submitted to the GPU reaches the scanner, is walked once and its dispatch reaches the
 // preparer. The programs differ, so the scanner's cache keeps none of the dispatches out, and N
 // items cannot come from fewer lists. The GPU thread is held until the scanner has taken every list,
 // so none is skipped as late. The baseline is the same lists with the option off, which makes
 // nothing at all. The mutation is to make Enqueue always take the fast path. The scanner then gets
-// no list and the hold runs out.
+// no list and the hold runs out. CheckPrescanReportHandOver then checks the report's figures.
 void CheckPrescanGuestGpuWiring(VulkanHarness &vulkan) {
   constexpr const char *name = "PrescanGuestGpuWiring";
   for (const bool prescan : {false, true}) {
+    Common::FirstRunReport::Global().Reset();
     RenderContext context(vulkan.RuntimeContext(), std::filesystem::path{});
     InitializePrescanGpu(context, PrescanGpuOptions(prescan));
     auto &gpu = context.GetGpu();
@@ -65587,6 +65621,8 @@ void CheckPrescanGuestGpuWiring(VulkanHarness &vulkan) {
     if (!prescan) {
       CheckPrescanGuestGpuWiringOff(context, name);
       context.ShutdownGpu();
+      Require(name, "off writes no prescan block", !PrescanReportSubmissions().has_value(),
+              "with the prescan off the report had a prescan block");
       continue;
     }
     const auto stats = scanner->Stats();
@@ -65600,8 +65636,10 @@ void CheckPrescanGuestGpuWiring(VulkanHarness &vulkan) {
     Require(name, "the preparer takes every dispatch",
             WaitForPrescan([preparer] { return preparer->Counters().items == PRESCAN_GPU_LISTS; }),
             "the preparer did not take one item per submitted list");
-    context.ShutdownGpu();
+    CheckPrescanReportHandOver(context, gpu, name);
   }
+  // Later checks start from a report without this one's figures.
+  Common::FirstRunReport::Global().Reset();
   std::printf("[gpu]     %-32s ok\n", name);
 }
 
