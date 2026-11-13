@@ -2,6 +2,7 @@
 #define GRAPHICS_SHADER_STOREGEN_SHADER_STORE_WORKER_H
 
 #include "graphics/shader/shaderStoreRecord.h"
+#include "graphics/shader/storegen/computeCompile.h"
 #include "graphics/shader/storegen/computePredictor.h"
 #include "graphics/shader/storegen/storeWorkerFormat.h"
 
@@ -31,6 +32,13 @@ constexpr int WORKER_EXIT_OUTPUT_FAILED = 13;
 /// A restart expected another candidate ordering than this run computed, so the ranks of the old
 /// run mean other candidates now. Nothing was written to the output file.
 constexpr int WORKER_EXIT_ORDER_MISMATCH = 14;
+/// A Stream worker could not connect to its pipe in time.
+constexpr int WORKER_EXIT_PIPE_FAILED = 15;
+/// A Stream worker found that the server end of its pipe is not the process that started it, so it
+/// served nothing.
+constexpr int WORKER_EXIT_PEER_MISMATCH = 16;
+/// A Stream worker read a frame that is not a request it can decode, so the stream is out of step.
+constexpr int WORKER_EXIT_PROTOCOL_ERROR = 17;
 /// What the recompiler's EXIT leaves behind. DbgReport calls _Exit(321), which no worker code
 /// chooses. Windows keeps the whole value, but POSIX keeps 8 bits of an exit status, so there it
 /// reads as 65 (321 & 0xFF). Windows also gives 3 to abort and terminate, and 1 to an uncaught
@@ -166,19 +174,11 @@ struct WorkerHooks {
 ///
 /// The recompiler can end the process through EXIT, so a caller that must survive that runs this
 /// in a child process.
+///
+/// A request in Stream mode does none of this. It runs RunStreamWorker, as streamWorker.h
+/// describes, and only the result's exit_code is set.
 /// @return the result. Its exit_code is a WORKER_EXIT_ value.
 WorkerResult RunShaderStoreWorker(const WorkerRequest& request, const WorkerHooks& hooks = {});
-
-/// Whether a translated program lists more buffers, images or samplers than a specialization
-/// describes, which ApplyResourceSpecialization refuses with EXIT. A specialization may have more
-/// entries than the program, since indirect children are appended to it, so only a program with
-/// more of one kind counts.
-/// @param buffers  the number of buffers the translated program lists.
-/// @param images   the number of images it lists.
-/// @param samplers the number of samplers it lists.
-[[nodiscard]] bool
-ProgramExceedsSpecialization(size_t buffers, size_t images, size_t samplers,
-                             const ShaderRecompiler::IR::ResourceSpecialization& specialization);
 
 /// What a worker process does with its command line, which is to read the request file and run
 /// it. This takes the place of a worker's main.

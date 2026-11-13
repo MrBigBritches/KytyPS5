@@ -1,11 +1,11 @@
 #include "graphics/shader/storegen/shaderStoreWorker.h"
 
 #include "common/file.h"
-#include "graphics/shader/moduleId.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
-#include "graphics/shader/recompiler/ir/Serialize.h"
 #include "graphics/shader/shaderStoreRecord.h"
+#include "graphics/shader/storegen/appendFile.h"
 #include "graphics/shader/storegen/candidateOrder.h"
+#include "graphics/shader/storegen/computeCompile.h"
 #include "graphics/shader/storegen/computePredictor.h"
 #include "graphics/shader/storegen/computeStaticKey.h"
 #include "graphics/shader/storegen/computeTranslation.h"
@@ -13,6 +13,7 @@
 #include "graphics/shader/storegen/headerSlots.h"
 #include "graphics/shader/storegen/resourceKeys.h"
 #include "graphics/shader/storegen/sl00Metadata.h"
+#include "graphics/shader/storegen/streamWorker.h"
 
 #include <algorithm>
 #include <chrono>
@@ -27,50 +28,10 @@ namespace Libs::Graphics::StoreGen {
 
 namespace {
 
-namespace IR = ShaderRecompiler::IR;
-
 using Clock = std::chrono::steady_clock;
 
 double MillisecondsSince(Clock::time_point start) {
 	return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
-}
-
-// Whether every flag byte of a store header is 0 or 1. The header is read once more as plain bytes
-// in the order the fields are written, which is the build stamp, the jump table flag, the profile
-// (three flags, the device clock period and six flags) and the shared memory limit. A flag read
-// into a bool from any other byte value would be undefined behaviour. If the profile gains a
-// field this read comes up short and the header is refused, which fails every test at once.
-bool HeaderFlagsAreBooleans(std::span<const uint8_t> bytes) {
-	IR::Reader reader {bytes};
-	uint64_t   stamp       = 0;
-	uint8_t    jump_tables = 0;
-	uint8_t    profile_flags[9] {};
-	uint32_t   clock_period = 0;
-	uint32_t   shared       = 0;
-	IR::IoAll(reader, stamp, jump_tables, profile_flags[0], profile_flags[1], profile_flags[2],
-	          clock_period, profile_flags[3], profile_flags[4], profile_flags[5], profile_flags[6],
-	          profile_flags[7], profile_flags[8], shared);
-	bool booleans = jump_tables <= 1;
-	for (const auto flag: profile_flags) {
-		booleans = booleans && flag <= 1;
-	}
-	return reader.ok && reader.bytes.empty() && booleans;
-}
-
-// Reads the store header the way PipelineCache writes it. The build stamp comes first and does not
-// affect translation.
-std::optional<HostValues> DecodeHostHeader(std::span<const uint8_t> bytes) {
-	if (!HeaderFlagsAreBooleans(bytes)) {
-		return std::nullopt;
-	}
-	IR::Reader reader {bytes};
-	uint64_t   stamp = 0;
-	HostValues host;
-	IR::IoAll(reader, stamp, host.structured_jump_tables, host.profile, host.max_shared_bytes);
-	if (!reader.ok || !reader.bytes.empty()) {
-		return std::nullopt;
-	}
-	return host;
 }
 
 // How far a program got toward having candidates.
@@ -97,14 +58,14 @@ const char* PredictOutcomeWord(PredictKind kind) {
 // Translates a program once to list its resources, then predicts its candidates.
 PredictKind PredictProgram(const ScannedProgram& scanned, const ComputeStaticKey& key,
                            const HostValues& host, std::vector<Candidate>& candidates) {
-	TranslationSetup setup(key.input_info, key.user_data_count, scanned.code_hash, host);
-	const auto       source = ShaderRecompiler::PrepareShaderSource(scanned.code, setup.Options());
-	// The store holds only programs without GPU-selected calls.
-	if (source.unsupported_call_pc != UINT32_MAX || !source.calls.empty()) {
+	TranslationSetup  setup(key.input_info, key.user_data_count, scanned.code_hash, host);
+	const ComputeUnit unit {scanned.code, scanned.code_hash, key.user_data_count, key.state};
+	// The store holds only programs without GPU-selected calls, which the shared path refuses.
+	const auto translated = TranslateComputeUnit(unit, setup);
+	if (!translated) {
 		return PredictKind::HasCalls;
 	}
-	auto       translated = ShaderRecompiler::TranslateProgram(source.decoded, setup.Options());
-	const auto facts      = ExtractResourceFacts(translated.program);
+	const auto facts = ExtractResourceFacts(translated->program);
 	if (!facts) {
 		return PredictKind::Unclassified;
 	}
@@ -161,104 +122,27 @@ struct BuiltCandidate {
 };
 
 // Translates a candidate the way the runtime would, compiles it with its specialization and encodes
-// the record. The module id comes from the compiled module's own push data start, as the runtime
-// computes it, so the record is found only when the prediction was right. A prediction that was
-// wrong is reported and the record is left out.
+// the record, all through the compile path the Stream worker shares. The module id comes from the
+// compiled module's own push data start, as the runtime computes it, so the record is found only
+// when the prediction was right. A prediction that was wrong is reported and the record is left
+// out.
 BuiltCandidate BuildCandidate(const PredictedProgram& program, const Candidate& candidate,
                               const HostValues& host) {
-	const auto&      scanned = *program.scanned;
-	TranslationSetup setup(program.key.input_info, program.key.user_data_count, scanned.code_hash,
-	                       host);
-	const auto       source = ShaderRecompiler::PrepareShaderSource(scanned.code, setup.Options());
-	auto       translated   = ShaderRecompiler::TranslateProgram(source.decoded, setup.Options());
-	const auto plan         = IR::ExtractResourcePlan(translated.program);
-	// A specialization may have more entries than the program, since indirect children are appended
-	// to it, but never fewer. The check is the one ApplyResourceSpecialization makes with EXIT.
-	const auto& info_before = translated.program.info;
-	if (ProgramExceedsSpecialization(info_before.buffers.size(), info_before.images.size(),
-	                                 info_before.samplers.size(), candidate.specialization)) {
+	const auto&       scanned = *program.scanned;
+	TranslationSetup  setup(program.key.input_info, program.key.user_data_count, scanned.code_hash,
+	                        host);
+	const ComputeUnit unit {scanned.code, scanned.code_hash, program.key.user_data_count,
+	                        program.key.state};
+	auto              built = BuildComputeUnit(unit, setup, candidate.specialization);
+	if (built.status == ComputeBuildStatus::ResourceCountMismatch) {
 		return {DropReason::ResourceCountMismatch, {}, 0};
 	}
-	auto       result = ShaderRecompiler::CompileProgram(std::move(translated), setup.Options(),
-	                                                     candidate.specialization, 0);
-	const auto info   = std::move(result.program).TakeCompiledInfo();
-	const auto push   = info.bindings.push_data_start_dword;
-	if (push != candidate.push_start) {
+	if (built.push_start != candidate.push_start) {
 		// The runtime's id carries the real start, so this is the id a miss on the candidate has.
-		const auto actual_id =
-		    ShaderModuleId(ShaderType::Compute, scanned.code_hash, program.key.user_data_count,
-		                   program.key.state, push, candidate.specialization, {});
-		return {DropReason::PushStartMismatch, {}, push, actual_id};
+		return {DropReason::PushStartMismatch, {}, built.push_start, built.id};
 	}
-	const auto id =
-	    ShaderModuleId(ShaderType::Compute, scanned.code_hash, program.key.user_data_count,
-	                   program.key.state, push, candidate.specialization, {});
-	return {std::nullopt,
-	        EncodeModuleRecord({.stage           = ShaderType::Compute,
-	                            .hash            = scanned.code_hash,
-	                            .user_data_count = program.key.user_data_count,
-	                            .static_state    = program.key.state,
-	                            .plan            = plan,
-	                            .id              = id,
-	                            .info            = info,
-	                            .specialization  = candidate.specialization,
-	                            .vertex_formats  = {},
-	                            .rect_parameters = {},
-	                            .mesh_task       = false,
-	                            .spirv           = result.spirv}),
-	        push};
+	return {std::nullopt, std::move(built.record), built.push_start};
 }
-
-// A file that is appended to. Common::File writes straight to the operating system on every
-// platform, so a write is visible to another process as soon as it returns and a crash of this
-// process loses nothing written before it. A flush would only add FlushFileBuffers or fsync, which
-// protects against power loss, and this file can be generated again. The start line test reads
-// the log through another handle, so it would catch a worker that held its lines back.
-class AppendFile {
-public:
-	// Opens a log, which is appended to when it exists.
-	bool OpenAppend(const std::filesystem::path& path) {
-		Common::File::CreateDirectories(path.parent_path());
-		if (m_file.Open(path, Common::File::Mode::ReadWrite)) {
-			return m_file.Seek(m_file.Size());
-		}
-		return m_file.Create(path);
-	}
-
-	// Starts the output. With nothing kept it is a new file that begins with the header. Otherwise
-	// the first `kept` bytes stay, after a check that they begin with the same header, and the
-	// writes go after them.
-	bool OpenOutput(const std::filesystem::path& path, std::span<const uint8_t> header,
-	                uint64_t kept) {
-		Common::File::CreateDirectories(path.parent_path());
-		if (kept == 0) {
-			return m_file.Create(path) && Append(header);
-		}
-		if (!m_file.Open(path, Common::File::Mode::ReadWrite) || kept < header.size() ||
-		    m_file.Size() < kept) {
-			return false;
-		}
-		std::vector<uint8_t> existing(header.size());
-		m_file.Read(existing.data(), static_cast<uint32_t>(existing.size()));
-		return std::ranges::equal(existing, header) && m_file.Truncate(kept) && m_file.Seek(kept);
-	}
-
-	// Writes bytes. Returns false when they were not all written.
-	bool Append(std::span<const uint8_t> bytes) {
-		uint32_t written = 0;
-		m_file.Write(bytes.data(), static_cast<uint32_t>(bytes.size()), &written);
-		return written == bytes.size();
-	}
-
-	// Writes one text line.
-	bool Line(const std::string& text) {
-		const auto line = text + "\n";
-		return Append({reinterpret_cast<const uint8_t*>(line.data()), line.size()});
-	}
-
-private:
-	Common::File m_file;
-};
 
 // Whether the finished file begins with exactly the header this run would write.
 bool FileBeginsWith(const std::filesystem::path& path, std::span<const uint8_t> header) {
@@ -594,14 +478,14 @@ int Worker::Generate(const ScanResult& scan, const HostValues& host,
 
 } // namespace
 
-bool ProgramExceedsSpecialization(size_t buffers, size_t images, size_t samplers,
-                                  const IR::ResourceSpecialization& specialization) {
-	return buffers > specialization.buffers.size() || images > specialization.images.size() ||
-	       samplers > specialization.samplers.size();
-}
-
 WorkerResult RunShaderStoreWorker(const WorkerRequest& request, const WorkerHooks& hooks) {
 	WorkerResult result;
+	// A Stream request serves a pipe and has none of the Generate steps, so it leaves every
+	// Generate figure at zero.
+	if (request.mode == WorkerMode::Stream) {
+		result.exit_code = RunStreamWorker(request).exit_code;
+		return result;
+	}
 	result.exit_code = Worker(request, result, hooks).Run();
 	return result;
 }

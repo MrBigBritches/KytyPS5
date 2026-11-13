@@ -10,6 +10,7 @@
 #include "graphics/shader/storegen/progressLog.h"
 #include "graphics/shader/storegen/shaderStoreWorker.h"
 #include "graphics/shader/storegen/storeWorkerFormat.h"
+#include "graphics/shader/storegen/streamChannel.h"
 #include "graphics/shader/storegen/workerProcess.h"
 
 #include <algorithm>
@@ -20,6 +21,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iterator>
 #include <limits>
 #include <optional>
@@ -27,6 +29,7 @@
 #include <string_view>
 #include <thread>
 #include <vector>
+#include <xxhash.h>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #ifndef NOMINMAX
@@ -93,6 +96,9 @@ constexpr std::string_view EXIT_TEXT_MARK = "--- Build ---";
 constexpr std::string_view RECOMPILER_LOG_MARK = "ShaderRecompiler CS phase";
 // The size of an eboot that holds no shader.
 constexpr size_t TINY_EBOOT_BYTES = 64;
+// How long the Stream smoke test waits for the worker to connect, and for its answer.
+constexpr auto STREAM_CONNECT_LIMIT = 30s;
+constexpr auto STREAM_ANSWER_LIMIT  = 60s;
 
 // A directory for the files of one test, which is removed with it.
 class TempDirectory {
@@ -532,6 +538,93 @@ void TestEveryThreadIsNiced() {
 }
 #endif
 
+// A Plan request for the small fixture program, with registers written by hand. Any registers a
+// dispatch could have will do, since the smoke test only needs the worker to translate it.
+StreamRequest SmokePlanRequest() {
+	const auto    words = BuildCode(ProgramSmall());
+	StreamRequest request;
+	request.seq       = 1;
+	request.kind      = StreamRequestKind::Plan;
+	const auto* bytes = reinterpret_cast<const uint8_t*>(words.data());
+	request.code.assign(bytes, bytes + words.size() * sizeof(uint32_t));
+	request.code_hash                 = XXH3_64bits(request.code.data(), request.code.size());
+	auto& regs                        = request.dispatch.cs_regs;
+	regs.num_thread_x                 = THREADS_X;
+	regs.num_thread_y                 = 1;
+	regs.num_thread_z                 = 1;
+	regs.wave_size                    = static_cast<uint8_t>(MOTOR_DISPATCH.wave_size);
+	regs.user_sgpr                    = USER_SGPR_COUNT;
+	regs.tgid_x_en                    = true;
+	request.dispatch.workgroup_counts = {1, 1, 1};
+	request.user_data_count           = USER_SGPR_COUNT;
+	return request;
+}
+
+// Reads one answer, and ends the child to free the read when none comes in time.
+std::optional<StreamResponse> ReadAnswer(StreamChannel& channel, ChildProcess& child) {
+	std::promise<std::optional<StreamResponse>> done;
+	auto                                        answer = done.get_future();
+	std::thread                                 reader([&] {
+		const auto read = channel.ReadFrame();
+		done.set_value(read.status == StreamReadStatus::Frame ? DecodeStreamResponse(read.frame)
+		                                                      : std::nullopt);
+	});
+	if (answer.wait_for(STREAM_ANSWER_LIMIT) != std::future_status::ready) {
+		child.Terminate();
+		channel.Interrupt();
+	}
+	reader.join();
+	return answer.get();
+}
+
+// The emulator binary started in Stream mode connects to this process's pipe, finds that the
+// pipe's server is the parent its request names, answers a Plan and ends with 0 once the pipe
+// closes. A worker that asked for the wrong end's process id would see its own, refuse the pipe
+// and end with WORKER_EXIT_PEER_MISMATCH, and the Accept here takes only the child's own id, so
+// both ends are checked across two real processes. An Ok answer with plan bytes is something only a
+// worker that translated the program can send. The log opens with the priority the child runs at,
+// which on Windows is the below normal class that ChildProcess gives it, or idle under an idle
+// parent.
+void TestStreamWorkerAnswersOverPipe() {
+	TempDirectory directory;
+	auto          listener = StreamPipeListener::Create("dispatch");
+	CHECK(listener.has_value());
+	if (!listener) {
+		return;
+	}
+	auto request        = MakeRequest(directory, "stream", directory / "unused.eboot");
+	request.mode        = WorkerMode::Stream;
+	request.stream_pipe = listener->Name();
+	const auto                     file = WriteRequest(directory, "stream", request);
+	ChildProcess                   child;
+	const std::vector<std::string> arguments {WORKER_COMMAND_LINE_FLAG, Utf8FromPath(file)};
+	CHECK(child.Start(KYTY_EMULATOR_PATH, arguments));
+	auto pipe = listener->Accept(STREAM_CONNECT_LIMIT, child.Pid());
+	CHECK(pipe.has_value());
+	if (pipe) {
+		StreamChannel channel(std::move(*pipe));
+		const auto    plan = SmokePlanRequest();
+		CHECK(channel.Send(plan));
+		const auto answer = ReadAnswer(channel, child);
+		CHECK(answer && answer->seq == plan.seq && answer->status == StreamStatus::Ok &&
+		      !answer->payload.empty());
+		channel.Close();
+	}
+	const auto code = child.Wait(WORKER_LIMIT);
+	if (!code) {
+		child.Terminate();
+	}
+	CHECK(code == WORKER_EXIT_DONE);
+	const auto log = ReadText(PathFromUtf8(request.progress_path));
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// ChildProcess gives a child idle class instead when the parent itself runs at idle.
+	CHECK(log.starts_with("priority below_normal\n") || log.starts_with("priority idle\n"));
+#else
+	CHECK(log.starts_with("priority nice_"));
+#endif
+	CHECK(log.find("done 1 ok\n") != std::string::npos);
+}
+
 // What this binary does when started with --fake-mode, which is how the crash tests get a process
 // of their own. It answers FAKE_MODE_UNKNOWN to a mode it does not know.
 int RunFakeModeMain(const std::vector<std::string>& args) {
@@ -588,6 +681,7 @@ int main(int argc, char** argv) {
 	TestDeadParentEndsTheWorker();
 	TestCrashUiState();
 	TestCrashEndsPromptly();
+	TestStreamWorkerAnswersOverPipe();
 #if defined(__linux__)
 	TestEveryThreadIsNiced();
 #endif

@@ -4,6 +4,7 @@
 // baseline that differs only in the behaviour under test.
 #include "common/childProcess.h"
 #include "common/config.h"
+#include "graphics/shader/recompiler/ir/Serialize.h"
 #include "graphics/shader/storegen/storeWorkerFormat.h"
 #include "graphics/shader/storegen/streamChannel.h"
 #include "graphics/shader/storegen/streamProtocol.h"
@@ -18,7 +19,9 @@
 #include <cstring>
 #include <future>
 #include <new>
+#include <optional>
 #include <span>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -85,6 +88,8 @@ constexpr std::chrono::milliseconds BLOCK_FIRST {100};
 constexpr std::chrono::milliseconds AT_ONCE_LIMIT {200};
 /// How many equal frames the allocation tests read after the warm-up frame.
 constexpr int FRAMES_AFTER_WARMUP = 7;
+/// How long the connect retry test lets a connect keep trying, far longer than the test needs.
+constexpr std::chrono::milliseconds CONNECT_RETRY_LIMIT {5000};
 
 // A request with every field set to a value of its own, and every flag true, since each defaults to
 // false and a flag the frame lost would come back false.
@@ -835,11 +840,65 @@ void TestStopWakesBlockedWrite() {
 	CHECK(write_prompt && !wrote);
 }
 
+// Each end of a pair sees this process at the other end, the client asking about the server and the
+// server about the client. The baseline is another id, which neither end takes, and an end that is
+// not open takes none. Both ends are this process, so this cannot tell which end's id the system
+// gave, and the real child smoke test in ShaderStoreDispatchTests covers that.
+void TestPeerProcessOfEachEnd() {
+	const uint32_t own  = Common::CurrentProcessId();
+	auto           pair = CreateStreamPipePair();
+	CHECK(pair.has_value());
+	if (!pair) {
+		return;
+	}
+	CHECK(pair->first.IsPeerProcess(own) && pair->second.IsPeerProcess(own));
+	CHECK(!pair->first.IsPeerProcess(own + 1) && !pair->second.IsPeerProcess(own + 1));
+	const StreamPipe closed;
+	CHECK(!closed.IsPeerProcess(own));
+}
+
+// A connect that finds the pipe busy tries again until the listener lets go of the client it has
+// and takes this one. A listener serves one client, so a second client finds it busy until Accept
+// refuses the first. A connect that gave up on a busy pipe fails here. The baseline is a name that
+// no listener has, which fails at once rather than after the timeout, so the retry is kept to the
+// busy case. POSIX queues the second client instead of refusing it, so there only the outcome is
+// checked, not that a retry happened.
+void TestConnectRetriesWhileBusy() {
+	const uint32_t own      = Common::CurrentProcessId();
+	auto           listener = StreamPipeListener::Create("connect-retry");
+	CHECK(listener.has_value());
+	if (!listener) {
+		return;
+	}
+	// A copy, since a successful Accept empties the listener's name while the connector reads it.
+	const std::string name  = listener->Name();
+	auto              first = ConnectStreamPipe(name);
+	CHECK(first.has_value());
+	std::optional<StreamPipe> second;
+	std::thread connector([&] { second = ConnectStreamPipeWithin(name, CONNECT_RETRY_LIMIT); });
+	// Long enough that the connector meets the busy pipe before the first client is refused.
+	std::this_thread::sleep_for(BLOCK_FIRST);
+	CHECK(!listener->Accept(CONNECTED_ACCEPT, own + 1).has_value());
+	auto server = listener->Accept(CONNECTED_ACCEPT, own);
+	connector.join();
+	CHECK(second.has_value() && server.has_value());
+	if (second && server) {
+		CHECK(ByteCrosses(*second, *server));
+	}
+	auto       nobody = StreamPipeListener::Create("connect-nobody");
+	const auto gone   = nobody ? nobody->Name() : std::string("missing");
+	nobody.reset();
+	const auto [prompt, connected] = ReturnsAtOnce(
+	    [&] { return ConnectStreamPipeWithin(gone, CONNECT_RETRY_LIMIT).has_value(); });
+	CHECK(prompt && !connected);
+}
+
 // ---- Worker request. ----
 
-// A request file in Stream mode is refused until the worker has a loop for it, so no build runs it
-// as Generate. The baseline is the same request in Generate mode, which decodes.
-void TestStreamModeNotYetDecodable() {
+// A request file in Stream mode decodes once it names its pipe, and the name comes back. A Stream
+// request with no pipe could only fail to connect, so it is refused as a bad request. The baseline
+// is the same request in Generate mode, which decodes without a pipe.
+void TestStreamModeNeedsPipeName() {
 	WorkerRequest request;
 	request.store_header       = {1, 2, 3, 4};
 	request.host_subgroup_size = 64;
@@ -847,6 +906,46 @@ void TestStreamModeNotYetDecodable() {
 	CHECK(DecodeWorkerRequest(EncodeWorkerRequest(request)));
 	request.mode = WorkerMode::Stream;
 	CHECK(!DecodeWorkerRequest(EncodeWorkerRequest(request)));
+	request.stream_pipe = R"(\\.\pipe\kyty-stream-1-test-0123456789abcdef)";
+	const auto decoded  = DecodeWorkerRequest(EncodeWorkerRequest(request));
+	CHECK(decoded && decoded->mode == WorkerMode::Stream &&
+	      decoded->stream_pipe == request.stream_pipe);
+}
+
+// A request's fields written by hand in the order of the file, at a given version and with or
+// without the stream pipe name that version 3 added.
+Bytes HandEncodedRequest(const WorkerRequest& request, uint32_t version, bool with_pipe) {
+	namespace IR = ShaderRecompiler::IR;
+	IR::Writer writer;
+	auto       fields = request;
+	auto       magic  = WORKER_REQUEST_MAGIC;
+	IR::IoAll(writer, magic, version, fields.store_header, fields.host_subgroup_size,
+	          fields.eboot_path, fields.output_path, fields.progress_path, fields.generated_path,
+	          fields.kept, fields.start_rank, fields.skip_hashes, fields.failed_hashes,
+	          fields.parent_pid, fields.mode, fields.generator_version, fields.expected_order);
+	if (with_pipe) {
+		IR::IoAll(writer, fields.stream_pipe);
+	}
+	return std::move(writer.bytes);
+}
+
+// A request in the layout before the pipe name, at version 2, is refused, and so is that layout
+// labelled version 3, which is cut short. The baseline is the same fields at version 3 with the
+// name, which decode, and which are byte for byte what EncodeWorkerRequest writes, so the hand
+// layout is the real one.
+void TestOldRequestLayoutRefused() {
+	WorkerRequest request;
+	request.store_header       = {1, 2, 3, 4};
+	request.host_subgroup_size = 64;
+	request.parent_pid         = 4242;
+	request.mode               = WorkerMode::Generate;
+	request.stream_pipe        = "pipe";
+	const auto current         = HandEncodedRequest(request, WORKER_REQUEST_VERSION, true);
+	CHECK(current == EncodeWorkerRequest(request));
+	CHECK(DecodeWorkerRequest(current));
+	CHECK(WORKER_REQUEST_VERSION == 3);
+	CHECK(!DecodeWorkerRequest(HandEncodedRequest(request, 2, false)));
+	CHECK(!DecodeWorkerRequest(HandEncodedRequest(request, WORKER_REQUEST_VERSION, false)));
 }
 
 // Fails the run when the tests take far longer than they should, since a read that never returns
@@ -902,7 +1001,10 @@ int main() {
 	TestClientLeftBeforeAccept();
 	TestStopWakesBlockedRead();
 	TestStopWakesBlockedWrite();
-	TestStreamModeNotYetDecodable();
+	TestPeerProcessOfEachEnd();
+	TestConnectRetriesWhileBusy();
+	TestStreamModeNeedsPipeName();
+	TestOldRequestLayoutRefused();
 	if (g_failures != 0) {
 		std::fprintf(stderr, "shader_store_stream_tests: %d failures\n", g_failures);
 		return 1;

@@ -113,6 +113,11 @@ struct StreamResponse {
 /// @return false when the payload would be over MAX_STREAM_PAYLOAD_BYTES, and frame is then empty.
 [[nodiscard]] bool EncodeStreamRequest(const StreamRequest& request, std::vector<uint8_t>& frame);
 
+/// Whether EncodeStreamResponse would take a response, which is when its payload fits under
+/// MAX_STREAM_PAYLOAD_BYTES and it carries a payload only with the Ok status. It copies nothing, so
+/// a sender can choose another answer before it commits to one.
+[[nodiscard]] bool StreamResponseEncodes(const StreamResponse& response);
+
 /// Writes a response as one frame, replacing what frame held, the way EncodeStreamRequest does.
 /// @return false when the payload would be over MAX_STREAM_PAYLOAD_BYTES or the response has a
 ///         payload with a status other than Ok, and frame is then empty.

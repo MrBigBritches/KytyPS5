@@ -79,6 +79,8 @@ private:
 	std::optional<StreamReadResult> m_final;
 };
 
+struct StreamConnectAttempt;
+
 /// One end of a connected stream pipe. Moving is allowed and copying is not. One thread may read
 /// while another writes, but two threads must not read, or write, at the same time.
 ///
@@ -113,6 +115,13 @@ public:
 	/// Whether this end holds an open connection.
 	[[nodiscard]] bool IsOpen() const;
 
+	/// Whether the process at the other end has the given id. A client asks about the server and a
+	/// server about the client. On Windows that is GetNamedPipeServerProcessId or
+	/// GetNamedPipeClientProcessId, and on POSIX the socket's peer credentials, where macOS without
+	/// LOCAL_PEERPID checks only the peer's user.
+	/// @return false as well when this end is not open or the system cannot say.
+	[[nodiscard]] bool IsPeerProcess(uint32_t expected_pid) const;
+
 	/// Closes this end, which makes the other end's reads return 0.
 	void Close();
 
@@ -121,7 +130,7 @@ public:
 
 private:
 	friend class StreamPipeListener;
-	friend std::optional<StreamPipe> ConnectStreamPipe(const std::string& name);
+	friend StreamConnectAttempt TryConnectStreamPipe(const std::string& name);
 
 	explicit StreamPipe(std::unique_ptr<Impl> impl);
 
@@ -166,9 +175,31 @@ private:
 	std::unique_ptr<Impl> m_impl;
 };
 
+/// One try at connecting to a listener by name.
+struct StreamConnectAttempt {
+	/// The connected client end, when the try succeeded.
+	std::optional<StreamPipe> pipe;
+	/// Whether a try that failed may succeed if made again, which is ERROR_PIPE_BUSY on Windows and
+	/// ECONNREFUSED or EINTR on POSIX. A listener that does not exist is not worth another try.
+	bool retry = false;
+};
+
+/// Tries once to connect to a listener by name, and says whether a failure is worth another try.
+[[nodiscard]] StreamConnectAttempt TryConnectStreamPipe(const std::string& name);
+
 /// Connects to a listener by name, as a child does with the name its parent gave it.
 /// @return nothing when no listener has that name or it already has its client.
 [[nodiscard]] std::optional<StreamPipe> ConnectStreamPipe(const std::string& name);
+
+/// How long ConnectStreamPipeWithin sleeps between two tries.
+constexpr std::chrono::milliseconds STREAM_CONNECT_RETRY_SLICE {10};
+
+/// Connects to a listener by name, trying again for up to timeout while the failures are ones that
+/// TryConnectStreamPipe says are worth another try. The listener's server end serves one client and
+/// waits for the next only after it refused one, so a child can find it busy for a moment.
+/// @return nothing when the timeout ran out or a failure was not worth another try.
+[[nodiscard]] std::optional<StreamPipe> ConnectStreamPipeWithin(const std::string&        name,
+                                                                std::chrono::milliseconds timeout);
 
 /// Two connected ends in this process, made through a listener and a connect with a name of their
 /// own, so the same code is used as between two processes.
@@ -192,6 +223,11 @@ public:
 	/// Encodes and writes a response.
 	/// @return false when it does not encode or the write failed.
 	[[nodiscard]] bool Send(const StreamResponse& response);
+
+	/// Whether the process at the other end has the given id, as StreamPipe::IsPeerProcess says.
+	[[nodiscard]] bool IsPeerProcess(uint32_t expected_pid) const {
+		return m_pipe.IsPeerProcess(expected_pid);
+	}
 
 	/// Wakes a blocked ReadFrame or Send for good, as StreamPipe::Interrupt does.
 	void Interrupt() { m_pipe.Interrupt(); }

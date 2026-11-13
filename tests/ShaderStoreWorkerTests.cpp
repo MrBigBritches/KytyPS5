@@ -283,6 +283,7 @@ WorkerRequest FullRequest() {
 	request.mode               = WorkerMode::Verify;
 	request.generator_version  = 9;
 	request.expected_order     = 0x0123456789abcdefull;
+	request.stream_pipe        = R"(\\.\pipe\kyty-stream-42-full-0123456789abcdef)";
 	return request;
 }
 
@@ -293,7 +294,8 @@ bool SameRequest(const WorkerRequest& a, const WorkerRequest& b) {
 	       a.progress_path == b.progress_path && a.generated_path == b.generated_path &&
 	       a.kept == b.kept && a.start_rank == b.start_rank && a.skip_hashes == b.skip_hashes &&
 	       a.failed_hashes == b.failed_hashes && a.parent_pid == b.parent_pid && a.mode == b.mode &&
-	       a.generator_version == b.generator_version && a.expected_order == b.expected_order;
+	       a.generator_version == b.generator_version && a.expected_order == b.expected_order &&
+	       a.stream_pipe == b.stream_pipe;
 }
 
 // Every field of a request comes back, and each way a request can be wrong is refused.

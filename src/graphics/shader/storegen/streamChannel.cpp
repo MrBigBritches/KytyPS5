@@ -2,6 +2,7 @@
 
 #include "common/childProcess.h"
 #include "common/config.h"
+#include "common/logging/log.h"
 
 #include <algorithm>
 #include <atomic>
@@ -9,6 +10,7 @@
 #include <random>
 #include <string>
 #include <system_error>
+#include <thread>
 
 #include <fmt/format.h>
 
@@ -106,6 +108,22 @@ bool StreamChannel::Send(const StreamRequest& request) {
 
 bool StreamChannel::Send(const StreamResponse& response) {
 	return EncodeStreamResponse(response, m_send_buffer) && m_pipe.WriteAll(m_send_buffer);
+}
+
+std::optional<StreamPipe> ConnectStreamPipe(const std::string& name) {
+	return std::move(TryConnectStreamPipe(name).pipe);
+}
+
+std::optional<StreamPipe> ConnectStreamPipeWithin(const std::string&        name,
+                                                  std::chrono::milliseconds timeout) {
+	const auto deadline = std::chrono::steady_clock::now() + timeout;
+	for (;;) {
+		auto attempt = TryConnectStreamPipe(name);
+		if (attempt.pipe || !attempt.retry || std::chrono::steady_clock::now() >= deadline) {
+			return std::move(attempt.pipe);
+		}
+		std::this_thread::sleep_for(STREAM_CONNECT_RETRY_SLICE);
+	}
 }
 
 std::optional<std::pair<StreamPipe, StreamPipe>> CreateStreamPipePair() {
@@ -206,6 +224,8 @@ struct StreamPipe::Impl {
 	OwnedHandle write_event {MakeEvent()};
 	/// Set by Interrupt and never reset, so every later read and write sees it.
 	OwnedHandle stop_event {MakeEvent()};
+	/// Whether this end connected by name, which decides which end's process id the system gives.
+	bool client = false;
 
 	[[nodiscard]] bool Valid() const {
 		return pipe.value != nullptr && read_event.value != nullptr &&
@@ -492,18 +512,33 @@ std::optional<StreamPipe> StreamPipeListener::Accept(std::chrono::milliseconds t
 	return accepted;
 }
 
-std::optional<StreamPipe> ConnectStreamPipe(const std::string& name) {
-	auto impl = std::make_unique<StreamPipe::Impl>();
-	// Identification only, so the server can never act as this process.
-	impl->pipe.Reset(CreateFileW(WideName(name).c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
-	                             OPEN_EXISTING,
-	                             FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT |
-	                                 SECURITY_IDENTIFICATION,
-	                             nullptr));
-	if (!impl->Valid()) {
-		return std::nullopt;
+bool StreamPipe::IsPeerProcess(uint32_t expected_pid) const {
+	if (!m_impl) {
+		return false;
 	}
-	return StreamPipe(std::move(impl));
+	ULONG      pid  = 0;
+	const BOOL read = m_impl->client ? GetNamedPipeServerProcessId(m_impl->pipe.value, &pid)
+	                                 : GetNamedPipeClientProcessId(m_impl->pipe.value, &pid);
+	return read != FALSE && pid == expected_pid;
+}
+
+StreamConnectAttempt TryConnectStreamPipe(const std::string& name) {
+	auto impl    = std::make_unique<StreamPipe::Impl>();
+	impl->client = true;
+	// Identification only, so the server can never act as this process.
+	const HANDLE handle = CreateFileW(WideName(name).c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+	                                  OPEN_EXISTING,
+	                                  FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT |
+	                                      SECURITY_IDENTIFICATION,
+	                                  nullptr);
+	// Read before anything else can change it.
+	const DWORD error = handle == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;
+	impl->pipe.Reset(handle);
+	if (!impl->Valid()) {
+		// A busy pipe has a client it has not let go of yet, and listens again once it refuses it.
+		return {std::nullopt, error == ERROR_PIPE_BUSY};
+	}
+	return {StreamPipe(std::move(impl)), false};
 }
 
 #else
@@ -591,8 +626,8 @@ std::optional<sockaddr_un> SocketAddress(const std::string& path) {
 	sockaddr_un address {};
 	address.sun_family = AF_UNIX;
 	if (path.size() >= sizeof(address.sun_path)) {
-		std::fprintf(stderr, "Stream pipe: the socket path %s is too long for a Unix socket\n",
-		             path.c_str());
+		// The logger rather than stderr, since a child's stderr is /dev/null on POSIX.
+		LOGF("Stream pipe: the socket path %s is too long for a Unix socket\n", path.c_str());
 		return std::nullopt;
 	}
 	std::copy(path.begin(), path.end(), address.sun_path);
@@ -753,19 +788,27 @@ std::optional<StreamPipe> StreamPipeListener::Accept(std::chrono::milliseconds t
 	return StreamPipe(std::move(impl));
 }
 
-std::optional<StreamPipe> ConnectStreamPipe(const std::string& name) {
+bool StreamPipe::IsPeerProcess(uint32_t expected_pid) const {
+	return m_impl && PeerIsProcess(m_impl->fd.value, expected_pid);
+}
+
+StreamConnectAttempt TryConnectStreamPipe(const std::string& name) {
 	const auto address = SocketAddress(name);
 	if (!address) {
-		return std::nullopt;
+		return {std::nullopt, false};
 	}
 	auto impl = std::make_unique<StreamPipe::Impl>();
 	impl->fd.Reset(MakeSocket());
-	if (impl->fd.value < 0 ||
-	    ::connect(impl->fd.value, reinterpret_cast<const sockaddr*>(&*address), sizeof(*address)) !=
-	        0) {
-		return std::nullopt;
+	if (impl->fd.value < 0) {
+		return {std::nullopt, false};
 	}
-	return StreamPipe(std::move(impl));
+	if (::connect(impl->fd.value, reinterpret_cast<const sockaddr*>(&*address), sizeof(*address)) !=
+	    0) {
+		// A full backlog refuses, and a signal interrupts. Either may pass on a fresh socket.
+		const int error = errno;
+		return {std::nullopt, error == ECONNREFUSED || error == EINTR};
+	}
+	return {StreamPipe(std::move(impl)), false};
 }
 
 #endif

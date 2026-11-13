@@ -43,6 +43,7 @@
 #include "graphics/shader/shaderStoreRecord.h"
 #include "graphics/guest_gpu/command_processor/prescanDispatchInputs.h"
 #include "graphics/guest_gpu/command_processor/submitScan.h"
+#include "graphics/shader/storegen/computeCompile.h"
 #include "graphics/shader/storegen/computeTranslation.h"
 #include "graphics/shader/storegen/ebootShaderScan.h"
 #include "graphics/shader/storegen/ebootSource.h"
@@ -63817,9 +63818,11 @@ SetupModule RuntimeSetupModule(VulkanHarness &vulkan, const SetupFixture &fixtur
   return result;
 }
 
-// Translates and compiles a fixture through the shared setup, with the input info the pre-scan
-// builds from the same registers and the host values the store header would carry. The program
-// has no resources, so its specialization is empty, as the runtime's is.
+// Translates and compiles a fixture through the shared setup and the shared compile path that the
+// generator and the Stream worker use, with the input info the pre-scan builds from the same
+// registers and the host values the store header would carry. The SPIR-V is read back from the
+// record that path encodes, so the record is what is held to the runtime. The program has no
+// resources, so its specialization is empty, as the runtime's is.
 SetupModule SharedSetupModule(VulkanHarness &vulkan, const SetupFixture &fixture) {
   GraphicContext graphics;
   FillSetupGraphics(vulkan, fixture, graphics);
@@ -63838,16 +63841,22 @@ SetupModule SharedSetupModule(VulkanHarness &vulkan, const SetupFixture &fixture
   const uint64_t hash = XXH3_64bits(code.data(), code.size() * sizeof(u32));
   const uint32_t user_data_count = dispatch.regs.cs_regs.user_sgpr;
   StoreGen::TranslationSetup setup(*info, user_data_count, hash, host);
-  const auto source = ShaderRecompiler::PrepareShaderSource(code, setup.Options());
-  auto translated = ShaderRecompiler::TranslateProgram(source.decoded, setup.Options());
-  const ShaderRecompiler::IR::ResourceSpecialization specialization;
-  auto compiled = ShaderRecompiler::CompileProgram(std::move(translated), setup.Options(),
-                                                   specialization, 0);
-  const auto push = std::move(compiled.program).TakeCompiledInfo().bindings.push_data_start_dword;
-  SetupModule result{.lds_storage = info->lds_storage, .spirv = std::move(compiled.spirv)};
+  SetupModule result{.lds_storage = info->lds_storage};
   BuildStageStaticKey(*info, result.static_state);
-  result.id = ShaderModuleId(ShaderType::Compute, hash, user_data_count, result.static_state, push,
-                             specialization, {});
+  const StoreGen::ComputeUnit unit{code, hash, user_data_count, result.static_state};
+  const ShaderRecompiler::IR::ResourceSpecialization specialization;
+  const auto built = StoreGen::BuildComputeUnit(unit, setup, specialization);
+  ShaderRecompiler::IR::Reader reader{built.record};
+  auto type = StoreRecord::GraphicsPipeline;
+  ShaderRecompiler::IR::IoAll(reader, type);
+  DecodedModuleRecord record;
+  DecodeModuleRecord(reader, record);
+  Require("SetupIdMatchesRuntime", "shared record",
+          built.status == StoreGen::ComputeBuildStatus::Built && type == StoreRecord::Module &&
+              reader.ok && reader.bytes.empty() && record.id == built.id,
+          std::string(fixture.label) + ": the shared path did not encode one whole module record");
+  result.id = built.id;
+  result.spirv = std::move(record.spirv);
   return result;
 }
 

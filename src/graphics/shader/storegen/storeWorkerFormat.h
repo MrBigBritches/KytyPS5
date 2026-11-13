@@ -20,9 +20,7 @@ namespace Libs::Graphics::StoreGen {
 enum class WorkerMode : uint8_t {
 	Generate, ///< Generate the records into the output file.
 	Verify,   ///< Exit at once with WORKER_EXIT_UP_TO_DATE when the finished file is current.
-	/// Serve StreamRequest frames from a pipe, as streamProtocol.h describes them. A request file
-	/// does not decode with this mode yet, because the worker has no Stream loop, and a build that
-	/// took it would run the request as Generate.
+	/// Serve StreamRequest frames from the pipe the request names, as streamWorker.h describes.
 	Stream,
 };
 
@@ -33,8 +31,9 @@ constexpr uint32_t SHADER_STORE_GENERATOR_VERSION = 2;
 
 /// Starts every request file, and holds "WSRQ".
 constexpr uint32_t WORKER_REQUEST_MAGIC = 0x51525357;
-/// The layout of the request file. A reader refuses any other value.
-constexpr uint32_t WORKER_REQUEST_VERSION = 2;
+/// The layout of the request file. A reader refuses any other value. Version 3 added the stream
+/// pipe name.
+constexpr uint32_t WORKER_REQUEST_VERSION = 3;
 
 /// Everything a worker needs, so it reads no device and no Config. The supervisor writes it to a
 /// file and passes the file's path on the worker's command line.
@@ -78,6 +77,10 @@ struct WorkerRequest {
 	WorkerMode mode       = WorkerMode::Generate;
 	/// The SHADER_STORE_GENERATOR_VERSION of the supervisor, which the worker writes into the file.
 	uint32_t generator_version = SHADER_STORE_GENERATOR_VERSION;
+	/// Stream mode only, the name of the pipe to connect to, from StreamPipeListener::Name. It
+	/// travels in the request rather than on the command line so the request stays the one thing a
+	/// worker reads, next to the parent_pid that the pipe's server must have.
+	std::string stream_pipe;
 };
 
 /// A path from the UTF-8 text a request holds.
@@ -91,7 +94,7 @@ struct WorkerRequest {
 
 /// Reads a request.
 /// @return nothing when the bytes are cut short, have trailing bytes, hold another magic or
-///         version, or hold a mode that does not exist.
+///         version, hold a mode that does not exist, or are in Stream mode with no pipe name.
 [[nodiscard]] std::optional<WorkerRequest> DecodeWorkerRequest(std::span<const uint8_t> bytes);
 
 /// Writes a request file, replacing the file if it exists.

@@ -139,6 +139,12 @@ size_t ResponseFixedBytes() {
 	return bytes;
 }
 
+// The payload size of a response's frame, taken in 64 bits so a huge payload cannot wrap.
+uint64_t ResponsePayloadBytes(const StreamResponse& response) {
+	return static_cast<uint64_t>(ResponseFixedBytes()) + response.payload.size() +
+	       response.static_state.size() * sizeof(uint32_t);
+}
+
 // Whether a request kind read off the wire is one that exists.
 bool KnownRequestKind(StreamRequestKind kind) {
 	return kind == StreamRequestKind::Plan || kind == StreamRequestKind::Compile;
@@ -246,15 +252,18 @@ bool EncodeStreamRequest(const StreamRequest& request, std::vector<uint8_t>& fra
 	return true;
 }
 
+bool StreamResponseEncodes(const StreamResponse& response) {
+	return ResponsePayloadBytes(response) <= MAX_STREAM_PAYLOAD_BYTES &&
+	       PayloadFitsStatus(response.status, response.payload.size());
+}
+
 bool EncodeStreamResponse(const StreamResponse& response, std::vector<uint8_t>& frame) {
 	frame.clear();
-	const uint64_t state_bytes   = response.static_state.size() * sizeof(uint32_t);
-	const uint64_t payload_bytes = static_cast<uint64_t>(ResponseFixedBytes()) +
-	                               response.payload.size() + state_bytes;
-	if (payload_bytes > MAX_STREAM_PAYLOAD_BYTES ||
-	    !PayloadFitsStatus(response.status, response.payload.size())) {
+	if (!StreamResponseEncodes(response)) {
 		return false;
 	}
+	const uint64_t state_bytes   = response.static_state.size() * sizeof(uint32_t);
+	const uint64_t payload_bytes = ResponsePayloadBytes(response);
 	BeginFrame(frame, StreamFrameKind::Response, static_cast<uint32_t>(payload_bytes));
 	FieldWriter write {frame};
 	BlobLengths lengths {static_cast<uint32_t>(response.payload.size()),

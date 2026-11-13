@@ -10,6 +10,7 @@
 #include <array>
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <vector>
 
 // How a compute program is translated away from the GPU thread, so that the module it gives has the
@@ -24,6 +25,11 @@ struct HostValues {
 	ShaderRecompiler::Spirv::Profile profile;
 	uint32_t                         max_shared_bytes = 0;
 };
+
+/// Reads the store header the way PipelineCache writes it, which is the build stamp, then the host
+/// values. The build stamp does not affect translation and is skipped.
+/// @return nothing when the bytes are not exactly one header or a flag byte is not 0 or 1.
+[[nodiscard]] std::optional<HostValues> DecodeHostHeader(std::span<const uint8_t> bytes);
 
 /// The translation options of one compute program, set as the runtime sets them for a compute
 /// program. The user data is zeroed, since translation reads only how many registers there are. The

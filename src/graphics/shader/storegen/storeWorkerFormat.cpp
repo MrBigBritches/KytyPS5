@@ -30,7 +30,8 @@ std::vector<uint8_t> EncodeWorkerRequest(const WorkerRequest& request) {
 	IR::IoAll(writer, magic, version, fields.store_header, fields.host_subgroup_size,
 	          fields.eboot_path, fields.output_path, fields.progress_path, fields.generated_path,
 	          fields.kept, fields.start_rank, fields.skip_hashes, fields.failed_hashes,
-	          fields.parent_pid, fields.mode, fields.generator_version, fields.expected_order);
+	          fields.parent_pid, fields.mode, fields.generator_version, fields.expected_order,
+	          fields.stream_pipe);
 	return std::move(writer.bytes);
 }
 
@@ -46,11 +47,12 @@ std::optional<WorkerRequest> DecodeWorkerRequest(std::span<const uint8_t> bytes)
 	IR::IoAll(reader, request.store_header, request.host_subgroup_size, request.eboot_path,
 	          request.output_path, request.progress_path, request.generated_path, request.kept,
 	          request.start_rank, request.skip_hashes, request.failed_hashes, request.parent_pid,
-	          request.mode, request.generator_version, request.expected_order);
-	// A mode byte is checked after the read, since an enum read takes any value. Stream is left out
-	// until the worker has a loop for it, so no build runs a Stream request as Generate.
-	const bool known_mode =
-	    request.mode == WorkerMode::Generate || request.mode == WorkerMode::Verify;
+	          request.mode, request.generator_version, request.expected_order, request.stream_pipe);
+	// A mode byte is checked after the read, since an enum read takes any value. A Stream request
+	// with no pipe could only fail to connect, so it is refused here as a bad request.
+	const bool known_mode = request.mode == WorkerMode::Generate ||
+	                        request.mode == WorkerMode::Verify ||
+	                        (request.mode == WorkerMode::Stream && !request.stream_pipe.empty());
 	if (!reader.ok || !reader.bytes.empty() || !known_mode) {
 		return std::nullopt;
 	}

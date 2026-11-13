@@ -871,13 +871,38 @@ if (KYTY_CLANG_CL)
 	set_source_files_properties(${shader_store_worker_recompiler_src} PROPERTIES COMPILE_FLAGS "-Wno-pragma-pack -Wno-deprecated-declarations -D_TIMESPEC_DEFINED")
 endif()
 
+# The Stream mode of the store worker, its cache of translated programs and the compile path it
+# shares with the generator. The worker runs on a thread of the test and talks to it through a real
+# pipe, and it translates real programs, so this links the whole recompiler like the worker test.
+# It still needs no graphics device.
+add_executable(shader_store_stream_worker_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ShaderStoreStreamWorkerTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/csRegisters.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/gpu_format.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/moduleId.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/shaderPixelParameter.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/shaderStaticKey.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/shaderStoreRecord.cpp"
+	${shader_store_worker_storegen_src}
+	${shader_store_worker_recompiler_src}
+)
+target_link_libraries(shader_store_stream_worker_tests common Vulkan::Headers fmt::fmt xxhash xbyak::xbyak spirv-tools-opt spirv-tools libzstd_static)
+target_include_directories(shader_store_stream_worker_tests PRIVATE ${inc_headers})
+if (KYTY_CLANG_CL)
+	# The recompiler headers bring in the deprecated codecvt use the stream test silences too.
+	target_compile_options(shader_store_stream_worker_tests PRIVATE -Wno-deprecated-declarations)
+endif()
+
 # The store worker mode of the emulator binary. The test starts the real kyty_emulator through
 # ChildProcess, so it only builds the requests and eboots it sends and links no recompiler. The
-# emulator is built first, since the test runs it.
+# stream pipe is linked for the Stream mode's smoke test. The emulator is built first, since the
+# test runs it.
 add_executable(shader_store_dispatch_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ShaderStoreDispatchTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/storegen/storeWorkerFormat.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/storegen/progressLog.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/storegen/streamProtocol.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/storegen/streamChannel.cpp"
 )
 add_dependencies(shader_store_dispatch_tests kyty_emulator)
 target_compile_definitions(shader_store_dispatch_tests PRIVATE
@@ -1105,6 +1130,9 @@ if(BUILD_TESTING)
 	add_test(NAME shader_store_eboot_source COMMAND $<TARGET_FILE:shader_store_eboot_source_tests>)
 	set_tests_properties(shader_store_supervisor PROPERTIES TIMEOUT 300)
 	add_test(NAME shader_store_worker COMMAND $<TARGET_FILE:shader_store_worker_tests>)
+	add_test(NAME shader_store_stream_worker COMMAND $<TARGET_FILE:shader_store_stream_worker_tests>)
+	# A worker or a read that never returns shows up as a hang, which the test's own watchdog ends first.
+	set_tests_properties(shader_store_stream_worker PROPERTIES TIMEOUT 300)
 	add_test(NAME shader_store_dispatch COMMAND $<TARGET_FILE:shader_store_dispatch_tests>)
 	set_tests_properties(shader_store_dispatch PROPERTIES TIMEOUT 300)
 	add_test(NAME shader_recompiler_store_generation
@@ -1262,6 +1290,7 @@ if(BUILD_TESTING)
 		generation_miss_classifier_tests
 		shader_store_eboot_source_tests
 		shader_store_worker_tests
+		shader_store_stream_worker_tests
 		shader_store_dispatch_tests
 		virtual_memory_allocation_tests
 		audio_out2_port_tests
