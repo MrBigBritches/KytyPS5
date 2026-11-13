@@ -13,6 +13,7 @@
 #include "common/childProcess.h"
 #include "common/crashUi.h"
 #include "common/file.h"
+#include "common/firstRunReport.h"
 #include "graphics/host_gpu/renderer/pipeline/prescanPreparer.h"
 #include "graphics/shader/moduleId.h"
 #include "graphics/shader/storegen/prescanTransport.h"
@@ -305,6 +306,12 @@ struct Script {
 	// The first compiles_held Compiles are queued and left unanswered, and Stop answers them, as an
 	// answer the supervisor read just before it stopped would reach the callback.
 	uint32_t compiles_held = 0;
+	// When set, Stop drops what it holds without an outcome, as a transport that lost one would, so
+	// only the preparer itself can let go of those requests.
+	bool stop_withholds = false;
+	// Set by the transport when it is made. It answers the oldest held request as Stop would and
+	// leaves the rest held. Call it only from the thread that drives the preparer.
+	std::function<void()> answer_first_held;
 	// Called at each Submit, before the request is answered.
 	std::function<void(const StreamRequest&)> on_submit;
 	// What reached Submit, by kind, and what was answered by translation.
@@ -316,7 +323,9 @@ struct Script {
 class ScriptedTransport final: public PrescanTransport {
 public:
 	ScriptedTransport(Script& script, PrescanCompletionHandler handler)
-	    : m_script(script), m_handler(std::move(handler)) {}
+	    : m_script(script), m_handler(std::move(handler)) {
+		m_script.answer_first_held = [this] { AnswerFirstHeld(); };
+	}
 
 	StreamSubmitResult Submit(StreamRequest request, std::shared_ptr<const std::vector<uint8_t>> code,
 	                          uint64_t tag) override {
@@ -352,20 +361,16 @@ public:
 		m_handler(std::move(completion));
 		return {StreamSubmitStatus::Queued, request.seq};
 	}
-	// Completes the held Plans as Dropped and answers the held Compiles, once.
+	// Completes the held Plans as Dropped and answers the held Compiles, once, unless the script
+	// says to withhold them.
 	void Stop() override {
 		auto held = std::move(m_held);
 		m_held.clear();
+		if (m_script.stop_withholds) {
+			return;
+		}
 		for (const auto& entry: held) {
-			StreamCompletion completion {.seq     = entry.request.seq,
-			                             .kind    = entry.request.kind,
-			                             .outcome = StreamOutcome::Dropped,
-			                             .tag     = entry.tag};
-			if (entry.answer) {
-				completion.outcome = StreamOutcome::Answered;
-				Answer(entry.request, false, false, completion.response);
-			}
-			m_handler(std::move(completion));
+			m_handler(Complete(entry));
 		}
 	}
 
@@ -391,6 +396,28 @@ private:
 		uint64_t      tag    = 0;
 		bool          answer = false;
 	};
+
+	// A held request's outcome, a Dropped Plan or an answered Compile.
+	StreamCompletion Complete(const HeldRequest& entry) {
+		StreamCompletion completion {.seq     = entry.request.seq,
+		                             .kind    = entry.request.kind,
+		                             .outcome = StreamOutcome::Dropped,
+		                             .tag     = entry.tag};
+		if (entry.answer) {
+			completion.outcome = StreamOutcome::Answered;
+			Answer(entry.request, false, false, completion.response);
+		}
+		return completion;
+	}
+	// Gives the oldest held request its outcome and keeps the rest.
+	void AnswerFirstHeld() {
+		if (m_held.empty()) {
+			return;
+		}
+		const HeldRequest entry = std::move(m_held.front());
+		m_held.erase(m_held.begin());
+		m_handler(Complete(entry));
+	}
 
 	Script&                  m_script;
 	PrescanCompletionHandler m_handler;
@@ -1290,6 +1317,110 @@ void TestSettleThrowGivesBack() {
 	std::puts("SettleThrowGivesBack ok");
 }
 
+// ---- The prescan_running underrun tag. ----
+
+// Turns the first-run report on for one test and off again after it, since only work begun while
+// the report is on counts toward the tag.
+class ReportOn {
+public:
+	ReportOn() { Common::FirstRunReport::Configure(true, false); }
+	~ReportOn() { Common::FirstRunReport::Configure(false, false); }
+	ReportOn(const ReportOn&)            = delete;
+	ReportOn& operator=(const ReportOn&) = delete;
+};
+
+// A pass counts as one unit of work while it runs, even with nothing sent. The shader map lookup
+// reads the tag in the middle of the pass, and the program is not mapped, so no request is ever
+// pending and only the pass can be counted. The baseline is the tag outside the pass, before and
+// after it, which is 0, so a unit that is never given back cannot pass. With the report off the
+// same pass counts nothing, which is the baseline of the gate. The mutations are to drop the pass's
+// unit, and the lookup sees 0, and to drop the report gate, and the pass with the report off sees 1.
+void TestPassCountsAsPrescanWork() {
+	const auto program = DirectProgram(MUBUF_STORE_DWORD);
+	for (const bool report: {false, true}) {
+		Common::FirstRunReport::Configure(report, false);
+		std::optional<uint32_t> seen;
+		Harness harness({}, [&seen](uint64_t) -> std::optional<ShaderMapSnapshot> {
+			seen = Common::FirstRunReport::PrescanRunning();
+			return std::nullopt;
+		});
+		harness.Push(ItemFor(program, Descriptor(STRIDE_A, DstSel(4, 5, 6, 7)), KEY));
+		CHECK(Common::FirstRunReport::PrescanRunning() == 0);
+		(void)harness.preparer->RunOnce();
+		CHECK(seen == (report ? 1u : 0u));
+		CHECK(harness.Counters().no_map_entry == 1 && harness.Counters().plan_requests == 0);
+		CHECK(Common::FirstRunReport::PrescanRunning() == 0);
+	}
+	Common::FirstRunReport::Configure(false, false);
+	std::puts("PassCountsAsPrescanWork ok");
+}
+
+// Each request counts from its send until its outcome is handled. Two Compiles of two strides are
+// held by the transport. Between passes the tag is then 2, and 0 before anything was sent. Answering
+// the first and handling it leaves exactly 1. A count that never moved, one that gave back every
+// request at the first answer, and a token whose moved-from copy also gives back, which reads 0 at
+// every step since the count can never read below 0, all fail one of those. Stop with the second
+// still held brings it to 0. This transport answers that Compile at Stop and no pass is left to
+// handle it, so only the clear in Stop can give it back. The mutations are to drop the token, to
+// let a moved-from token give back, and to drop the clear in Stop, which leaves 1 after Stop.
+void TestPrescanRunningCountsHeldCompile() {
+	constexpr uint32_t HELD_COMPILES = 2;
+	const ReportOn     report;
+	const auto         program = DirectProgram(MUBUF_STORE_DWORD);
+	Script             script {.compiles_held = HELD_COMPILES};
+	Harness            harness(ScriptedFactory(script));
+	harness.Map(program);
+	CHECK(Common::FirstRunReport::PrescanRunning() == 0);
+	harness.Push(ItemFor(program, Descriptor(STRIDE_A, DstSel(4, 5, 6, 7)), KEY));
+	harness.Drive();
+	CHECK(script.compile_attempts == 1 && Common::FirstRunReport::PrescanRunning() == 1);
+	harness.Push(ItemFor(program, Descriptor(STRIDE_B, DstSel(4, 5, 6, 7)), KEY));
+	harness.Drive();
+	CHECK(script.compile_attempts == 2 && Common::FirstRunReport::PrescanRunning() == 2);
+	script.answer_first_held();
+	harness.Drive();
+	CHECK(harness.adopted.size() == 1 && Common::FirstRunReport::PrescanRunning() == 1);
+	harness.preparer->Stop();
+	CHECK(harness.adopted.size() == 1 && Common::FirstRunReport::PrescanRunning() == 0);
+	std::puts("PrescanRunningCountsHeldCompile ok");
+}
+
+// A lane that turns off ends the preparer's thread, and a request the stopped transport never
+// answered stops counting when the thread ends, before anyone calls Stop. A's Compile is held, and
+// this transport's Stop withholds its outcome, so the settle after the lane turns off cannot hand
+// it back. B's Compile then meets LaneOff. The baseline is the same run with B refused with
+// QueueFull, which differs only in the status. There the thread keeps running and A still counts 1,
+// so the 0 comes from the thread ending and not from A being handled. The mutation is to drop the
+// clear at the end of the thread, and the tag stays 1 until Stop, so the wait for 0 runs out.
+void TestPrescanRunningClearedAtThreadExit() {
+	const ReportOn report;
+	const auto     program = DirectProgram(MUBUF_STORE_DWORD);
+	for (const auto status: {StreamSubmitStatus::QueueFull, StreamSubmitStatus::LaneOff}) {
+		const bool off = status == StreamSubmitStatus::LaneOff;
+		Script     script {.compile_submit = status, .compiles_held = 1, .stop_withholds = true};
+		Harness    harness(ScriptedFactory(script));
+		harness.Map(program);
+		harness.preparer->Start();
+		harness.Push(ItemFor(program, Descriptor(STRIDE_A, DstSel(4, 5, 6, 7)), KEY));
+		WakePreparer(*harness.handoff);
+		CHECK(WaitFor([&] {
+			return harness.Counters().compile_requests == 1 &&
+			       Common::FirstRunReport::PrescanRunning() == 1;
+		}));
+		harness.Push(ItemFor(program, Descriptor(STRIDE_B, DstSel(4, 5, 6, 7)), KEY));
+		WakePreparer(*harness.handoff);
+		CHECK(WaitFor([&] {
+			const auto counters = harness.Counters();
+			return counters.refused_sends == 1 && counters.lane_off == off &&
+			       Common::FirstRunReport::PrescanRunning() == (off ? 0u : 1u);
+		}));
+		CHECK(!harness.Counters().failed);
+		harness.preparer->Stop();
+		CHECK(Common::FirstRunReport::PrescanRunning() == 0);
+	}
+	std::puts("PrescanRunningClearedAtThreadExit ok");
+}
+
 // What a supervised run of three dispatches ended with.
 struct SupervisedRun {
 	PrescanPreparerCounters counters;
@@ -1634,6 +1765,9 @@ int main(int argc, char** argv) {
 	TestLaneOffTurnsPrescanOff();
 	TestLaneOffSettlesParkedPlan();
 	TestSettleThrowGivesBack();
+	TestPassCountsAsPrescanWork();
+	TestPrescanRunningCountsHeldCompile();
+	TestPrescanRunningClearedAtThreadExit();
 	TestSupervisedHelperOutcomes();
 	TestSupervisedLaneOff();
 	TestSupervisedStopIsFinal();

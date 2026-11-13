@@ -1676,14 +1676,46 @@ Common::GpuStall::HoldCause WarmTakeCause(PipelineBuildQueue::Acquired how, bool
 	return paused ? HoldCause::WarmInlinePaused : HoldCause::WarmInline;
 }
 
+// The stall state a prescan build reads at its start and end. Only lock-free reads, so a worker
+// never takes the stall mutex the GPU thread and the audio threads share.
+struct PipelineCache::StallSample {
+	bool     hold_active  = false;
+	uint64_t holds        = 0;
+	uint64_t scopes       = 0;
+	bool     scope_active = false;
+
+	// The two pairs are read in opposite orders because their counts move at opposite ends. The hold
+	// count goes up when a hold ends, so the hold flag is read first, and a hold that ends between
+	// the reads is already in the count. The Scope count goes up when a Scope begins, so the Scope
+	// count is read first, and a Scope that begins between the reads is still active at the flag.
+	// Read the other way round, a Scope that began between them and ended before the build did
+	// would show in neither sample. A test passes between_scope_reads to open a Scope just there.
+	static StallSample Take(const std::function<void()>* between_scope_reads = nullptr) {
+		StallSample sample;
+		sample.hold_active = Common::GpuStall::HoldInProgress();
+		sample.holds       = Common::GpuStall::HoldCount();
+		sample.scopes      = Common::GpuStall::ScopeCount();
+		if (between_scope_reads != nullptr && *between_scope_reads) {
+			(*between_scope_reads)();
+		}
+		sample.scope_active = Common::GpuStall::AnyScopeActive();
+		return sample;
+	}
+};
+
 // The prescan's builds never wait on the pause and never take a generator row. A build that runs on
-// the GPU thread is the stop itself and not work beside it, so only a worker's build is judged.
+// the GPU thread is the stop itself and not work beside it, so only a worker's build is judged, and
+// only a worker's build counts toward the prescan_running underrun tag. That unit opens first, so
+// the test hook already sees it.
 void PipelineCache::StartPrescanCompute(const ShaderModule& module) {
 	auto build = [this, &module](Pipeline& pipeline) {
-		const bool     on_worker     = !GuestGpu::IsGpuThread();
-		const uint64_t scopes_before = Common::GpuStall::ScopeCount();
-		const bool     active_before = Common::GpuStall::AnyScopeActive();
-		const auto     start         = std::chrono::steady_clock::now();
+		const bool on_worker = !GuestGpu::IsGpuThread();
+		std::optional<Common::FirstRunReport::PrescanRunningScope> running;
+		if (on_worker) {
+			running.emplace();
+		}
+		const auto before = StallSample::Take(&m_prescan_sample_hook);
+		const auto start  = std::chrono::steady_clock::now();
 		if (m_prescan_build_hook) {
 			m_prescan_build_hook();
 		}
@@ -1691,28 +1723,49 @@ void PipelineCache::StartPrescanCompute(const ShaderModule& module) {
 		const auto elapsed = std::chrono::steady_clock::now() - start;
 		// Marked here because this build adds to the driver cache without a checkpoint of its own.
 		m_driver_cache_dirty.store(true, std::memory_order_relaxed);
-		m_prescan_builds.builds.fetch_add(1, std::memory_order_relaxed);
-		const bool overlapped = active_before || Common::GpuStall::AnyScopeActive() ||
-		                        Common::GpuStall::ScopeCount() != scopes_before;
-		if (on_worker && overlapped) {
-			m_prescan_builds.in_scope.fetch_add(1, std::memory_order_relaxed);
-			m_prescan_builds.in_scope_us.fetch_add(
-			    std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count(),
-			    std::memory_order_relaxed);
-		}
+		CountPrescanBuild(on_worker, before, elapsed);
 	};
 	(void)m_prescan_compute->Start(module.id, std::move(build), PipelineBuildQueue::Lane::Front);
 }
 
-// in_scope_ms is the whole time of each build that overlapped a stop, not only the overlap, so it
-// is an upper bound on the contention the stop met.
+// A worker's build overlapped a stop when a Scope was active at its start or end or one began while
+// it ran. It overlapped a hold of guest audio when a hold was in progress at its start or end or
+// one ended while it ran. The hold is judged from HoldInProgress and HoldCount and never from
+// IsStalled, which takes the stall mutex.
+void PipelineCache::CountPrescanBuild(bool on_worker, const StallSample& before,
+                                      std::chrono::steady_clock::duration elapsed) {
+	const auto after      = StallSample::Take();
+	const auto elapsed_us = static_cast<uint64_t>(
+	    std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count());
+	m_prescan_builds.builds.fetch_add(1, std::memory_order_relaxed);
+	if (!on_worker) {
+		return;
+	}
+	// Worker-only, since it is what in_scope_ms and in_hold_ms are measured against.
+	m_prescan_builds.total_us.fetch_add(elapsed_us, std::memory_order_relaxed);
+	if (before.scope_active || after.scope_active || after.scopes != before.scopes) {
+		m_prescan_builds.in_scope.fetch_add(1, std::memory_order_relaxed);
+		m_prescan_builds.in_scope_us.fetch_add(elapsed_us, std::memory_order_relaxed);
+	}
+	if (before.hold_active || after.hold_active || after.holds != before.holds) {
+		m_prescan_builds.in_hold.fetch_add(1, std::memory_order_relaxed);
+		m_prescan_builds.in_hold_us.fetch_add(elapsed_us, std::memory_order_relaxed);
+	}
+}
+
+// in_scope_ms and in_hold_ms are the whole time of each build that overlapped a stop or a hold, not
+// only the overlap, so they are upper bounds on the contention the stop met.
 PrescanBuildStats PipelineCache::PrescanBuilds() const {
 	constexpr double MS_PER_US = 1e-3;
-	return {.builds   = m_prescan_builds.builds.load(std::memory_order_relaxed),
-	        .in_scope = m_prescan_builds.in_scope.load(std::memory_order_relaxed),
-	        .in_scope_ms =
-	            static_cast<double>(m_prescan_builds.in_scope_us.load(std::memory_order_relaxed)) *
-	            MS_PER_US};
+	const auto       to_ms     = [](const std::atomic<uint64_t>& micros) {
+		return static_cast<double>(micros.load(std::memory_order_relaxed)) * MS_PER_US;
+	};
+	return {.builds      = m_prescan_builds.builds.load(std::memory_order_relaxed),
+	        .in_scope    = m_prescan_builds.in_scope.load(std::memory_order_relaxed),
+	        .in_hold     = m_prescan_builds.in_hold.load(std::memory_order_relaxed),
+	        .total_ms    = to_ms(m_prescan_builds.total_us),
+	        .in_scope_ms = to_ms(m_prescan_builds.in_scope_us),
+	        .in_hold_ms  = to_ms(m_prescan_builds.in_hold_us)};
 }
 
 WarmBuildSet<uint64_t, PipelineCache::Pipeline>* PipelineCache::WarmSetPending(uint64_t id) const {

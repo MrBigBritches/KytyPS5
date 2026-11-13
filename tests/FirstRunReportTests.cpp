@@ -1906,11 +1906,11 @@ void TestUnderrunsCarryThePrescanTag() {
   Common::FirstRunReport::SetGeneratorChildAlive(true);
   report.AddAudioUnderrun();
   Common::FirstRunReport::SetGeneratorChildAlive(false);
-  Common::FirstRunReport::SetPrescanRunning(3);
+  Common::FirstRunReport::SetPrescanRunningForTest(3);
   report.AddAudioUnderrun();
-  Common::FirstRunReport::SetPrescanRunning(70000);
+  Common::FirstRunReport::SetPrescanRunningForTest(70000);
   report.AddAudioUnderrun();
-  Common::FirstRunReport::SetPrescanRunning(0);
+  Common::FirstRunReport::SetPrescanRunningForTest(0);
   Common::FirstRunReport::Configure(false, false);
   const auto taken = report.AudioUnderrunsSoFar();
   Check(taken.prescan_running == std::vector<uint16_t> {0, 3, 65535} &&

@@ -1408,6 +1408,11 @@ struct PipelineCacheTestAccess {
   static void SetPrescanBuildHook(PipelineCache &cache, std::function<void()> hook) {
     cache.m_prescan_build_hook = std::move(hook);
   }
+  // Sets the hook every prescan build calls between the Scope count and Scope flag reads of its
+  // start sample. Set it before EnablePrescan.
+  static void SetPrescanSampleHook(PipelineCache &cache, std::function<void()> hook) {
+    cache.m_prescan_sample_hook = std::move(hook);
+  }
   // Posts a record as the preparer's sink does, with its plan hash changed, which stands for a
   // prescan module whose plan is not its program's.
   static void PostPrescanChanged(PipelineCache &cache, DecodedModuleRecord &&record) {
@@ -63982,22 +63987,124 @@ void CheckPrescanPauseExempt(VulkanHarness &vulkan, GuestGpu &gpu,
   std::printf("[gpu]     %-32s ok\n", "PrescanPauseExempt");
 }
 
+// The cases of CheckPrescanOverlapMidBuild. Scope opens and closes a Scope that holds nothing in the
+// middle of the build. HoldEnded does the same with an audio thread held by the Scope, so the hold
+// ends while the build runs. HoldRunning holds the audio thread from the middle of the build until
+// the build has finished.
+enum class OverlapCase { None, Scope, HoldEnded, HoldRunning };
+
+// Runs the middle of one case while the build waits at its hook, then lets the build go. The hold
+// cases turn holding on with no threshold, so the stand-in audio thread is held as soon as the
+// Scope is open, and turn it off again once the thread is back. Returns whether a hold case's
+// thread was really held, and for HoldRunning also whether the build finished while the hold ran,
+// since a build that finished late would turn the case into HoldEnded.
+bool RunOverlapMiddle(PipelineCache &cache, uint64_t id, OverlapCase which, std::promise<void> &release) {
+  if (which == OverlapCase::None) {
+    release.set_value();
+    return true;
+  }
+  const bool hold = which != OverlapCase::Scope;
+  if (hold) Common::GpuStall::Configure(true, std::chrono::milliseconds(0));
+  std::optional<Common::GpuStall::Scope> scope(std::in_place, Common::GpuStall::HoldCause::Other);
+  std::atomic<bool> held{false};
+  std::thread audio;
+  if (hold) {
+    audio = std::thread([&held] { held = Common::GpuStall::WaitWhileStalled(); });
+    (void)WaitForPrescan([] { return Common::GpuStall::WaiterCount() == 1; });
+  }
+  if (which != OverlapCase::HoldRunning) scope.reset();
+  release.set_value();
+  bool done_during_hold = true;
+  if (which == OverlapCase::HoldRunning) {
+    // The build must be over while the hold still runs, so only the check at its end can see it.
+    done_during_hold = WaitForPrescan([&] { return PipelineCacheTestAccess::PrescanWarmDone(cache, id); });
+    scope.reset();
+  }
+  if (audio.joinable()) audio.join();
+  if (hold) Common::GpuStall::Configure(false);
+  return (!hold || held) && done_during_hold;
+}
+
+// One case of CheckPrescanOverlapMidBuild, with the build held at its hook until the middle ran.
+void CheckPrescanOverlapCase(VulkanHarness &vulkan, GuestGpu &gpu, const DecodedModuleRecord &record,
+                             OverlapCase which) {
+  constexpr const char *name = "PrescanOverlapMidBuild";
+  PipelineCache cache(vulkan.RuntimeContext(), nullptr);
+  PipelineCacheTestAccess::EnableWarmCompute(cache);
+  PipelineCacheTestAccess::EnableGeneration(cache);
+  std::promise<void> entered;
+  std::promise<void> release;
+  auto entered_future = entered.get_future();
+  auto release_future = release.get_future().share();
+  PipelineCacheTestAccess::SetPrescanBuildHook(cache, [&entered, release_future] {
+    entered.set_value();
+    (void)release_future.wait_for(PRESCAN_WAIT_LIMIT);
+  });
+  cache.EnablePrescan(StoreGen::InProcessPrescanTransportFactory());
+  PipelineCacheTestAccess::PostPrescanRecord(cache, DecodedModuleRecord(record));
+  ShaderComputeInputInfo input{};
+  gpu.SendCommandSync([&] { GeneratedLookup(cache, GENERATED_STRIDE_A, input); });
+  Require(name, "the build reaches its middle",
+          entered_future.wait_for(PRESCAN_WAIT_LIMIT) == std::future_status::ready,
+          "the prescan build never started");
+  Require(name, "a hold case's audio thread is held", RunOverlapMiddle(cache, record.id, which, release),
+          "the stand-in audio thread was not held by the Scope, or the build outlasted the hold");
+  Require(name, "the build finishes",
+          WaitForPrescan([&] { return PipelineCacheTestAccess::PrescanWarmDone(cache, record.id); }),
+          "the prescan build never finished");
+  const bool scoped = which != OverlapCase::None;
+  const bool holding = which == OverlapCase::HoldEnded || which == OverlapCase::HoldRunning;
+  const auto stats = cache.PrescanBuilds();
+  Require(name, holding ? "a hold beside the build is counted" : "a build beside no hold is not counted",
+          stats.builds == 1 && stats.in_scope == (scoped ? 1u : 0u) && stats.in_hold == (holding ? 1u : 0u),
+          "a build that overlapped a Scope or a hold only in part was not counted, or one without was");
+  Require(name, "the build times add up",
+          stats.total_ms > 0.0 && stats.in_scope_ms == (scoped ? stats.total_ms : 0.0) &&
+              stats.in_hold_ms == (holding ? stats.total_ms : 0.0),
+          "the time of the one build is not in every figure it counted in");
+  cache.StopBuilds();
+}
+
 // A Scope that opens and closes while a prescan build runs on a worker is counted, though none is
 // active at the build's start or end. The build's hook holds it in the middle until the test has
 // opened and closed the Scope. The baseline is the same build with no Scope, which is not counted.
 // The mutation is to judge the overlap by the Scope at the build's start alone. The build is then
-// not counted.
+// not counted. A Scope that held no audio is not a hold, and the same Scope with an audio thread
+// held by it is, both when the hold ends in the build's middle and when it is still running at the
+// build's end. Those differ from the Scope case only in the held thread. The mutations are to count
+// holds by ScopeCount instead of HoldCount, and the Scope case counts a hold, and to drop the check
+// at the build's end, and the hold still running is not counted.
 void CheckPrescanOverlapMidBuild(VulkanHarness &vulkan, GuestGpu &gpu,
                                  const std::vector<DecodedModuleRecord> &records) {
-  constexpr const char *name = "PrescanOverlapMidBuild";
+  for (const auto which : {OverlapCase::None, OverlapCase::Scope, OverlapCase::HoldEnded,
+                           OverlapCase::HoldRunning}) {
+    CheckPrescanOverlapCase(vulkan, gpu, records[0], which);
+  }
+  std::printf("[gpu]     %-32s ok\n", "PrescanOverlapMidBuild");
+}
+
+// A Scope that begins between the two Scope reads of a build's start sample, and ends before the
+// build does, is still counted. The sample hook opens it from the test thread at that moment, and
+// the build hook holds the build until the test has closed it, so it shows in neither sample's flag
+// read at the end. Only the start sample's flag, read after the count, can see it. The baseline is
+// the same run with no Scope opened at the sample, which is not counted. The mutation is to read the
+// Scope flag before the Scope count, and the Scope is then missed.
+void CheckPrescanScopeAtSample(VulkanHarness &vulkan, GuestGpu &gpu,
+                               const std::vector<DecodedModuleRecord> &records) {
+  constexpr const char *name = "PrescanScopeAtSample";
   for (const bool open_scope : {false, true}) {
     PipelineCache cache(vulkan.RuntimeContext(), nullptr);
     PipelineCacheTestAccess::EnableWarmCompute(cache);
     PipelineCacheTestAccess::EnableGeneration(cache);
-    std::promise<void> entered;
-    std::promise<void> release;
+    std::promise<void> at_sample, opened, entered, release;
+    auto at_sample_future = at_sample.get_future();
+    auto opened_future = opened.get_future().share();
     auto entered_future = entered.get_future();
     auto release_future = release.get_future().share();
+    PipelineCacheTestAccess::SetPrescanSampleHook(cache, [&at_sample, opened_future] {
+      at_sample.set_value();
+      (void)opened_future.wait_for(PRESCAN_WAIT_LIMIT);
+    });
     PipelineCacheTestAccess::SetPrescanBuildHook(cache, [&entered, release_future] {
       entered.set_value();
       (void)release_future.wait_for(PRESCAN_WAIT_LIMIT);
@@ -64006,19 +64113,88 @@ void CheckPrescanOverlapMidBuild(VulkanHarness &vulkan, GuestGpu &gpu,
     PipelineCacheTestAccess::PostPrescanRecord(cache, DecodedModuleRecord(records[0]));
     ShaderComputeInputInfo input{};
     gpu.SendCommandSync([&] { GeneratedLookup(cache, GENERATED_STRIDE_A, input); });
+    Require(name, "the build reaches its start sample",
+            at_sample_future.wait_for(PRESCAN_WAIT_LIMIT) == std::future_status::ready,
+            "the prescan build never sampled the stall state");
+    std::optional<Common::GpuStall::Scope> scope;
+    if (open_scope) scope.emplace(Common::GpuStall::HoldCause::Other);
+    opened.set_value();
     Require(name, "the build reaches its middle",
             entered_future.wait_for(PRESCAN_WAIT_LIMIT) == std::future_status::ready,
-            "the prescan build never started");
-    if (open_scope) {
-      const Common::GpuStall::Scope scope(Common::GpuStall::HoldCause::Other);
-    }
+            "the prescan build never reached its hook");
+    scope.reset();
     release.set_value();
     Require(name, "the build finishes",
             WaitForPrescan([&] { return PipelineCacheTestAccess::PrescanWarmDone(cache, records[0].id); }),
             "the prescan build never finished");
-    Require(name, open_scope ? "a Scope in the middle is counted" : "no Scope is not counted",
-            cache.PrescanBuilds().in_scope == (open_scope ? 1u : 0u) && cache.PrescanBuilds().builds == 1,
-            "a build that overlapped a Scope only in its middle was not counted, or one without was");
+    const auto stats = cache.PrescanBuilds();
+    Require(name, open_scope ? "a Scope begun inside the sample is counted" : "no Scope is not counted",
+            stats.builds == 1 && stats.in_scope == (open_scope ? 1u : 0u) && stats.in_hold == 0,
+            "a Scope that began between the start sample's reads was missed, or one was counted without it");
+    cache.StopBuilds();
+  }
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
+// Turns the first-run report on and empties it for one check, and turns it off and empties it again
+// after, so the check's rows never reach a later one.
+class PrescanReportOn {
+public:
+  PrescanReportOn() {
+    Common::FirstRunReport::Configure(true, false);
+    Common::FirstRunReport::Global().Reset();
+  }
+  ~PrescanReportOn() {
+    Common::FirstRunReport::Configure(false, false);
+    Common::FirstRunReport::Global().Reset();
+  }
+  PrescanReportOn(const PrescanReportOn &) = delete;
+  PrescanReportOn &operator=(const PrescanReportOn &) = delete;
+};
+
+// A prescan build counts toward the prescan_running underrun tag only on a worker. The build's hook
+// reads the tag and which thread it runs on. The module is posted directly and the preparer is
+// stopped first, so no request is pending and no pass runs, and the build's own unit is all the
+// hook can see. The baseline is the same module with the prescan's set held, so the take runs the
+// build on the GPU thread inside its Scope, as in CheckPrescanInlineTake, and the hook there sees 0
+// and must find itself on the GPU thread. The pause for draws cannot hold it, since the prescan's
+// set is exempt. The mutations are to drop the worker's unit, and the worker build sees 0, and to
+// count builds on the GPU thread too, and the baseline sees 1.
+void CheckPrescanRunningWorkerOnly(VulkanHarness &vulkan, GuestGpu &gpu,
+                                   const std::vector<DecodedModuleRecord> &records) {
+  constexpr const char *name = "PrescanRunningWorkerOnly";
+  constexpr int64_t NOT_SEEN = -1;
+  const PrescanReportOn report;
+  for (const bool on_worker : {false, true}) {
+    PipelineCache cache(vulkan.RuntimeContext(), nullptr);
+    PipelineCacheTestAccess::EnableWarmCompute(cache);
+    PipelineCacheTestAccess::EnableGeneration(cache);
+    std::atomic<int64_t> seen{NOT_SEEN};
+    std::atomic<bool> hook_on_gpu{false};
+    PipelineCacheTestAccess::SetPrescanBuildHook(cache, [&seen, &hook_on_gpu] {
+      hook_on_gpu = GuestGpu::IsGpuThread();
+      seen = Common::FirstRunReport::PrescanRunning();
+    });
+    cache.EnablePrescan(StoreGen::InProcessPrescanTransportFactory());
+    cache.StopPrescan();
+    if (!on_worker) PipelineCacheTestAccess::PausePrescanSet(cache);
+    Require(name, "nothing else counts", Common::FirstRunReport::PrescanRunning() == 0,
+            "the tag was not 0 with the preparer stopped and nothing built");
+    PipelineCacheTestAccess::PostPrescanRecord(cache, DecodedModuleRecord(records[0]));
+    ShaderComputeInputInfo input{};
+    gpu.SendCommandSync([&] {
+      GeneratedLookup(cache, GENERATED_STRIDE_A, input);
+      if (!on_worker) (void)cache.GetComputePipeline(input);
+    });
+    Require(name, "the build ran",
+            WaitForPrescan([&] { return seen.load() != NOT_SEEN && cache.PrescanBuilds().builds == 1; }),
+            "the prescan build never reached its hook");
+    Require(name, on_worker ? "the build runs on a worker" : "the held take runs the build on the GPU thread",
+            hook_on_gpu.load() == !on_worker, "the build did not run on the thread the case needs");
+    Require(name, on_worker ? "a worker's build counts" : "a GPU-thread build does not count",
+            seen.load() == (on_worker ? 1 : 0), "the tag counted a build on the GPU thread, or missed a worker's");
+    Require(name, "the unit is given back", WaitForPrescan([] { return Common::FirstRunReport::PrescanRunning() == 0; }),
+            "the tag stayed up after the build");
     cache.StopBuilds();
   }
   std::printf("[gpu]     %-32s ok\n", name);
@@ -64045,6 +64221,9 @@ struct PrescanAudioProbe {
 // counted as work beside a stop, since it is the stop. The prescan's set is held so the take must
 // run the build. The mutations are to give the prescan's set the store's origin, and the hold is
 // charged to WarmInlinePaused. Count builds on the GPU thread too, and the inline build is counted.
+// The probe's hold is still running when the inline build ends, so the build would also count as
+// beside a hold if the GPU thread were judged. The mutations are to judge holds before the GPU
+// thread returns, and in_hold is 1, and to add the GPU thread's build to total_ms, and it is not 0.
 void CheckPrescanInlineTake(VulkanHarness &vulkan, GuestGpu &gpu,
                             const std::vector<DecodedModuleRecord> &records) {
   constexpr const char *name = "PrescanInlineTake";
@@ -64070,9 +64249,10 @@ void CheckPrescanInlineTake(VulkanHarness &vulkan, GuestGpu &gpu,
   Require(name, "the take is charged to PrescanQueued",
           audio.held && Common::GpuStall::Breakdown().cause_count[queued] == before + 1,
           "the GPU thread's run of a queued prescan build was not charged to PrescanQueued");
+  const auto stats = cache.PrescanBuilds();
   Require(name, "the inline build is not work beside a stop",
-          cache.PrescanBuilds().builds == 1 && cache.PrescanBuilds().in_scope == 0,
-          "the build the GPU thread ran in its own Scope was counted as overlapping a stop");
+          stats.builds == 1 && stats.in_scope == 0 && stats.in_hold == 0 && stats.total_ms == 0.0,
+          "the build the GPU thread ran in its own Scope was counted as overlapping a stop or a hold");
   cache.StopBuilds();
   std::printf("[gpu]     %-32s ok\n", name);
 }
@@ -64629,6 +64809,8 @@ void CheckPrescanIntake(VulkanHarness &vulkan) {
       CheckPrescanNeverWaits(vulkan, gpu);
       CheckPrescanPauseExempt(vulkan, gpu, records);
       CheckPrescanOverlapMidBuild(vulkan, gpu, records);
+      CheckPrescanScopeAtSample(vulkan, gpu, records);
+      CheckPrescanRunningWorkerOnly(vulkan, gpu, records);
       CheckPrescanInlineTake(vulkan, gpu, records);
       CheckPrescanPlannerSeparate(vulkan, gpu, records);
       CheckPrescanDrainsFirst(vulkan, gpu, records);

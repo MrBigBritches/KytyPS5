@@ -44,6 +44,9 @@ State& GetState() {
 std::atomic<bool>     g_enabled {false};
 std::atomic<uint32_t> g_active_scopes {0};
 std::atomic<uint64_t> g_hold_count {0};
+// A lock-free copy of whether first_hold is set, so a worker can tell whether audio is held now
+// without taking the mutex. It is written under the mutex wherever first_hold changes.
+std::atomic<bool>     g_hold_in_progress {false};
 std::atomic<uint64_t> g_held_ns {0};
 std::atomic<uint64_t> g_scope_count {0};
 // Scope ids start at 1, since 0 means a stall begun without one.
@@ -238,7 +241,9 @@ Scope::Scope(HoldCause cause)
 	LockGuard lock(state.mutex);
 	state.tracker.Begin(m_start, m_id);
 	g_active_scopes.fetch_add(1, std::memory_order_relaxed);
-	g_scope_count.fetch_add(1, std::memory_order_relaxed);
+	// Release, after the active count, so a lock-free reader that sees this Scope counted with an
+	// acquire load also sees it active. The prescan's build samples rely on that pairing.
+	g_scope_count.fetch_add(1, std::memory_order_release);
 	t_owned_scopes++;
 }
 
@@ -259,6 +264,13 @@ Scope::~Scope() {
 			stall_first_hold = std::exchange(state.first_hold, std::nullopt);
 			stall_cause      = std::exchange(state.hold_cause, HoldCause::Other);
 			state.hold_scope_id = 0;
+			// The count goes up before the flag drops, and the release pairs with HoldInProgress's
+			// acquire, so a reader that sees the hold over also sees it counted. A hold can then
+			// never slip between the two reads of a worker that samples both.
+			if (stall_first_hold.has_value()) {
+				g_hold_count.fetch_add(1, std::memory_order_relaxed);
+			}
+			g_hold_in_progress.store(false, std::memory_order_release);
 		}
 		t_owned_scopes--;
 	}
@@ -266,7 +278,6 @@ Scope::~Scope() {
 	if (stall_first_hold.has_value()) {
 		const auto held_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
 		    Clock::now() - *stall_first_hold);
-		g_hold_count.fetch_add(1, std::memory_order_relaxed);
 		g_held_ns.fetch_add(static_cast<uint64_t>(held_ns.count()), std::memory_order_relaxed);
 		const auto end_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
 		                        Clock::now().time_since_epoch())
@@ -299,6 +310,7 @@ bool HoldWhileStalled() {
 				state.waiters++;
 				if (!state.first_hold.has_value()) {
 					state.first_hold = hold_start;
+					g_hold_in_progress.store(true, std::memory_order_relaxed);
 					// The stall is past the threshold, so the oldest Scope is the one that crossed it.
 					state.hold_scope_id = state.tracker.OldestId().value_or(0);
 				}
@@ -341,6 +353,10 @@ bool IsStalled() {
 
 uint64_t HoldCount() {
 	return g_hold_count.load(std::memory_order_relaxed);
+}
+
+bool HoldInProgress() {
+	return g_hold_in_progress.load(std::memory_order_acquire);
 }
 
 uint64_t HeldNs() {
@@ -389,8 +405,10 @@ std::vector<HoldRecord> HoldRecords() {
 	return records;
 }
 
+// Acquire pairs with the release in the Scope's constructor, so a Scope seen counted here is also
+// seen active by a later AnyScopeActive on this thread.
 uint64_t ScopeCount() {
-	return g_scope_count.load(std::memory_order_relaxed);
+	return g_scope_count.load(std::memory_order_acquire);
 }
 
 bool AnyScopeActive() {

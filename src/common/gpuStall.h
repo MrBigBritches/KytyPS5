@@ -192,6 +192,12 @@ bool WaitWhileStalled();
 /// counter it always counts, so a run report can read it.
 [[nodiscard]] uint64_t HoldCount();
 
+/// True while a stall is holding guest audio, from the first thread it held until its last Scope
+/// ends. It reads one atomic and never takes the mutex, so a worker may call it where IsStalled
+/// would contend with the GPU thread. When a thread reads it false for a hold that ended and then
+/// reads HoldCount, the count includes that hold. Read in the other order, the count may not.
+[[nodiscard]] bool HoldInProgress();
+
 /// Nanoseconds that guest audio was held in total since the process began, counted when each stall
 /// ends, from the first thread it held to the end of the stall. Unlike the performance panel's
 /// counter it always counts. A stall shorter than the threshold holds nothing and adds nothing, and

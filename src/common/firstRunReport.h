@@ -3,6 +3,7 @@
 
 #include "common/gpuStall.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -10,6 +11,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <limits>
 #include <mutex>
 #include <optional>
 #include <span>
@@ -1001,10 +1003,12 @@ inline std::atomic<int32_t>  g_warm_running {0};
 inline std::atomic<int32_t>  g_warm_front_running {0};
 inline std::atomic<int32_t>  g_warm_back_running {0};
 inline std::atomic<bool>     g_child_alive {false};
-inline std::atomic<uint32_t> g_prescan_running {0};
+inline std::atomic<int32_t>  g_prescan_running {0};
 inline std::atomic<uint32_t> g_warm_workers {0};
 
-/// A counter never reads below zero, which a reader racing a scope could otherwise see.
+/// A counter never reads below zero. Scopes only add and then take back what they added, so a
+/// racing reader cannot see a negative value. Only a test setter that overwrites a counter while
+/// scopes are live can drive it below zero, and the clamp keeps that from showing as a huge count.
 [[nodiscard]] inline uint32_t ReadCount(const std::atomic<int32_t>& counter) noexcept {
 	const auto running = counter.load(std::memory_order_relaxed);
 	return running > 0 ? static_cast<uint32_t>(running) : 0;
@@ -1081,18 +1085,61 @@ inline void SetGeneratorChildAlive(bool alive) noexcept {
 	return Detail::g_child_alive.load(std::memory_order_relaxed);
 }
 
-/// Sets the figure behind the prescan_running underrun tag. It is the number of pre-scan builds
-/// compiling plus the requests to the pre-scan child that are outstanding. It is a measure of work
-/// in progress and not of whether the child process is alive, so an idle child counts 0. The owner
-/// of the pre-scan updates it as builds start and end and as requests are sent and answered. Nothing
-/// sets it yet, since the pre-scan is not part of this build, so the tag is 0 until then. It is
-/// deliberately not folded into GeneratorChildAlive.
-inline void SetPrescanRunning(uint32_t in_progress) noexcept {
-	Detail::g_prescan_running.store(in_progress, std::memory_order_relaxed);
-}
+/// The figure behind the prescan_running underrun tag, which is the pre-scan work in progress now.
+/// It counts the pre-scan's pipeline builds running on a worker, the Plan and Compile requests sent
+/// to the helper whose outcome the preparer has not handled yet, and 1 while a preparer pass runs.
+/// It measures work and not whether the helper process is alive, so an idle helper counts 0, and it
+/// is deliberately not folded into GeneratorChildAlive. The scanner is deliberately left out. Its
+/// walk runs on every submission while the pre-scan is on and is bounded in time, so counting it
+/// would tag nearly every underrun and say nothing about the helper or the builds. Each unit is a
+/// PrescanRunningScope, and only scopes made while the report is on count.
 [[nodiscard]] inline uint32_t PrescanRunning() noexcept {
-	return Detail::g_prescan_running.load(std::memory_order_relaxed);
+	return Detail::ReadCount(Detail::g_prescan_running);
 }
+
+/// Overwrites the prescan_running figure, for a test that needs a value no real work would give.
+/// Live scopes still add and subtract on top of it, so a test calls it with no pre-scan running.
+inline void SetPrescanRunningForTest(uint32_t in_progress) noexcept {
+	const auto clamped = std::min<uint32_t>(in_progress, std::numeric_limits<int32_t>::max());
+	Detail::g_prescan_running.store(static_cast<int32_t>(clamped), std::memory_order_relaxed);
+}
+
+/// Counts one unit of pre-scan work toward PrescanRunning for as long as it lives, when the report
+/// is on. It is move-only, so a pending request can carry its unit through a map, and a moved-from
+/// scope gives nothing back. Whether it counts is fixed when it is made, so it always gives back
+/// exactly what it took even if the report is turned off meanwhile.
+class PrescanRunningScope {
+public:
+	PrescanRunningScope() noexcept
+	    : m_active(Enabled()) {
+		if (m_active) {
+			Detail::g_prescan_running.fetch_add(1, std::memory_order_relaxed);
+		}
+	}
+	~PrescanRunningScope() { Release(); }
+	PrescanRunningScope(PrescanRunningScope&& other) noexcept
+	    : m_active(std::exchange(other.m_active, false)) {}
+	PrescanRunningScope& operator=(PrescanRunningScope&& other) noexcept {
+		if (this != &other) {
+			Release();
+			m_active = std::exchange(other.m_active, false);
+		}
+		return *this;
+	}
+	PrescanRunningScope(const PrescanRunningScope&)            = delete;
+	PrescanRunningScope& operator=(const PrescanRunningScope&) = delete;
+
+private:
+	/// Gives the unit back once.
+	void Release() noexcept {
+		if (m_active) {
+			Detail::g_prescan_running.fetch_sub(1, std::memory_order_relaxed);
+			m_active = false;
+		}
+	}
+
+	bool m_active;
+};
 
 /// Says how many workers the background warm-up runs, which the machine block shows.
 inline void SetWarmWorkerCount(uint32_t workers) noexcept {

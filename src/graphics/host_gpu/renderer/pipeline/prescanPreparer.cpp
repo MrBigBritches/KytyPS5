@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/pipeline/prescanPreparer.h"
 
+#include "common/firstRunReport.h"
 #include "common/hostException.h"
 #include "common/logging/log.h"
 #include "common/threadPriority.h"
@@ -78,6 +79,27 @@ struct PlanEntry {
 	uint64_t last_used = 0;
 };
 
+// One request's share of the work the prescan_running underrun tag counts. It lives in the request's
+// pending entry, from just before the send until the outcome is handled, the send is refused or
+// throws, or the entries are cleared by a stop, a failure or the end of the thread. A request the
+// supervisor sends again to a respawned helper keeps its entry, so it stays counted. It is move-only
+// so the unit follows the entry and a moved-from token gives nothing back. Whether it counts follows
+// the report being on, as for every PrescanRunningScope. It is the one place a request's life is
+// tracked, so a per-unit in-flight count for hold causes belongs here too, and that one must not be
+// gated on the report, since hold causes are always recorded.
+class PendingWork {
+public:
+	PendingWork() = default;
+	~PendingWork() = default;
+	PendingWork(PendingWork&&) noexcept            = default;
+	PendingWork& operator=(PendingWork&&) noexcept = default;
+	PendingWork(const PendingWork&)                = delete;
+	PendingWork& operator=(const PendingWork&)     = delete;
+
+private:
+	Common::FirstRunReport::PrescanRunningScope m_running;
+};
+
 // A request whose outcome has not come yet, with what checking that outcome needs. A Compile keeps
 // its specialization, so a refused or dropped one can be forgotten and sent again.
 struct PendingRequest {
@@ -87,6 +109,7 @@ struct PendingRequest {
 	uint32_t                   user_data_count = 0;
 	std::vector<uint32_t>      static_state;
 	std::optional<PrescanSpec> spec;
+	PendingWork                work;
 };
 
 // A report from the GPU thread about a module the preparer built. A duplicate is one the drain
@@ -296,7 +319,8 @@ PrescanPreparer::Impl::Impl(PrescanHandoff& shared, PrescanPreparerConfig suppli
 // answers go before the preparation, so snapshots whose plan just came are prepared in this pass.
 // The cache's module reports go after the ring, so a key whose report happens before an admitted
 // item's push is known when that item is prepared.
-// Once the helper's lane is off nothing could be sent, so a pass does nothing.
+// Once the helper's lane is off nothing could be sent, so a pass does nothing. A pass counts as one
+// unit of pre-scan work for the underrun tag while it runs, even with no request outstanding.
 bool PrescanPreparer::Impl::RunOnce() {
 	if (counters.lane_off) {
 		return false;
@@ -304,6 +328,7 @@ bool PrescanPreparer::Impl::RunOnce() {
 	if (completion_lost.load(std::memory_order_acquire)) {
 		throw std::runtime_error("an answer from the helper could not be queued");
 	}
+	const Common::FirstRunReport::PrescanRunningScope running;
 	pass++;
 	bool worked = DrainNotes();
 	worked      = AdmitRing() || worked;
@@ -333,6 +358,13 @@ void PrescanPreparer::Impl::ThreadMain() {
 	} catch (...) {
 		Fail("an unknown error");
 	}
+	// No pass reads the entries once the thread ends. A lane that turned off leaves the entries of
+	// requests the stopped transport never answered, and they would hold up the underrun tag until
+	// Stop, which may never come while the game runs. If the helper was in fact still working on one
+	// of them, that work stops counting here. That is accepted, since the lane is off for the session
+	// and nothing the helper finishes is used, while a count stuck above 0 would tag every later
+	// underrun.
+	pending.clear();
 }
 
 // The epoch is read before the pass, so a bump that lands while the pass drains makes the wait
@@ -368,6 +400,9 @@ void PrescanPreparer::Impl::Fail(const char* what) noexcept {
 		transport->Stop();
 	} catch (...) {
 	}
+	// No pass handles another outcome, so the entries go now and the underrun tag drops with them.
+	// ThreadMain clears again when the thread ends, which then finds nothing.
+	pending.clear();
 }
 
 // The helper's lane is off for the session, so every later send would be refused. Without this
@@ -386,7 +421,11 @@ void PrescanPreparer::Impl::TurnOff() {
 }
 
 // The thread is joined before the transport is stopped, so the transport never runs Stop beside a
-// Submit from the preparer. Stopping it completes what it holds as Dropped, which nothing reads.
+// Submit from the preparer. Stopping it completes what it holds as Dropped, which nothing reads. On
+// a normal Stop the thread's end has already cleared the pending entries before the transport
+// stops. The clear here is for a preparer whose thread never ran, as when a test drives it with
+// RunOnce. Its entries would otherwise hold up the underrun tag, since the preparer outlives
+// StopPrescan.
 void PrescanPreparer::Impl::Stop() {
 	std::lock_guard lock(stop_mutex);
 	stopping.store(true, std::memory_order_release);
@@ -396,6 +435,7 @@ void PrescanPreparer::Impl::Stop() {
 		thread.join();
 	}
 	transport->Stop();
+	pending.clear();
 }
 
 // The transport's callback. It only queues the outcome and wakes the preparer, since the
@@ -621,7 +661,8 @@ bool PrescanPreparer::Impl::DrainCompletions() {
 }
 
 // Matches an outcome to its request by tag, since it may have come before Submit returned, counts
-// how it ended and hands it on by kind.
+// how it ended and hands it on by kind. The request's work token moves into the local copy, so the
+// request stays counted until its outcome is handled, from the helper's answer to the end of this.
 void PrescanPreparer::Impl::HandleCompletion(StreamCompletion&& completion) {
 	const auto found = pending.find(completion.tag);
 	if (found == pending.end()) {
@@ -1000,16 +1041,18 @@ StreamRequest PrescanPreparer::Impl::MakeRequest(const PlanEntry& entry, const P
 }
 
 // The pending entry is made before the send, since the outcome may arrive before Submit returns,
-// and it is taken back when Submit throws. A Compile refused for now is forgotten, so a later
-// snapshot sends it again. A lane that is off turns the prescan off, and the caller still treats
-// that refusal as one for now, so the snapshot in hand is given back.
+// and it is taken back when Submit throws. Its work token counts the request for the underrun tag
+// from that moment, and erasing the entry gives it back. A Compile refused for now is forgotten, so
+// a later snapshot sends it again. A lane that is off turns the prescan off, and the caller still
+// treats that refusal as one for now, so the snapshot in hand is given back.
 StreamSubmitStatus PrescanPreparer::Impl::Send(StreamRequest request, const PlanEntry& entry,
                                                uint64_t unit, const PrescanSpec* spec) {
 	const uint64_t tag  = next_tag++;
 	const auto     kind = request.kind;
 	pending.emplace(tag, PendingRequest {kind, unit, entry.code_hash, entry.user_data_count,
 	                                     entry.static_state,
-	                                     spec != nullptr ? std::optional(*spec) : std::nullopt});
+	                                     spec != nullptr ? std::optional(*spec) : std::nullopt,
+	                                     PendingWork {}});
 	StoreGen::StreamSubmitResult result;
 	try {
 		result = transport->Submit(std::move(request), entry.code, tag);

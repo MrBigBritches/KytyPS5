@@ -265,11 +265,18 @@ inline constexpr uint32_t PRESCAN_BUILD_WORKERS = 3;
 
 // What the prescan's pipeline builds did. A build overlapped a stop of the GPU thread when a
 // GpuStall Scope was active at its start or end, or one began while it ran, and it ran on a worker.
-// in_scope_ms is the whole time of those builds, so it is an upper bound on the overlap.
+// It overlapped a hold of guest audio when a hold was in progress at its start or end, or one ended
+// while it ran, and it ran on a worker. in_scope_ms and in_hold_ms are the whole time of those
+// builds, so they are upper bounds on the overlap, and nothing may gate on them. total_ms is the
+// time of the worker builds only, since it is what those two are measured against. builds counts
+// every build, on a worker or on the GPU thread.
 struct PrescanBuildStats {
-	uint64_t builds   = 0;
-	uint64_t in_scope = 0;
+	uint64_t builds      = 0;
+	uint64_t in_scope    = 0;
+	uint64_t in_hold     = 0;
+	double   total_ms    = 0.0;
 	double   in_scope_ms = 0.0;
+	double   in_hold_ms  = 0.0;
 };
 
 // What a draw that has no pipeline yet does while the pipeline builds. A skipped draw leaves out its
@@ -613,16 +620,24 @@ private:
 	struct PrescanBuildCounters {
 		std::atomic<uint64_t> builds {0};
 		std::atomic<uint64_t> in_scope {0};
+		std::atomic<uint64_t> in_hold {0};
+		std::atomic<uint64_t> total_us {0};
 		std::atomic<uint64_t> in_scope_us {0};
+		std::atomic<uint64_t> in_hold_us {0};
 	};
 	PrescanBuildCounters m_prescan_builds;
 	// A test changes the preparer's settings here before EnablePrescan makes it, such as a memory
 	// reader for host memory.
 	std::function<void(PrescanPreparerConfig&)> m_prescan_tweak;
 	// A test hook every prescan build calls after it sampled the stall state and before it compiles,
-	// on whichever thread runs it, so a test can open a Scope in the middle of a build. Set before
+	// on whichever thread runs it, so a test can open a Scope in the middle of a build. A worker's
+	// prescan_running unit is already counted when it runs, so the hook can read it. Set before
 	// EnablePrescan and never changed after. Empty in production.
 	std::function<void()> m_prescan_build_hook;
+	// A test hook every prescan build calls in its start sample, between reading the Scope count and
+	// the Scope flag, so a test can open a Scope at the one moment the read order decides. Set before
+	// EnablePrescan and never changed after. Empty in production.
+	std::function<void()> m_prescan_sample_hook;
 
 	template <typename InputInfo>
 	const ShaderModule* GetProgram(const ShaderParams& params, InputInfo& input_info,
@@ -720,8 +735,15 @@ private:
 	// Starts the build of a prescan module on the prescan's warm set. Like StartWarmCompute it never
 	// stores a record, and the module's id stays out of m_generated_warm_ids, so a stop for it is
 	// charged to the prescan's causes. It counts the builds that overlapped a stop of the GPU
-	// thread.
+	// thread or a hold of guest audio, and a worker's build counts toward the prescan_running
+	// underrun tag while it runs.
 	void StartPrescanCompute(const ShaderModule& module);
+	// What a prescan build reads of the stall state at its start and end. Defined in the source.
+	struct StallSample;
+	// Counts one finished prescan build, with the stall state from its start and how long it took.
+	// Only a worker's build can overlap a stop or a hold, since a build on the GPU thread is the stop.
+	void CountPrescanBuild(bool on_worker, const StallSample& before,
+	                       std::chrono::steady_clock::duration elapsed);
 	// The warm set that has a build pending for the module, or null. A module is on one set only,
 	// since the prescan's modules are adopted only when their program has no module with the id.
 	[[nodiscard]] WarmBuildSet<uint64_t, Pipeline>* WarmSetPending(uint64_t id) const;
