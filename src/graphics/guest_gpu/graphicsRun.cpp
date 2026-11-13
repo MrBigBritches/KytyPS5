@@ -68,8 +68,7 @@ GuestGpu::GuestGpu(RenderContext& renderer, const GuestGpuOptions& options): m_r
 	m_gfx_cp = std::make_unique<CommandProcessor>(renderer, 0);
 	// Before the thread, so every enqueuer and the GPU thread see the scanner from their first use. The
 	// shader store's warm-up has run by now and the GPU thread does not yet own the program cache, which
-	// is where EnablePrescan must run. It also comes before the differential registers `this` with the
-	// report, since it can throw, and a throw after that would leave the report holding a dead object.
+	// is where EnablePrescan must run.
 	StartPrescan(options);
 	// Built before the thread starts, so the thread and every enqueuer see it from their first use.
 	m_scan_differential = ScanDifferential::Create(
@@ -77,14 +76,14 @@ GuestGpu::GuestGpu(RenderContext& renderer, const GuestGpuOptions& options): m_r
 	    [](uint64_t address, void* destination, uint64_t bytes) {
 		    return LibKernel::Memory::TryReadBacking(address, destination, bytes);
 	    });
+	m_thread = std::jthread(ThreadRun, this);
+	// Both sources are registered last, so every step that can fail the constructor has already
+	// run, and a throw from any of them leaves the report without a source that reads this object.
+	// Lists submitted before this are still counted, since the figures are totals.
 	if (m_scan_differential) {
 		Common::FirstRunReport::Global().SetScanDifferentialSource(
 		    [this] { return m_scan_differential->Snapshot(); });
 	}
-	m_thread = std::jthread(ThreadRun, this);
-	// Registered last, so every step that can fail the constructor has already run, and a throw from any
-	// of them leaves the report without a source that reads this object. Lists submitted before this are
-	// still counted, since the figures are totals.
 	if (m_prescan_scanner != nullptr) {
 		Common::FirstRunReport::Global().SetPrescanScanSource(
 		    [this] { return PrescanReportOf(m_prescan_scanner->Stats()); });
