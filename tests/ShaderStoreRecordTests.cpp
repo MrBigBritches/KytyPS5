@@ -340,6 +340,8 @@ struct MockModule {
 	std::vector<MockFormat>        vertex_formats;
 	std::vector<RectListParameter> rect_parameters;
 	bool                           mesh_task = false;
+	// Stands for the retained record, which neither a fill nor an encode touches.
+	int retained = 79;
 };
 
 struct MockKey {
@@ -395,6 +397,7 @@ void TestFillModuleFromRecord() {
 	// What a stored module does not hold stays as it was.
 	CHECK(filled.handle == 77 && filled.gpl_handle == 78);
 	CHECK((filled.function_code == std::vector<uint32_t> {5, 6}));
+	CHECK(filled.retained == 79);
 	// The baseline fills the compute module over stale values, so the tail must be reset.
 	MockModule baseline;
 	baseline.mesh_task       = true;
@@ -446,11 +449,12 @@ void TestRecordInputsOf() {
 	CHECK(changed_module([](MockModule& m) { m.vertex_formats[0] = MockFormat {38}; }));
 	CHECK(changed_module([](MockModule& m) { m.rect_parameters.clear(); }));
 	CHECK(changed_module([](MockModule& m) { m.mesh_task = false; }));
-	// The handles and the function code are not stored.
+	// The handles, the function code and the retained record are not stored.
 	CHECK(!changed_module([](MockModule& m) {
 		m.handle     = 1;
 		m.gpl_handle = 2;
 		m.function_code.clear();
+		m.retained = 3;
 	}));
 	const auto changed_key = [&](auto&& change) {
 		auto copy = key;

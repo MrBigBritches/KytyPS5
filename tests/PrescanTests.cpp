@@ -1,11 +1,15 @@
-// Tests the prescan's variant tracker and its descriptor validation. Both are headers over plain types,
-// so no guest memory, translation or device is needed. Each check that proves a behaviour has a
-// baseline that differs only in that behaviour, as the comments say.
+// Tests the prescan's variant tracker, its descriptor validation and the list of retained store
+// records. All are headers over plain types, so no guest memory, translation or device is needed.
+// Each check that proves a behaviour has a baseline that differs only in that behaviour, as the
+// comments say.
 #include "graphics/host_gpu/renderer/pipeline/prescanValidate.h"
 #include "graphics/host_gpu/renderer/pipeline/prescanVariants.h"
+#include "graphics/host_gpu/renderer/pipeline/retainedRecords.h"
 
 #include <cstdint>
 #include <cstdio>
+#include <initializer_list>
+#include <memory>
 #include <optional>
 #include <set>
 #include <string>
@@ -600,6 +604,176 @@ void TestRefusalNamesDistinct() {
 	CHECK(std::string(DescriptorInvalidName(DescriptorInvalid::Count)).empty());
 }
 
+// ---- The list of retained store records. ----
+
+// The bytes of one test record, and a cap that holds many of them.
+constexpr uint64_t RECORD_BYTES   = 100;
+constexpr uint64_t ROOMY_CAP      = 10 * RECORD_BYTES;
+constexpr uint8_t  RECORD_FILLING = 0xAB;
+
+std::unique_ptr<RetainedRecord> MakeRecord(uint64_t size = RECORD_BYTES) {
+	return std::make_unique<RetainedRecord>(std::vector<uint8_t>(size, RECORD_FILLING));
+}
+
+// When a check fails under a mutation the list may hold links to freed records, or records may
+// point at a freed list. Leaking all of them keeps the failing run from walking freed memory, so it
+// reports the failure instead of crashing. For the same reason the tests that do not destroy a
+// waiting record on purpose declare their records before the list, so the list releases them first.
+void LeakOnFailure(std::unique_ptr<RetainedRecordList>& list,
+                   std::initializer_list<std::unique_ptr<RetainedRecord>*> records) {
+	(void)list.release();
+	for (auto* record: records) {
+		(void)record->release();
+	}
+}
+
+// A record destroyed while it waits leaves the list, and is counted neither as dropped nor as
+// unused. The baseline keeps the record, which the release then counts as unused. The mutation is
+// to take the unlink out of the record's destructor, and the list still counts the record.
+void TestDestroyedRecordUnlinks() {
+	for (const bool destroy: {false, true}) {
+		auto list   = std::make_unique<RetainedRecordList>(ROOMY_CAP);
+		auto first  = MakeRecord();
+		auto second = MakeRecord();
+		list->Add(*first);
+		list->Add(*second);
+		if (destroy) {
+			first.reset();
+		}
+		const uint64_t waiting  = destroy ? 1 : 2;
+		const auto     counters = list->Counters();
+		const bool     unlinked =
+		    counters.retained == waiting && counters.retained_bytes == waiting * RECORD_BYTES;
+		CHECK(unlinked);
+		if (!unlinked) {
+			LeakOnFailure(list, {&first, &second});
+			continue;
+		}
+		list->Release();
+		const auto released = list->Counters();
+		CHECK(released.unused_at_exit == waiting && released.dropped_over_cap == 0 &&
+		      released.retained == 0 && released.retained_bytes == 0);
+	}
+}
+
+// Adding a record that already waits does nothing. The baseline adds a second record, which counts.
+// The mutation is to take the Linked check out of Add, and the one record is counted twice.
+void TestAddTwiceDoesNothing() {
+	for (const bool same: {false, true}) {
+		auto first  = MakeRecord();
+		auto second = MakeRecord();
+		auto list   = std::make_unique<RetainedRecordList>(ROOMY_CAP);
+		list->Add(*first);
+		list->Add(same ? *first : *second);
+		const uint64_t waiting  = same ? 1 : 2;
+		const auto     counters = list->Counters();
+		const bool     counted_once =
+		    counters.retained == waiting && counters.retained_bytes == waiting * RECORD_BYTES;
+		CHECK(counted_once);
+		if (!counted_once) {
+			LeakOnFailure(list, {&first, &second});
+		}
+	}
+}
+
+// A record the cap dropped gives nothing to Take and is not counted as stored. The cap holds one
+// record, so the second one added drops the first. The baseline takes the second, which waits and
+// gives its bytes. The mutation is to take the list check out of Take, and the dropped record is
+// counted as stored.
+void TestTakeAfterDropGivesNothing() {
+	for (const bool take_dropped: {false, true}) {
+		auto               first  = MakeRecord();
+		auto               second = MakeRecord();
+		RetainedRecordList list(RECORD_BYTES);
+		list.Add(*first);
+		list.Add(*second);
+		CHECK(!first->Linked() && second->Linked() && list.Counters().dropped_over_cap == 1);
+		const auto bytes = list.Take(take_dropped ? *first : *second);
+		CHECK(bytes.size() == (take_dropped ? 0 : RECORD_BYTES));
+		CHECK(list.Counters().stored_first_use == (take_dropped ? 0u : 1u));
+	}
+}
+
+// Take from a list the record does not wait in gives nothing and leaves the record where it was.
+// The baseline takes it from its own list. The mutation is to take the list check out of Take, and
+// the other list hands out the record's bytes.
+void TestTakeFromOtherListGivesNothing() {
+	for (const bool other: {false, true}) {
+		auto               record = MakeRecord();
+		RetainedRecordList own(ROOMY_CAP);
+		RetainedRecordList stranger(ROOMY_CAP);
+		own.Add(*record);
+		const auto bytes = (other ? stranger : own).Take(*record);
+		CHECK(bytes.size() == (other ? 0 : RECORD_BYTES));
+		CHECK(record->Linked() == other && own.Counters().retained == (other ? 1u : 0u));
+		CHECK(stranger.Counters().stored_first_use == 0);
+	}
+}
+
+// A record larger than the whole cap is dropped alone, and the records that wait stay. The cap holds
+// two and a half records. The baseline adds a third record of the usual size, which goes over the
+// cap and drops the oldest. The mutation is to take the early check out of Add, and the oversized
+// record drops both waiting records before it drops itself.
+void TestOversizedRecordDropsOnlyItself() {
+	constexpr uint64_t cap = 2 * RECORD_BYTES + RECORD_BYTES / 2;
+	for (const bool oversized: {false, true}) {
+		auto               first  = MakeRecord();
+		auto               second = MakeRecord();
+		auto               third  = MakeRecord(oversized ? 2 * cap : RECORD_BYTES);
+		RetainedRecordList list(cap);
+		list.Add(*first);
+		list.Add(*second);
+		list.Add(*third);
+		const auto counters = list.Counters();
+		CHECK(counters.dropped_over_cap == 1 && counters.retained == 2 &&
+		      counters.retained_bytes == 2 * RECORD_BYTES);
+		CHECK(first->Linked() == oversized && second->Linked() && third->Linked() == !oversized);
+		CHECK(third->bytes.empty() == oversized && first->bytes.empty() == !oversized);
+	}
+}
+
+// A second release adds nothing to the unused count. The first release of two waiting records is the
+// baseline, which counts both. The mutation is to count the waiting records in Release without
+// taking them out, and the second release counts them again.
+void TestReleaseTwiceAddsNothing() {
+	auto               first  = MakeRecord();
+	auto               second = MakeRecord();
+	RetainedRecordList list(ROOMY_CAP);
+	list.Add(*first);
+	list.Add(*second);
+	list.Release();
+	CHECK(list.Counters().unused_at_exit == 2 && list.Counters().retained == 0);
+	list.Release();
+	CHECK(list.Counters().unused_at_exit == 2);
+	CHECK(!first->Linked() && first->bytes.empty() && !second->Linked() && second->bytes.empty());
+}
+
+// A list destroyed before its records detaches them, so destroying a record later touches no list.
+// The baseline destroys the record first, which leaves the list empty. The mutation is to give the
+// list a destructor that does not release, and the record still points at the destroyed list.
+void TestListDestroyedBeforeRecord() {
+	for (const bool list_first: {false, true}) {
+		auto list   = std::make_unique<RetainedRecordList>(ROOMY_CAP);
+		auto record = MakeRecord();
+		list->Add(*record);
+		if (!list_first) {
+			record.reset();
+			const bool empty = list->Counters().retained == 0 && list->Counters().retained_bytes == 0;
+			CHECK(empty);
+			if (!empty) {
+				LeakOnFailure(list, {});
+			}
+			continue;
+		}
+		list.reset();
+		const bool detached = !record->Linked();
+		CHECK(detached);
+		if (!detached) {
+			(void)record.release();
+		}
+	}
+}
+
 } // namespace
 
 int main() {
@@ -628,6 +802,13 @@ int main() {
 	TestSamplerRootsChecked();
 	TestShortSpecializationRefused();
 	TestRefusalNamesDistinct();
+	TestDestroyedRecordUnlinks();
+	TestAddTwiceDoesNothing();
+	TestTakeAfterDropGivesNothing();
+	TestTakeFromOtherListGivesNothing();
+	TestOversizedRecordDropsOnlyItself();
+	TestReleaseTwiceAddsNothing();
+	TestListDestroyedBeforeRecord();
 	if (g_failures != 0) {
 		std::fprintf(stderr, "%d check(s) failed\n", g_failures);
 		return 1;

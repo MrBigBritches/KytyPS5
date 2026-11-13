@@ -212,9 +212,9 @@ struct PrescanPreparer::Impl {
 	PlanVerdict JudgePlan(const PendingRequest& request, const StreamCompletion& completion,
 	                      PlanEntry& entry);
 	void        FinishWaiting(PlanEntry& entry, PlanVerdict verdict);
-	void HandleCompileOutcome(const PendingRequest& request, const StreamCompletion& completion);
+	void HandleCompileOutcome(const PendingRequest& request, StreamCompletion& completion);
 	void ForgetSpec(const PendingRequest& request);
-	void Adopt(const PendingRequest& request, std::span<const uint8_t> payload);
+	void Adopt(const PendingRequest& request, std::vector<uint8_t>&& payload);
 
 	bool PrepareReady();
 	void SettleAfterLaneOff();
@@ -663,9 +663,10 @@ void PrescanPreparer::Impl::FinishWaiting(PlanEntry& entry, PlanVerdict verdict)
 
 // A Compile's specialization is already recorded, so only the answer's fate is decided here. A
 // blamed module or a program with calls blocks the program. A dropped one is forgotten so a later
-// snapshot sends it again, while a failed one stays recorded, since the child would fail again.
-void PrescanPreparer::Impl::HandleCompileOutcome(const PendingRequest&   request,
-                                                 const StreamCompletion& completion) {
+// snapshot sends it again, while a failed one stays recorded, since the child would fail again. An
+// adopted answer's payload is moved on, since the store takes those bytes as they are.
+void PrescanPreparer::Impl::HandleCompileOutcome(const PendingRequest& request,
+                                                 StreamCompletion&     completion) {
 	if (completion.outcome == StreamOutcome::Blamed) {
 		Block(request.unit);
 		return;
@@ -674,7 +675,7 @@ void PrescanPreparer::Impl::HandleCompileOutcome(const PendingRequest&   request
 		ForgetSpec(request);
 		return;
 	}
-	const auto& response = completion.response;
+	auto& response = completion.response;
 	switch (response.status) {
 		case StreamStatus::Ok: break;
 		case StreamStatus::HasCalls:
@@ -691,7 +692,7 @@ void PrescanPreparer::Impl::HandleCompileOutcome(const PendingRequest&   request
 		counters.key_mismatch++;
 		return;
 	}
-	Adopt(request, response.payload);
+	Adopt(request, std::move(response.payload));
 }
 
 // Lets the variant tracker forget a Compile's specialization that was never built.
@@ -702,9 +703,9 @@ void PrescanPreparer::Impl::ForgetSpec(const PendingRequest& request) {
 	}
 }
 
-// Decodes the record and hands it to the sink, which makes its shader module on this thread. The
-// module counts as unused until the GPU thread reports it.
-void PrescanPreparer::Impl::Adopt(const PendingRequest& request, std::span<const uint8_t> payload) {
+// Decodes the record and hands it to the sink with its bytes, which makes its shader module on this
+// thread. The module counts as unused until the GPU thread reports it.
+void PrescanPreparer::Impl::Adopt(const PendingRequest& request, std::vector<uint8_t>&& payload) {
 	auto record = DecodeCompiled(payload, request);
 	if (!record) {
 		counters.decode_failed++;
@@ -713,7 +714,7 @@ void PrescanPreparer::Impl::Adopt(const PendingRequest& request, std::span<const
 	untaken_by_unit[request.unit]++;
 	unit_of_module[record->id] = request.unit;
 	counters.adopted++;
-	config.sink(std::move(*record));
+	config.sink(std::move(*record), std::move(payload));
 }
 
 // Prepares the posted snapshots. When one throws, the rest still hold open admissions, so they are

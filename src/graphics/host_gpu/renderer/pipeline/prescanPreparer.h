@@ -18,6 +18,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <vector>
 
 // The pre-scan's preparer. It takes the dispatches the scanner found, decides with PrescanState
 // which snapshots to prepare, asks the helper for each program's resource plan once, specializes
@@ -120,9 +121,11 @@ struct PrescanPreparerCounters {
 
 /// Looks a program up in the shader map, by its guest address.
 using PrescanMapLookup = std::function<std::optional<ShaderMapSnapshot>(uint64_t address)>;
-/// Takes a compiled module on the preparer's thread. It may create Vulkan handles and must not wait
-/// for the GPU thread.
-using PrescanSink = std::function<void(DecodedModuleRecord&& record)>;
+/// Takes a compiled module on the preparer's thread, decoded and as the helper's EncodeModuleRecord
+/// bytes, which the shader store can take as they are. It may create Vulkan handles and must not
+/// wait for the GPU thread.
+using PrescanSink =
+    std::function<void(DecodedModuleRecord&& record, std::vector<uint8_t>&& record_bytes)>;
 
 /// What a preparer is made with.
 struct PrescanPreparerConfig {

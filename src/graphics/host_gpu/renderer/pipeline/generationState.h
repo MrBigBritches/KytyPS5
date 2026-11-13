@@ -14,6 +14,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <type_traits>
 #include <unordered_set>
 #include <vector>
 
@@ -53,6 +54,11 @@ struct PipelineCache::GeneratedIntake {
 };
 
 struct PipelineCache::GenerationState {
+	// A copy of a generated module would silently drop its retained record, so the backlogs and the
+	// inbox must move them, which containers do only when the move cannot throw. It is checked here,
+	// since the state is nested in the cache and may name the cache's private types.
+	static_assert(std::is_nothrow_move_constructible_v<GeneratedModule>);
+
 	// The generator's thread fills the inbox under the mutex and sets m_has_generated, and the GPU
 	// thread clears the flag before it takes the inbox, as for the published builds. A list, so
 	// that both sides only splice under the lock, which is constant time and allocates nothing: the
@@ -77,6 +83,10 @@ struct PipelineCache::GenerationState {
 	// planner a prescan module with a bad plan would make the generator's modules of that program
 	// refused for good, and each producer's figures would hold the other's modules.
 	StoreGen::GeneratedDrainPlanner prescan_planner;
+	// The store records of adopted prescan modules that no lookup has used yet. The GPU thread owns
+	// it, like the backlogs. The records belong to their modules, and the list is released by
+	// StopStoreGeneration, so destroying the program cache after the state touches no list.
+	RetainedRecordList retained_records;
 
 	// What the drain last counted, copied under the mutex at the end of each drain so the report's
 	// writer can read it from another thread. The planners' own counters belong to the GPU thread.

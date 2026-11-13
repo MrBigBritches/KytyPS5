@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptorSetLayoutCache.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineBuildQueue.h"
+#include "graphics/host_gpu/renderer/pipeline/retainedRecords.h"
 #include "graphics/host_gpu/renderer/pipeline/warmBuildSet.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -177,7 +178,14 @@ struct ShaderModule {
 	std::vector<RectListParameter>               rect_parameters;
 	// Indirect mesh draw: a task shader reads the records and launches the groups.
 	bool                                         mesh_task = false;
+	// A prescan module's store record, kept until its first use appends it to the shader store.
+	// Empty for every other module, and for a prescan module without a store.
+	RetainedRecordSlot                           retained;
 };
+
+// A copy of a module silently drops its retained record, so a container that copied modules when
+// it grows would lose them. Containers move only what is nothrow move constructible.
+static_assert(std::is_nothrow_move_constructible_v<ShaderModule>);
 
 // A draw's topology, shader stages (from PipelineCache::GetGraphicsPrograms) and targets.
 struct DrawRenderState {
@@ -240,6 +248,8 @@ struct StoreGenerationStats {
 	uint64_t undrained_at_stop = 0;
 	// Posted modules that are waiting for a drain.
 	uint64_t pending = 0;
+	// The store records of prescan modules, which wait for each module's first use.
+	RetainedRecordCounters prescan_records;
 };
 
 // The longest the warm-up queue is held while deferred draws wait for their pipelines. A resolve
@@ -729,8 +739,26 @@ private:
 	[[nodiscard]] PrescanPreparerConfig
 	MakePrescanConfig(StoreGen::PrescanTransportFactory make_transport);
 	// pipelineGeneration.cpp. Makes the module of a prescan record on the preparer's thread and posts
-	// it, as PostGeneratedModule does for the generator.
-	void PostPrescanModule(DecodedModuleRecord&& record);
+	// it, as PostGeneratedModule does for the generator. The record's bytes, as the helper encoded
+	// them, travel with the module so its first use can store them without encoding them again. Empty
+	// bytes keep nothing.
+	void PostPrescanModule(DecodedModuleRecord&& record, std::vector<uint8_t>&& record_bytes);
+	// Links an adopted prescan module's record into the list of records waiting for their first use,
+	// or drops it when there is no shader store, since prescan modules persist only with one. Only
+	// the thread that owns the program cache calls it.
+	void RetainPrescanRecord(ShaderModule& module);
+	// The check a lookup makes on the module it found. Every module but a prescan one waiting for
+	// its first use has no record, so the cost is one test. Inline so the test needs no call.
+	void StoreOnFirstUse(const Program& program, ShaderModule& module) {
+		if (module.retained) {
+			StoreRetainedRecord(program, module);
+		}
+	}
+	// Appends a prescan module's record to the shader store at the module's first use and frees it,
+	// so the module is stored once. A record the cap dropped is only freed, and so is the record of
+	// a program with GPU-selected calls, which CompileModule never stores either. Constant time
+	// apart from the append. Only the thread that owns the program cache calls it.
+	void StoreRetainedRecord(const Program& program, ShaderModule& module);
 
 	// Makes the state of the generated modules intake. Called once, before the generator starts.
 	void EnableStoreGeneration();

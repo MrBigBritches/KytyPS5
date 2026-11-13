@@ -142,12 +142,17 @@ void PipelineCache::PostGeneratedModule(DecodedModuleRecord&&           record,
 
 // Runs on the prescan's preparer thread, which decodes the plan and makes the shader module here so
 // the GPU thread only splices the module in. The preparer has its own intake state, so it never
-// shares one with the generator's thread.
-void PipelineCache::PostPrescanModule(DecodedModuleRecord&& record) {
+// shares one with the generator's thread. The record that keeps the bytes is allocated here too, so
+// the GPU thread only links it.
+void PipelineCache::PostPrescanModule(DecodedModuleRecord&& record,
+                                      std::vector<uint8_t>&& record_bytes) {
 	if (m_generation == nullptr) {
 		return;
 	}
 	if (auto item = MakeGeneratedModule(std::move(record), {.prescan = true}, m_generation->prescan)) {
+		if (!record_bytes.empty()) {
+			item->module.retained.record = std::make_unique<RetainedRecord>(std::move(record_bytes));
+		}
 		PushGenerated(std::move(*item));
 	}
 }
@@ -302,11 +307,44 @@ void PipelineCache::TakeGeneratedIn(GeneratedModule&& item, Program& program) {
 	// A deque, so the address that the queued build holds stays valid.
 	program.modules.push_back(std::move(item.module));
 	if (prescan) {
+		RetainPrescanRecord(program.modules.back());
 		StartPrescanCompute(program.modules.back());
 		return;
 	}
 	// Narrow bases and wide partials go to the back lane and never delay the others.
 	StartWarmCompute(program.modules.back(), row, WarmLaneOf(item.order));
+}
+
+// A prescan module is a guess, so its record waits for the module's first use instead of being
+// stored now. Prescan modules persist only with --shader-cache, so without a store nothing is kept.
+// The list belongs to the thread that owns the program cache, which is the one that adopts.
+void PipelineCache::RetainPrescanRecord(ShaderModule& module) {
+	auto& record = module.retained.record;
+	if (record == nullptr) {
+		return;
+	}
+	if (!m_store) {
+		record.reset();
+		return;
+	}
+	m_generation->retained_records.Add(*record);
+}
+
+// The bytes are the helper's EncodeModuleRecord bytes, which are what StoreModule would write for
+// this module, so the GPU thread appends them without encoding anything. The record leaves the
+// module first, so a second use finds nothing to store. A program with GPU-selected calls is never
+// stored, as CompileModule skips StoreModule for one, so its record is freed, which also unlinks it.
+// That free is in none of the record counters. It cannot happen today, since the helper refuses
+// programs with calls, so stored, dropped and unused still add up to every record added.
+void PipelineCache::StoreRetainedRecord(const Program& program, ShaderModule& module) {
+	const auto record = std::move(module.retained.record);
+	if (record == nullptr || m_generation == nullptr || program.call_source != nullptr) {
+		return;
+	}
+	auto bytes = m_generation->retained_records.Take(*record);
+	if (!bytes.empty()) {
+		m_store.Append(std::move(bytes));
+	}
 }
 
 // Adds the row of a module that was taken in, and returns it for the warm build to stamp. The row
@@ -410,6 +448,9 @@ void PipelineCache::StopStoreGeneration() {
 		DestroyGeneratedHandles(item);
 	}
 	m_has_generated.store(false, std::memory_order_relaxed);
+	// No lookup runs after the stop, so the records still waiting are never used. They are counted
+	// and freed now, which also leaves the list empty before the program cache is destroyed.
+	state.retained_records.Release();
 	// The final figures are taken now that nothing posts and nothing drains, and handed to the
 	// report in one step that also takes the source away. The writer may be calling the source at
 	// this moment, which is safe since the state still exists. After this it never calls it again,
@@ -475,6 +516,7 @@ std::optional<StoreGenerationStats> PipelineCache::GenerationStats() const {
 	stats.handles_destroyed = state.destroyed;
 	stats.bad_plans         = state.bad_plans;
 	stats.undrained_at_stop = state.undrained_at_stop;
+	stats.prescan_records   = state.retained_records.Counters();
 	// The inbox is the generator's thread's to fill, so it is read under the lock. The backlog is
 	// the GPU thread's own, which is why the whole count is only exact when nothing drains
 	// meanwhile.

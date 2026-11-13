@@ -67,7 +67,9 @@ PipelineCache::MakePrescanConfig(StoreGen::PrescanTransportFactory make_transpor
 	config.device         = {.host_subgroup_size              = HostComputeSubgroupSize(m_graphics),
 	                         .max_compute_shared_memory_bytes = max_shared};
 	config.make_transport = std::move(make_transport);
-	config.sink = [this](DecodedModuleRecord&& record) { PostPrescanModule(std::move(record)); };
+	config.sink = [this](DecodedModuleRecord&& record, std::vector<uint8_t>&& record_bytes) {
+		PostPrescanModule(std::move(record), std::move(record_bytes));
+	};
 	return config;
 }
 

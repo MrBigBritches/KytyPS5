@@ -427,7 +427,7 @@ struct Harness {
 		config.host           = host;
 		config.device         = DEVICE;
 		config.make_transport = factory ? std::move(factory) : InProcessPrescanTransportFactory(&transport);
-		config.sink           = [this](DecodedModuleRecord&& record) {
+		config.sink           = [this](DecodedModuleRecord&& record, std::vector<uint8_t>&& /*bytes*/) {
 			if (g_sink_throws.load()) {
 				throw std::runtime_error("test sink failure");
 			}

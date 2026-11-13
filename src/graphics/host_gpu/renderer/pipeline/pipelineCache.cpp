@@ -477,7 +477,10 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	m_lookup_key.user_data_count = params.user_data_count;
 	BuildStageStaticKey(input_info, m_lookup_key.static_state);
 	auto entry = m_program_cache.find(m_lookup_key);
-	const auto bind = [&](const ShaderModule& module) {
+	const auto bind = [&](ShaderModule& module) {
+		// A prescan module's record goes to the store at its first use, so a guess the game never
+		// runs leaves nothing in the store.
+		StoreOnFirstUse(entry->second, module);
 		input_info.stage = {.module = &module, .resources = &entry->second.resources};
 		module.info.bindings.AdvancePushData(push_data_cursor);
 		return &module;
@@ -550,7 +553,7 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		    program.resource_plan, runtime, program.resources, program.specialization));
 	} else if (source_changed) {
 		entry->second.resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
-		if (const auto* module = entry->second.FindModule<true>(runtime, push_data_cursor)) {
+		if (auto* module = entry->second.FindModule<true>(runtime, push_data_cursor)) {
 			return bind(*module);
 		}
 	} else if (m_generation != nullptr && GuestGpu::IsGpuThread()) {

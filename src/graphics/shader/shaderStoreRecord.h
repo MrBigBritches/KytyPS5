@@ -112,14 +112,15 @@ template <class Format>
 constexpr bool IS_RAW_INT_FORMAT =
     std::is_enum_v<Format> && std::is_same_v<std::underlying_type_t<Format>, int32_t>;
 
-/// Fills a module of the pipeline cache from a decoded record. The handles, the function code and
-/// anything else a stored module does not hold are left alone. The module's fields are all bound
-/// here, so a field added to it fails to compile until it is stored or skipped on purpose.
-/// @tparam Module a ShaderModule, or a type with the same nine fields in the same order.
+/// Fills a module of the pipeline cache from a decoded record. The handles, the function code, the
+/// retained record and anything else a stored module does not hold are left alone. The module's
+/// fields are all bound here, so a field added to it fails to compile until it is stored or skipped
+/// on purpose.
+/// @tparam Module a ShaderModule, or a type with the same ten fields in the same order.
 template <class Module>
 void FillModuleFromRecord(DecodedModuleRecord&& record, Module& module) {
 	auto& [id, handle, gpl_handle, info, specialization, function_code, vertex_formats,
-	       rect_parameters, mesh_task] = module;
+	       rect_parameters, mesh_task, retained] = module;
 	using Format = typename std::decay_t<decltype(vertex_formats)>::value_type;
 	static_assert(IS_RAW_INT_FORMAT<Format>);
 	id              = record.id;
@@ -146,6 +147,7 @@ void FillKeyFromRecord(DecodedModuleRecord& record, Key& key) {
 
 /// The inputs of EncodeModuleRecord for a program key and a module of the pipeline cache. Both are
 /// bound field by field, so a field added to either fails to compile until it is stored or skipped.
+/// The handles, the function code and the retained record are skipped.
 /// @param formats receives the raw host formats and must outlive the returned inputs.
 /// @param plan    the plan of the program the module belongs to.
 /// @param spirv   the module's SPIR-V.
@@ -155,7 +157,7 @@ ModuleRecordInputs RecordInputsOf(const Key& key, const ShaderRecompiler::IR::Re
                                   std::span<const uint32_t> spirv) {
 	const auto& [stage, hash, user_data_count, static_state] = key;
 	const auto& [id, handle, gpl_handle, info, specialization, function_code, vertex_formats,
-	             rect_parameters, mesh_task]                 = module;
+	             rect_parameters, mesh_task, retained]       = module;
 	using Format = typename std::decay_t<decltype(vertex_formats)>::value_type;
 	static_assert(IS_RAW_INT_FORMAT<Format>);
 	formats.clear();

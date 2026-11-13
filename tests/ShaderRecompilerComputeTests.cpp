@@ -1344,8 +1344,48 @@ struct PipelineCacheTestAccess {
   static void SetPrescanTweak(PipelineCache &cache, std::function<void(PrescanPreparerConfig &)> tweak) {
     cache.m_prescan_tweak = std::move(tweak);
   }
-  static void PostPrescanRecord(PipelineCache &cache, DecodedModuleRecord &&record) {
-    cache.PostPrescanModule(std::move(record));
+  static void PostPrescanRecord(PipelineCache &cache, DecodedModuleRecord &&record,
+                                std::vector<uint8_t> &&record_bytes = {}) {
+    cache.PostPrescanModule(std::move(record), std::move(record_bytes));
+  }
+  // Takes posted modules in, as the top of a lookup on the GPU thread does, without a lookup.
+  static void DrainGenerated(PipelineCache &cache) { cache.DrainGenerated(); }
+  // Sets the cap on the bytes of the prescan's retained records, so a few records go over it.
+  static void SetRetainCap(PipelineCache &cache, uint64_t cap_bytes) {
+    cache.m_generation->retained_records.SetCap(cap_bytes);
+  }
+  // The ids of the modules whose store record waits for their first use, in ascending order.
+  static std::vector<uint64_t> RetainedIds(const PipelineCache &cache) {
+    std::vector<uint64_t> ids;
+    for (const auto &program : cache.m_program_cache)
+      for (const auto &module : program.second.modules)
+        if (module.retained && module.retained.record->Linked()) ids.push_back(module.id);
+    std::ranges::sort(ids);
+    return ids;
+  }
+  // The bytes a module retains, and the same bytes decoded and encoded again from the adopted module,
+  // its key and its program's plan, the way StoreModule encodes. Equal bytes show the retained bytes
+  // round-trip. They come from the retained bytes alone, so whether they match an inline compile is
+  // a separate check. Both are empty when no module with the id has a record, and the second is
+  // empty when the retained bytes do not decode.
+  static std::pair<std::vector<uint8_t>, std::vector<uint8_t>> RetainedAndReencodedBytes(
+      const PipelineCache &cache, uint64_t id) {
+    for (const auto &[key, program] : cache.m_program_cache) {
+      for (const auto &module : program.modules) {
+        if (module.id != id || !module.retained) continue;
+        const auto &retained = module.retained.record->bytes;
+        ShaderRecompiler::IR::Reader reader{retained};
+        auto type = StoreRecord::GraphicsPipeline;
+        ShaderRecompiler::IR::IoAll(reader, type);
+        DecodedModuleRecord decoded;
+        if (type == StoreRecord::Module) DecodeModuleRecord(reader, decoded);
+        if (type != StoreRecord::Module || !reader.ok || !reader.bytes.empty()) return {retained, {}};
+        std::vector<int32_t> formats;
+        return {retained, EncodeModuleRecord(RecordInputsOf(key, program.resource_plan, module, formats,
+                                                            decoded.spirv))};
+      }
+    }
+    return {};
   }
   static bool PrescanWarmDone(const PipelineCache &cache, uint64_t id) {
     return cache.m_prescan_compute != nullptr && cache.m_prescan_compute->IsDone(id);
@@ -64126,6 +64166,322 @@ void CheckPrescanTwoProducers(VulkanHarness &vulkan, GuestGpu &gpu,
   std::printf("[gpu]     %-32s ok\n", name);
 }
 
+// ---- Storing prescan modules at first use. ----
+
+// A shader store path in a directory of its own, for one run of a prescan store check.
+std::filesystem::path PrescanStorePath(const char *tag) {
+  return std::filesystem::temp_directory_path() /
+         fmt::format("kyty_prescan_{}_{}", tag, std::chrono::steady_clock::now().time_since_epoch().count()) /
+         "TEST00001.shaders";
+}
+
+// The store record bytes of a decoded record, which is what the helper's Compile answer carries.
+std::vector<uint8_t> PrescanRecordBytes(const DecodedModuleRecord &record) {
+  ShaderRecompiler::IR::ResourcePlan plan;
+  Require("PrescanRecordBytes", "the plan loads", ShaderRecompiler::IR::LoadResourcePlan(record.plan, plan),
+          "a captured record's plan did not load");
+  return EncodeModuleRecord({.stage = record.stage,
+                             .hash = record.hash,
+                             .user_data_count = record.user_data_count,
+                             .static_state = record.static_state,
+                             .plan = plan,
+                             .id = record.id,
+                             .info = record.info,
+                             .specialization = record.specialization,
+                             .vertex_formats = record.vertex_formats,
+                             .rect_parameters = record.rect_parameters,
+                             .mesh_task = record.mesh_task,
+                             .spirv = record.spirv});
+}
+
+// The raw bytes of the stored module record with the id, found as ReadStoredModuleRecords finds the
+// records, or nothing.
+std::vector<uint8_t> StoredRecordBytesOf(const std::filesystem::path &path, uint64_t id) {
+  std::vector<uint8_t> bytes;
+  if (Common::File file; Common::File::IsFileExisting(path) && file.Open(path, Common::File::Mode::Read)) {
+    bytes.resize(file.Size());
+    uint32_t read = 0;
+    file.Read(bytes.data(), static_cast<uint32_t>(bytes.size()), &read);
+    bytes.resize(read);
+  }
+  constexpr size_t longest_header = 512;
+  for (size_t start = 0; start < std::min(bytes.size(), longest_header); start++) {
+    std::vector<std::vector<uint8_t>> raws;
+    bool whole = true;
+    for (size_t at = start; at < bytes.size();) {
+      auto frame = UnframeStoreRecord(std::span<const uint8_t>(bytes).subspan(at));
+      if (!frame) {
+        whole = false;
+        break;
+      }
+      at += frame->frame_bytes;
+      raws.push_back(std::move(frame->raw));
+    }
+    if (!whole || raws.empty()) continue;
+    for (auto &raw : raws) {
+      ShaderRecompiler::IR::Reader reader{raw};
+      auto type = StoreRecord::GraphicsPipeline;
+      ShaderRecompiler::IR::IoAll(reader, type);
+      DecodedModuleRecord record;
+      if (type == StoreRecord::Module) DecodeModuleRecord(reader, record);
+      if (type == StoreRecord::Module && reader.ok && reader.bytes.empty() && record.id == id) return raw;
+    }
+    return {};
+  }
+  return {};
+}
+
+// Makes a cache whose shader store is open at `store`, with the prescan on the in-process transport,
+// runs `before_dispatch` on it, sends it the GeneratedLookup dispatch and takes the module in on the
+// GPU thread. Returns the id of the module that waits for its first use, or 0.
+uint64_t PrescanAdoptThroughHelper(GuestGpu &gpu, PipelineCache &cache, const std::filesystem::path &store,
+                                   const char *name,
+                                   const std::function<void(PipelineCache &)> &before_dispatch = {}) {
+  cache.WarmUp(store);
+  PipelineCacheTestAccess::SetPrescanTweak(
+      cache, [](PrescanPreparerConfig &config) { config.read_memory = ReadHostForPrescan; });
+  cache.EnablePrescan(StoreGen::InProcessPrescanTransportFactory());
+  if (before_dispatch) before_dispatch(cache);
+  PushPrescanDispatch(cache, GENERATED_STRIDE_A);
+  Require(name, "the module is posted", WaitForPrescan([&] { return cache.GenerationStats()->pending == 1; }),
+          "the preparer never posted the module");
+  gpu.SendCommandSync([&] { PipelineCacheTestAccess::DrainGenerated(cache); });
+  const auto retained = PipelineCacheTestAccess::RetainedIds(cache);
+  return retained.size() == 1 ? retained[0] : 0;
+}
+
+// A prescan module's record reaches the store at the module's first use and never twice. The runs
+// differ only in how many lookups use the module, 0, 1 or 2, and each store is read once the cache
+// is gone. Unused, the store holds nothing, which also passes if nothing is ever stored, so the
+// baseline is the run with one use, whose store holds exactly that module's record. That record
+// would also be there if the lookup compiled the module itself, so the lookups must compile
+// nothing. The run with two uses must still hold one record. The mutations are to store the record
+// at adoption, and the unused run's store holds it. Store at every use without clearing the record,
+// and the run with two uses holds two. Never store on use, and the run with one use holds none.
+void CheckPrescanStoredOnlyWhenUsed(VulkanHarness &vulkan, GuestGpu &gpu) {
+  constexpr const char *name = "PrescanStoredOnlyWhenUsed";
+  Common::DebugCounters::SetEnabled(true);
+  for (const uint64_t uses : {0u, 1u, 2u}) {
+    const auto store = PrescanStorePath("first_use");
+    uint64_t id = 0;
+    {
+      PipelineCache cache(vulkan.RuntimeContext(), nullptr);
+      id = PrescanAdoptThroughHelper(gpu, cache, store, name);
+      Require(name, "the adopted module is not stored before use",
+              id != 0 && cache.GenerationStats()->prescan_records.stored_first_use == 0,
+              "the adopted prescan module did not wait for its first use");
+      const auto compiled_before = ShadersCompiledSoFar();
+      for (uint64_t use = 0; use < uses; use++) {
+        ShaderComputeInputInfo input{};
+        gpu.SendCommandSync([&] { GeneratedLookup(cache, GENERATED_STRIDE_A, input); });
+        Require(name, "the lookup finds the prescan's module",
+                input.stage.module != nullptr && input.stage.module->id == id,
+                "the lookup did not find the prescan's module");
+      }
+      const auto records = cache.GenerationStats()->prescan_records;
+      Require(name, "the module is stored by its first use and only then",
+              ShadersCompiledSoFar() == compiled_before && records.stored_first_use == std::min<uint64_t>(uses, 1) &&
+                  records.retained == (uses == 0 ? 1u : 0u),
+              "a use compiled the module, or did not take its record out exactly once");
+      cache.StopBuilds();
+      Require(name, "an unused module is counted at the stop",
+              cache.GenerationStats()->prescan_records.unused_at_exit == (uses == 0 ? 1u : 0u),
+              "the stop did not count the record that was never used");
+    }
+    const auto stored = ReadStoredModuleRecords(store);
+    Require(name, uses == 0 ? "an unused module is not stored" : "a used module is stored once",
+            stored.size() == std::min<uint64_t>(uses, 1) && (stored.empty() || stored[0].id == id),
+            "the store did not hold exactly the records of the modules that were used");
+    std::filesystem::remove_all(store.parent_path());
+  }
+  Common::DebugCounters::SetEnabled(false);
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
+// Loads a store into a new cache and looks the GeneratedLookup module up on the GPU thread. Returns
+// the id the lookup found, or 0 when it found none or had to compile.
+uint64_t PrescanLoadedLookup(VulkanHarness &vulkan, GuestGpu &gpu, const std::filesystem::path &store) {
+  PipelineCache cache(vulkan.RuntimeContext(), nullptr);
+  cache.WarmUp(store);
+  const auto compiled_before = ShadersCompiledSoFar();
+  ShaderComputeInputInfo input{};
+  gpu.SendCommandSync([&] { GeneratedLookup(cache, GENERATED_STRIDE_A, input); });
+  const bool loaded = input.stage.module != nullptr && ShadersCompiledSoFar() == compiled_before;
+  const uint64_t id = loaded ? input.stage.module->id : 0;
+  cache.StopBuilds();
+  return id;
+}
+
+// One prescan run of CheckPrescanRecordRoundTrip. With earlier_variant the runtime first compiles the
+// stride B module inline, so the program and its plan exist before the prescan's stride A module
+// joins it. The A module is adopted, checked to round-trip, used once without any compile, and the
+// cache is destroyed so its store is complete. Returns how many module records the store holds.
+size_t PrescanRoundTripRun(VulkanHarness &vulkan, GuestGpu &gpu, const std::filesystem::path &store,
+                           uint64_t id, bool earlier_variant) {
+  constexpr const char *name = "PrescanRecordRoundTrip";
+  {
+    PipelineCache cache(vulkan.RuntimeContext(), nullptr);
+    const auto compile_earlier = [&](PipelineCache &target) {
+      ShaderComputeInputInfo earlier{};
+      gpu.SendCommandSync([&] { GeneratedLookup(target, GENERATED_STRIDE_B, earlier); });
+    };
+    const uint64_t adopted = PrescanAdoptThroughHelper(
+        gpu, cache, store, name,
+        earlier_variant ? std::function<void(PipelineCache &)>(compile_earlier) : nullptr);
+    const auto [retained, reencoded] = PipelineCacheTestAccess::RetainedAndReencodedBytes(cache, adopted);
+    Require(name, "the retained bytes round-trip",
+            adopted == id && !retained.empty() && retained == reencoded,
+            "the adopted module is not the inline one, or its bytes do not decode and encode back");
+    const auto compiled_before = ShadersCompiledSoFar();
+    ShaderComputeInputInfo input{};
+    gpu.SendCommandSync([&] { GeneratedLookup(cache, GENERATED_STRIDE_A, input); });
+    Require(name, "the use compiles nothing",
+            input.stage.module != nullptr && input.stage.module->id == id &&
+                ShadersCompiledSoFar() == compiled_before,
+            "the lookup compiled the module, so its record would be StoreModule's own");
+    cache.StopBuilds();
+  }
+  return ReadStoredModuleRecords(store).size();
+}
+
+// The record the GPU thread appends from the helper's bytes is byte for byte the record StoreModule
+// writes for the same module compiled inline, which covers every field, info, specialization and the
+// vertex and rectangle fields included. The inline store is the baseline and differs only in where
+// the module was compiled. Equal bytes also pass if both are empty, so they must not be, and a
+// record the prescan cache compiled inline would be StoreModule's own, so its use must compile
+// nothing. The fresh program, whose plan comes from the helper's record, is the baseline of the run
+// where an earlier inline module already made the program and its plan. Both stored records then
+// load into a new cache, and a lookup finds the module without compiling, as for the inline store.
+// The mutations are to change one info field in CompileComputeUnit, and the records differ. Retain
+// only for a program with no earlier module, and the earlier-variant run stores nothing for A.
+void CheckPrescanRecordRoundTrip(VulkanHarness &vulkan, GuestGpu &gpu) {
+  constexpr const char *name = "PrescanRecordRoundTrip";
+  Common::DebugCounters::SetEnabled(true);
+  const auto inline_store = PrescanStorePath("round_trip_inline");
+  {
+    PipelineCache cache(vulkan.RuntimeContext(), nullptr);
+    cache.WarmUp(inline_store);
+    ShaderComputeInputInfo input{};
+    gpu.SendCommandSync([&] { GeneratedLookup(cache, GENERATED_STRIDE_A, input); });
+    cache.StopBuilds();
+  }
+  const auto inline_records = ReadStoredModuleRecords(inline_store);
+  const uint64_t id = inline_records.size() == 1 ? inline_records[0].id : 0;
+  const auto inline_bytes = StoredRecordBytesOf(inline_store, id);
+  Require(name, "the inline store loads", id != 0 && !inline_bytes.empty() &&
+                                              PrescanLoadedLookup(vulkan, gpu, inline_store) == id,
+          "the inline baseline did not store one module that loads back");
+  for (const bool earlier_variant : {false, true}) {
+    const auto store = PrescanStorePath(earlier_variant ? "round_trip_earlier" : "round_trip");
+    const size_t stored_count = PrescanRoundTripRun(vulkan, gpu, store, id, earlier_variant);
+    Require(name, earlier_variant ? "after an earlier variant the record is StoreModule's" : "the record is StoreModule's",
+            stored_count == (earlier_variant ? 2u : 1u) && StoredRecordBytesOf(store, id) == inline_bytes,
+            "the appended record is not byte for byte the inline module's record");
+    Require(name, "the stored record loads as the inline one does", PrescanLoadedLookup(vulkan, gpu, store) == id,
+            "the appended record did not load back into a module the lookup finds");
+    std::filesystem::remove_all(store.parent_path());
+  }
+  std::filesystem::remove_all(inline_store.parent_path());
+  Common::DebugCounters::SetEnabled(false);
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
+// Posts prescan modules with their record bytes and takes them in on the GPU thread.
+void PostRetained(GuestGpu &gpu, PipelineCache &cache, std::span<const DecodedModuleRecord> posted) {
+  for (const auto &record : posted)
+    PipelineCacheTestAccess::PostPrescanRecord(cache, DecodedModuleRecord(record), PrescanRecordBytes(record));
+  gpu.SendCommandSync([&] { PipelineCacheTestAccess::DrainGenerated(cache); });
+}
+
+// Over the cap the oldest unused record is dropped and counted, and a used one no longer counts. The
+// cap holds two and a half of the records. The module U, which a stride A lookup finds, and O1 are
+// taken in below the cap, the baseline that drops nothing. U is used, then O2 and O3 come in. That
+// is three unused records, so O1, the oldest, must go and O2 and O3 stay. A drop also passes if a
+// record was dropped for another reason, so exactly one is counted, which a used U still held would
+// make two. The mutations are to drop the newest instead of the oldest, and O3 goes in place of O1.
+// Keep the used record in the list, and two are dropped.
+void CheckPrescanRetainCap(VulkanHarness &vulkan, GuestGpu &gpu, const std::vector<DecodedModuleRecord> &records) {
+  constexpr const char *name = "PrescanRetainCap";
+  constexpr uint64_t OTHER_ID_OFFSET = 9000;
+  constexpr uint64_t OTHER_COUNT = 3;
+  const auto store = PrescanStorePath("cap");
+  std::vector<DecodedModuleRecord> others;
+  for (uint64_t index = 0; index < OTHER_COUNT; index++) {
+    others.push_back(records[1]);
+    others.back().id += OTHER_ID_OFFSET + index;
+  }
+  const uint64_t used_bytes = PrescanRecordBytes(records[0]).size();
+  const uint64_t other_bytes = PrescanRecordBytes(others[0]).size();
+  const uint64_t cap = 2 * other_bytes + other_bytes / 2;
+  Require(name, "the records fit the plan of the check", 2 * used_bytes > other_bytes && used_bytes + other_bytes <= cap,
+          "the two programs' records are too different in size for a cap of two and a half");
+  {
+    PipelineCache cache(vulkan.RuntimeContext(), nullptr);
+    cache.WarmUp(store);
+    cache.EnablePrescan(StoreGen::InProcessPrescanTransportFactory());
+    PipelineCacheTestAccess::SetRetainCap(cache, cap);
+    PostRetained(gpu, cache, std::array{records[0], others[0]});
+    const auto below = cache.GenerationStats()->prescan_records;
+    Require(name, "below the cap nothing is dropped",
+            below.dropped_over_cap == 0 &&
+                PipelineCacheTestAccess::RetainedIds(cache) == std::vector<uint64_t>{records[0].id, others[0].id},
+            "a record was dropped below the cap");
+    ShaderComputeInputInfo input{};
+    gpu.SendCommandSync([&] { GeneratedLookup(cache, GENERATED_STRIDE_A, input); });
+    Require(name, "a used record is no longer retained",
+            input.stage.module != nullptr && input.stage.module->id == records[0].id &&
+                PipelineCacheTestAccess::RetainedIds(cache) == std::vector<uint64_t>{others[0].id},
+            "the used module's record stayed in the list");
+    PostRetained(gpu, cache, std::span(others).subspan(1));
+    const auto over = cache.GenerationStats()->prescan_records;
+    Require(name, "the oldest unused record is dropped and counted",
+            over.dropped_over_cap == 1 && over.stored_first_use == 1 &&
+                PipelineCacheTestAccess::RetainedIds(cache) == std::vector<uint64_t>{others[1].id, others[2].id} &&
+                over.retained_bytes == 2 * other_bytes &&
+                over.retained_peak_bytes == std::max(used_bytes + other_bytes, 2 * other_bytes),
+            "over the cap the wrong record was dropped, or a used one still counted");
+    cache.StopBuilds();
+    Require(name, "the waiting records are unused at the stop",
+            cache.GenerationStats()->prescan_records.unused_at_exit == 2,
+            "the stop did not count the two records still waiting");
+  }
+  std::filesystem::remove_all(store.parent_path());
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
+// Without a shader store a prescan module keeps no record, since prescan modules persist only with
+// --shader-cache. No record also passes if the bytes never reached the module, so the baseline is
+// the same module posted to a cache with a store, which retains its record and stores it at its use.
+// The mutation is to retain without checking for a store, and the cache without one keeps it.
+void CheckPrescanNoStoreRetainsNothing(VulkanHarness &vulkan, GuestGpu &gpu,
+                                       const std::vector<DecodedModuleRecord> &records) {
+  constexpr const char *name = "PrescanNoStoreRetainsNothing";
+  for (const bool with_store : {true, false}) {
+    const auto store = PrescanStorePath("no_store");
+    {
+      PipelineCache cache(vulkan.RuntimeContext(), nullptr);
+      if (with_store) cache.WarmUp(store);
+      cache.EnablePrescan(StoreGen::InProcessPrescanTransportFactory());
+      PostRetained(gpu, cache, std::array{records[0]});
+      const auto adopted = cache.GenerationStats();
+      Require(name, with_store ? "with a store the record waits" : "without a store nothing is retained",
+              adopted->prescan_drain.adopted == 1 &&
+                  PipelineCacheTestAccess::RetainedIds(cache).size() == (with_store ? 1u : 0u) &&
+                  (adopted->prescan_records.retained_peak_bytes != 0) == with_store,
+              "a cache without a store retained a record, or one with a store did not");
+      ShaderComputeInputInfo input{};
+      gpu.SendCommandSync([&] { GeneratedLookup(cache, GENERATED_STRIDE_A, input); });
+      Require(name, with_store ? "with a store the use stores it" : "without a store the use stores nothing",
+              input.stage.module != nullptr &&
+                  cache.GenerationStats()->prescan_records.stored_first_use == (with_store ? 1u : 0u),
+              "the use did not store exactly what was retained");
+      cache.StopBuilds();
+    }
+    std::filesystem::remove_all(store.parent_path());
+  }
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
 // Captures two module records of one program, as CheckGeneratedModules does, and runs the
 // prescan's intake checks over them.
 void CheckPrescanIntake(VulkanHarness &vulkan) {
@@ -64155,6 +64511,10 @@ void CheckPrescanIntake(VulkanHarness &vulkan) {
       CheckPrescanPlannerSeparate(vulkan, gpu, records);
       CheckPrescanDrainsFirst(vulkan, gpu, records);
       CheckPrescanTwoProducers(vulkan, gpu, records);
+      CheckPrescanStoredOnlyWhenUsed(vulkan, gpu);
+      CheckPrescanRecordRoundTrip(vulkan, gpu);
+      CheckPrescanRetainCap(vulkan, gpu, records);
+      CheckPrescanNoStoreRetainsNothing(vulkan, gpu, records);
     });
   }
   std::filesystem::remove_all(dir);
