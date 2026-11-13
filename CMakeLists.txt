@@ -720,6 +720,14 @@ add_executable(prescan_tests EXCLUDE_FROM_ALL
 target_link_libraries(prescan_tests common fmt::fmt xxhash)
 target_include_directories(prescan_tests PRIVATE ${inc_headers})
 
+# The prescan's scanner-to-preparer ring, its answer table and the preparer's state. All are headers, so
+# the test links nothing of the walk, the recompiler or the device.
+add_executable(prescan_handoff_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/PrescanHandoffTests.cpp"
+)
+target_link_libraries(prescan_handoff_tests common fmt::fmt xxhash)
+target_include_directories(prescan_handoff_tests PRIVATE ${inc_headers})
+
 # The predictor rules, the header slots and the module id need no device and no translated program.
 add_executable(shader_store_predictor_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ShaderStorePredictorTests.cpp"
@@ -1147,6 +1155,10 @@ if(BUILD_TESTING)
 	add_test(NAME submit_scan COMMAND $<TARGET_FILE:submit_scan_tests>)
 	add_test(NAME scan_differential COMMAND $<TARGET_FILE:scan_differential_tests>)
 	add_test(NAME prescan COMMAND $<TARGET_FILE:prescan_tests>)
+	# The whole test runs in about a second, so a ring that loses track of an item and leaves the
+	# consumer spinning shows up as a hang, which the timeout ends.
+	add_test(NAME prescan_handoff COMMAND $<TARGET_FILE:prescan_handoff_tests>)
+	set_tests_properties(prescan_handoff PROPERTIES TIMEOUT 60)
 	add_test(NAME compute_translation COMMAND $<TARGET_FILE:compute_translation_tests>)
 	add_test(NAME shader_store_predictor COMMAND $<TARGET_FILE:shader_store_predictor_tests>)
 	add_test(NAME shader_store_keys COMMAND $<TARGET_FILE:shader_store_keys_tests>)
@@ -1311,6 +1323,7 @@ if(BUILD_TESTING)
 		submit_scan_tests
 		scan_differential_tests
 		prescan_tests
+		prescan_handoff_tests
 		compute_translation_tests
 		shader_store_predictor_tests
 		shader_store_keys_tests
