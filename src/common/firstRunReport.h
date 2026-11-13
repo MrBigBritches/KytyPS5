@@ -803,6 +803,7 @@ struct PrescanPreparerReport {
 	uint64_t compile_failed   = 0;
 	uint64_t key_mismatch     = 0;
 	uint64_t decode_failed    = 0;
+	uint64_t record_mismatch  = 0;
 	uint64_t adopted          = 0;
 	uint64_t taken            = 0;
 	uint64_t late_duplicates  = 0;

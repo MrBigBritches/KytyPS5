@@ -2476,6 +2476,7 @@ std::vector<PrescanCacheFieldCase> PrescanPreparerOutcomeCases() {
 	        CACHE_COUNT("/preparer/compile_failed", preparer.compile_failed),
 	        CACHE_COUNT("/preparer/key_mismatch", preparer.key_mismatch),
 	        CACHE_COUNT("/preparer/decode_failed", preparer.decode_failed),
+	        CACHE_COUNT("/preparer/record_mismatch", preparer.record_mismatch),
 	        CACHE_COUNT("/preparer/adopted", preparer.adopted),
 	        CACHE_COUNT("/preparer/taken", preparer.taken),
 	        CACHE_COUNT("/preparer/late_duplicates", preparer.late_duplicates),

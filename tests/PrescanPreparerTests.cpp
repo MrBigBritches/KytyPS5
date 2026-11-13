@@ -17,7 +17,9 @@
 #include "common/firstRunReport.h"
 #include "graphics/host_gpu/renderer/pipeline/prescanPreparer.h"
 #include "graphics/shader/moduleId.h"
+#include "graphics/shader/recompiler/ir/Serialize.h"
 #include "graphics/shader/shaderCompiler.h"
+#include "graphics/shader/shaderStoreRecord.h"
 #include "graphics/shader/storegen/prescanTransport.h"
 #include "graphics/shader/storegen/shaderStoreWorker.h"
 #include "graphics/shader/storegen/storeWorkerFormat.h"
@@ -306,7 +308,8 @@ struct Script {
 	// so a test can give the preparer a plan no test program translates to.
 	std::optional<std::vector<uint8_t>> plan_payload;
 	// When set, a scripted Compile that is answered carries these bytes in place of its record, so
-	// a test can give the preparer a record that does not decode.
+	// a test can give the preparer a record that does not decode, or a crafted one that decodes but
+	// does not match the request.
 	std::optional<std::vector<uint8_t>> compile_payload;
 	// The first plans_held Plans are queued and left unanswered, whatever plan_submit says, and Stop
 	// completes them as Dropped, as the supervisor does with what it still holds.
@@ -1719,7 +1722,8 @@ std::vector<VerdictRow> PlanVerdictRows() {
 	};
 }
 
-// Every Compile outcome and Compile refusal. An empty record is one that does not decode.
+// Every Compile outcome and Compile refusal but the record mismatch, whose verdict
+// CheckCraftedRecordRun checks. An empty record is one that does not decode.
 std::vector<VerdictRow> CompileVerdictRows() {
 	using C = PrescanPreparerCounters;
 	return {
@@ -1816,6 +1820,169 @@ void TestVerdictBuiltWhenKnown() {
 		      (known ? Verdict::Built : Verdict::Admitted));
 	}
 	std::puts("VerdictBuiltWhenKnown ok");
+}
+
+// ---- Records checked at adoption. ----
+
+// How far the wrong-id case moves a record's id. Any change would do.
+constexpr uint64_t WRONG_ID_DELTA = 1;
+
+// The record bytes the helper answers one dispatch's Compile with, made as the scripted transport
+// makes them. The Compile is caught at its send, where it carries no code yet, so the program's
+// code is put in here as the transport puts it in.
+std::vector<uint8_t> CompiledRecordBytes(const Program& program, uint32_t stride) {
+	std::optional<StreamRequest> compile;
+	Script                       script;
+	script.on_submit = [&compile](const StreamRequest& request) {
+		if (request.kind == StreamRequestKind::Compile) {
+			compile = request;
+		}
+	};
+	Harness harness(ScriptedFactory(script));
+	harness.Map(program);
+	harness.Push(ItemFor(program, Descriptor(stride, DstSel(4, 5, 6, 7)), KEY));
+	harness.Drive();
+	CHECK(compile.has_value());
+	if (!compile) {
+		return {};
+	}
+	const auto* code = reinterpret_cast<const uint8_t*>(program.code.data());
+	compile->code.assign(code, code + program.code.size() * sizeof(uint32_t));
+	auto response = AnswerStreamRequest(*compile, HostValues {}, DEVICE);
+	CHECK(response.status == StreamStatus::Ok);
+	return std::move(response.payload);
+}
+
+// Reads record bytes back as the preparer does, and checks they are one whole module record.
+DecodedModuleRecord DecodeRecordBytes(std::span<const uint8_t> bytes) {
+	ShaderRecompiler::IR::Reader reader {bytes};
+	auto                         type = StoreRecord::GraphicsPipeline;
+	ShaderRecompiler::IR::IoAll(reader, type);
+	DecodedModuleRecord record;
+	DecodeModuleRecord(reader, record);
+	CHECK(reader.ok && reader.bytes.empty() && type == StoreRecord::Module);
+	return record;
+}
+
+// The id a record's own fields give, made as the helper makes it for a program with no calls.
+uint64_t OwnId(const DecodedModuleRecord& record) {
+	return ShaderModuleId(record.stage, record.hash, record.user_data_count, record.static_state,
+	                      record.info.bindings.push_data_start_dword, record.specialization, {});
+}
+
+// The record bytes decoded and encoded again with the id moved by `id_delta`. A delta of 0 gives
+// the record back through the same round trip, which is the wrong-id case's baseline.
+std::vector<uint8_t> WithIdShifted(std::span<const uint8_t> bytes, uint64_t id_delta) {
+	const auto                         record = DecodeRecordBytes(bytes);
+	ShaderRecompiler::IR::ResourcePlan plan;
+	CHECK(ShaderRecompiler::IR::LoadResourcePlan(record.plan, plan));
+	return EncodeModuleRecord({.stage           = record.stage,
+	                           .hash            = record.hash,
+	                           .user_data_count = record.user_data_count,
+	                           .static_state    = record.static_state,
+	                           .plan            = plan,
+	                           .id              = record.id + id_delta,
+	                           .info            = record.info,
+	                           .specialization  = record.specialization,
+	                           .vertex_formats  = record.vertex_formats,
+	                           .rect_parameters = record.rect_parameters,
+	                           .mesh_task       = record.mesh_task,
+	                           .spirv           = record.spirv});
+}
+
+// Checks one run of a single dispatch whose Compile record was handed back as crafted. A refused
+// record reaches no sink, counts record_mismatch and reads CompileFailed. An adopted one reads
+// Built. Either way the unit is no longer in flight, and the other refusals of an answer, a record
+// that does not decode and a static key that is not the preparer's, count nothing.
+void CheckCraftedRecordRun(const CaseResult& result, bool refused) {
+	const auto& counters = result.counters;
+	CHECK(result.script.compile_attempts == 1 && !result.in_flight);
+	CHECK(result.adopted == (refused ? 0u : 1u) && counters.adopted == (refused ? 0u : 1u));
+	CHECK(counters.record_mismatch == (refused ? 1u : 0u));
+	CHECK(counters.decode_failed == 0 && counters.key_mismatch == 0);
+	CHECK(result.verdict == (refused ? Verdict::CompileFailed : Verdict::Built));
+}
+
+// A Compile record whose id is not the one its own fields give is refused, counted and read as
+// CompileFailed, and nothing reaches the sink. The baseline is the same record decoded and encoded
+// again with its id unchanged, which must be adopted, so the round trip cannot be what refuses it.
+// A refusal also comes from a record that does not decode or whose static key is not the
+// preparer's, and the run counts neither. The specialization is the one sent in both runs, so only
+// the id check can refuse. The mutation is to drop the id check. The wrong id is then adopted.
+void TestWrongRecordIdRefused() {
+	const auto program = DirectProgram(MUBUF_STORE_DWORD);
+	const auto item    = ItemFor(program, Descriptor(STRIDE_A, DstSel(4, 5, 6, 7)), KEY);
+	const auto bytes   = CompiledRecordBytes(program, STRIDE_A);
+	for (const uint64_t id_delta: {uint64_t {0}, WRONG_ID_DELTA}) {
+		const bool wrong   = id_delta != 0;
+		const auto payload = WithIdShifted(bytes, id_delta);
+		const auto record  = DecodeRecordBytes(payload);
+		CHECK((OwnId(record) == record.id) == !wrong);
+		CheckCraftedRecordRun(RunScripted({.compile_payload = payload}, program, {item}), wrong);
+	}
+	std::puts("WrongRecordIdRefused ok");
+}
+
+// A record that is valid in itself, whose id is the one its own fields give, is refused when its
+// specialization is not the one sent. It is the program's real module for another stride, handed
+// back for the first stride's Compile, so its program, static key and id all pass. The baseline is
+// the first stride's own module handed back the same way, which differs only in the specialization
+// and is adopted. The checks before the runs show both records are consistent and their
+// specializations differ, so the id check cannot be what refuses the other one. The mutation is to
+// drop the specialization check. The other stride's module is then adopted.
+void TestWrongRecordSpecializationRefused() {
+	const auto program = DirectProgram(MUBUF_STORE_DWORD);
+	const auto item    = ItemFor(program, Descriptor(STRIDE_A, DstSel(4, 5, 6, 7)), KEY);
+	const auto sent    = CompiledRecordBytes(program, STRIDE_A);
+	const auto other   = CompiledRecordBytes(program, STRIDE_B);
+	const auto sent_record  = DecodeRecordBytes(sent);
+	const auto other_record = DecodeRecordBytes(other);
+	CHECK(OwnId(sent_record) == sent_record.id && OwnId(other_record) == other_record.id);
+	CHECK(other_record.specialization != sent_record.specialization);
+	CHECK(other_record.hash == sent_record.hash &&
+	      other_record.user_data_count == sent_record.user_data_count &&
+	      other_record.static_state == sent_record.static_state);
+	for (const bool wrong: {false, true}) {
+		const auto result = RunScripted({.compile_payload = wrong ? other : sent}, program, {item});
+		CheckCraftedRecordRun(result, wrong);
+	}
+	std::puts("WrongRecordSpecializationRefused ok");
+}
+
+// A refused record takes the path of a Compile the helper failed, so each admission still has one
+// outcome. Two dispatches of one specialization are driven one after the other. The second is
+// posted, not answered Busy, so the first admission was closed, and it is found Known and sends no
+// second Compile, since the specialization stays recorded. Nothing is forgotten, blocked or capped,
+// and the unit reads CompileFailed and is no longer in flight. The baseline is a Compile answered
+// Failed, which must end the same and counts compile_failed where a refusal counts
+// record_mismatch. The plain run adopts and reads Built, so a refusal is told apart by those two
+// and not by the posted and known counts. The mutations are to forget the specialization on
+// a refusal, which sends a second Compile, and to block the program on it, which retires the second
+// dispatch.
+void TestRecordRefusalTakesFailedPath() {
+	const auto program = DirectProgram(MUBUF_STORE_DWORD);
+	const auto item    = ItemFor(program, Descriptor(STRIDE_A, DstSel(4, 5, 6, 7)), KEY);
+	const std::vector<PrescanItem> twice {item, item};
+	const auto plain = RunScripted({}, program, twice);
+	CHECK(plain.adopted == 1 && plain.verdict == Verdict::Built);
+	const std::array<Script, 3> scripts {
+	    Script {.compile_status = StreamStatus::Failed},
+	    Script {.compile_payload = WithIdShifted(CompiledRecordBytes(program, STRIDE_A),
+	                                             WRONG_ID_DELTA)},
+	    Script {.compile_payload = CompiledRecordBytes(program, STRIDE_B)}};
+	for (size_t index = 0; index < scripts.size(); ++index) {
+		const bool  refused  = index != 0;
+		const auto  result   = RunScripted(scripts[index], program, twice);
+		const auto& counters = result.counters;
+		CHECK(result.verdict == Verdict::CompileFailed && !result.in_flight);
+		CHECK(result.script.compile_attempts == 1 && result.adopted == 0);
+		CHECK(counters.state.posted == 2 && counters.state.busy == 0);
+		CHECK(counters.variant_modules == 1 && counters.known_variants == 1);
+		CHECK(counters.forgotten == 0 && counters.blocked == 0 && counters.state.capped == 0);
+		CHECK(counters.compile_failed == (refused ? 0u : 1u));
+		CHECK(counters.record_mismatch == (refused ? 1u : 0u));
+	}
+	std::puts("RecordRefusalTakesFailedPath ok");
 }
 
 // A reader that never reads, as one would for a program whose code is not mapped.
@@ -2774,7 +2941,8 @@ PrescanPreparerCounters DistinctPreparerCounters() {
 	      &counters.capped_variants, &counters.known_skipped, &counters.heap_image_variants,
 	      &counters.known_modules, &counters.known_dropped, &counters.refused_sends,
 	      &counters.never_retry, &counters.blamed, &counters.dropped, &counters.compile_failed,
-	      &counters.key_mismatch, &counters.decode_failed, &counters.adopted, &counters.taken,
+	      &counters.key_mismatch, &counters.decode_failed, &counters.record_mismatch,
+	      &counters.adopted, &counters.taken,
 	      &counters.late_duplicates, &counters.taken_dropped, &counters.plans_dropped,
 	      &counters.forgotten, &counters.verdicts_evicted, &counters.state.posted,
 	      &counters.state.busy,
@@ -2827,6 +2995,7 @@ void CheckOutcomesCopied(const Common::FirstRunReport::PrescanPreparerReport& re
 	CHECK(report.dropped == source.dropped && report.compile_failed == source.compile_failed);
 	CHECK(report.key_mismatch == source.key_mismatch &&
 	      report.decode_failed == source.decode_failed);
+	CHECK(report.record_mismatch == source.record_mismatch);
 	CHECK(report.adopted == source.adopted && report.taken == source.taken);
 	CHECK(report.late_duplicates == source.late_duplicates &&
 	      report.taken_dropped == source.taken_dropped);
@@ -2964,6 +3133,9 @@ int main(int argc, char** argv) {
 	TestUnitVerdictTable();
 	TestVerdictFollowsOutcome();
 	TestVerdictBuiltWhenKnown();
+	TestWrongRecordIdRefused();
+	TestWrongRecordSpecializationRefused();
+	TestRecordRefusalTakesFailedPath();
 	TestVerdictRejectedSnapshots();
 	TestVerdictThrottles();
 	TestVerdictIndirectArgs();

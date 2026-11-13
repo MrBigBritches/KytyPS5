@@ -127,6 +127,10 @@ struct PrescanPreparerCounters {
 	uint64_t key_mismatch = 0;
 	/// Compile answers whose record did not decode or was not for the program asked about.
 	uint64_t decode_failed = 0;
+	/// Compile records that decoded for the program asked about but whose id is not the one their
+	/// own fields give, or whose specialization is not the one sent. Pipelines are filed by module
+	/// id, so such a record could make two modules share one. The record is not used.
+	uint64_t record_mismatch = 0;
 	/// Modules handed to the sink.
 	uint64_t adopted = 0;
 	/// Module ids the GPU thread reported as taken, ids the drain refused as late duplicates, and
@@ -206,7 +210,8 @@ struct PrescanPreparerConfig {
 /// sent. A specialization the emitter would refuse is not sent. A new one whose module the cache
 /// already has from the shader store or the generator is recorded like a built one and not sent.
 /// Any other new one is sent as a Compile, and its answer is checked against the preparer's own
-/// static key before the sink gets it.
+/// static key, and its record's id and specialization against its own fields and the one sent,
+/// before the sink gets it.
 ///
 /// Blamed and NeverRetry answers retire the program and are never retried here or in this process.
 /// QueueFull, Stopped and Dropped only skip the snapshot, and the GPU thread compiles the module

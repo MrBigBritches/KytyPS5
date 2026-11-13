@@ -1448,6 +1448,7 @@ nlohmann::json PrescanPreparerToJson(const PrescanPreparerReport& preparer) {
 	                            {"compile_failed", preparer.compile_failed},
 	                            {"key_mismatch", preparer.key_mismatch},
 	                            {"decode_failed", preparer.decode_failed},
+	                            {"record_mismatch", preparer.record_mismatch},
 	                            {"adopted", preparer.adopted},
 	                            {"taken", preparer.taken},
 	                            {"late_duplicates", preparer.late_duplicates},

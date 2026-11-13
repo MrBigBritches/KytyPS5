@@ -263,6 +263,22 @@ std::optional<DecodedModuleRecord> DecodeCompiled(std::span<const uint8_t> bytes
 	return record;
 }
 
+// Whether a decoded Compile record is the module that was asked for, which DecodeCompiled's checks
+// of the program do not show. Compute pipelines and warm builds are filed by module id, so a record
+// whose id is not the one its own fields give could make two modules share a pipeline. The id is
+// made as the helper's CompileComputeUnit makes it, with no function code, since the helper answers
+// a program with calls HasCalls and never builds it. The specialization goes first, as it costs
+// less than the hash. It must be the one sent, since a record of another carries a consistent id.
+bool RecordMatchesRequest(const DecodedModuleRecord& record, const PendingRequest& request) {
+	if (!request.spec || record.specialization != *request.spec) {
+		return false;
+	}
+	return record.id == ShaderModuleId(ShaderType::Compute, record.hash, record.user_data_count,
+	                                   record.static_state,
+	                                   record.info.bindings.push_data_start_dword,
+	                                   record.specialization, {});
+}
+
 // Whether a plan entry has nothing in hand, so it may be dropped.
 bool IsIdle(const PlanEntry& entry) {
 	return entry.plan_state != PlanEntry::Plan::Requested && entry.waiting.empty() &&
@@ -901,12 +917,19 @@ void PrescanPreparer::Impl::ForgetSpec(const PendingRequest& request) {
 }
 
 // Decodes the record and hands it to the sink with its bytes, which makes its shader module on this
-// thread. The module counts as unused until the GPU thread reports it. The unit reads Built only
-// once the sink took the module, since a sink that throws installed nothing.
+// thread. A record whose id or specialization is not the one asked for is refused as a key mismatch
+// is, and its specialization stays recorded like a failed Compile's. The module counts as unused
+// until the GPU thread reports it. The unit reads Built only once the sink took the module, since a
+// sink that throws installed nothing.
 void PrescanPreparer::Impl::Adopt(const PendingRequest& request, std::vector<uint8_t>&& payload) {
 	auto record = DecodeCompiled(payload, request);
 	if (!record) {
 		counters.decode_failed++;
+		PublishVerdict(request.unit, PrescanUnitVerdict::CompileFailed);
+		return;
+	}
+	if (!RecordMatchesRequest(*record, request)) {
+		counters.record_mismatch++;
 		PublishVerdict(request.unit, PrescanUnitVerdict::CompileFailed);
 		return;
 	}
@@ -1317,6 +1340,7 @@ void CopyOutcomeCounts(const PrescanPreparerCounters&                counters,
 	report.compile_failed   = counters.compile_failed;
 	report.key_mismatch     = counters.key_mismatch;
 	report.decode_failed    = counters.decode_failed;
+	report.record_mismatch  = counters.record_mismatch;
 	report.adopted          = counters.adopted;
 	report.taken            = counters.taken;
 	report.late_duplicates  = counters.late_duplicates;
