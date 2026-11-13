@@ -1290,4 +1290,11 @@ bool GuestGpu::IsGpuThread() noexcept {
 	return g_gpu_state != nullptr;
 }
 
+// The execution is this thread's, set only while Process runs, so the read needs no lock.
+uint32_t GuestGpu::CurrentDispatchDepth() noexcept {
+	return g_current_execution == nullptr
+	           ? 0
+	           : static_cast<uint32_t>(g_current_execution->BufferDepth());
+}
+
 } // namespace Libs::Graphics

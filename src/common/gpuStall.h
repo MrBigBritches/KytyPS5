@@ -28,10 +28,20 @@ inline constexpr std::chrono::milliseconds GPU_STALL_AUDIO_HOLD_THRESHOLD {250};
 /// PrescanInFlight is charged by the GPU thread's own pipeline compile of a compute module whose
 /// unit the prescan's helper still had a Plan or Compile for, at the lookup's miss or when the
 /// compile's Scope opens. A request for another specialization of the same unit counts, and so
-/// does the time between the helper answering and the preparer handling the answer. The three
-/// PrescanNeverPosted causes and PrescanRefused have no call sites yet. They are reserved for the
-/// GPU thread's compile of a module the prescan did not deliver, so the report's schema does not
-/// change when they get sites. Other is a gate value that must stay 0 in a finished run.
+/// does the time between the helper answering and the preparer handling the answer. The GPU
+/// thread's other compiles of a compute module with the prescan on are charged by the reason the
+/// prescan did not deliver it (see PrescanMiss). PrescanRefused means the live preparer had a
+/// verdict for the unit at the miss and nothing outstanding for it. That covers a refusal, a unit
+/// admitted but not sent yet, one deferred for capacity, and one built, whose module was another
+/// specialization, was posted but not drained by this lookup, or was known to the cache already.
+/// Verdicts are kept per unit, so until misses record whether the scanner saw the dispatch, a
+/// specialization the scanner never posted, of a unit it did post, counts as PrescanRefused too.
+/// The three PrescanNeverPosted causes mean the preparer had no verdict for the unit and the
+/// dispatch was nested deeper than the scan follows, indirect, or on an async queue. Those are
+/// attributes of the dispatch, not proof of why it was missed. With the prescan on,
+/// RequiredCompute for compute means a plain never-posted dispatch, a prescan that had stopped, or
+/// a module whose lookup found it already made. Other is a gate value that must stay 0 in a
+/// finished run.
 /// WarmInlinePaused and GeneratedInlinePaused are causes of their own and not subsets, so the
 /// causes add up to the total held time. The cost of the pause is their sum, and the generator's
 /// misses are GeneratedInline plus GeneratedInlinePaused. LibraryOnce is reserved and has no site,

@@ -35,6 +35,10 @@ struct IndirectDrawRegisters {
 class Pm4Execution {
 public:
 	[[nodiscard]] bool MadeProgress() const noexcept { return m_made_progress; }
+	/// How many buffers are on the stack, the top-level list included. A call pushes one and a
+	/// chain replaces the buffer it is in, so this is the nesting a dispatch in the top buffer runs
+	/// at.
+	[[nodiscard]] size_t BufferDepth() const noexcept { return m_buffer_stack.size(); }
 
 private:
 	friend class CommandProcessor;

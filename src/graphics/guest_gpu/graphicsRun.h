@@ -55,6 +55,12 @@ public:
 	[[nodiscard]] int GetFrameNum() const;
 
 	[[nodiscard]] static bool IsGpuThread() noexcept;
+	/// How many buffers the command processor of this thread has on its stack, the top-level list
+	/// included, so a dispatch in the top-level list reads 1 and one behind two calls reads 3. It
+	/// is 0 outside a CommandProcessor::Process, as in a command sent with SendCommandSync or a
+	/// test. A command the GPU thread runs from inside ProcessPm4 reads the running submission's
+	/// depth.
+	[[nodiscard]] static uint32_t CurrentDispatchDepth() noexcept;
 
 private:
 	static constexpr uint32_t ComputePipeCount     = 7;

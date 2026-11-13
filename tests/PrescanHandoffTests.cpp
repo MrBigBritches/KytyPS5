@@ -6,6 +6,7 @@
 // say.
 #include "common/spscRing.h"
 #include "graphics/host_gpu/renderer/pipeline/prescanHandoff.h"
+#include "graphics/host_gpu/renderer/pipeline/prescanMiss.h"
 #include "graphics/host_gpu/renderer/pipeline/prescanState.h"
 #include "graphics/host_gpu/renderer/pipeline/prescanVariants.h"
 
@@ -18,8 +19,10 @@
 #include <memory>
 #include <new>
 #include <stdexcept>
+#include <string_view>
 #include <thread>
 #include <typeinfo>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -739,6 +742,128 @@ void TestProducerClaimedOnce() {
 	CHECK(!handoff->TryClaimProducer());
 }
 
+// What the GPU thread read for one inline compile, and the reason it must give.
+struct MissRow {
+	bool               noted;
+	bool               in_flight;
+	PrescanUnitVerdict verdict;
+	bool               stopped;
+	bool               deep;
+	bool               indirect;
+	bool               async;
+	PrescanMiss        expected;
+};
+
+// The reason of one row, through the two steps the GPU thread takes.
+PrescanMiss MissOf(const MissRow& row) {
+	const auto unposted =
+	    ClassifyUnposted(row.verdict, row.stopped, row.deep, row.indirect, row.async);
+	return ClassifyMiss(row.noted, row.in_flight, unposted);
+}
+
+// Each reason wins over every reason below it. Row 0 has every fact set, with the miss not noted,
+// and gives ModulePresent. Rows 1, 2, 4, 5, 6, 7 and 8 form a chain in which each row clears only
+// the fact of the reason the row before it gave, so it gives the next reason down while every
+// lower reason's fact is still set. Row 2 is Deferred with the prescan stopped and gives Stopped,
+// since a stopped prescan's verdicts are history. Row 4 differs from it only in the stop and gives
+// Refused, so it is row 2's baseline. Row 3 is the stop alone. Every verdict alone refuses. The
+// mutation is the order with Refused above Stopped, which makes row 2 read Refused.
+void TestMissPrecedence() {
+	using enum PrescanUnitVerdict;
+	using enum PrescanMiss;
+	const std::array<MissRow, 9> rows {{
+	    {false, true, Deferred, true, true, true, true, ModulePresent},
+	    {true, true, Deferred, true, true, true, true, InFlight},
+	    {true, false, Deferred, true, true, true, true, Stopped},
+	    {true, false, None, true, false, false, false, Stopped},
+	    {true, false, Deferred, false, true, true, true, Refused},
+	    {true, false, None, false, true, true, true, NeverPostedDeep},
+	    {true, false, None, false, false, true, true, NeverPostedIndirect},
+	    {true, false, None, false, false, false, true, NeverPostedAsync},
+	    {true, false, None, false, false, false, false, NeverPosted},
+	}};
+	for (const auto& row: rows) {
+		CHECK(MissOf(row) == row.expected);
+	}
+	const auto last = static_cast<uint8_t>(PRESCAN_UNIT_VERDICT_LAST);
+	for (auto code = static_cast<uint8_t>(Admitted); code <= last; ++code) {
+		const auto verdict = static_cast<PrescanUnitVerdict>(code);
+		CHECK(MissOf({true, false, verdict, false, false, false, false, Refused}) == Refused);
+	}
+}
+
+// Every reason charges the cause the table gives, none charges Other, and each cause reserved for
+// a miss is charged by exactly one reason, so its hold time means one thing. The explicit rows are
+// the baseline the counts are checked beside, so a table that swapped two reserved causes keeps
+// the counts at one each and still fails a row. The mutation is to map NeverPostedAsync to
+// RequiredCompute, which fails its row and leaves PrescanNeverPostedAsync charged by none.
+void TestMissCauseTable() {
+	using Common::GpuStall::HoldCause;
+	using enum PrescanMiss;
+	const std::array<std::pair<PrescanMiss, HoldCause>, PRESCAN_MISS_COUNT> table {{
+	    {ModulePresent, HoldCause::RequiredCompute},
+	    {InFlight, HoldCause::PrescanInFlight},
+	    {Stopped, HoldCause::RequiredCompute},
+	    {Refused, HoldCause::PrescanRefused},
+	    {NeverPostedDeep, HoldCause::PrescanNeverPostedDeep},
+	    {NeverPostedIndirect, HoldCause::PrescanNeverPostedIndirect},
+	    {NeverPostedAsync, HoldCause::PrescanNeverPostedAsync},
+	    {NeverPosted, HoldCause::RequiredCompute},
+	}};
+	std::array<uint32_t, Common::GpuStall::HOLD_CAUSE_COUNT> charged_by {};
+	for (const auto& [miss, cause]: table) {
+		CHECK(HoldCauseOf(miss) == cause);
+		CHECK(HoldCauseOf(miss) != HoldCause::Other);
+		charged_by[static_cast<size_t>(HoldCauseOf(miss))]++;
+	}
+	for (const auto reserved:
+	     {HoldCause::PrescanNeverPostedAsync, HoldCause::PrescanNeverPostedIndirect,
+	      HoldCause::PrescanNeverPostedDeep, HoldCause::PrescanRefused,
+	      HoldCause::PrescanInFlight}) {
+		CHECK(charged_by[static_cast<size_t>(reserved)] == 1);
+	}
+}
+
+// Each reason and each refusing verdict has the name the report writes, in its own slot. The names
+// are written out here, so a table shifted by one, or two names swapped, fails. The verdicts start
+// at Admitted, so None has no name and the slot of each verdict is its value less one. The
+// mutation is to shift the reason names by one.
+void TestMissNames() {
+	using enum PrescanMiss;
+	const std::array<std::pair<PrescanMiss, std::string_view>, PRESCAN_MISS_COUNT> reasons {{
+	    {ModulePresent, "module_present"},
+	    {InFlight, "in_flight"},
+	    {Stopped, "stopped"},
+	    {Refused, "refused"},
+	    {NeverPostedDeep, "never_posted_deep"},
+	    {NeverPostedIndirect, "never_posted_indirect"},
+	    {NeverPostedAsync, "never_posted_async"},
+	    {NeverPosted, "never_posted"},
+	}};
+	for (const auto& [miss, name]: reasons) {
+		CHECK(PRESCAN_MISS_NAMES[static_cast<size_t>(miss)] == name);
+	}
+	using enum PrescanUnitVerdict;
+	const std::array<std::pair<PrescanUnitVerdict, std::string_view>, PRESCAN_REFUSED_VERDICT_COUNT>
+	    verdicts {{
+	        {Admitted, "admitted"},
+	        {Deferred, "deferred"},
+	        {Built, "built"},
+	        {Rejected, "rejected"},
+	        {IndirectArgs, "indirect_args"},
+	        {Retired, "retired"},
+	        {CompileFailed, "compile_failed"},
+	        {Capped, "capped"},
+	        {Settled, "settled"},
+	        {BackedOff, "backed_off"},
+	        {CodeUnreadable, "code_unreadable"},
+	        {CodeChanged, "code_changed"},
+	    }};
+	for (const auto& [verdict, name]: verdicts) {
+		CHECK(PRESCAN_REFUSED_VERDICT_NAMES[RefusedVerdictIndex(verdict)] == name);
+	}
+}
+
 } // namespace
 
 // Counts the allocations of the tests, for TestNoAllocationAfterConstruction.
@@ -813,6 +938,9 @@ int main() {
 	TestFeedbackPackingKeepsEveryLowBitPattern();
 	TestInFlightTableCollision();
 	TestProducerClaimedOnce();
+	TestMissPrecedence();
+	TestMissCauseTable();
+	TestMissNames();
 	if (g_failures != 0) {
 		std::fprintf(stderr, "%d check(s) failed\n", g_failures);
 		return 1;

@@ -1431,6 +1431,11 @@ struct PipelineCacheTestAccess {
   static std::pair<uint32_t, std::vector<uint32_t>> LookupUnitFields(const PipelineCache &cache) {
     return {cache.m_lookup_key.user_data_count, cache.m_lookup_key.static_state};
   }
+  // Makes the next misses read this buffer depth in place of the command processor's. 0 reads the
+  // real one again.
+  static void SetDispatchDepthForTest(PipelineCache &cache, uint32_t depth) {
+    cache.m_dispatch_depth_for_test = depth;
+  }
   // Posts a record as the preparer's sink does, with its plan hash changed, which stands for a
   // prescan module whose plan is not its program's.
   static void PostPrescanChanged(PipelineCache &cache, DecodedModuleRecord &&record) {
@@ -62814,8 +62819,10 @@ const std::vector<u32> &GeneratedCheckCode() {
 }
 
 // Looks the program up with a buffer of the given stride. The stride is part of the module's
-// specialization, so two strides give two modules of the one program.
-void GeneratedLookup(PipelineCache &cache, u32 stride, ShaderComputeInputInfo &input) {
+// specialization, so two strides give two modules of the one program. The input starts as `start`,
+// which a caller sets for what the dispatch's queue and launch would set.
+void GeneratedLookup(PipelineCache &cache, u32 stride, ShaderComputeInputInfo &input,
+                     const ShaderComputeInputInfo &start = {}) {
   const auto &code = GeneratedCheckCode();
   HW::ComputeShaderInfo regs{};
   regs.cs_regs.data_addr = reinterpret_cast<uint64_t>(code.data());
@@ -62827,7 +62834,7 @@ void GeneratedLookup(PipelineCache &cache, u32 stride, ShaderComputeInputInfo &i
   const ShaderBufferResource buffer{{0x10000u, stride << 16u, 64,
       DstSel(4, 5, 6, 7) | (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u)}};
   std::copy_n(buffer.fields, 4, regs.cs_user_sgpr.value);
-  input = ShaderComputeInputInfo{};
+  input = start;
   (void)cache.GetComputeProgram(regs, input);
 }
 
@@ -64318,7 +64325,59 @@ struct InFlightSeen {
   uint64_t required_holds = 0;
   uint64_t at_miss_only = 0;
   uint64_t compiled = 0;
+  // The cache's miss counts and the live report's prescan block, both read before the cache stops.
+  PrescanMissCounts misses;
+  nlohmann::json block;
 };
+
+// Defined with the cache report checks below.
+nlohmann::json GlobalPrescanBlock();
+bool BlockCount(const nlohmann::json &block, const char *pointer, uint64_t expected);
+
+// Whether the block's misses are the cache's counts, with every reason and every refusing verdict
+// written, those at 0 too.
+bool MissesBlockMatches(const nlohmann::json &block, const PrescanMissCounts &counts) {
+  const nlohmann::json::json_pointer at("/misses");
+  if (!block.is_object() || !block.contains(at)) return false;
+  const auto &misses = block.at(at);
+  if (!misses.contains("by_reason") || misses.at("by_reason").size() != PRESCAN_MISS_COUNT ||
+      !misses.contains("refused_by") ||
+      misses.at("refused_by").size() != PRESCAN_REFUSED_VERDICT_COUNT) {
+    return false;
+  }
+  bool same = BlockCount(misses, "/inline_compiles", counts.InlineCompiles()) &&
+              BlockCount(misses, "/upper_bounds/built_undrained", counts.built_undrained);
+  for (size_t reason = 0; reason < PRESCAN_MISS_COUNT; reason++) {
+    const auto pointer = std::string("/by_reason/") + PRESCAN_MISS_NAMES[reason];
+    same = same && BlockCount(misses, pointer.c_str(), counts.by_reason[reason]);
+  }
+  for (size_t verdict = 0; verdict < PRESCAN_REFUSED_VERDICT_COUNT; verdict++) {
+    const auto pointer = std::string("/refused_by/") + PRESCAN_REFUSED_VERDICT_NAMES[verdict];
+    same = same && BlockCount(misses, pointer.c_str(), counts.refused_by[verdict]);
+  }
+  return same;
+}
+
+// Requires that a case's one inline compile was counted once, under `expected` alone, under the
+// verdict `refused` too when it was refused, and as undrained `undrained` times, and that the live
+// report's block shows the cache's counts.
+void RequireMissCounted(const char *name, const std::string &label, const PrescanMissCounts &misses,
+                        const nlohmann::json &block, PrescanMiss expected,
+                        std::optional<PrescanUnitVerdict> refused = std::nullopt,
+                        uint64_t undrained = 0) {
+  PrescanMissCounts want;
+  want.by_reason[static_cast<size_t>(expected)] = 1;
+  if (refused) want.refused_by[RefusedVerdictIndex(*refused)] = 1;
+  want.built_undrained = undrained;
+  Require(name, label.c_str(),
+          misses.InlineCompiles() == 1 && misses.by_reason == want.by_reason &&
+              misses.refused_by == want.refused_by &&
+              misses.built_undrained == want.built_undrained,
+          label + ": the inline compile was not counted once, under " +
+              PRESCAN_MISS_NAMES[static_cast<size_t>(expected)] + " alone");
+  Require(name, label.c_str(), MissesBlockMatches(block, misses),
+          label + ": the live report's misses are not the cache's counts");
+}
 
 // Has the preparer send the Compile of a dispatch of `code` with the generated checks' inputs, and
 // waits until the transport holds it.
@@ -64400,6 +64459,8 @@ InFlightSeen RunInFlightCase(VulkanHarness &vulkan, GuestGpu &gpu, InFlightCase 
   seen.required_holds = count(HoldCause::RequiredCompute);
   seen.at_miss_only = cache.PrescanInFlightAtMissOnly();
   seen.compiled = ShadersCompiledSoFar() - compiled_before;
+  seen.misses = cache.PrescanMisses();
+  seen.block = GlobalPrescanBlock();
   cache.StopBuilds();
   return seen;
 }
@@ -64484,10 +64545,17 @@ const std::vector<u32> &MapSlotSharingProgram(const InFlightSeen &key, uint64_t 
 // Keeping only the check at the miss sends SentAfterMiss to RequiredCompute.
 // Never counting a stop charged by the miss alone leaves ReleasedAtMiss's count at 0.
 // Dropping the clear at the top of a compute lookup charges StaleNote to PrescanInFlight.
+// Each case's compile is also counted once in the cache's misses, under its one reason, and the
+// live report shows the same counts. A case whose unit was in flight counts in_flight, and the two
+// with nothing out for the unit count never_posted. StaleNote's compile follows a hit, so it counts
+// module_present, and that is the one count a compile without a noted miss leaves. The mutation is
+// to count only noted compiles, and StaleNote counts nothing.
 void CheckPrescanInFlightCause(VulkanHarness &vulkan, GuestGpu &gpu) {
+  constexpr const char *name = "PrescanInFlightCause";
   Common::DebugCounters::SetEnabled(true);
   const auto none = RunInFlightCase(vulkan, gpu, InFlightCase::NoDispatch, {}, 0);
   RequireInFlightCase("no request out", none, false, false, false);
+  RequireMissCounted(name, "no request out", none.misses, none.block, PrescanMiss::NeverPosted);
   const auto &own = GeneratedCheckCode();
   const uint64_t own_unit = PrescanUnitKey(XXH3_64bits(own.data(), own.size() * sizeof(u32)),
                                            none.user_data_count, none.static_state);
@@ -64495,6 +64563,7 @@ void CheckPrescanInFlightCause(VulkanHarness &vulkan, GuestGpu &gpu) {
           "the GPU thread's unit is not the one made from its key and the program's code");
   const auto same = RunInFlightCase(vulkan, gpu, InFlightCase::SameUnitHeld, own, own_unit);
   RequireInFlightCase("the same unit held", same, true, true, true);
+  RequireMissCounted(name, "the same unit held", same.misses, same.block, PrescanMiss::InFlight);
   Require("PrescanInFlightCause", "the preparer's mark", same.expected_unit_marked,
           "the preparer did not mark the unit the GPU thread looks up");
   const auto &other = MapSlotSharingProgram(none, own_unit);
@@ -64504,14 +64573,309 @@ void CheckPrescanInFlightCause(VulkanHarness &vulkan, GuestGpu &gpu) {
   Require("PrescanInFlightCause", "the sharer's mark", shared.expected_unit_marked,
           "the other program's held Compile did not mark its unit in the GPU unit's slot");
   RequireInFlightCase("another unit held in the same slot", shared, false, false, false);
+  RequireMissCounted(name, "another unit held in the same slot", shared.misses, shared.block,
+                     PrescanMiss::NeverPosted);
   const auto released = RunInFlightCase(vulkan, gpu, InFlightCase::ReleasedAtMiss, own, own_unit);
   RequireInFlightCase("answered after the miss", released, true, false, true, 1);
+  RequireMissCounted(name, "answered after the miss", released.misses, released.block,
+                     PrescanMiss::InFlight);
   const auto late = RunInFlightCase(vulkan, gpu, InFlightCase::SentAfterMiss, {}, 0);
   RequireInFlightCase("sent after the miss", late, false, true, true);
+  RequireMissCounted(name, "sent after the miss", late.misses, late.block, PrescanMiss::InFlight);
   const auto stale = RunInFlightCase(vulkan, gpu, InFlightCase::StaleNote, own, own_unit);
   RequireInFlightCase("a note from an earlier lookup", stale, true, true, false);
+  RequireMissCounted(name, "a note from an earlier lookup", stale.misses, stale.block,
+                     PrescanMiss::ModulePresent);
   Common::DebugCounters::SetEnabled(false);
   std::printf("[gpu]     %-32s ok\n", "PrescanInFlightCause");
+}
+
+// The cases of CheckPrescanMissCause, each named for what it changes from NoDispatch, which has the
+// prescan on and nothing sent. Async and Indirect change the dispatch's queue and launch. Deep and
+// AtReach make the miss read a buffer depth one past the scan's reach and at it. CodeUnreadable
+// has the preparer refuse the program's unit. BuiltOtherStride has it build the program's module
+// for another stride, and BuiltUndrained also leaves more modules in the inbox than one drain
+// takes.
+// SlotSharerRefused has it refuse another program whose unit shares the verdict table's slot.
+// VerdictInMissHook has it refuse the unit only after the miss. Stopped refuses the unit and then
+// stops the prescan. PrescanOff never starts the prescan.
+enum class MissCase {
+  NoDispatch, Async, Indirect, Deep, AtReach, CodeUnreadable, BuiltOtherStride, BuiltUndrained,
+  SlotSharerRefused, VerdictInMissHook, Stopped, PrescanOff
+};
+
+// What one case of CheckPrescanMissCause saw. The user-data count, static key and unit are the GPU
+// thread's at the miss. holds are the holds charged to each cause during the case. The misses and
+// the live report's prescan block are read before the cache stops.
+struct MissSeen {
+  uint32_t user_data_count = 0;
+  std::vector<uint32_t> static_state;
+  uint64_t unit = 0;
+  bool held = false;
+  uint64_t compiled = 0;
+  std::array<uint64_t, Common::GpuStall::HOLD_CAUSE_COUNT> holds{};
+  PrescanMissCounts misses;
+  nlohmann::json block;
+};
+
+// What the cases after NoDispatch need from it and from the captured records. The program's unit,
+// the program whose unit shares its slot and that unit, and the store record of the program's
+// module for the other stride.
+struct MissSetup {
+  uint64_t own_unit = 0;
+  const std::vector<u32> *sharer = nullptr;
+  uint64_t sharer_unit = 0;
+  const DecodedModuleRecord *other_stride_record = nullptr;
+};
+
+// A reader that fails every read, so the preparer refuses the program as unreadable.
+bool FailReadForPrescan(void * /*userdata*/, uint64_t /*address*/, std::span<uint32_t> /*values*/) {
+  return false;
+}
+
+// Whether a case's preparer reads through the failing reader.
+bool MissCaseFailsReads(MissCase which) {
+  return which == MissCase::CodeUnreadable || which == MissCase::SlotSharerRefused ||
+         which == MissCase::VerdictInMissHook || which == MissCase::Stopped;
+}
+
+// Hands the preparer a dispatch of `code` and waits until it has given `unit` the verdict and has
+// no request out for it. The preparer publishes the verdict on its own thread, whichever thread
+// calls this.
+void SettlePrescanVerdict(PipelineCache &cache, u32 stride, const std::vector<u32> &code,
+                          uint64_t unit, PrescanUnitVerdict verdict) {
+  PushPrescanDispatchOf(cache, stride, code);
+  const auto &inbox = *cache.PrescanInbox();
+  const auto settled = [&] {
+    return inbox.verdicts.Read(unit) == verdict && !inbox.in_flight.Contains(unit);
+  };
+  Require("PrescanMissCause", "the verdict", WaitForPrescan(settled),
+          "the preparer never gave the unit the verdict the case needs");
+}
+
+// Has the preparer build the program's module for the other stride, which posts it and gives the
+// unit Built. For BuiltUndrained more modules than one drain takes are posted after it, all
+// duplicates of the other stride's, so the drain at the top of the lookup leaves some waiting.
+void PrepareBuiltOtherStride(PipelineCache &cache, MissCase which, const MissSetup &setup) {
+  SettlePrescanVerdict(cache, GENERATED_STRIDE_B, GeneratedCheckCode(), setup.own_unit,
+                       PrescanUnitVerdict::Built);
+  uint64_t posted = 1;
+  if (which == MissCase::BuiltUndrained) {
+    for (size_t copy = 0; copy < StoreGen::GENERATION_DRAIN_BUDGET; copy++) {
+      PipelineCacheTestAccess::PostPrescanRecord(cache,
+                                                 DecodedModuleRecord(*setup.other_stride_record));
+    }
+    posted += StoreGen::GENERATION_DRAIN_BUDGET;
+  }
+  Require("PrescanMissCause", "the modules wait",
+          WaitForPrescan([&] { return cache.GenerationStats()->pending == posted; }),
+          "the other stride's module, or the modules after it, never reached the intake");
+}
+
+// Starts the case's prescan and gives the preparer, or the miss, what the case needs.
+void PrepareMissCase(PipelineCache &cache, MissCase which, const MissSetup &setup) {
+  if (which == MissCase::PrescanOff) return;
+  const auto reader = MissCaseFailsReads(which) ? FailReadForPrescan : ReadHostForPrescan;
+  PipelineCacheTestAccess::SetPrescanTweak(
+      cache, [reader](PrescanPreparerConfig &config) { config.read_memory = reader; });
+  cache.EnablePrescan(StoreGen::InProcessPrescanTransportFactory());
+  if (which == MissCase::Deep || which == MissCase::AtReach) {
+    PipelineCacheTestAccess::SetDispatchDepthForTest(
+        cache, PRESCAN_SCAN_REACH_STACK_DEPTH + (which == MissCase::Deep ? 1u : 0u));
+  } else if (which == MissCase::CodeUnreadable || which == MissCase::Stopped) {
+    SettlePrescanVerdict(cache, GENERATED_STRIDE_A, GeneratedCheckCode(), setup.own_unit,
+                         PrescanUnitVerdict::CodeUnreadable);
+  } else if (which == MissCase::SlotSharerRefused) {
+    SettlePrescanVerdict(cache, GENERATED_STRIDE_A, *setup.sharer, setup.sharer_unit,
+                         PrescanUnitVerdict::CodeUnreadable);
+  } else if (which == MissCase::BuiltOtherStride || which == MissCase::BuiltUndrained) {
+    PrepareBuiltOtherStride(cache, which, setup);
+  }
+  if (which == MissCase::Stopped) {
+    cache.StopPrescan();
+    Require("PrescanMissCause", "the prescan stopped",
+            cache.PrescanInbox()->preparer_stopped.load(),
+            "StopPrescan left the hand-off's stop flag clear");
+    // The verdict must still be there, so the case shows Stopped winning over a present verdict.
+    const auto verdict = cache.PrescanInbox()->verdicts.Read(setup.own_unit);
+    Require("PrescanMissCause", "the verdict outlives the stop",
+            verdict == PrescanUnitVerdict::CodeUnreadable,
+            "the stop cleared the unit's verdict, so Stopped had no refusal to win over");
+  }
+}
+
+// The GPU thread's part of one case, the lookup with the dispatch's queue and launch, and the
+// pipeline compile whose Scope is under test. The indirect arguments are real, though the program
+// never reads them.
+void RunMissLookups(GuestGpu &gpu, PipelineCache &cache, MissCase which) {
+  alignas(sizeof(u32)) static const std::array<u32, 3> group_counts{1, 1, 1};
+  ShaderComputeInputInfo start{};
+  start.async_compute = which == MissCase::Async;
+  start.indirect_args_address =
+      which == MissCase::Indirect ? reinterpret_cast<uint64_t>(group_counts.data()) : 0;
+  ShaderComputeInputInfo input{};
+  gpu.SendCommandSync([&] {
+    GeneratedLookup(cache, GENERATED_STRIDE_A, input, start);
+    (void)cache.GetComputePipeline(input);
+  });
+}
+
+// The miss hook of CheckPrescanMissCause. It reads what the miss noted and, for VerdictInMissHook,
+// has the preparer refuse the unit before the Scope opens.
+void NoteMissCaseMiss(PipelineCache &cache, MissCase which, MissSeen &seen) {
+  std::tie(seen.user_data_count, seen.static_state) =
+      PipelineCacheTestAccess::LookupUnitFields(cache);
+  seen.unit = PipelineCacheTestAccess::InlineComputeUnit(cache);
+  if (which == MissCase::VerdictInMissHook) {
+    SettlePrescanVerdict(cache, GENERATED_STRIDE_A, GeneratedCheckCode(), seen.unit,
+                         PrescanUnitVerdict::CodeUnreadable);
+  }
+}
+
+// Runs one case, with the same audio probe and holding as RunInFlightCase, so the compile's Scope
+// reaches a hold that is charged to the Scope's cause. PrescanOff starts from an empty report, so a
+// prescan block in it could only be its own.
+MissSeen RunMissCase(VulkanHarness &vulkan, GuestGpu &gpu, MissCase which, const MissSetup &setup) {
+  if (which == MissCase::PrescanOff) Common::FirstRunReport::Global().Reset();
+  PipelineCache cache(vulkan.RuntimeContext(), nullptr);
+  PipelineCacheTestAccess::EnableWarmCompute(cache);
+  PrepareMissCase(cache, which, setup);
+  MissSeen seen;
+  PrescanAudioProbe audio;
+  PipelineCacheTestAccess::SetInlineScopeHook(cache, [&audio] { audio.HoldDuringScope(); });
+  PipelineCacheTestAccess::SetInlineMissHook(cache, [&] { NoteMissCaseMiss(cache, which, seen); });
+  const auto before = Common::GpuStall::Breakdown();
+  const auto compiled_before = ShadersCompiledSoFar();
+  Common::GpuStall::Configure(true, std::chrono::milliseconds(0));
+  RunMissLookups(gpu, cache, which);
+  if (audio.thread.joinable()) audio.thread.join();
+  Common::GpuStall::Configure(false);
+  const auto after = Common::GpuStall::Breakdown();
+  for (size_t cause = 0; cause < Common::GpuStall::HOLD_CAUSE_COUNT; cause++) {
+    seen.holds[cause] = after.cause_count[cause] - before.cause_count[cause];
+  }
+  seen.held = audio.held;
+  seen.compiled = ShadersCompiledSoFar() - compiled_before;
+  seen.misses = cache.PrescanMisses();
+  seen.block = GlobalPrescanBlock();
+  cache.StopBuilds();
+  return seen;
+}
+
+// One case of CheckPrescanMissCause and what it must give. counted is false only for the case
+// without the prescan, which counts nothing.
+struct MissExpectation {
+  MissCase which;
+  const char *label;
+  PrescanMiss miss;
+  Common::GpuStall::HoldCause cause;
+  std::optional<PrescanUnitVerdict> refused;
+  uint64_t undrained = 0;
+  bool counted = true;
+};
+
+// Requires one case's outcome. The module was compiled inline once and its Scope held the audio
+// thread, exactly one hold was charged and to the expected cause, and the compile was counted once
+// under its reason with the live report's block showing the same. Without the prescan nothing is
+// counted and there is no block.
+void RequireMissCase(const MissExpectation &expected, const MissSeen &seen) {
+  constexpr const char *name = "PrescanMissCause";
+  const std::string label = expected.label;
+  Require(name, expected.label, seen.held && seen.compiled == 1,
+          label + ": the inline compile did not run once, or its Scope held no audio thread");
+  const auto total = std::accumulate(seen.holds.begin(), seen.holds.end(), uint64_t{0});
+  Require(name, expected.label, total == 1 && seen.holds[static_cast<size_t>(expected.cause)] == 1,
+          label + ": the hold was not charged once, to " +
+              Common::GpuStall::HoldCauseName(expected.cause));
+  if (!expected.counted) {
+    Require(name, expected.label, seen.misses.InlineCompiles() == 0 && seen.block.is_null(),
+            label + ": a compile without the prescan was counted, or wrote a prescan block");
+    return;
+  }
+  RequireMissCounted(name, label, seen.misses, seen.block, expected.miss, expected.refused,
+                     expected.undrained);
+}
+
+// The cases after NoDispatch, with what each must give.
+std::vector<MissExpectation> MissExpectations() {
+  using enum Common::GpuStall::HoldCause;
+  using enum PrescanMiss;
+  constexpr auto unreadable = PrescanUnitVerdict::CodeUnreadable;
+  constexpr auto built = PrescanUnitVerdict::Built;
+  return {
+      {MissCase::Async, "an async dispatch", NeverPostedAsync, PrescanNeverPostedAsync},
+      {MissCase::Indirect, "an indirect dispatch", NeverPostedIndirect, PrescanNeverPostedIndirect},
+      {MissCase::Deep, "past the scan's reach", NeverPostedDeep, PrescanNeverPostedDeep},
+      {MissCase::AtReach, "at the scan's reach", NeverPosted, RequiredCompute},
+      {MissCase::CodeUnreadable, "the unit refused", Refused, PrescanRefused, unreadable},
+      {MissCase::BuiltOtherStride, "built for another stride", Refused, PrescanRefused, built},
+      {MissCase::BuiltUndrained, "built with modules waiting", Refused, PrescanRefused, built, 1},
+      {MissCase::SlotSharerRefused, "a slot sharer refused", NeverPosted, RequiredCompute},
+      {MissCase::VerdictInMissHook, "refused after the miss", NeverPosted, RequiredCompute},
+      {MissCase::Stopped, "refused, then stopped", Stopped, RequiredCompute},
+      {MissCase::PrescanOff, "the prescan off", NeverPosted, RequiredCompute, {}, 0, false},
+  };
+}
+
+// The GPU thread's own compile of a compute module with the prescan on is counted once, under the
+// one reason the prescan did not deliver it, and charged to that reason's cause. Every case runs
+// the same lookup and pipeline compile on the GPU thread with the same audio probe, and differs
+// from NoDispatch in one thing only, which is the baseline and gives never_posted and
+// RequiredCompute.
+// Its unit, made from the GPU thread's key, is the one the test's preparer cases refuse.
+//
+// What else could pass each case, and how it is ruled out. An async, indirect or deep dispatch that
+// read as plain never-posted would fail its case. A boundary off by one would make AtReach deep. A
+// verdict for the program refused through the real preparer path gives refused under
+// code_unreadable, and a module built for another stride gives refused under built, since verdicts
+// are per unit. Only BuiltUndrained leaves modules in the inbox at the miss, so built_undrained
+// counts there and not in BuiltOtherStride, which is its baseline. A slot sharer's refusal reads
+// as nothing for the program, so a table read without its key would count refused there. A verdict
+// that appears only after the miss is lateness and counts never_posted, which a verdict read at the
+// Scope would not. A stopped prescan whose verdict is still there counts stopped, which the order
+// with refused first would not. Without the prescan nothing is counted, though the cause is the
+// same RequiredCompute, so counting compiles without the hand-off fails there.
+// The mutations, each with the case it fails.
+// The order with refused above stopped fails Stopped.
+// Comparing the depth with >= fails AtReach.
+// Reading the verdict when the Scope opens fails VerdictInMissHook.
+// Counting without the hand-off fails PrescanOff.
+// Leaving the async, indirect or depth read out fails Async, Indirect or Deep.
+// Mapping NeverPostedAsync to RequiredCompute fails Async.
+// Two mutations are caught first by checks that run before this one and stop the run. Making the
+// GPU thread's unit with another user-data count is caught first by PrescanInFlightCause's unit
+// check, and then by this check's own. With both skipped it fails CodeUnreadable. Reading the
+// table without the key is caught first by PrescanInFlightCause's OtherUnitHeld case. With that
+// check skipped it fails SlotSharerRefused.
+void CheckPrescanMissCause(VulkanHarness &vulkan, GuestGpu &gpu,
+                           const std::vector<DecodedModuleRecord> &records) {
+  constexpr const char *name = "PrescanMissCause";
+  Common::DebugCounters::SetEnabled(true);
+  const auto none = RunMissCase(vulkan, gpu, MissCase::NoDispatch, {});
+  RequireMissCase({MissCase::NoDispatch, "no dispatch", PrescanMiss::NeverPosted,
+                   Common::GpuStall::HoldCause::RequiredCompute},
+                  none);
+  const auto &own = GeneratedCheckCode();
+  MissSetup setup;
+  const auto unit_of = [&none](const std::vector<u32> &code) {
+    return PrescanUnitKey(XXH3_64bits(code.data(), code.size() * sizeof(u32)), none.user_data_count,
+                          none.static_state);
+  };
+  setup.own_unit = unit_of(own);
+  Require(name, "the unit", none.unit != 0 && none.unit == setup.own_unit,
+          "the GPU thread's unit is not the one made from its key and the program's code");
+  InFlightSeen key;
+  key.user_data_count = none.user_data_count;
+  key.static_state = none.static_state;
+  setup.sharer = &MapSlotSharingProgram(key, setup.own_unit);
+  setup.sharer_unit = unit_of(*setup.sharer);
+  setup.other_stride_record = &records[1];
+  for (const auto &expected : MissExpectations()) {
+    RequireMissCase(expected, RunMissCase(vulkan, gpu, expected.which, setup));
+  }
+  Common::FirstRunReport::Global().Reset();
+  Common::DebugCounters::SetEnabled(false);
+  std::printf("[gpu]     %-32s ok\n", name);
 }
 
 // A prescan module with a bad plan is refused by the prescan's own planner and leaves the
@@ -65114,12 +65478,15 @@ bool CacheBlockPreparerMatches(const nlohmann::json &block, PipelineCache &cache
 
 // The cache's figures, with no scanner key, since no GPU with a scanner runs here. The figures
 // that show the dispatch went the whole way must not be 0, so a block of zeros against zeros
-// cannot pass. The module's build ran on a worker, so it counts as a worker build too.
+// cannot pass. The module's build ran on a worker, so it counts as a worker build too. The misses
+// are the cache's too, with every name written though nothing compiled inline.
 bool CacheBlockMatches(const nlohmann::json &block, PipelineCache &cache) {
   return block.is_object() && !block.contains("scan") && !block.contains("child") &&
          BlockCount(block, "/preparer/items", 1) && BlockCount(block, "/drain/adopted", 1) &&
          BlockCount(block, "/builds/builds", 1) && BlockCount(block, "/builds/worker_builds", 1) &&
-         CacheBlockPreparerMatches(block, cache) && CacheBlockDrainBuildsRecordsMatch(block, cache);
+         CacheBlockPreparerMatches(block, cache) &&
+         CacheBlockDrainBuildsRecordsMatch(block, cache) &&
+         MissesBlockMatches(block, cache.PrescanMisses());
 }
 
 // The builds and records part of CheckPrescanCacheConverters. Each figure takes the next value from
@@ -65150,6 +65517,42 @@ void CheckPrescanBuildsAndRecordsConverters(uint64_t next) {
               records.dropped_over_cap == counters.dropped_over_cap &&
               records.unused_at_exit == counters.unused_at_exit,
           "a record figure was not copied from its own field");
+}
+
+// The misses part of CheckPrescanCacheConverters. Every count has a value of its own, and every
+// reason and verdict must come out under the name written out here, in the enum's order, so a name
+// table shifted by one, a count copied from its neighbour, or a name left out fails.
+// inline_compiles must be the sum of the reasons. The mutation is to shift the reason names by one.
+void CheckPrescanMissesConverter() {
+  constexpr const char *name = "PrescanCacheConverters";
+  // Away from 0 and from the other converters' values.
+  constexpr uint64_t FIRST_VALUE = 901;
+  uint64_t next = FIRST_VALUE;
+  PrescanMissCounts counts;
+  for (auto &count : counts.by_reason) count = next++;
+  for (auto &count : counts.refused_by) count = next++;
+  counts.built_undrained = next++;
+  const auto report = PrescanMissesReportOf(counts);
+  const std::array<const char *, PRESCAN_MISS_COUNT> reasons{
+      "module_present",        "in_flight",          "stopped",     "refused", "never_posted_deep",
+      "never_posted_indirect", "never_posted_async", "never_posted"};
+  const std::array<const char *, PRESCAN_REFUSED_VERDICT_COUNT> verdicts{
+      "admitted", "deferred", "built",      "rejected",        "indirect_args", "retired",
+      "compile_failed", "capped", "settled", "backed_off", "code_unreadable", "code_changed"};
+  bool same = report.by_reason.size() == reasons.size() &&
+              report.refused_by.size() == verdicts.size();
+  for (size_t reason = 0; same && reason < reasons.size(); reason++) {
+    same = report.by_reason[reason].first == reasons[reason] &&
+           report.by_reason[reason].second == counts.by_reason[reason];
+  }
+  for (size_t verdict = 0; same && verdict < verdicts.size(); verdict++) {
+    same = report.refused_by[verdict].first == verdicts[verdict] &&
+           report.refused_by[verdict].second == counts.refused_by[verdict];
+  }
+  const auto sum = std::accumulate(counts.by_reason.begin(), counts.by_reason.end(), uint64_t{0});
+  Require(name, "the misses",
+          same && report.inline_compiles == sum && report.built_undrained == counts.built_undrained,
+          "a miss count was not written under its own name, or inline_compiles is not their sum");
 }
 
 // The converters of the drain, the builds and the records copy each figure into its own place.
@@ -65185,6 +65588,7 @@ void CheckPrescanCacheConverters() {
               drain.both_lag_ms_max == both.drain_lag_ms_max,
           "a drain figure was not copied from its own field and producer");
   CheckPrescanBuildsAndRecordsConverters(next);
+  CheckPrescanMissesConverter();
   std::printf("[gpu]     %-32s ok\n", name);
 }
 
@@ -65363,6 +65767,7 @@ void CheckPrescanIntake(VulkanHarness &vulkan) {
       CheckPrescanRunningWorkerOnly(vulkan, gpu, records);
       CheckPrescanInlineTake(vulkan, gpu, records);
       CheckPrescanInFlightCause(vulkan, gpu);
+      CheckPrescanMissCause(vulkan, gpu, records);
       CheckPrescanPlannerSeparate(vulkan, gpu, records);
       CheckPrescanDrainsFirst(vulkan, gpu, records);
       CheckPrescanTwoProducers(vulkan, gpu, records);
@@ -66202,6 +66607,108 @@ void CheckPrescanSinkWithoutStore(VulkanHarness &vulkan, const DecodedModuleReco
   std::printf("[gpu]     %-32s ok\n", name);
 }
 
+// What one run of CheckDispatchDepthSeen saw. outside is the depth a command read outside any
+// submission, at_miss the depth the miss hook read, noted how many misses ran the hook, and misses
+// the cache's counts after the dispatch's pipeline compile.
+struct DepthSeen {
+  bool complete = false;
+  uint32_t outside = UINT32_MAX;
+  uint32_t at_miss = UINT32_MAX;
+  uint32_t noted = 0;
+  PrescanMissCounts misses;
+};
+
+// An INDIRECT_BUFFER packet that calls `buffer`.
+std::vector<u32> PrescanCallOf(const std::vector<u32> &buffer) {
+  const auto address = reinterpret_cast<uint64_t>(buffer.data());
+  return {KYTY_PM4(PRESCAN_IB_DWORDS, Pm4::IT_INDIRECT_BUFFER, 0), static_cast<u32>(address),
+          static_cast<u32>(address >> PRESCAN_ADDRESS_HIGH_DWORD_SHIFT),
+          static_cast<u32>(buffer.size())};
+}
+
+// The scanned key check's stream with its dispatch moved behind `calls` nested indirect buffer
+// calls. buffers[0] holds the dispatch and each later one calls the one before, and the vector is
+// sized first, so no buffer moves once a call names it.
+std::vector<u32> StreamBehindCalls(std::span<const u32> program, u32 calls,
+                                   std::vector<std::vector<u32>> &buffers) {
+  auto stream = ScanKeyStream(reinterpret_cast<uint64_t>(program.data()), 0u);
+  std::vector<u32> innermost(stream.end() - SCAN_KEY_DISPATCH_DWORDS, stream.end());
+  stream.resize(stream.size() - SCAN_KEY_DISPATCH_DWORDS);
+  buffers.assign(calls, {});
+  for (u32 level = 0; level < calls; level++) {
+    buffers[level] = std::move(innermost);
+    innermost = PrescanCallOf(buffers[level]);
+  }
+  stream.insert(stream.end(), innermost.begin(), innermost.end());
+  return stream;
+}
+
+// Runs the stream through the command processor on the GPU thread of a fresh render context with
+// the prescan on, so the dispatch takes the emulator's own path to its lookup's miss, and the miss
+// hook reads the depth there. The context is fresh, so the lookup misses.
+DepthSeen RunDepthCase(VulkanHarness &vulkan, u32 calls) {
+  std::vector<std::vector<u32>> buffers;
+  const auto stream = StreamBehindCalls(ScanKeyProgram(), calls, buffers);
+  RenderContext context(vulkan.RuntimeContext(), std::filesystem::path{});
+  auto &cache = context.GetPipelineCache();
+  cache.EnablePrescan(StoreGen::InProcessPrescanTransportFactory());
+  context.InitializeGpu(nullptr);
+  LibKernel::Memory::InstallGpuResources(&context);
+  DepthSeen seen;
+  PipelineCacheTestAccess::SetInlineMissHook(cache, [&seen] {
+    seen.at_miss = GuestGpu::CurrentDispatchDepth();
+    seen.noted++;
+  });
+  context.GetGpu().SendCommandSync([&] {
+    seen.outside = GuestGpu::CurrentDispatchDepth();
+    CommandProcessor processor(context, SCAN_KEY_GRAPHICS_QUEUE);
+    processor.BufferInit();
+    Pm4Execution execution;
+    seen.complete = processor.Process(execution, stream) == Pm4ProcessResult::Complete;
+    context.GetCommandScheduler().Finish();
+  });
+  seen.misses = cache.PrescanMisses();
+  context.ShutdownGpu();
+  LibKernel::Memory::InstallGpuResources(nullptr);
+  return seen;
+}
+
+// The depth the GPU thread reads at a compute miss is the command processor's real buffer stack,
+// read from the miss hook of a dispatch the processor runs, so production pays nothing for the
+// check. The top-level dispatch is the baseline and reads 1, and one behind two calls reads 3, so a
+// constant cannot pass both. A command outside any submission reads 0. The runs behind 16 and 17
+// calls tie the real depth to the reason with no test seam, the first at the scan's reach and plain
+// never-posted, the second past it and deep. The mutations are to return 0, which fails the
+// baseline, and to count the stack one high, which fails it too.
+void CheckDispatchDepthSeen(VulkanHarness &vulkan) {
+  constexpr const char *name = "DispatchDepthSeen";
+  struct DepthCase {
+    u32 calls;
+    PrescanMiss miss;
+  };
+  const std::array<DepthCase, 4> cases{{{0, PrescanMiss::NeverPosted},
+                                        {2, PrescanMiss::NeverPosted},
+                                        {SCAN_MAX_IB_DEPTH, PrescanMiss::NeverPosted},
+                                        {SCAN_MAX_IB_DEPTH + 1, PrescanMiss::NeverPostedDeep}}};
+  for (const auto &test : cases) {
+    const auto seen = RunDepthCase(vulkan, test.calls);
+    const std::string label = std::to_string(test.calls) + " calls";
+    Require(name, "the stream runs", seen.complete && seen.noted == 1,
+            label + ": the stream did not complete with one noted miss");
+    Require(name, "no stack outside a submission", seen.outside == 0,
+            label + ": a command outside any submission read a buffer depth");
+    Require(name, "the depth", seen.at_miss == test.calls + 1,
+            label + ": the miss read depth " + std::to_string(seen.at_miss));
+    const auto reason = static_cast<size_t>(test.miss);
+    Require(name, "the reason",
+            seen.misses.InlineCompiles() == 1 && seen.misses.by_reason[reason] == 1,
+            label + ": the compile was not counted once under " + PRESCAN_MISS_NAMES[reason]);
+  }
+  // Each context's cache registered its figures with the report, which later checks start without.
+  Common::FirstRunReport::Global().Reset();
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
 // The prescan run from GuestGpu. The sink check needs a module record, which is captured from a store
 // written as CheckPrescanIntake writes its own.
 void CheckPrescanGuestGpu(VulkanHarness &vulkan) {
@@ -66211,6 +66718,7 @@ void CheckPrescanGuestGpu(VulkanHarness &vulkan) {
   CheckPrescanSuspendPointResets(vulkan);
   CheckPrescanShutdownOrder(vulkan);
   CheckPrescanSingleProducer(vulkan);
+  CheckDispatchDepthSeen(vulkan);
   const auto store = PrescanStorePath("gpu_record");
   {
     PipelineCache writer(vulkan.RuntimeContext(), nullptr);

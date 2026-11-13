@@ -503,7 +503,7 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		if (module != nullptr) return bind(*module);
 	}
 	if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
-		NoteInlineComputeMiss();
+		NoteInlineComputeMiss(input_info);
 	}
 
 	// Everything from here to the driver's pipeline compile is translation, SPIR-V emission and

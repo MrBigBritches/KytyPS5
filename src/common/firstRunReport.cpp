@@ -1528,6 +1528,23 @@ nlohmann::json PrescanBuildsToJson(const PrescanBuildsReport& builds) {
 	          {"in_hold_ms", Round3(builds.in_hold_ms)}}}};
 }
 
+// Writes the GPU thread's own compute compiles by reason. The reasons and the verdicts are objects
+// by name, and the one upper bound sits in an object named for what it is, so nothing gates on it.
+nlohmann::json PrescanMissesToJson(const PrescanMissesReport& misses) {
+	nlohmann::json by_reason = nlohmann::json::object();
+	for (const auto& [name, count]: misses.by_reason) {
+		by_reason[name] = count;
+	}
+	nlohmann::json refused_by = nlohmann::json::object();
+	for (const auto& [name, count]: misses.refused_by) {
+		refused_by[name] = count;
+	}
+	return {{"inline_compiles", misses.inline_compiles},
+	        {"by_reason", by_reason},
+	        {"refused_by", refused_by},
+	        {"upper_bounds", {{"built_undrained", misses.built_undrained}}}};
+}
+
 // Adds the pipeline cache's part to the prescan block, next to whatever keys the scanner gave it.
 void AddPrescanCacheToJson(const PrescanCacheReport& figures, nlohmann::json& block) {
 	block["state"]    = PrescanStateToJson(figures.state);
@@ -1539,6 +1556,7 @@ void AddPrescanCacheToJson(const PrescanCacheReport& figures, nlohmann::json& bl
 	block["builds"]  = PrescanBuildsToJson(figures.builds);
 	// The GPU thread's own compiles, kept apart from the prescan's builds.
 	block["holds"]   = {{"in_flight_at_miss_only", figures.holds.in_flight_at_miss_only}};
+	block["misses"]  = PrescanMissesToJson(figures.misses);
 	block["records"] = {{"stored_first_use", figures.records.stored_first_use},
 	                    {"retained_peak_bytes", figures.records.retained_peak_bytes},
 	                    {"dropped_over_cap", figures.records.dropped_over_cap},

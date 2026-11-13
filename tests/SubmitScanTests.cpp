@@ -6,6 +6,7 @@
 #include "graphics/guest_gpu/command_processor/scanScratch.h"
 #include "graphics/guest_gpu/command_processor/submitScan.h"
 #include "graphics/guest_gpu/pm4.h"
+#include "graphics/host_gpu/renderer/pipeline/prescanMiss.h"
 
 #include <algorithm>
 #include <atomic>
@@ -608,6 +609,48 @@ void TestChainAddsNoDepth() {
 	const auto by_call  = Scan(call_commands, called, call_shadow);
 	CHECK(by_chain.dispatches.size() == 1 && by_chain.stats.ib_depth_limited == 0);
 	CHECK(by_call.dispatches.empty() && by_call.stats.ib_depth_limited >= 1);
+}
+
+// The scan of a dispatch behind `calls` nested indirect buffer calls, each buffer at an address of
+// its own so none is a revisit.
+ScanResult ScanBehindCalls(uint32_t calls) {
+	constexpr uint64_t BASE               = 0xA0000u;
+	constexpr uint64_t STRIDE             = 0x1000u;
+	constexpr uint32_t CALL_PACKET_DWORDS = 4;
+	FakeMemory         memory;
+	// The dwords of the buffer at a level, which holds the dispatch at the last level and a call
+	// before it.
+	const auto dwords_at = [calls](uint32_t level) {
+		return level == calls ? DISPATCH_PACKET_DWORDS : CALL_PACKET_DWORDS;
+	};
+	for (uint32_t level = 1; level <= calls; ++level) {
+		const uint64_t address = BASE + level * STRIDE;
+		memory.regions[address] = level == calls
+		                              ? Dispatch(1, 1, 1, 0)
+		                              : IndirectBuffer(address + STRIDE, dwords_at(level + 1));
+	}
+	Stream commands = SetProgram();
+	Append(commands,
+	       calls == 0 ? Dispatch(1, 1, 1, 0) : IndirectBuffer(BASE + STRIDE, dwords_at(1)));
+	CsShadow shadow;
+	return Scan(commands, memory, shadow);
+}
+
+// The GPU thread calls a dispatch deep when it ran with more buffers on the command processor's
+// stack than the scan reaches. The stack holds the top-level list too, so a dispatch behind n calls
+// runs with n + 1 on it. For every n from the top level to two past the walk's limit, the real walk
+// finds the dispatch exactly when the GPU thread would not call it deep, so the bound and the walk
+// agree at 17 against 18 and nowhere else. A dispatch with no stack at all is never deep. The
+// mutation is to compare with >=, and the dispatch the walk finds behind 16 calls reads deep.
+void TestDeepBoundary() {
+	CHECK(PRESCAN_SCAN_REACH_STACK_DEPTH == SCAN_MAX_IB_DEPTH + 1);
+	CHECK(!IsDeepDispatch(0));
+	for (uint32_t calls = 0; calls <= SCAN_MAX_IB_DEPTH + 2; ++calls) {
+		const auto result = ScanBehindCalls(calls);
+		const bool found  = result.dispatches.size() == 1;
+		CHECK(found == !IsDeepDispatch(calls + 1));
+		CHECK(found == (result.stats.ib_depth_limited == 0));
+	}
 }
 
 // Three buffers at different addresses holding the same dispatch, so none is a revisit, used by the
@@ -2179,6 +2222,7 @@ int main() {
 	TestAsyncQueueFlag();
 	TestDepthSixFoundOnlyBeyondOldLimit();
 	TestChainAddsNoDepth();
+	TestDeepBoundary();
 	TestSettledCacheKeepsCoverage();
 	TestCacheProbesAtInterval();
 	TestUncertainDispatchLeavesCacheAlone();

@@ -895,6 +895,32 @@ struct PrescanHoldsReport {
 	uint64_t in_flight_at_miss_only = 0;
 };
 
+/// Why the GPU thread compiled compute pipelines itself with the prescan on, by name, with every
+/// name present even at 0. These count compiles, one per pipeline Scope and not per translation,
+/// while the holds by cause count holds of guest audio. A cause's holds are at most its compiles,
+/// and for RequiredCompute those are module_present + stopped + never_posted. Nested Scopes charge
+/// a hold to the oldest one's cause. inline_compiles is the sum of by_reason. never_posted_deep,
+/// never_posted_indirect and never_posted_async are attributes of the dispatch, not proof of why it
+/// was missed.
+///
+/// How to read a run. A run without the prescan charges every inline compute hold to
+/// required_compute, so a prescan run is compared with it through the sum of required_compute,
+/// prescan_in_flight, prescan_refused and the three prescan_never_posted causes, never through
+/// required_compute alone. RequiredCompute time stands for never-posted modules only when stopped
+/// is 0 and module_present is small, since those share the cause. Verdicts are per unit, so until
+/// misses record whether the scanner saw the dispatch, refused includes a specialization the
+/// scanner never posted of a unit it did post. It also includes a unit between its plan's answer
+/// and its compile's send, which reads admitted. A large verdicts_evicted overstates never_posted
+/// and understates refused. refused_by keeps the first throttle a unit met, since a throttle never
+/// replaces another. built_undrained is an upper bound on the refused misses with a built verdict
+/// whose module was still in the generated inbox, since the generator posts there too.
+struct PrescanMissesReport {
+	uint64_t                                      inline_compiles = 0;
+	std::vector<std::pair<std::string, uint64_t>> by_reason;
+	std::vector<std::pair<std::string, uint64_t>> refused_by;
+	uint64_t                                      built_undrained = 0;
+};
+
 /// What became of the store records of the prescan's modules, which wait for each module's first
 /// use. While the cache runs these are the figures the last drain published, so a first use after
 /// the last drain shows only once a later drain, or the stop, publishes again.
@@ -914,6 +940,7 @@ struct PrescanCacheReport {
 	PrescanDrainReport                drain;
 	PrescanBuildsReport               builds;
 	PrescanHoldsReport                holds;
+	PrescanMissesReport               misses;
 	PrescanRecordsReport              records;
 };
 

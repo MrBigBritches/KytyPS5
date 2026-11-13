@@ -209,6 +209,23 @@ PrescanRecordsReportOf(const RetainedRecordCounters& records) {
 	        .unused_at_exit      = records.unused_at_exit};
 }
 
+// Every name is written, so a reason or verdict that never happened shows as 0 and not as missing.
+Common::FirstRunReport::PrescanMissesReport PrescanMissesReportOf(const PrescanMissCounts& counts) {
+	Common::FirstRunReport::PrescanMissesReport report;
+	report.inline_compiles = counts.InlineCompiles();
+	report.by_reason.reserve(PRESCAN_MISS_COUNT);
+	for (size_t reason = 0; reason < PRESCAN_MISS_COUNT; ++reason) {
+		report.by_reason.emplace_back(PRESCAN_MISS_NAMES[reason], counts.by_reason[reason]);
+	}
+	report.refused_by.reserve(PRESCAN_REFUSED_VERDICT_COUNT);
+	for (size_t verdict = 0; verdict < PRESCAN_REFUSED_VERDICT_COUNT; ++verdict) {
+		report.refused_by.emplace_back(PRESCAN_REFUSED_VERDICT_NAMES[verdict],
+		                               counts.refused_by[verdict]);
+	}
+	report.built_undrained = counts.built_undrained;
+	return report;
+}
+
 // The state's lock is taken alone and released before the preparer's and the supervisor's own locks
 // are taken, so no two of them are ever held together. The preparer and its transport outlive its
 // stop, so a source called after StopPrescan still reads live objects.
@@ -237,6 +254,7 @@ PipelineCache::BuildPrescanReport(bool final_figures) const {
 	report.drain                        = PrescanDrainReportOf(prescan_drain, both_drain);
 	report.builds                       = PrescanBuildsReportOf(PrescanBuilds());
 	report.holds.in_flight_at_miss_only = PrescanInFlightAtMissOnly();
+	report.misses                       = PrescanMissesReportOf(PrescanMisses());
 	report.records                      = PrescanRecordsReportOf(records);
 	return report;
 }
@@ -265,13 +283,30 @@ void PipelineCache::FinishPrescanReport() {
 
 // The hand-off is tested first, so a run without the prescan pays one null test. The unit is made
 // by the one function the preparer makes it with, from the fields of the key the lookup missed.
-void PipelineCache::NoteInlineComputeMiss() {
+// The preparer writes a unit's verdict before it clears the unit's in-flight mark, behind a release
+// fence. The acquire fence here pairs with it, so a miss that sees the unit cleared also sees the
+// verdict that ended its request. x86 orders these loads anyway, so only review shows the fence
+// is needed. The test hook runs last, so what it changes is never read here.
+void PipelineCache::NoteInlineComputeMiss(const ShaderComputeInputInfo& input_info) {
 	if (m_prescan_handoff == nullptr || !GuestGpu::IsGpuThread()) {
 		return;
 	}
+	const auto& handoff   = *m_prescan_handoff;
 	m_inline_compute_unit = PrescanUnitKey(m_lookup_key.hash, m_lookup_key.user_data_count,
 	                                       m_lookup_key.static_state);
-	m_inline_compute_in_flight = m_prescan_handoff->in_flight.Contains(m_inline_compute_unit);
+	m_inline_compute_in_flight = handoff.in_flight.Contains(m_inline_compute_unit);
+	std::atomic_thread_fence(std::memory_order_acquire);
+	const auto     verdict = handoff.verdicts.Read(m_inline_compute_unit);
+	const bool     stopped = handoff.preparer_stopped.load(std::memory_order_acquire);
+	const uint32_t depth   = m_dispatch_depth_for_test != 0 ? m_dispatch_depth_for_test
+	                                                        : GuestGpu::CurrentDispatchDepth();
+	m_inline_compute_unposted =
+	    ClassifyUnposted(verdict, stopped, IsDeepDispatch(depth),
+	                     input_info.indirect_args_address != 0, input_info.async_compute);
+	m_inline_compute_verdict = verdict;
+	// The generator posts into the same inbox, so a module waiting there may not be this unit's.
+	m_inline_compute_undrained = verdict == PrescanUnitVerdict::Built &&
+	                             m_has_generated.load(std::memory_order_relaxed);
 	if (m_inline_miss_hook) {
 		m_inline_miss_hook();
 	}
@@ -287,7 +322,9 @@ void PipelineCache::NoteInlineComputeModule(uint64_t module_id) noexcept {
 // The id check keeps the note of one lookup from naming another module's compile, such as one whose
 // lookup missed but whose pipeline was already made. Both reads are relaxed loads of the table, so
 // the GPU thread never waits on the preparer. The table is read even when the miss already said in
-// flight, so a stop the miss alone accounts for can be counted apart.
+// flight, so a stop the miss alone accounts for can be counted apart. Without the prescan nothing
+// is noted, so the reason is ModulePresent, whose cause is the RequiredCompute this always gave,
+// and nothing is counted, so the report stays as it was.
 Common::GpuStall::HoldCause PipelineCache::InlineComputeCause(uint64_t module_id) noexcept {
 	const bool noted = m_prescan_handoff != nullptr && m_inline_compute_unit != 0 &&
 	                   module_id == m_inline_compute_id;
@@ -296,9 +333,48 @@ Common::GpuStall::HoldCause PipelineCache::InlineComputeCause(uint64_t module_id
 	if (at_miss && !at_scope) {
 		m_in_flight_at_miss_only.fetch_add(1, std::memory_order_relaxed);
 	}
+	const auto miss = ClassifyMiss(noted, at_miss || at_scope, m_inline_compute_unposted);
+	if (m_prescan_handoff != nullptr) {
+		NoteDispatchCompile(miss, m_inline_compute_verdict, m_inline_compute_undrained);
+	}
 	ResetInlineCompute();
-	return at_miss || at_scope ? Common::GpuStall::HoldCause::PrescanInFlight
-	                           : Common::GpuStall::HoldCause::RequiredCompute;
+	return HoldCauseOf(miss);
+}
+
+// Only a refused miss has a verdict to count it under, and only a Built one can be undrained. The
+// counts are bumped from the widest to the narrowest with a release fence between, and
+// PrescanMisses reads them in the other order with acquire fences, so a snapshot never shows a
+// subset count above the count it is part of. Neither fence costs anything on x86.
+void PipelineCache::NoteDispatchCompile(PrescanMiss miss, PrescanUnitVerdict verdict,
+                                        bool undrained) noexcept {
+	auto& counters = m_prescan_misses;
+	counters.by_reason[static_cast<size_t>(miss)].fetch_add(1, std::memory_order_relaxed);
+	if (miss != PrescanMiss::Refused || verdict == PrescanUnitVerdict::None) {
+		return;
+	}
+	std::atomic_thread_fence(std::memory_order_release);
+	counters.refused_by[RefusedVerdictIndex(verdict)].fetch_add(1, std::memory_order_relaxed);
+	if (undrained) {
+		std::atomic_thread_fence(std::memory_order_release);
+		counters.built_undrained.fetch_add(1, std::memory_order_relaxed);
+	}
+}
+
+// Read from the narrowest count to the widest (see NoteDispatchCompile).
+PrescanMissCounts PipelineCache::PrescanMisses() const noexcept {
+	PrescanMissCounts counts;
+	counts.built_undrained = m_prescan_misses.built_undrained.load(std::memory_order_relaxed);
+	std::atomic_thread_fence(std::memory_order_acquire);
+	for (size_t verdict = 0; verdict < PRESCAN_REFUSED_VERDICT_COUNT; ++verdict) {
+		counts.refused_by[verdict] =
+		    m_prescan_misses.refused_by[verdict].load(std::memory_order_relaxed);
+	}
+	std::atomic_thread_fence(std::memory_order_acquire);
+	for (size_t reason = 0; reason < PRESCAN_MISS_COUNT; ++reason) {
+		counts.by_reason[reason] =
+		    m_prescan_misses.by_reason[reason].load(std::memory_order_relaxed);
+	}
+	return counts;
 }
 
 } // namespace Libs::Graphics

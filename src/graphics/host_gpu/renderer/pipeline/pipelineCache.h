@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptorSetLayoutCache.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineBuildQueue.h"
+#include "graphics/host_gpu/renderer/pipeline/prescanMiss.h"
 #include "graphics/host_gpu/renderer/pipeline/retainedRecords.h"
 #include "graphics/host_gpu/renderer/pipeline/warmBuildSet.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
@@ -68,7 +69,6 @@ struct GraphicContext;
 struct ShaderParams;
 class CommandBuffer;
 class GraphicsLibraryCache;
-struct PrescanHandoff;
 class PrescanPreparer;
 struct PrescanPreparerConfig;
 
@@ -293,6 +293,10 @@ PrescanBuildsReportOf(const PrescanBuildStats& builds);
 /// The first-run report's view of what became of the prescan's store records.
 [[nodiscard]] Common::FirstRunReport::PrescanRecordsReport
 PrescanRecordsReportOf(const RetainedRecordCounters& records);
+/// The first-run report's view of the GPU thread's own compute compiles by reason, with every
+/// reason and every refusing verdict named, those still at 0 too.
+[[nodiscard]] Common::FirstRunReport::PrescanMissesReport
+PrescanMissesReportOf(const PrescanMissCounts& counts);
 
 // What a draw that has no pipeline yet does while the pipeline builds. A skipped draw leaves out its
 // commands, a deferred draw becomes a hole in the command stream that is recorded once the pipeline
@@ -490,6 +494,11 @@ public:
 	[[nodiscard]] uint64_t PrescanInFlightAtMissOnly() const noexcept {
 		return m_in_flight_at_miss_only.load(std::memory_order_relaxed);
 	}
+	// The GPU thread's own compute pipeline compiles with the prescan on, by the reason the prescan
+	// did not deliver the module. Each count is exact when read, and they are read one by one, so a
+	// compile counted meanwhile may show in one and not another, though never in built_undrained or
+	// refused_by without its reason. All 0 without the prescan. Any thread.
+	[[nodiscard]] PrescanMissCounts PrescanMisses() const noexcept;
 
 private:
 	friend struct PipelineCacheTestAccess;
@@ -673,10 +682,27 @@ private:
 	uint64_t m_inline_compute_id        = 0;
 	uint64_t m_inline_compute_unit      = 0;
 	bool     m_inline_compute_in_flight = false;
+	// What else the miss read, kept with the note for the compile's reason. The reason the miss
+	// gives if the unit turns out not in flight, the unit's verdict, and whether the verdict was
+	// Built while the generated inbox had modules waiting. Only the GPU thread touches them.
+	PrescanMiss        m_inline_compute_unposted  = PrescanMiss::NeverPosted;
+	PrescanUnitVerdict m_inline_compute_verdict   = PrescanUnitVerdict::None;
+	bool               m_inline_compute_undrained = false;
 	// How many GPU-thread compiles were charged to PrescanInFlight by the check at the miss alone,
 	// with the unit no longer in flight when the Scope opened. Written by the GPU thread, read by
 	// anyone.
 	std::atomic<uint64_t> m_in_flight_at_miss_only {0};
+	// The counts behind PrescanMisses. Written by the GPU thread, read by anyone.
+	struct PrescanMissCounters {
+		std::array<std::atomic<uint64_t>, PRESCAN_MISS_COUNT>            by_reason {};
+		std::array<std::atomic<uint64_t>, PRESCAN_REFUSED_VERDICT_COUNT> refused_by {};
+		std::atomic<uint64_t>                                            built_undrained {0};
+	};
+	PrescanMissCounters m_prescan_misses;
+	// A test sets the buffer depth the miss reads in place of the command processor's, which a
+	// lookup outside a submission does not have. 0 reads the real one. It is read only at a miss
+	// with the prescan on, so production pays nothing for it.
+	uint32_t m_dispatch_depth_for_test = 0;
 	// Test hooks on the GPU thread's own compute compile with the prescan on. The miss hook runs just
 	// after the in-flight check at the lookup's miss and before translation, and the Scope hook runs
 	// inside the pipeline compile's Scope. Set before the lookup. Empty in production.
@@ -828,22 +854,34 @@ private:
 		m_inline_compute_id        = 0;
 		m_inline_compute_unit      = 0;
 		m_inline_compute_in_flight = false;
+		m_inline_compute_unposted  = PrescanMiss::NeverPosted;
+		m_inline_compute_verdict   = PrescanUnitVerdict::None;
+		m_inline_compute_undrained = false;
 	}
 	// pipelinePrescan.cpp. Notes, at a compute lookup's miss on the GPU thread, the prescan unit of
 	// the program in m_lookup_key and whether the preparer has it in flight. Translation may take
 	// hundreds of ms outside any Scope, and the helper may answer meanwhile, so the answer at the
-	// miss counts as well as the one when the Scope opens. It does nothing without the prescan or on
-	// another thread.
-	void NoteInlineComputeMiss();
+	// miss counts as well as the one when the Scope opens. It also notes the reason the miss gives
+	// should the unit not be in flight, from the unit's verdict, whether the prescan had stopped,
+	// and the dispatch's depth, indirect address and queue. Those are read here only, so a verdict
+	// that appears during translation is lateness, which the in-flight check at the Scope catches
+	// if the unit was sent meanwhile. It does nothing without the prescan or on another thread.
+	void NoteInlineComputeMiss(const ShaderComputeInputInfo& input_info);
 	// Keeps the id of the module a noted miss compiled, for InlineComputeCause.
 	void NoteInlineComputeModule(uint64_t module_id) noexcept;
 	// The hold cause of the GPU thread's pipeline compile of `module_id`, picked before its Scope
-	// opens with lock-free reads only. It is PrescanInFlight when the module is the one the last
-	// noted miss compiled and the preparer had its unit in flight at the miss or has it now, and
-	// RequiredCompute otherwise. The table is kept by unit, so a request for another specialization
-	// of the same unit counts too. A stop charged by the check at the miss alone is counted in
-	// m_in_flight_at_miss_only. It forgets the note.
+	// opens with lock-free reads only. It is the cause of the compile's PrescanMiss. That is
+	// ModulePresent when the module is not the one the last noted miss compiled, InFlight when the
+	// preparer had its unit in flight at the miss or has it now, and the reason the miss noted
+	// otherwise. The table is kept by unit, so a request for another specialization of the same
+	// unit counts too. A stop charged by the check at the miss alone is counted in
+	// m_in_flight_at_miss_only. With the prescan on, the reason is counted once here and nowhere
+	// else, so the counts add up to the inline compute Scopes. It forgets the note.
 	[[nodiscard]] Common::GpuStall::HoldCause InlineComputeCause(uint64_t module_id) noexcept;
+	// pipelinePrescan.cpp. Counts one inline compute compile under its reason, and a refused one
+	// under its verdict too. Relaxed atomics with release fences between, so a reader that sees a
+	// narrower count also sees the wider one it is part of.
+	void NoteDispatchCompile(PrescanMiss miss, PrescanUnitVerdict verdict, bool undrained) noexcept;
 	// pipelineGeneration.cpp. Makes the module of a prescan record on the preparer's thread and posts
 	// it, as PostGeneratedModule does for the generator. The record's bytes, as the helper encoded
 	// them, travel with the module so its first use can store them without encoding them again. Empty

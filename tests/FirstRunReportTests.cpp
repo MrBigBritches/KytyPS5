@@ -2275,8 +2275,8 @@ using Common::FirstRunReport::PrescanCacheReport;
 
 // The keys each part of the prescan block writes at its top level.
 const std::vector<std::string> PRESCAN_SCANNER_KEYS = {"scan", "queue", "thread", "reads", "offer"};
-const std::vector<std::string> PRESCAN_CACHE_KEYS   = {"state",  "preparer", "drain",
-                                                       "builds", "holds",    "records"};
+const std::vector<std::string> PRESCAN_CACHE_KEYS   = {"state", "preparer", "drain",  "builds",
+                                                       "holds", "misses",   "records"};
 
 // The top-level keys of a JSON object, in the object's own order.
 std::vector<std::string> KeysOf(const nlohmann::json& object) {
@@ -2313,6 +2313,7 @@ PrescanCacheReport SomeCacheFigures() {
 	figures.builds.builds                = 5;
 	figures.records.unused_at_exit       = 6;
 	figures.holds.in_flight_at_miss_only = 7;
+	figures.misses.inline_compiles       = 8;
 	return figures;
 }
 
@@ -2334,13 +2335,15 @@ nlohmann::json BlockOfParts(const std::optional<PrescanScannerReport>& scanner,
 // only when there is one.
 void TestPrescanCacheBlockMerges() {
 	const auto                     cache_block = BlockOfParts(std::nullopt, SomeCacheFigures());
-	const std::vector<std::string> cache_keys  = {"builds",   "drain",   "holds",
+	const std::vector<std::string> cache_keys  = {"builds", "drain",   "holds", "misses",
 	                                              "preparer", "records", "state"};
 	Check(cache_block.is_object() && KeysOf(cache_block) == cache_keys,
 	      "the cache alone did not make a block of exactly its own keys");
 	Check(cache_block["state"]["posted"] == 2 && cache_block["records"]["unused_at_exit"] == 6 &&
 	          cache_block["holds"]["in_flight_at_miss_only"] == 7,
 	      "the cache alone wrote other figures than its own");
+	Check(cache_block["misses"]["inline_compiles"] == 8,
+	      "the cache alone wrote other miss figures than its own");
 	const auto scan_block = BlockOfParts(PrescanScannerReport {}, std::nullopt);
 	Check(HasAllKeys(scan_block, PRESCAN_SCANNER_KEYS) &&
 	          HasNoKey(scan_block, PRESCAN_CACHE_KEYS) && !scan_block.contains("child"),
@@ -2552,6 +2555,25 @@ std::vector<PrescanCacheFieldCase> PrescanDrainBuildsRecordsCases() {
 	        CACHE_COUNT("/records/unused_at_exit", records.unused_at_exit)};
 }
 
+// A list of named counts holding one name, set to the value, as the miss figures are written.
+#define CACHE_NAMED(pointer, member, name)                                            \
+	PrescanCacheFieldCase {                                                           \
+		pointer, [](PrescanCacheReport& figures, uint64_t value) -> nlohmann::json {  \
+			figures.member = {{name, value}};                                         \
+			return value;                                                             \
+		}                                                                             \
+	}
+
+// The GPU thread's own compiles by reason and by verdict, and the one upper bound, which must sit
+// under upper_bounds.
+std::vector<PrescanCacheFieldCase> PrescanMissesCases() {
+	return {CACHE_COUNT("/misses/inline_compiles", misses.inline_compiles),
+	        CACHE_NAMED("/misses/by_reason/never_posted", misses.by_reason, "never_posted"),
+	        CACHE_NAMED("/misses/refused_by/built", misses.refused_by, "built"),
+	        CACHE_COUNT("/misses/upper_bounds/built_undrained", misses.built_undrained)};
+}
+
+#undef CACHE_NAMED
 #undef CACHE_COUNT
 #undef CACHE_TIME
 #undef CACHE_FLAG
@@ -2578,9 +2600,18 @@ void TestPrescanCacheFieldsRoundTrip() {
 	          base["preparer"]["invalid"].empty() && base["child"]["priority"] == "" &&
 	          base["builds"]["upper_bounds"]["in_hold_ms"] == 0.0,
 	      "the empty cache block is not empty");
+	const auto empty_at = [&base](const char* pointer, const nlohmann::json& value) {
+		const nlohmann::json::json_pointer at(pointer);
+		return base.contains(at) && base.at(at) == value;
+	};
+	Check(empty_at("/misses/inline_compiles", 0) &&
+	          empty_at("/misses/by_reason", nlohmann::json::object()) &&
+	          empty_at("/misses/refused_by", nlohmann::json::object()) &&
+	          empty_at("/misses/upper_bounds/built_undrained", 0),
+	      "the empty cache block's misses are not empty");
 	auto cases = PrescanStateIntakeCases();
 	for (auto& more: {PrescanPreparerOutcomeCases(), PrescanChildCases(),
-	                  PrescanDrainBuildsRecordsCases()}) {
+	                  PrescanDrainBuildsRecordsCases(), PrescanMissesCases()}) {
 		cases.insert(cases.end(), more.begin(), more.end());
 	}
 	// Distinct from 0 and from one another, so a figure that took another's value shows.

@@ -166,8 +166,9 @@ public:
 	/// Clears `unit`, and leaves a different unit that took its slot alone. Only the preparer may
 	/// call it. The preparer's InFlightUnits::Release puts a release fence before it, which also
 	/// publishes the verdicts the unit's outcomes wrote, so a reader that sees the unit clear and
-	/// then fences with acquire finds them. That fence must stay. A unit that drops out because
-	/// another unit's Mark replaced it is not ordered that way, and a reader may then see an older
+	/// then fences with acquire finds them. That fence must stay. Another unit's Mark that lands in
+	/// the slot after the fence is ordered by it too. Only a unit that another unit's Mark replaced
+	/// while its own request was still out drops out unordered, and a reader may then see an older
 	/// verdict, which only costs one miss its cause.
 	void Clear(uint64_t unit) noexcept { m_slots.Publish(unit, PrescanFeedback::Answer::None); }
 	/// Whether `unit` is marked. It never waits, so the GPU thread may ask while it is stopped.
