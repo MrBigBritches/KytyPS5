@@ -9,6 +9,7 @@
 // file>, which runs the real Stream worker with a hook that crashes, hangs or exits early as the
 // mode says, so a crash on one request is repeatable. One smoke test starts the real emulator
 // binary in its worker mode instead.
+#include "IndirectImageFixture.h"
 #include "SrtWalkerTestMemory.h"
 #include "common/childProcess.h"
 #include "common/crashUi.h"
@@ -301,6 +302,9 @@ struct Script {
 	std::optional<StreamStatus> compile_status;
 	bool                        corrupt_compile_key = false;
 	uint32_t                    compile_scripted    = UINT32_MAX;
+	// When set, an answered Plan carries these plan bytes in place of the translated program's,
+	// so a test can give the preparer a plan no test program translates to.
+	std::optional<std::vector<uint8_t>> plan_payload;
 	// The first plans_held Plans are queued and left unanswered, whatever plan_submit says, and Stop
 	// completes them as Dropped, as the supervisor does with what it still holds.
 	uint32_t plans_held = 0;
@@ -389,6 +393,9 @@ private:
 		if (scripted && corrupt && !response.static_state.empty()) {
 			response.static_state[0] ^= 1u;
 		}
+		if (plan && m_script.plan_payload) {
+			response.payload = *m_script.plan_payload;
+		}
 	}
 
 	// A request kept back until Stop, which answers it or drops it.
@@ -441,10 +448,12 @@ PrescanTransportFactory ScriptedFactory(Script& script) {
 // A preparer over a shader map of test programs, host memory and a sink that keeps what it gets.
 // The hand-off is on the heap, since its ring is large. A supervised harness passes host values
 // whose shared memory limit is the device's, since its child takes the limit from them. `known` is
-// the seed of skip keys the pipeline cache would pass.
+// the seed of skip keys the pipeline cache would pass, and `reader` reads guest memory for the code
+// and the walks.
 struct Harness {
 	explicit Harness(PrescanTransportFactory factory = {}, PrescanMapLookup lookup = {},
-	                 const HostValues& host = {}, std::vector<uint64_t> known = {}) {
+	                 const HostValues& host = {}, std::vector<uint64_t> known = {},
+	                 ShaderRecompiler::IR::SrtMemoryReader reader = ReadHost) {
 		PrescanPreparerConfig config;
 		config.known_modules = std::move(known);
 		config.lookup = std::move(lookup);
@@ -454,7 +463,7 @@ struct Harness {
 				return found == map.end() ? std::nullopt : std::optional(found->second);
 			};
 		}
-		config.read_memory    = ReadHost;
+		config.read_memory    = reader;
 		config.host           = host;
 		config.device         = DEVICE;
 		config.make_transport = factory ? std::move(factory) : InProcessPrescanTransportFactory(&transport);
@@ -1813,6 +1822,256 @@ void TestRealHelperBuildsSameModule() {
 }
 #endif
 
+// ---- Heap image variants and the report's view of the preparer. ----
+
+// The user data registers the indirect image table fixture reads, a material buffer in 0 to 3 and
+// the table's buffer in 4 to 7.
+constexpr uint32_t HEAP_TABLE_USER_SGPRS = 8;
+// The table's records and where the descriptor sits in one, as TestPrescanHeapProbe lays them out.
+constexpr uint32_t HEAP_TABLE_STRIDE        = 48;
+constexpr uint32_t HEAP_TABLE_OFFSET        = 0;
+constexpr uint32_t HEAP_TABLE_SHADER_OFFSET = 16;
+
+// The fixture's guest memory, which the preparer's reader serves while a heap check runs. The
+// reader is given no userdata, so it reaches the memory through this.
+IndirectImageTest::LinearTestMemory* g_heap_table_memory = nullptr;
+
+// Serves the fixture's table from its guest memory and everything else, which is the test program's
+// code, from host memory. The fixture's addresses are far below any host allocation.
+bool ReadHeapTableOrHost(void* /*userdata*/, uint64_t address, std::span<uint32_t> values) {
+	auto* memory = g_heap_table_memory;
+	if (memory != nullptr && address >= memory->base &&
+	    address - memory->base < memory->words.size() * sizeof(uint32_t)) {
+		return IndirectImageTest::ReadLinearTestMemory(memory, address, values);
+	}
+	return ReadHost(nullptr, address, values);
+}
+
+// Runs one dispatch whose plan is the indirect image table fixture's, built for the given access,
+// and returns what the preparer counted. The helper's Plan answer carries the fixture's plan in
+// place of the test program's, which no test program translates to. Its Compile is refused for
+// now, so nothing tries to build the program against a specialization that is not its own, and the
+// variant is counted before the send all the same.
+PrescanPreparerCounters HeapTableVariantCounters(ShaderRecompiler::IR::ValueOpcode access) {
+	namespace IR = ShaderRecompiler::IR;
+	auto fixture = IndirectImageTest::MakeIndirectImageFixture(
+	    false, HEAP_TABLE_STRIDE, HEAP_TABLE_OFFSET, HEAP_TABLE_SHADER_OFFSET, false, access);
+	fixture->PlanAndTrack();
+	IndirectImageTest::HeapTableSetup setup;
+	g_heap_table_memory = &setup.memory;
+	Script script;
+	script.plan_payload   = IR::SaveResourcePlan(IR::ExtractResourcePlan(fixture->program));
+	script.compile_submit = StreamSubmitStatus::QueueFull;
+	auto program          = DirectProgram(MUBUF_STORE_DWORD);
+	program.user_sgprs    = HEAP_TABLE_USER_SGPRS;
+	PrescanPreparerCounters counters;
+	{
+		Harness harness(ScriptedFactory(script), {}, {}, {}, ReadHeapTableOrHost);
+		harness.Map(program);
+		harness.Push(ItemFor(program, std::span(setup.data).first(HEAP_TABLE_USER_SGPRS), KEY));
+		harness.Drive();
+		counters = harness.Counters();
+	}
+	g_heap_table_memory = nullptr;
+	CHECK(script.plan_attempts == 1 && script.compile_attempts == 1);
+	return counters;
+}
+
+// A new variant whose walk offered an image table to the heap is counted as a heap image variant.
+// The sampled table is one a heap takes, and the baseline is the same table read through a storage
+// image, which no heap takes, so the two runs differ only in whether the probe was offered the
+// table. Each must reach exactly one new variant, so a count of 0 cannot come from a walk that
+// failed, and both sent their Compile. The mutation is to delete the line that adds the heap flag
+// to the count. The sampled run then counts 0.
+void TestHeapImageVariantCounted() {
+	using ShaderRecompiler::IR::ValueOpcode;
+	for (const auto access: {ValueOpcode::ImageWrite, ValueOpcode::ImageSampleRaw}) {
+		const auto counters = HeapTableVariantCounters(access);
+		const bool sampled  = access == ValueOpcode::ImageSampleRaw;
+		CHECK(counters.variant_modules == 1 && counters.srt_faults == 0 &&
+		      counters.materialize_failed == 0);
+		CHECK(counters.heap_image_variants == (sampled ? 1u : 0u));
+	}
+	std::puts("HeapImageVariantCounted ok");
+}
+
+// The covered variants are the new variants less the heap image variants. Ten new variants with
+// three heap ones cover seven. The baseline is the same ten with no heap variant, which cover all
+// ten, so a covered count that is a constant, or that copies the heap count, fails one of the two.
+// The mutation is to leave out the subtraction, and the first case gives ten.
+void TestPrescanCoveredExcludesHeapImages() {
+	constexpr uint64_t VARIANTS      = 10;
+	constexpr uint64_t HEAP_VARIANTS = 3;
+	for (const uint64_t heap: {uint64_t {0}, HEAP_VARIANTS}) {
+		PrescanPreparerCounters counters;
+		counters.variant_modules     = VARIANTS;
+		counters.heap_image_variants = heap;
+		const auto report            = PrescanPreparerReportOf(counters);
+		CHECK(report.variant_modules == VARIANTS && report.heap_image_variants == heap);
+		CHECK(report.covered_variants == VARIANTS - heap);
+	}
+	std::puts("PrescanCoveredExcludesHeapImages ok");
+}
+
+// Counters with a value of their own in every plain count, so a count copied into another's place
+// shows. The two flags are left false, and the refusals each get a value too.
+PrescanPreparerCounters DistinctPreparerCounters() {
+	PrescanPreparerCounters counters;
+	// Away from 0 and the small counts a default would give.
+	constexpr uint64_t FIRST_VALUE = 301;
+	uint64_t           next        = FIRST_VALUE;
+	for (uint64_t* count:
+	     {&counters.items, &counters.no_map_entry, &counters.zero_size,
+	      &counters.indirect_thread_dims, &counters.bad_item, &counters.backed_off,
+	      &counters.blocked, &counters.plan_requests, &counters.compile_requests,
+	      &counters.code_unreadable, &counters.code_changed, &counters.plan_failed,
+	      &counters.has_calls, &counters.srt_faults, &counters.materialize_failed,
+	      &counters.indirect_args_unknown, &counters.variant_modules, &counters.known_variants,
+	      &counters.capped_variants, &counters.known_skipped, &counters.heap_image_variants,
+	      &counters.known_modules, &counters.known_dropped, &counters.refused_sends,
+	      &counters.never_retry, &counters.blamed, &counters.dropped, &counters.compile_failed,
+	      &counters.key_mismatch, &counters.decode_failed, &counters.adopted, &counters.taken,
+	      &counters.late_duplicates, &counters.taken_dropped, &counters.plans_dropped,
+	      &counters.forgotten, &counters.state.posted, &counters.state.busy,
+	      &counters.state.capped, &counters.state.settled, &counters.state.uncertain,
+	      &counters.state.dropped_full}) {
+		*count = next++;
+	}
+	for (auto& refusals: counters.invalid) {
+		refusals = next++;
+	}
+	return counters;
+}
+
+// Checks that the preparer's counts before it sent anything were copied each from its own field,
+// with each refusal under its reason's name in the order of DescriptorInvalid.
+void CheckIntakeCopied(const Common::FirstRunReport::PrescanPreparerReport& report,
+                       const PrescanPreparerCounters&                       source) {
+	CHECK(report.items == source.items && report.no_map_entry == source.no_map_entry);
+	CHECK(report.zero_size == source.zero_size &&
+	      report.indirect_thread_dims == source.indirect_thread_dims);
+	CHECK(report.bad_item == source.bad_item && report.backed_off == source.backed_off);
+	CHECK(report.blocked == source.blocked && report.plan_requests == source.plan_requests);
+	CHECK(report.compile_requests == source.compile_requests &&
+	      report.code_unreadable == source.code_unreadable);
+	CHECK(report.code_changed == source.code_changed && report.plan_failed == source.plan_failed);
+	CHECK(report.has_calls == source.has_calls && report.srt_faults == source.srt_faults);
+	CHECK(report.materialize_failed == source.materialize_failed &&
+	      report.indirect_args_unknown == source.indirect_args_unknown);
+	CHECK(report.invalid.size() == source.invalid.size());
+	for (size_t reason = 0; reason < report.invalid.size(); ++reason) {
+		const auto name = DescriptorInvalidName(static_cast<DescriptorInvalid>(reason));
+		CHECK(report.invalid[reason].first == name);
+		CHECK(report.invalid[reason].second == source.invalid[reason]);
+	}
+}
+
+// Checks that the preparer's variant, outcome and module counts were copied each from its own
+// field.
+void CheckOutcomesCopied(const Common::FirstRunReport::PrescanPreparerReport& report,
+                         const PrescanPreparerCounters&                       source) {
+	CHECK(report.variant_modules == source.variant_modules &&
+	      report.known_variants == source.known_variants);
+	CHECK(report.capped_variants == source.capped_variants &&
+	      report.known_skipped == source.known_skipped);
+	CHECK(report.heap_image_variants == source.heap_image_variants &&
+	      report.known_modules == source.known_modules);
+	CHECK(report.known_dropped == source.known_dropped &&
+	      report.refused_sends == source.refused_sends);
+	CHECK(report.never_retry == source.never_retry && report.blamed == source.blamed);
+	CHECK(report.dropped == source.dropped && report.compile_failed == source.compile_failed);
+	CHECK(report.key_mismatch == source.key_mismatch &&
+	      report.decode_failed == source.decode_failed);
+	CHECK(report.adopted == source.adopted && report.taken == source.taken);
+	CHECK(report.late_duplicates == source.late_duplicates &&
+	      report.taken_dropped == source.taken_dropped);
+	CHECK(report.plans_dropped == source.plans_dropped && report.forgotten == source.forgotten);
+}
+
+// Every count of the preparer and its state reaches the report under its own name, and each
+// refusal under its reason's name in the order of DescriptorInvalid. The source gives each count a
+// different value, so a count copied from the wrong field, or not at all, differs from its source.
+// The two flags are false in the source, so each is checked again set alone, which a flag copied
+// from the other would miss.
+void TestPreparerReportCopiesEachCount() {
+	const auto source = DistinctPreparerCounters();
+	const auto report = PrescanPreparerReportOf(source);
+	CheckIntakeCopied(report, source);
+	CheckOutcomesCopied(report, source);
+	CHECK(!report.failed && !report.lane_off);
+	for (const bool failed: {false, true}) {
+		PrescanPreparerCounters flags;
+		flags.failed       = failed;
+		flags.lane_off     = !failed;
+		const auto flagged = PrescanPreparerReportOf(flags);
+		CHECK(flagged.failed == failed && flagged.lane_off == !failed);
+	}
+	const auto state = PrescanStateReportOf(source.state);
+	CHECK(state.posted == source.state.posted && state.busy == source.state.busy);
+	CHECK(state.capped == source.state.capped && state.settled == source.state.settled);
+	CHECK(state.uncertain == source.state.uncertain &&
+	      state.dropped_full == source.state.dropped_full);
+	std::puts("PreparerReportCopiesEachCount ok");
+}
+
+// Supervisor stats with a value of their own in every count and time, and the lane flag and the two
+// words set, since false and empty are also what a missing copy gives.
+StreamSupervisorStats DistinctSupervisorStats() {
+	StreamSupervisorStats stats;
+	// Away from 0 and the small counts a default would give.
+	constexpr uint32_t FIRST_VALUE = 501;
+	uint32_t           next        = FIRST_VALUE;
+	for (uint32_t* count: {&stats.spawns, &stats.failed_spawns, &stats.crashes, &stats.hangs,
+	                       &stats.protocol_errors, &stats.failures, &stats.never_retry,
+	                       &stats.never_retry_programs, &stats.peak_outstanding}) {
+		*count = next++;
+	}
+	for (uint64_t* count: {&stats.submitted, &stats.answered, &stats.blamed, &stats.dropped,
+	                       &stats.resent, &stats.refused, &stats.late_replies,
+	                       &stats.unexpected_replies, &stats.callback_failures,
+	                       &stats.plan_rtt.count, &stats.compile_rtt.count}) {
+		*count = next++;
+	}
+	for (double* time: {&stats.plan_rtt.p50_ms, &stats.plan_rtt.p90_ms, &stats.plan_rtt.max_ms,
+	                    &stats.compile_rtt.p50_ms, &stats.compile_rtt.p90_ms,
+	                    &stats.compile_rtt.max_ms}) {
+		*time = static_cast<double>(next++);
+	}
+	stats.lane_off        = true;
+	stats.lane_off_reason = "restarts_capped";
+	stats.priority        = "below_normal";
+	return stats;
+}
+
+// Every count the report takes from the helper's supervisor reaches it under its own name, with
+// both round trips and the two words. The source gives each a different value, as for the
+// preparer, and the lane flag is checked set.
+void TestChildReportCopiesEachCount() {
+	const auto  stats = DistinctSupervisorStats();
+	const auto  child = PrescanChildReportOf(stats);
+	const auto& plan  = stats.plan_rtt;
+	const auto& build = stats.compile_rtt;
+	CHECK(child.spawns == stats.spawns && child.failed_spawns == stats.failed_spawns);
+	CHECK(child.crashes == stats.crashes && child.hangs == stats.hangs);
+	CHECK(child.protocol_errors == stats.protocol_errors && child.failures == stats.failures);
+	CHECK(child.never_retry == stats.never_retry &&
+	      child.never_retry_programs == stats.never_retry_programs);
+	CHECK(child.peak_outstanding == stats.peak_outstanding && child.submitted == stats.submitted);
+	CHECK(child.answered == stats.answered && child.blamed == stats.blamed &&
+	      child.dropped == stats.dropped);
+	CHECK(child.resent == stats.resent && child.refused == stats.refused);
+	CHECK(child.late_replies == stats.late_replies &&
+	      child.unexpected_replies == stats.unexpected_replies);
+	CHECK(child.callback_failures == stats.callback_failures);
+	CHECK(child.plan_rtt.count == plan.count && child.plan_rtt.p50_ms == plan.p50_ms &&
+	      child.plan_rtt.p90_ms == plan.p90_ms && child.plan_rtt.max_ms == plan.max_ms);
+	CHECK(child.compile_rtt.count == build.count && child.compile_rtt.p50_ms == build.p50_ms &&
+	      child.compile_rtt.p90_ms == build.p90_ms && child.compile_rtt.max_ms == build.max_ms);
+	CHECK(child.lane_off && child.lane_off_reason == stats.lane_off_reason &&
+	      child.priority == stats.priority);
+	std::puts("ChildReportCopiesEachCount ok");
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -1860,6 +2119,10 @@ int main(int argc, char** argv) {
 	TestMismatchedDeviceRefused();
 	TestHelperFileNames();
 	TestStaleHelperFilesRemoved();
+	TestHeapImageVariantCounted();
+	TestPrescanCoveredExcludesHeapImages();
+	TestPreparerReportCopiesEachCount();
+	TestChildReportCopiesEachCount();
 #ifdef KYTY_EMULATOR_PATH
 	TestRealHelperBuildsSameModule();
 #endif

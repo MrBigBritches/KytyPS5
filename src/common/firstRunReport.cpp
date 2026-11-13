@@ -537,7 +537,38 @@ bool Report::HoldsPrescanScanFinal() const {
 	return m_prescan_scan_final.has_value();
 }
 
-void Report::Reset() {
+void Report::SetPrescanCacheSource(std::function<PrescanCacheReport()> source) {
+	std::lock_guard lock(m_prescan_cache_mutex);
+	m_prescan_cache_source = std::move(source);
+	m_prescan_cache_final.reset();
+}
+
+void Report::SetPrescanCacheFinal(PrescanCacheReport final_figures) {
+	std::lock_guard lock(m_prescan_cache_mutex);
+	m_prescan_cache_source = nullptr;
+	m_prescan_cache_final  = std::move(final_figures);
+}
+
+std::optional<PrescanCacheReport> Report::PrescanCacheFigures() const {
+	std::lock_guard lock(m_prescan_cache_mutex);
+	if (m_prescan_cache_source) {
+		return m_prescan_cache_source();
+	}
+	return m_prescan_cache_final;
+}
+
+bool Report::HoldsPrescanCacheSource() const {
+	std::lock_guard lock(m_prescan_cache_mutex);
+	return static_cast<bool>(m_prescan_cache_source);
+}
+
+bool Report::HoldsPrescanCacheFinal() const {
+	std::lock_guard lock(m_prescan_cache_mutex);
+	return m_prescan_cache_final.has_value();
+}
+
+// Each pair is cleared under its own lock, one lock at a time, as every writer of it takes them.
+void Report::ResetSources() {
 	{
 		std::lock_guard lock(m_scan_differential_mutex);
 		m_scan_differential_source = nullptr;
@@ -549,11 +580,18 @@ void Report::Reset() {
 		m_prescan_scan_final.reset();
 	}
 	{
-		std::lock_guard lock(m_generation_mutex);
-		m_generation_inactive.reset();
-		m_generation_source = nullptr;
-		m_generation_final.reset();
+		std::lock_guard lock(m_prescan_cache_mutex);
+		m_prescan_cache_source = nullptr;
+		m_prescan_cache_final.reset();
 	}
+	std::lock_guard lock(m_generation_mutex);
+	m_generation_inactive.reset();
+	m_generation_source = nullptr;
+	m_generation_final.reset();
+}
+
+void Report::Reset() {
+	ResetSources();
 	std::lock_guard lock(m_mutex);
 	m_phase             = Phase::Play;
 	m_flip              = 0;
@@ -1216,6 +1254,10 @@ nlohmann::json GenerationToJson(const ShaderStoreGenerationReport& block, int64_
 	}
 	json["worker"] = worker;
 	json["drain"]  = GenerationDrainToJson(block.drain);
+	// Only with the prescan on, so the block of a run without it is unchanged.
+	if (block.drain.includes_prescan) {
+		json["drain"]["includes_prescan"] = true;
+	}
 	GenerationRowsToJson(json, block, epoch_ns);
 	return json;
 }
@@ -1350,6 +1392,170 @@ nlohmann::json PrescanScannerToJson(const PrescanScannerReport& block) {
 	         {{"calls", block.read_calls}, {"max_us", block.read_max_us}, {"over_1ms", block.read_over_1ms}}},
 	        {"offer",
 	         {{"posted", block.offers_posted}, {"skipped", block.offers_skipped}, {"dropped", block.offers_dropped}}}};
+}
+
+// Writes how the preparer's state answered the dispatches it was asked about.
+nlohmann::json PrescanStateToJson(const PrescanStateReport& state) {
+	return {{"posted", state.posted},
+	        {"busy", state.busy},
+	        {"capped", state.capped},
+	        {"settled", state.settled},
+	        {"uncertain", state.uncertain},
+	        {"dropped_full", state.dropped_full}};
+}
+
+// Writes what the preparer counted before it sent anything, with the refusals as an object by
+// reason.
+nlohmann::json PrescanPreparerIntakeToJson(const PrescanPreparerReport& preparer) {
+	nlohmann::json invalid = nlohmann::json::object();
+	for (const auto& [name, count]: preparer.invalid) {
+		invalid[name] = count;
+	}
+	return {{"items", preparer.items},
+	        {"no_map_entry", preparer.no_map_entry},
+	        {"zero_size", preparer.zero_size},
+	        {"indirect_thread_dims", preparer.indirect_thread_dims},
+	        {"bad_item", preparer.bad_item},
+	        {"backed_off", preparer.backed_off},
+	        {"blocked", preparer.blocked},
+	        {"plan_requests", preparer.plan_requests},
+	        {"compile_requests", preparer.compile_requests},
+	        {"code_unreadable", preparer.code_unreadable},
+	        {"code_changed", preparer.code_changed},
+	        {"plan_failed", preparer.plan_failed},
+	        {"has_calls", preparer.has_calls},
+	        {"srt_faults", preparer.srt_faults},
+	        {"materialize_failed", preparer.materialize_failed},
+	        {"indirect_args_unknown", preparer.indirect_args_unknown},
+	        {"invalid", invalid}};
+}
+
+// Writes what became of the preparer's variants and requests, joined to its intake figures.
+nlohmann::json PrescanPreparerToJson(const PrescanPreparerReport& preparer) {
+	auto json = PrescanPreparerIntakeToJson(preparer);
+	json.update(nlohmann::json {{"variant_modules", preparer.variant_modules},
+	                            {"known_variants", preparer.known_variants},
+	                            {"capped_variants", preparer.capped_variants},
+	                            {"known_skipped", preparer.known_skipped},
+	                            {"heap_image_variants", preparer.heap_image_variants},
+	                            {"covered_variants", preparer.covered_variants},
+	                            {"known_modules", preparer.known_modules},
+	                            {"known_dropped", preparer.known_dropped},
+	                            {"refused_sends", preparer.refused_sends},
+	                            {"never_retry", preparer.never_retry},
+	                            {"blamed", preparer.blamed},
+	                            {"dropped", preparer.dropped},
+	                            {"compile_failed", preparer.compile_failed},
+	                            {"key_mismatch", preparer.key_mismatch},
+	                            {"decode_failed", preparer.decode_failed},
+	                            {"adopted", preparer.adopted},
+	                            {"taken", preparer.taken},
+	                            {"late_duplicates", preparer.late_duplicates},
+	                            {"taken_dropped", preparer.taken_dropped},
+	                            {"plans_dropped", preparer.plans_dropped},
+	                            {"forgotten", preparer.forgotten},
+	                            {"failed", preparer.failed},
+	                            {"lane_off", preparer.lane_off}});
+	return json;
+}
+
+// Writes one kind of round trip to the helper.
+nlohmann::json PrescanRttToJson(const PrescanRttFigures& rtt) {
+	return {{"count", rtt.count},
+	        {"p50", Round3(rtt.p50_ms)},
+	        {"p90", Round3(rtt.p90_ms)},
+	        {"max", Round3(rtt.max_ms)}};
+}
+
+// Writes what the supervisor of the helper's child process counted.
+nlohmann::json PrescanChildToJson(const PrescanChildReport& child) {
+	return {{"spawns", child.spawns},
+	        {"failed_spawns", child.failed_spawns},
+	        {"crashes", child.crashes},
+	        {"hangs", child.hangs},
+	        {"protocol_errors", child.protocol_errors},
+	        {"failures", child.failures},
+	        {"never_retry", child.never_retry},
+	        {"never_retry_programs", child.never_retry_programs},
+	        {"lane_off", child.lane_off},
+	        {"lane_off_reason", child.lane_off_reason},
+	        {"submitted", child.submitted},
+	        {"answered", child.answered},
+	        {"blamed", child.blamed},
+	        {"dropped", child.dropped},
+	        {"resent", child.resent},
+	        {"refused", child.refused},
+	        {"late_replies", child.late_replies},
+	        {"unexpected_replies", child.unexpected_replies},
+	        {"callback_failures", child.callback_failures},
+	        {"peak_outstanding", child.peak_outstanding},
+	        {"priority", child.priority},
+	        {"plan_rtt_ms", PrescanRttToJson(child.plan_rtt)},
+	        {"compile_rtt_ms", PrescanRttToJson(child.compile_rtt)}};
+}
+
+// Writes how the drain treated the prescan's modules. The timing sits in an object named for both
+// producers, since one drain takes the generator's modules and the prescan's under one budget, and
+// it is the same timing the generator's block gives as its own.
+nlohmann::json PrescanDrainToJson(const PrescanDrainReport& drain) {
+	return {{"adopted", drain.adopted},
+	        {"duplicates", drain.duplicates},
+	        {"plan_mismatch", drain.plan_mismatch},
+	        {"failed_installs", drain.failed_installs},
+	        {"dropped_stopped", drain.dropped_stopped},
+	        {"item_max_ms", Round3(drain.item_max_ms)},
+	        {"both_producers",
+	         {{"calls", drain.both_calls},
+	          {"over_1ms", drain.both_over_1ms},
+	          {"over_4ms", drain.both_over_4ms},
+	          {"max_ms", Round3(drain.both_max_ms)},
+	          {"total_ms", Round3(drain.both_total_ms)},
+	          {"lag_ms_max", Round3(drain.both_lag_ms_max)}}}};
+}
+
+// Writes the prescan's builds. The overlap figures sit in an object named for what they are, upper
+// bounds that nothing may gate on, apart from the counts and the worker time they are measured
+// against.
+nlohmann::json PrescanBuildsToJson(const PrescanBuildsReport& builds) {
+	return {{"builds", builds.builds},
+	        {"worker_builds", builds.worker_builds},
+	        {"total_ms", Round3(builds.total_ms)},
+	        {"upper_bounds",
+	         {{"in_scope", builds.in_scope},
+	          {"in_scope_ms", Round3(builds.in_scope_ms)},
+	          {"in_hold", builds.in_hold},
+	          {"in_hold_ms", Round3(builds.in_hold_ms)}}}};
+}
+
+// Adds the pipeline cache's part to the prescan block, next to whatever keys the scanner gave it.
+void AddPrescanCacheToJson(const PrescanCacheReport& figures, nlohmann::json& block) {
+	block["state"]    = PrescanStateToJson(figures.state);
+	block["preparer"] = PrescanPreparerToJson(figures.preparer);
+	if (figures.child) {
+		block["child"] = PrescanChildToJson(*figures.child);
+	}
+	block["drain"]   = PrescanDrainToJson(figures.drain);
+	block["builds"]  = PrescanBuildsToJson(figures.builds);
+	// The GPU thread's own compiles, kept apart from the prescan's builds.
+	block["holds"]   = {{"in_flight_at_miss_only", figures.holds.in_flight_at_miss_only}};
+	block["records"] = {{"stored_first_use", figures.records.stored_first_use},
+	                    {"retained_peak_bytes", figures.records.retained_peak_bytes},
+	                    {"dropped_over_cap", figures.records.dropped_over_cap},
+	                    {"unused_at_exit", figures.records.unused_at_exit}};
+}
+
+// The whole prescan block, from either part or both, or nothing when neither registered. The
+// scanner's keys and the cache's keys never share a name, so the two only add to one object.
+std::optional<nlohmann::json> PrescanBlockToJson(const std::optional<PrescanScannerReport>& scanner,
+                                                 const std::optional<PrescanCacheReport>&   cache) {
+	if (!scanner && !cache) {
+		return std::nullopt;
+	}
+	auto block = scanner ? PrescanScannerToJson(*scanner) : nlohmann::json::object();
+	if (cache) {
+		AddPrescanCacheToJson(*cache, block);
+	}
+	return block;
 }
 
 // The guest audio underruns with each one's time from the run start. count includes the ones that
@@ -1568,8 +1774,8 @@ std::string Report::ToJson(const Metadata& metadata, uint64_t audio_holds, doubl
 			scan_differential = ScanDifferentialToJson(*m_scan_differential_final);
 		}
 	}
-	// The prescan block exists only when a scanner registered its figures.
-	const auto prescan_scan = PrescanScanFigures();
+	// The prescan block exists only when a scanner or a pipeline cache registered its figures.
+	auto prescan = PrescanBlockToJson(PrescanScanFigures(), PrescanCacheFigures());
 
 	// Read once, so the two blocks that come from it agree.
 	const auto machine = ReadMachineInfo();
@@ -1623,8 +1829,8 @@ std::string Report::ToJson(const Metadata& metadata, uint64_t audio_holds, doubl
 	if (scan_differential) {
 		report["scan_differential"] = std::move(*scan_differential);
 	}
-	if (prescan_scan) {
-		report["prescan"] = PrescanScannerToJson(*prescan_scan);
+	if (prescan) {
+		report["prescan"] = std::move(*prescan);
 	}
 	// The title id is not filtered, so bytes that are not UTF-8 are replaced instead of throwing.
 	return report.dump(JSON_INDENT, ' ', false, nlohmann::json::error_handler_t::replace);

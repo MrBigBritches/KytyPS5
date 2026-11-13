@@ -234,13 +234,20 @@ void PipelineCache::DrainGenerated() {
 		m_has_generated.store(true, std::memory_order_relaxed);
 	}
 	state.planner.NoteDrain(Clock::now() - start, oldest_wait);
-	// Handed to the report's writer. A copy of a few counters under the mutex that a post already
-	// takes, so it costs the GPU thread no more than a post costs the generator.
-	{
-		std::scoped_lock lock(state.mutex);
-		state.published_drain         = state.planner.Counters();
-		state.published_prescan_drain = state.prescan_planner.Counters();
-		state.published_backlog       = state.BacklogSize();
+	PublishDrain();
+}
+
+// Handed to the report's writer. A copy of a few counters under the mutex that a post already
+// takes, so it costs the GPU thread no more than a post costs the generator. The record counts are
+// copied only with the prescan on, so a run with the generator alone does exactly what it did.
+void PipelineCache::PublishDrain() {
+	auto&            state = *m_generation;
+	std::scoped_lock lock(state.mutex);
+	state.published_drain         = state.planner.Counters();
+	state.published_prescan_drain = state.prescan_planner.Counters();
+	state.published_backlog       = state.BacklogSize();
+	if (m_prescan != nullptr) {
+		state.published_prescan_records = state.retained_records.Counters();
 	}
 }
 
@@ -454,6 +461,7 @@ void PipelineCache::StopStoreGeneration() {
 	// No lookup runs after the stop, so the records still waiting are never used. They are counted
 	// and freed now, which also leaves the list empty before the program cache is destroyed.
 	state.retained_records.Release();
+	FinishPrescanReport();
 	// The final figures are taken now that nothing posts and nothing drains, and handed to the
 	// report in one step that also takes the source away. The writer may be calling the source at
 	// this moment, which is safe since the state still exists. After this it never calls it again,
@@ -503,7 +511,11 @@ PipelineCache::BuildGenerationReport(bool final_figures) const {
 	// held together.
 	rows.compiles = Common::FirstRunReport::Global().Compiles();
 	rows.takes    = Common::FirstRunReport::Global().WarmTakes();
-	return StoreGen::MakeGenerationReport(stats, drain, counts, rows);
+	auto report   = StoreGen::MakeGenerationReport(stats, drain, counts, rows);
+	// The drain and the intake's counts take the prescan's modules too, so a reader does not credit
+	// them to the generator.
+	report.drain.includes_prescan = state.includes_prescan.load(std::memory_order_relaxed);
+	return report;
 }
 
 std::optional<StoreGenerationStats> PipelineCache::GenerationStats() const {

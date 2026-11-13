@@ -572,6 +572,54 @@ void TestLazySpawnAnswersAndReadsPriority() {
 	supervisor.Stop();
 }
 
+// How long the slow fake of the round trip test waits before it answers.
+constexpr uint64_t RTT_HELPER_DELAY_MS = 50;
+
+// The median round trip of one Compile the supervisor reported, and the wall time the test saw
+// from just before the Submit to just after the outcome arrived.
+struct RoundTrip {
+	double rtt_ms  = 0.0;
+	double wall_ms = 0.0;
+};
+
+// The round trip of a Compile the fake answers after the given time, or at once for 0.
+RoundTrip CompileRoundTrip(uint64_t delay_ms) {
+	TempDirectory    directory;
+	Outcomes         outcomes;
+	StreamSupervisor supervisor(
+	    MakeConfig(directory, fmt::format("answer:{}", delay_ms), outcomes));
+	const auto code  = std::make_shared<const std::vector<uint8_t>>(MakeRequest(1).code);
+	const auto start = Clock::now();
+	const auto compile = supervisor.Submit(MakeRequest(1, StreamRequestKind::Compile), code);
+	CHECK(compile.status == StreamSubmitStatus::Queued);
+	CHECK(outcomes.WaitFor(1, OUTCOME_LIMIT));
+	const auto end = Clock::now();
+	CHECK(outcomes.Of(compile.seq) == StreamOutcome::Answered);
+	const auto stats = supervisor.Stats();
+	supervisor.Stop();
+	CHECK(stats.compile_rtt.count == 1 && stats.plan_rtt.count == 0);
+	return {.rtt_ms  = stats.compile_rtt.p50_ms,
+	        .wall_ms = std::chrono::duration<double, std::milli>(end - start).count()};
+}
+
+// A round trip runs from the request's send to its answer, so it covers the time the helper
+// takes, and it lies inside the wall time the test sees around the Submit and the outcome. With one
+// sample the median is capped at that sample, so it lies inside that span too. A Compile the fake
+// answers after 50 ms has a median of at least 50 ms. The baseline is the same Compile answered at
+// once, whose median must still lie inside its wall time, so a round trip that always gave a large
+// figure fails it. Neither bound depends on how fast the child is scheduled, which runs below
+// normal priority. The child is started for the request before it is sent, so its start-up is not
+// in the round trip, though it is in the wall time. The mutations are to stamp the send again when
+// the answer is read, and the slow Compile's median falls under 50 ms, and to report a constant
+// large figure, and the fast Compile's median passes its wall time.
+void TestRttMeasuresHelperTime() {
+	const auto delay = static_cast<double>(RTT_HELPER_DELAY_MS);
+	const auto fast  = CompileRoundTrip(0);
+	CHECK(fast.rtt_ms <= fast.wall_ms);
+	const auto slow = CompileRoundTrip(RTT_HELPER_DELAY_MS);
+	CHECK(slow.rtt_ms >= delay && slow.rtt_ms <= slow.wall_ms);
+}
+
 // With a slow child, no more than the cap are ever sent and unanswered. The fake logs a start line
 // as each request arrives and a done line before each answer, so the most starts ahead of dones is
 // what the child really held. All ten are answered, so the cap delays and drops nothing. Without
@@ -1058,6 +1106,7 @@ int main(int argc, char** argv) {
 	StartWatchdog();
 	TestRttHistogram();
 	TestLazySpawnAnswersAndReadsPriority();
+	TestRttMeasuresHelperTime();
 	TestOutstandingCapHolds();
 	TestCrashBlamesRequest();
 	TestDoneButNoReplyIsResent();

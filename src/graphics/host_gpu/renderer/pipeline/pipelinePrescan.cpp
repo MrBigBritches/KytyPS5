@@ -35,9 +35,11 @@ bool ReadPrescanMemory(void* /*userdata*/, uint64_t address, std::span<uint32_t>
 // log go in a directory no other user can write to, under this process's id, so two emulators
 // never share a log and a crash is never blamed on the other's request. The prescan runs without a
 // shader store too, so there is no store directory to put them next to. The files that dead runs
-// left there are removed first.
+// left there are removed first. The transport is written to `made` when the preparer makes it, so
+// the report can read its supervisor's counts.
 // Returns nothing when there is no such directory.
-std::optional<StoreGen::PrescanTransportFactory> HelperTransportFactory() {
+std::optional<StoreGen::PrescanTransportFactory>
+HelperTransportFactory(StoreGen::SupervisorPrescanTransport** made) {
 	const auto directory = StoreGen::PrescanHelperDirectory();
 	if (!directory) {
 		return std::nullopt;
@@ -48,7 +50,7 @@ std::optional<StoreGen::PrescanTransportFactory> HelperTransportFactory() {
 	    [](std::string_view line) { Log::WriteToConsoleAndLog(std::string(line) + "\n"); });
 	StoreGen::StreamSupervisorConfig config;
 	config.files_base = StoreGen::PrescanHelperFilesBase(*directory, pid);
-	return StoreGen::SupervisorPrescanTransportFactory(std::move(config));
+	return StoreGen::SupervisorPrescanTransportFactory(std::move(config), made);
 }
 
 } // namespace
@@ -129,8 +131,13 @@ void PipelineCache::EnablePrescan(StoreGen::PrescanTransportFactory make_transpo
 	if (m_prescan != nullptr) {
 		return;
 	}
+	// The factory writes the helper's transport here while the preparer is made below. A
+	// preparer that failed destroyed its transport, so what an earlier failed call left is
+	// cleared first. The factory writes a member and not a local, since the preparer keeps the
+	// factory.
+	m_prescan_supervisor = nullptr;
 	if (!make_transport) {
-		auto helper = HelperTransportFactory();
+		auto helper = HelperTransportFactory(&m_prescan_supervisor);
 		if (!helper) {
 			Log::WriteToConsoleAndLog("Prescan: there is no private directory for the helper's "
 			                          "files, so the prescan is off\n");
@@ -149,13 +156,110 @@ void PipelineCache::EnablePrescan(StoreGen::PrescanTransportFactory make_transpo
 		m_prescan_tweak(config);
 	}
 	m_prescan = std::make_unique<PrescanPreparer>(*m_prescan_handoff, std::move(config));
+	// Marked before the preparer runs, so no module of it reaches the intake unmarked.
+	m_generation->includes_prescan.store(true, std::memory_order_relaxed);
 	m_prescan->Start();
 	Log::WriteToConsoleAndLog("Prescan: the preparer started\n");
+	// Registered last, so a throw from any step above leaves the report without a source that reads
+	// this cache. StopStoreGeneration replaces it with the final figures, and the destructor always
+	// runs that before anything the source reads is destroyed.
+	m_generation->prescan_report_registered = true;
+	Common::FirstRunReport::Global().SetPrescanCacheSource(
+	    [this] { return BuildPrescanReport(false); });
 }
 
 void PipelineCache::StopPrescan() {
 	if (m_prescan != nullptr) {
 		m_prescan->Stop();
+	}
+}
+
+Common::FirstRunReport::PrescanDrainReport
+PrescanDrainReportOf(const StoreGen::GeneratedDrainCounters& prescan,
+                     const StoreGen::GeneratedDrainCounters& both) {
+	return {.adopted         = prescan.adopted,
+	        .duplicates      = prescan.duplicates,
+	        .plan_mismatch   = prescan.plan_mismatch,
+	        .failed_installs = prescan.failed_installs,
+	        .dropped_stopped = prescan.dropped_stopped,
+	        .item_max_ms     = prescan.item_max_ms,
+	        .both_calls      = both.drain_calls,
+	        .both_over_1ms   = both.drain_over_1ms,
+	        .both_over_4ms   = both.drain_over_4ms,
+	        .both_max_ms     = both.drain_max_ms,
+	        .both_total_ms   = both.drain_total_ms,
+	        .both_lag_ms_max = both.drain_lag_ms_max};
+}
+
+Common::FirstRunReport::PrescanBuildsReport PrescanBuildsReportOf(const PrescanBuildStats& builds) {
+	return {.builds        = builds.builds,
+	        .worker_builds = builds.worker_builds,
+	        .in_scope      = builds.in_scope,
+	        .in_hold       = builds.in_hold,
+	        .total_ms      = builds.total_ms,
+	        .in_scope_ms   = builds.in_scope_ms,
+	        .in_hold_ms    = builds.in_hold_ms};
+}
+
+Common::FirstRunReport::PrescanRecordsReport
+PrescanRecordsReportOf(const RetainedRecordCounters& records) {
+	return {.stored_first_use    = records.stored_first_use,
+	        .retained_peak_bytes = records.retained_peak_bytes,
+	        .dropped_over_cap    = records.dropped_over_cap,
+	        .unused_at_exit      = records.unused_at_exit};
+}
+
+// The state's lock is taken alone and released before the preparer's and the supervisor's own locks
+// are taken, so no two of them are ever held together. The preparer and its transport outlive its
+// stop, so a source called after StopPrescan still reads live objects.
+Common::FirstRunReport::PrescanCacheReport
+PipelineCache::BuildPrescanReport(bool final_figures) const {
+	// Only a cache whose prescan started registers the source or hands over final figures.
+	EXIT_IF(m_prescan == nullptr);
+	auto&                            state = *m_generation;
+	StoreGen::GeneratedDrainCounters prescan_drain;
+	StoreGen::GeneratedDrainCounters both_drain;
+	RetainedRecordCounters           records;
+	{
+		std::scoped_lock lock(state.mutex);
+		prescan_drain =
+		    final_figures ? state.prescan_planner.Counters() : state.published_prescan_drain;
+		both_drain = final_figures ? state.planner.Counters() : state.published_drain;
+		records    = state.published_prescan_records;
+	}
+	Common::FirstRunReport::PrescanCacheReport report;
+	const auto                                 counters = m_prescan->Counters();
+	report.state                                        = PrescanStateReportOf(counters.state);
+	report.preparer                                     = PrescanPreparerReportOf(counters);
+	if (m_prescan_supervisor != nullptr) {
+		report.child = PrescanChildReportOf(m_prescan_supervisor->Stats());
+	}
+	report.drain                        = PrescanDrainReportOf(prescan_drain, both_drain);
+	report.builds                       = PrescanBuildsReportOf(PrescanBuilds());
+	report.holds.in_flight_at_miss_only = PrescanInFlightAtMissOnly();
+	report.records                      = PrescanRecordsReportOf(records);
+	return report;
+}
+
+// The stop has released the list, so the unused count is final now. The copy goes through the same
+// published field the drain fills, under the same lock, so the live and final figures come one way.
+// The hand-over takes the report's lock after the state's is released. The flag is cleared only
+// once the report holds the final figures, so a throw while they are built or handed over leaves
+// the source registered, and the destructor's StopStoreGeneration tries again before anything the
+// source reads is gone.
+void PipelineCache::FinishPrescanReport() {
+	if (m_prescan == nullptr) {
+		return;
+	}
+	auto& state = *m_generation;
+	{
+		std::scoped_lock lock(state.mutex);
+		state.published_prescan_records = state.retained_records.Counters();
+	}
+	if (state.prescan_report_registered) {
+		auto final_figures = BuildPrescanReport(true);
+		Common::FirstRunReport::Global().SetPrescanCacheFinal(std::move(final_figures));
+		state.prescan_report_registered = false;
 	}
 }
 

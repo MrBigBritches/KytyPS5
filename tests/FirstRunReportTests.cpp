@@ -2244,6 +2244,445 @@ void TestPrescanFinalWaitsForAWriterInTheSource() {
 	Check(handed_over && left_source, "the hand-over or the writer never finished");
 }
 
+// The generation block's drain says it takes the prescan's modules too only when it does, so a
+// run with both producers does not credit the prescan's work to the generator. The baseline is the
+// same figures without the mark, whose drain has no such key, which is how a run without the
+// prescan keeps its report as it was. A writer that always wrote the key fails the baseline, and
+// one that never did fails the marked block. The mark changes nothing else in the block.
+void TestGenerationDrainMarksPrescan() {
+	const auto block_of = [](const ShaderStoreGenerationReport& figures) {
+		Report report;
+		report.SetGenerationFinal(figures);
+		return GenerationBlock(report);
+	};
+	ShaderStoreGenerationReport figures;
+	const auto                  unmarked = block_of(figures);
+	figures.drain.includes_prescan       = true;
+	const auto marked                    = block_of(figures);
+	Check(unmarked.is_object() && !unmarked["drain"].contains("includes_prescan"),
+	      "a generation without the prescan marked its drain");
+	Check(marked["drain"].contains("includes_prescan") &&
+	          marked["drain"]["includes_prescan"] == true,
+	      "a generation beside the prescan did not mark its drain");
+	auto without_mark = marked;
+	without_mark["drain"].erase("includes_prescan");
+	Check(without_mark == unmarked, "the mark changed another part of the generation block");
+}
+
+// ---- The pipeline cache's part of the prescan block. ----
+
+using Common::FirstRunReport::PrescanCacheReport;
+
+// The keys each part of the prescan block writes at its top level.
+const std::vector<std::string> PRESCAN_SCANNER_KEYS = {"scan", "queue", "thread", "reads", "offer"};
+const std::vector<std::string> PRESCAN_CACHE_KEYS   = {"state",  "preparer", "drain",
+                                                       "builds", "holds",    "records"};
+
+// The top-level keys of a JSON object, in the object's own order.
+std::vector<std::string> KeysOf(const nlohmann::json& object) {
+	std::vector<std::string> keys;
+	for (const auto& item: object.items()) {
+		keys.push_back(item.key());
+	}
+	return keys;
+}
+
+// Whether the block holds every key of the list.
+bool HasAllKeys(const nlohmann::json& block, const std::vector<std::string>& keys) {
+	for (const auto& key: keys) {
+		if (!block.contains(key)) return false;
+	}
+	return true;
+}
+
+// Whether the block holds no key of the list.
+bool HasNoKey(const nlohmann::json& block, const std::vector<std::string>& keys) {
+	for (const auto& key: keys) {
+		if (block.contains(key)) return false;
+	}
+	return true;
+}
+
+// Cache figures whose every part differs from an empty one, so a part written from the wrong
+// figures shows.
+PrescanCacheReport SomeCacheFigures() {
+	PrescanCacheReport figures;
+	figures.state.posted                 = 2;
+	figures.preparer.items               = 3;
+	figures.drain.adopted                = 4;
+	figures.builds.builds                = 5;
+	figures.records.unused_at_exit       = 6;
+	figures.holds.in_flight_at_miss_only = 7;
+	return figures;
+}
+
+// The prescan block of a report given the final figures of either part, or both. A report is
+// large, so each is made in a call of its own and gone before the next.
+nlohmann::json BlockOfParts(const std::optional<PrescanScannerReport>& scanner,
+                            const std::optional<PrescanCacheReport>&   cache) {
+	Report report;
+	if (scanner) report.SetPrescanScanFinal(*scanner);
+	if (cache) report.SetPrescanCacheFinal(*cache);
+	return PrescanBlock(report);
+}
+
+// Either part alone makes the prescan block with its own keys only, and with both the block holds
+// the two parts side by side, each as it is alone. The baseline of each part is the other part
+// alone, and the block with neither is absent, as the scanner checks show. A writer that dropped
+// the cache's figures would leave the cache alone with no block. One that let one part replace the
+// other would lose the scanner's keys or the cache's when both are there. A child block is written
+// only when there is one.
+void TestPrescanCacheBlockMerges() {
+	const auto                     cache_block = BlockOfParts(std::nullopt, SomeCacheFigures());
+	const std::vector<std::string> cache_keys  = {"builds",   "drain",   "holds",
+	                                              "preparer", "records", "state"};
+	Check(cache_block.is_object() && KeysOf(cache_block) == cache_keys,
+	      "the cache alone did not make a block of exactly its own keys");
+	Check(cache_block["state"]["posted"] == 2 && cache_block["records"]["unused_at_exit"] == 6 &&
+	          cache_block["holds"]["in_flight_at_miss_only"] == 7,
+	      "the cache alone wrote other figures than its own");
+	const auto scan_block = BlockOfParts(PrescanScannerReport {}, std::nullopt);
+	Check(HasAllKeys(scan_block, PRESCAN_SCANNER_KEYS) &&
+	          HasNoKey(scan_block, PRESCAN_CACHE_KEYS) && !scan_block.contains("child"),
+	      "the scanner alone wrote keys of the cache");
+	const auto both_block = BlockOfParts(PrescanScannerReport {}, SomeCacheFigures());
+	Check(HasAllKeys(both_block, PRESCAN_SCANNER_KEYS) &&
+	          HasAllKeys(both_block, PRESCAN_CACHE_KEYS),
+	      "with both parts the block lost the keys of one");
+	for (const auto& key: PRESCAN_SCANNER_KEYS) {
+		Check(both_block[key] == scan_block[key], "a scanner key changed");
+	}
+	for (const auto& key: PRESCAN_CACHE_KEYS) {
+		Check(both_block[key] == cache_block[key], "a cache key changed");
+	}
+	auto with_child = SomeCacheFigures();
+	with_child.child.emplace();
+	Check(!cache_block.contains("child") &&
+	          BlockOfParts(std::nullopt, with_child).contains("child"),
+	      "the child block did not follow whether there were child figures");
+}
+
+// The cache's part changes nothing else in the report. The baseline is the same report without
+// it, which differs only in the prescan block. Reset takes the cache's source away, and its final
+// figures.
+void TestPrescanCacheBlockLeavesTheRest() {
+	Report cache_only;
+	cache_only.SetPrescanCacheSource([] { return SomeCacheFigures(); });
+	auto cache_json = nlohmann::json::parse(cache_only.ToJson({}, 0, 1.0, 0.0, {}));
+	Check(cache_json.contains(PRESCAN_KEY), "a report with a cache source had no prescan block");
+	nlohmann::json off_json;
+	{
+		Report off;
+		off_json = nlohmann::json::parse(off.ToJson({}, 0, 1.0, 0.0, {}));
+	}
+	cache_json.erase(PRESCAN_KEY);
+	// The process peaks are read when each report is written, so they are left out of the
+	// comparison.
+	off_json.erase("process");
+	cache_json.erase("process");
+	Check(cache_json == off_json, "the cache's prescan block changed another part of the report");
+	cache_only.Reset();
+	Check(PrescanBlock(cache_only).is_null(), "Reset kept a prescan block from a cache source");
+	cache_only.SetPrescanCacheFinal(SomeCacheFigures());
+	cache_only.Reset();
+	Check(PrescanBlock(cache_only).is_null(),
+	      "Reset kept a prescan block from cache final figures");
+}
+
+// One figure of the cache's report, and where it shows in the block. The setter puts the value it
+// is given into the figures, in the figure's own type, and returns what the block must hold for it.
+struct PrescanCacheFieldCase {
+	const char*                                                  pointer;
+	std::function<nlohmann::json(PrescanCacheReport&, uint64_t)> set;
+};
+
+// A fraction a time keeps through the writer's rounding to thousandths, so a time differs from a
+// count.
+constexpr double PRESCAN_TIME_FRACTION = 0.25;
+
+// A count, set to the value itself.
+#define CACHE_COUNT(pointer, member)                                                  \
+	PrescanCacheFieldCase {                                                           \
+		pointer, [](PrescanCacheReport& figures, uint64_t value) -> nlohmann::json {  \
+			figures.member = value;                                                   \
+			return value;                                                             \
+		}                                                                             \
+	}
+// A time in milliseconds, set to the value and a fraction.
+#define CACHE_TIME(pointer, member)                                                   \
+	PrescanCacheFieldCase {                                                           \
+		pointer, [](PrescanCacheReport& figures, uint64_t value) -> nlohmann::json {  \
+			figures.member = static_cast<double>(value) + PRESCAN_TIME_FRACTION;      \
+			return static_cast<double>(value) + PRESCAN_TIME_FRACTION;                \
+		}                                                                             \
+	}
+// A flag, set to true.
+#define CACHE_FLAG(pointer, member)                                                   \
+	PrescanCacheFieldCase {                                                           \
+		pointer, [](PrescanCacheReport& figures, uint64_t) -> nlohmann::json {        \
+			figures.member = true;                                                    \
+			return true;                                                              \
+		}                                                                             \
+	}
+
+// The state's counts and the preparer's counts before it sends anything.
+std::vector<PrescanCacheFieldCase> PrescanStateIntakeCases() {
+	return {CACHE_COUNT("/state/posted", state.posted),
+	        CACHE_COUNT("/state/busy", state.busy),
+	        CACHE_COUNT("/state/capped", state.capped),
+	        CACHE_COUNT("/state/settled", state.settled),
+	        CACHE_COUNT("/state/uncertain", state.uncertain),
+	        CACHE_COUNT("/state/dropped_full", state.dropped_full),
+	        CACHE_COUNT("/preparer/items", preparer.items),
+	        CACHE_COUNT("/preparer/no_map_entry", preparer.no_map_entry),
+	        CACHE_COUNT("/preparer/zero_size", preparer.zero_size),
+	        CACHE_COUNT("/preparer/indirect_thread_dims", preparer.indirect_thread_dims),
+	        CACHE_COUNT("/preparer/bad_item", preparer.bad_item),
+	        CACHE_COUNT("/preparer/backed_off", preparer.backed_off),
+	        CACHE_COUNT("/preparer/blocked", preparer.blocked),
+	        CACHE_COUNT("/preparer/plan_requests", preparer.plan_requests),
+	        CACHE_COUNT("/preparer/compile_requests", preparer.compile_requests),
+	        CACHE_COUNT("/preparer/code_unreadable", preparer.code_unreadable),
+	        CACHE_COUNT("/preparer/code_changed", preparer.code_changed),
+	        CACHE_COUNT("/preparer/plan_failed", preparer.plan_failed),
+	        CACHE_COUNT("/preparer/has_calls", preparer.has_calls),
+	        CACHE_COUNT("/preparer/srt_faults", preparer.srt_faults),
+	        CACHE_COUNT("/preparer/materialize_failed", preparer.materialize_failed),
+	        CACHE_COUNT("/preparer/indirect_args_unknown", preparer.indirect_args_unknown),
+	        {"/preparer/invalid/image_mips",
+	         [](PrescanCacheReport& figures, uint64_t value) -> nlohmann::json {
+		         figures.preparer.invalid = {{"image_mips", value}};
+		         return value;
+	         }}};
+}
+
+// The preparer's variants, outcomes and modules.
+std::vector<PrescanCacheFieldCase> PrescanPreparerOutcomeCases() {
+	return {CACHE_COUNT("/preparer/variant_modules", preparer.variant_modules),
+	        CACHE_COUNT("/preparer/known_variants", preparer.known_variants),
+	        CACHE_COUNT("/preparer/capped_variants", preparer.capped_variants),
+	        CACHE_COUNT("/preparer/known_skipped", preparer.known_skipped),
+	        CACHE_COUNT("/preparer/heap_image_variants", preparer.heap_image_variants),
+	        CACHE_COUNT("/preparer/covered_variants", preparer.covered_variants),
+	        CACHE_COUNT("/preparer/known_modules", preparer.known_modules),
+	        CACHE_COUNT("/preparer/known_dropped", preparer.known_dropped),
+	        CACHE_COUNT("/preparer/refused_sends", preparer.refused_sends),
+	        CACHE_COUNT("/preparer/never_retry", preparer.never_retry),
+	        CACHE_COUNT("/preparer/blamed", preparer.blamed),
+	        CACHE_COUNT("/preparer/dropped", preparer.dropped),
+	        CACHE_COUNT("/preparer/compile_failed", preparer.compile_failed),
+	        CACHE_COUNT("/preparer/key_mismatch", preparer.key_mismatch),
+	        CACHE_COUNT("/preparer/decode_failed", preparer.decode_failed),
+	        CACHE_COUNT("/preparer/adopted", preparer.adopted),
+	        CACHE_COUNT("/preparer/taken", preparer.taken),
+	        CACHE_COUNT("/preparer/late_duplicates", preparer.late_duplicates),
+	        CACHE_COUNT("/preparer/taken_dropped", preparer.taken_dropped),
+	        CACHE_COUNT("/preparer/plans_dropped", preparer.plans_dropped),
+	        CACHE_COUNT("/preparer/forgotten", preparer.forgotten),
+	        CACHE_FLAG("/preparer/failed", preparer.failed),
+	        CACHE_FLAG("/preparer/lane_off", preparer.lane_off)};
+}
+
+// The child's counts, its two words and its round trips.
+std::vector<PrescanCacheFieldCase> PrescanChildCases() {
+	return {CACHE_COUNT("/child/spawns", child->spawns),
+	        CACHE_COUNT("/child/failed_spawns", child->failed_spawns),
+	        CACHE_COUNT("/child/crashes", child->crashes),
+	        CACHE_COUNT("/child/hangs", child->hangs),
+	        CACHE_COUNT("/child/protocol_errors", child->protocol_errors),
+	        CACHE_COUNT("/child/failures", child->failures),
+	        CACHE_COUNT("/child/never_retry", child->never_retry),
+	        CACHE_COUNT("/child/never_retry_programs", child->never_retry_programs),
+	        CACHE_FLAG("/child/lane_off", child->lane_off),
+	        CACHE_COUNT("/child/submitted", child->submitted),
+	        CACHE_COUNT("/child/answered", child->answered),
+	        CACHE_COUNT("/child/blamed", child->blamed),
+	        CACHE_COUNT("/child/dropped", child->dropped),
+	        CACHE_COUNT("/child/resent", child->resent),
+	        CACHE_COUNT("/child/refused", child->refused),
+	        CACHE_COUNT("/child/late_replies", child->late_replies),
+	        CACHE_COUNT("/child/unexpected_replies", child->unexpected_replies),
+	        CACHE_COUNT("/child/callback_failures", child->callback_failures),
+	        CACHE_COUNT("/child/peak_outstanding", child->peak_outstanding),
+	        CACHE_COUNT("/child/plan_rtt_ms/count", child->plan_rtt.count),
+	        CACHE_TIME("/child/plan_rtt_ms/p50", child->plan_rtt.p50_ms),
+	        CACHE_TIME("/child/plan_rtt_ms/p90", child->plan_rtt.p90_ms),
+	        CACHE_TIME("/child/plan_rtt_ms/max", child->plan_rtt.max_ms),
+	        CACHE_COUNT("/child/compile_rtt_ms/count", child->compile_rtt.count),
+	        CACHE_TIME("/child/compile_rtt_ms/p50", child->compile_rtt.p50_ms),
+	        CACHE_TIME("/child/compile_rtt_ms/p90", child->compile_rtt.p90_ms),
+	        CACHE_TIME("/child/compile_rtt_ms/max", child->compile_rtt.max_ms),
+	        {"/child/lane_off_reason",
+	         [](PrescanCacheReport& figures, uint64_t value) -> nlohmann::json {
+		         figures.child->lane_off_reason = "reason_" + std::to_string(value);
+		         return figures.child->lane_off_reason;
+	         }},
+	        {"/child/priority", [](PrescanCacheReport& figures, uint64_t value) -> nlohmann::json {
+		         figures.child->priority = "priority_" + std::to_string(value);
+		         return figures.child->priority;
+	         }}};
+}
+
+// The drain, the builds, the GPU thread's holds and the records.
+std::vector<PrescanCacheFieldCase> PrescanDrainBuildsRecordsCases() {
+	return {CACHE_COUNT("/drain/adopted", drain.adopted),
+	        CACHE_COUNT("/drain/duplicates", drain.duplicates),
+	        CACHE_COUNT("/drain/plan_mismatch", drain.plan_mismatch),
+	        CACHE_COUNT("/drain/failed_installs", drain.failed_installs),
+	        CACHE_COUNT("/drain/dropped_stopped", drain.dropped_stopped),
+	        CACHE_TIME("/drain/item_max_ms", drain.item_max_ms),
+	        CACHE_COUNT("/drain/both_producers/calls", drain.both_calls),
+	        CACHE_COUNT("/drain/both_producers/over_1ms", drain.both_over_1ms),
+	        CACHE_COUNT("/drain/both_producers/over_4ms", drain.both_over_4ms),
+	        CACHE_TIME("/drain/both_producers/max_ms", drain.both_max_ms),
+	        CACHE_TIME("/drain/both_producers/total_ms", drain.both_total_ms),
+	        CACHE_TIME("/drain/both_producers/lag_ms_max", drain.both_lag_ms_max),
+	        CACHE_COUNT("/builds/builds", builds.builds),
+	        CACHE_COUNT("/builds/worker_builds", builds.worker_builds),
+	        CACHE_TIME("/builds/total_ms", builds.total_ms),
+	        CACHE_COUNT("/holds/in_flight_at_miss_only", holds.in_flight_at_miss_only),
+	        CACHE_COUNT("/builds/upper_bounds/in_scope", builds.in_scope),
+	        CACHE_TIME("/builds/upper_bounds/in_scope_ms", builds.in_scope_ms),
+	        CACHE_COUNT("/builds/upper_bounds/in_hold", builds.in_hold),
+	        CACHE_TIME("/builds/upper_bounds/in_hold_ms", builds.in_hold_ms),
+	        CACHE_COUNT("/records/stored_first_use", records.stored_first_use),
+	        CACHE_COUNT("/records/retained_peak_bytes", records.retained_peak_bytes),
+	        CACHE_COUNT("/records/dropped_over_cap", records.dropped_over_cap),
+	        CACHE_COUNT("/records/unused_at_exit", records.unused_at_exit)};
+}
+
+#undef CACHE_COUNT
+#undef CACHE_TIME
+#undef CACHE_FLAG
+
+// Every figure of the cache's report has its own place in the block. Each case sets one figure of
+// figures that are empty but for a child, to a value no other case uses, and the block then
+// differs from the empty one in that place only, so the baseline is the same block without the
+// change. Two figures written under each other's keys, or one not written, would put the value in
+// the wrong place or nowhere. The overlap figures must sit under upper_bounds, which labels them as
+// bounds, and the GPU thread's holds under holds, apart from the builds.
+void TestPrescanCacheFieldsRoundTrip() {
+	const auto empty = [] {
+		PrescanCacheReport figures;
+		figures.child.emplace();
+		return figures;
+	};
+	const auto block_of = [](const PrescanCacheReport& figures) {
+		Report report;
+		report.SetPrescanCacheFinal(figures);
+		return PrescanBlock(report);
+	};
+	const auto base = block_of(empty());
+	Check(base.is_object() && base["preparer"]["items"] == 0 &&
+	          base["preparer"]["invalid"].empty() && base["child"]["priority"] == "" &&
+	          base["builds"]["upper_bounds"]["in_hold_ms"] == 0.0,
+	      "the empty cache block is not empty");
+	auto cases = PrescanStateIntakeCases();
+	for (auto& more: {PrescanPreparerOutcomeCases(), PrescanChildCases(),
+	                  PrescanDrainBuildsRecordsCases()}) {
+		cases.insert(cases.end(), more.begin(), more.end());
+	}
+	// Distinct from 0 and from one another, so a figure that took another's value shows.
+	constexpr uint64_t FIRST_VALUE = 2001;
+	for (size_t index = 0; index < cases.size(); ++index) {
+		auto       figures = empty();
+		const auto value   = cases[index].set(figures, FIRST_VALUE + index);
+		auto       expected = base;
+		expected[nlohmann::json::json_pointer(cases[index].pointer)] = value;
+		const auto actual = block_of(figures);
+		if (actual != expected || actual == base) {
+			std::fprintf(stderr,
+			             "FirstRunReportTests: the prescan cache figure %s is not where it "
+			             "belongs\n",
+			             cases[index].pointer);
+			std::abort();
+		}
+	}
+}
+
+// With a source, the writer asks it each time. A final figure replaces it at once and the source
+// is never called again, so the cache may destroy what the source reads. The baseline is the same
+// report before the final figure, which shows the source's figure and holds the source alone.
+void TestPrescanCacheFinalReplacesSource() {
+	Report           report;
+	std::atomic<int> calls {0};
+	report.SetPrescanCacheSource([&calls] {
+		PrescanCacheReport figures;
+		figures.preparer.items = 3;
+		calls++;
+		return figures;
+	});
+	Check(PrescanBlock(report)["preparer"]["items"] == 3 && calls == 1,
+	      "the writer did not use the cache source");
+	Check(report.HoldsPrescanCacheSource() && !report.HoldsPrescanCacheFinal(),
+	      "a registered cache source was not held alone");
+	PrescanCacheReport final_figures;
+	final_figures.preparer.items = 9;
+	report.SetPrescanCacheFinal(final_figures);
+	Check(!report.HoldsPrescanCacheSource() && report.HoldsPrescanCacheFinal(),
+	      "the final cache figures did not take the source's place");
+	Check(PrescanBlock(report)["preparer"]["items"] == 9, "the final cache figures were not used");
+	Check(calls == 1, "the cache source was called after the final figures replaced it");
+}
+
+// The cache is torn down right after SetPrescanCacheFinal returns. A writer that called the source
+// after that would read a destroyed object, which this test models as a flag that the source
+// checks. The baseline is the live source before the hand-over, which is called without a
+// violation.
+void TestPrescanCacheWriterNeverTouchesADestroyedSource() {
+	Report            report;
+	std::atomic<bool> alive {true};
+	std::atomic<int>  violations {0};
+	report.SetPrescanCacheSource([&] {
+		if (!alive) violations++;
+		return PrescanCacheReport {};
+	});
+	Check(PrescanBlock(report).contains("preparer") && violations == 0,
+	      "the live cache source failed");
+	report.SetPrescanCacheFinal({});
+	alive            = false;
+	const auto after = PrescanBlock(report);
+	Check(violations == 0, "the writer called a cache source that was destroyed");
+	Check(after.contains("preparer"),
+	      "the final cache figures were not written after the source went");
+}
+
+// The writer is inside the source when the cache hands over the final figures. The hand-over must
+// wait for the writer, because the cache's state goes right after it, and the writer must be out
+// of the source by then. The source here is slow on purpose. A writer that copied the source and
+// called it after unlocking would let the hand-over finish while it was still inside.
+void TestPrescanCacheFinalWaitsForAWriterInTheSource() {
+	Report            report;
+	std::atomic<bool> inside {false};
+	std::atomic<bool> release {false};
+	std::atomic<bool> left_source {false};
+	report.SetPrescanCacheSource([&] {
+		inside = true;
+		while (!release) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		}
+		left_source = true;
+		return PrescanCacheReport {};
+	});
+	std::thread writer([&] { (void)PrescanBlock(report); });
+	while (!inside) {
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+	}
+	std::atomic<bool> handed_over {false};
+	std::thread       owner([&] {
+        report.SetPrescanCacheFinal({});
+        handed_over = true;
+    });
+	// A hand-over that did not wait would be done by now.
+	std::this_thread::sleep_for(std::chrono::milliseconds(200));
+	const bool waited = !handed_over;
+	release           = true;
+	writer.join();
+	owner.join();
+	Check(waited, "the final cache figures were handed over while a writer was in the source");
+	Check(handed_over && left_source, "the hand-over or the writer never finished");
+}
+
 int main() {
   TestPausesMergeByFlip();
   TestPendingPauseCounts();
@@ -2299,6 +2738,13 @@ int main() {
   TestPrescanScanFinalReplacesSource();
   TestPrescanWriterNeverTouchesADestroyedSource();
   TestPrescanFinalWaitsForAWriterInTheSource();
+  TestGenerationDrainMarksPrescan();
+  TestPrescanCacheBlockMerges();
+  TestPrescanCacheBlockLeavesTheRest();
+  TestPrescanCacheFieldsRoundTrip();
+  TestPrescanCacheFinalReplacesSource();
+  TestPrescanCacheWriterNeverTouchesADestroyedSource();
+  TestPrescanCacheFinalWaitsForAWriterInTheSource();
   std::puts("FirstRunReportTests: all cases passed");
   return 0;
 }

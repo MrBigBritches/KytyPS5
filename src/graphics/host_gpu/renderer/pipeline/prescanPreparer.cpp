@@ -1184,4 +1184,119 @@ PrescanPreparerCounters PrescanPreparer::Counters() const {
 	return m_impl->published;
 }
 
+Common::FirstRunReport::PrescanStateReport PrescanStateReportOf(const PrescanCounters& counters) {
+	return {.posted       = counters.posted,
+	        .busy         = counters.busy,
+	        .capped       = counters.capped,
+	        .settled      = counters.settled,
+	        .uncertain    = counters.uncertain,
+	        .dropped_full = counters.dropped_full};
+}
+
+namespace {
+
+// The counts of what the preparer met before it sent anything, with each refusal by its name.
+void CopyIntakeCounts(const PrescanPreparerCounters&                counters,
+                      Common::FirstRunReport::PrescanPreparerReport& report) {
+	report.items                 = counters.items;
+	report.no_map_entry          = counters.no_map_entry;
+	report.zero_size             = counters.zero_size;
+	report.indirect_thread_dims  = counters.indirect_thread_dims;
+	report.bad_item              = counters.bad_item;
+	report.backed_off            = counters.backed_off;
+	report.blocked               = counters.blocked;
+	report.plan_requests         = counters.plan_requests;
+	report.compile_requests      = counters.compile_requests;
+	report.code_unreadable       = counters.code_unreadable;
+	report.code_changed          = counters.code_changed;
+	report.plan_failed           = counters.plan_failed;
+	report.has_calls             = counters.has_calls;
+	report.srt_faults            = counters.srt_faults;
+	report.materialize_failed    = counters.materialize_failed;
+	report.indirect_args_unknown = counters.indirect_args_unknown;
+	for (size_t reason = 0; reason < counters.invalid.size(); ++reason) {
+		report.invalid.emplace_back(DescriptorInvalidName(static_cast<DescriptorInvalid>(reason)),
+		                            counters.invalid[reason]);
+	}
+}
+
+// The counts of the variants, the requests' outcomes and the modules.
+void CopyOutcomeCounts(const PrescanPreparerCounters&                counters,
+                       Common::FirstRunReport::PrescanPreparerReport& report) {
+	report.variant_modules     = counters.variant_modules;
+	report.known_variants      = counters.known_variants;
+	report.capped_variants     = counters.capped_variants;
+	report.known_skipped       = counters.known_skipped;
+	report.heap_image_variants = counters.heap_image_variants;
+	// A heap variant is counted only with a new variant, so it never exceeds them. The minimum only
+	// keeps a report from wrapping round if that ever changed.
+	report.covered_variants =
+	    counters.variant_modules - std::min(counters.heap_image_variants, counters.variant_modules);
+	report.known_modules    = counters.known_modules;
+	report.known_dropped    = counters.known_dropped;
+	report.refused_sends    = counters.refused_sends;
+	report.never_retry      = counters.never_retry;
+	report.blamed           = counters.blamed;
+	report.dropped          = counters.dropped;
+	report.compile_failed   = counters.compile_failed;
+	report.key_mismatch     = counters.key_mismatch;
+	report.decode_failed    = counters.decode_failed;
+	report.adopted          = counters.adopted;
+	report.taken            = counters.taken;
+	report.late_duplicates  = counters.late_duplicates;
+	report.taken_dropped    = counters.taken_dropped;
+	report.plans_dropped    = counters.plans_dropped;
+	report.forgotten        = counters.forgotten;
+	report.failed           = counters.failed;
+	report.lane_off         = counters.lane_off;
+}
+
+} // namespace
+
+Common::FirstRunReport::PrescanPreparerReport
+PrescanPreparerReportOf(const PrescanPreparerCounters& counters) {
+	Common::FirstRunReport::PrescanPreparerReport report;
+	CopyIntakeCounts(counters, report);
+	CopyOutcomeCounts(counters, report);
+	return report;
+}
+
+namespace {
+
+// One kind of round trip, as the supervisor's histogram summed it up.
+Common::FirstRunReport::PrescanRttFigures RttOf(const StoreGen::StreamRttSummary& rtt) {
+	return {.count = rtt.count, .p50_ms = rtt.p50_ms, .p90_ms = rtt.p90_ms, .max_ms = rtt.max_ms};
+}
+
+} // namespace
+
+Common::FirstRunReport::PrescanChildReport
+PrescanChildReportOf(const StoreGen::StreamSupervisorStats& stats) {
+	Common::FirstRunReport::PrescanChildReport report;
+	report.spawns               = stats.spawns;
+	report.failed_spawns        = stats.failed_spawns;
+	report.crashes              = stats.crashes;
+	report.hangs                = stats.hangs;
+	report.protocol_errors      = stats.protocol_errors;
+	report.failures             = stats.failures;
+	report.never_retry          = stats.never_retry;
+	report.never_retry_programs = stats.never_retry_programs;
+	report.lane_off             = stats.lane_off;
+	report.lane_off_reason      = stats.lane_off_reason;
+	report.submitted            = stats.submitted;
+	report.answered             = stats.answered;
+	report.blamed               = stats.blamed;
+	report.dropped              = stats.dropped;
+	report.resent               = stats.resent;
+	report.refused              = stats.refused;
+	report.late_replies         = stats.late_replies;
+	report.unexpected_replies   = stats.unexpected_replies;
+	report.callback_failures    = stats.callback_failures;
+	report.peak_outstanding     = stats.peak_outstanding;
+	report.priority             = stats.priority;
+	report.plan_rtt             = RttOf(stats.plan_rtt);
+	report.compile_rtt          = RttOf(stats.compile_rtt);
+	return report;
+}
+
 } // namespace Libs::Graphics

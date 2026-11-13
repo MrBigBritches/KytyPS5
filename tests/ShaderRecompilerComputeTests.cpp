@@ -64182,7 +64182,10 @@ public:
 // build on the GPU thread inside its Scope, as in CheckPrescanInlineTake, and the hook there sees 0
 // and must find itself on the GPU thread. The pause for draws cannot hold it, since the prescan's
 // set is exempt. The mutations are to drop the worker's unit, and the worker build sees 0, and to
-// count builds on the GPU thread too, and the baseline sees 1.
+// count builds on the GPU thread too, and the baseline sees 1. Both builds count in builds, and
+// only the worker's in worker_builds, which the GPU-thread arm keeps at 0 and the worker arm
+// raises to 1. The mutation is to count worker_builds before the GPU thread's build returns, and
+// the GPU-thread arm counts 1.
 void CheckPrescanRunningWorkerOnly(VulkanHarness &vulkan, GuestGpu &gpu,
                                    const std::vector<DecodedModuleRecord> &records) {
   constexpr const char *name = "PrescanRunningWorkerOnly";
@@ -64212,6 +64215,12 @@ void CheckPrescanRunningWorkerOnly(VulkanHarness &vulkan, GuestGpu &gpu,
     Require(name, "the build ran",
             WaitForPrescan([&] { return seen.load() != NOT_SEEN && cache.PrescanBuilds().builds == 1; }),
             "the prescan build never reached its hook");
+    // A worker counts its build as a worker build just after it counts the build, so that is waited
+    // for. The GPU thread's build finished inside the take, so its counts are already final.
+    if (on_worker) (void)WaitForPrescan([&] { return cache.PrescanBuilds().worker_builds == 1; });
+    Require(name, on_worker ? "a worker's build is a worker build" : "a GPU-thread build is not",
+            cache.PrescanBuilds().worker_builds == (on_worker ? 1u : 0u),
+            "worker_builds counted a build the GPU thread ran, or missed a worker's");
     Require(name, on_worker ? "the build runs on a worker" : "the held take runs the build on the GPU thread",
             hook_on_gpu.load() == !on_worker, "the build did not run on the thread the case needs");
     Require(name, on_worker ? "a worker's build counts" : "a GPU-thread build does not count",
@@ -64247,6 +64256,7 @@ struct PrescanAudioProbe {
 // The probe's hold is still running when the inline build ends, so the build would also count as
 // beside a hold if the GPU thread were judged. The mutations are to judge holds before the GPU
 // thread returns, and in_hold is 1, and to add the GPU thread's build to total_ms, and it is not 0.
+// Count worker builds before the GPU thread returns, and worker_builds is 1.
 void CheckPrescanInlineTake(VulkanHarness &vulkan, GuestGpu &gpu,
                             const std::vector<DecodedModuleRecord> &records) {
   constexpr const char *name = "PrescanInlineTake";
@@ -64274,7 +64284,8 @@ void CheckPrescanInlineTake(VulkanHarness &vulkan, GuestGpu &gpu,
           "the GPU thread's run of a queued prescan build was not charged to PrescanQueued");
   const auto stats = cache.PrescanBuilds();
   Require(name, "the inline build is not work beside a stop",
-          stats.builds == 1 && stats.in_scope == 0 && stats.in_hold == 0 && stats.total_ms == 0.0,
+          stats.builds == 1 && stats.worker_builds == 0 && stats.in_scope == 0 &&
+              stats.in_hold == 0 && stats.total_ms == 0.0,
           "the build the GPU thread ran in its own Scope was counted as overlapping a stop or a hold");
   cache.StopBuilds();
   std::printf("[gpu]     %-32s ok\n", name);
@@ -65030,6 +65041,299 @@ void CheckPrescanGeneratedSkipsCompile(VulkanHarness &vulkan, GuestGpu &gpu,
   std::printf("[gpu]     %-32s ok\n", name);
 }
 
+// ---- The pipeline cache's figures in the first-run report's prescan block. ----
+
+// The prescan block of the process-wide report, or null when it has none.
+nlohmann::json GlobalPrescanBlock() {
+  const auto json =
+      nlohmann::json::parse(Common::FirstRunReport::Global().ToJson({}, 0, 1.0, 0.0, {}));
+  return json.contains("prescan") ? json["prescan"] : nlohmann::json(nullptr);
+}
+
+// The report rounds a time to thousandths of a millisecond. A time is rounded here the same way
+// before it is compared, since a tolerance of half a thousandth fails at a time that lies exactly
+// between two.
+constexpr double REPORT_TIME_SCALE = 1000.0;
+
+// Whether the block holds the count at the pointer.
+bool BlockCount(const nlohmann::json &block, const char *pointer, uint64_t expected) {
+  const nlohmann::json::json_pointer at(pointer);
+  return block.contains(at) && block.at(at).is_number_unsigned() &&
+         block.at(at).get<uint64_t>() == expected;
+}
+
+// Whether the block holds the time at the pointer, as the report rounds it.
+bool BlockTime(const nlohmann::json &block, const char *pointer, double expected) {
+  const nlohmann::json::json_pointer at(pointer);
+  return block.contains(at) && block.at(at).is_number() &&
+         block.at(at).get<double>() == std::round(expected * REPORT_TIME_SCALE) / REPORT_TIME_SCALE;
+}
+
+// The block's drain, builds and record figures are the cache's own. The drain's timing is the
+// generator's planner's, which times every drain.
+bool CacheBlockDrainBuildsRecordsMatch(const nlohmann::json &block, PipelineCache &cache) {
+  const auto stats = cache.GenerationStats();
+  const auto builds = cache.PrescanBuilds();
+  const auto &drain = stats->prescan_drain;
+  const auto &records = stats->prescan_records;
+  return BlockCount(block, "/drain/adopted", drain.adopted) &&
+         BlockCount(block, "/drain/duplicates", drain.duplicates) &&
+         BlockCount(block, "/drain/plan_mismatch", drain.plan_mismatch) &&
+         BlockCount(block, "/drain/failed_installs", drain.failed_installs) &&
+         BlockCount(block, "/drain/dropped_stopped", drain.dropped_stopped) &&
+         BlockTime(block, "/drain/item_max_ms", drain.item_max_ms) &&
+         BlockCount(block, "/drain/both_producers/calls", stats->drain.drain_calls) &&
+         BlockTime(block, "/drain/both_producers/total_ms", stats->drain.drain_total_ms) &&
+         BlockCount(block, "/builds/builds", builds.builds) &&
+         BlockCount(block, "/builds/worker_builds", builds.worker_builds) &&
+         BlockTime(block, "/builds/total_ms", builds.total_ms) &&
+         BlockCount(block, "/builds/upper_bounds/in_scope", builds.in_scope) &&
+         BlockCount(block, "/builds/upper_bounds/in_hold", builds.in_hold) &&
+         BlockCount(block, "/holds/in_flight_at_miss_only", cache.PrescanInFlightAtMissOnly()) &&
+         BlockCount(block, "/records/stored_first_use", records.stored_first_use) &&
+         BlockCount(block, "/records/retained_peak_bytes", records.retained_peak_bytes) &&
+         BlockCount(block, "/records/dropped_over_cap", records.dropped_over_cap) &&
+         BlockCount(block, "/records/unused_at_exit", records.unused_at_exit);
+}
+
+// The block's preparer and state figures are the preparer's published ones.
+bool CacheBlockPreparerMatches(const nlohmann::json &block, PipelineCache &cache) {
+  const auto counters = cache.Prescan()->Counters();
+  return BlockCount(block, "/preparer/items", counters.items) &&
+         BlockCount(block, "/preparer/plan_requests", counters.plan_requests) &&
+         BlockCount(block, "/preparer/compile_requests", counters.compile_requests) &&
+         BlockCount(block, "/preparer/variant_modules", counters.variant_modules) &&
+         BlockCount(block, "/preparer/heap_image_variants", counters.heap_image_variants) &&
+         BlockCount(block, "/preparer/covered_variants",
+                    counters.variant_modules - counters.heap_image_variants) &&
+         BlockCount(block, "/preparer/adopted", counters.adopted) &&
+         BlockCount(block, "/preparer/taken", counters.taken) &&
+         BlockCount(block, "/preparer/late_duplicates", counters.late_duplicates) &&
+         BlockCount(block, "/state/posted", counters.state.posted);
+}
+
+// The cache's figures, with no scanner key, since no GPU with a scanner runs here. The figures
+// that show the dispatch went the whole way must not be 0, so a block of zeros against zeros
+// cannot pass. The module's build ran on a worker, so it counts as a worker build too.
+bool CacheBlockMatches(const nlohmann::json &block, PipelineCache &cache) {
+  return block.is_object() && !block.contains("scan") && !block.contains("child") &&
+         BlockCount(block, "/preparer/items", 1) && BlockCount(block, "/drain/adopted", 1) &&
+         BlockCount(block, "/builds/builds", 1) && BlockCount(block, "/builds/worker_builds", 1) &&
+         CacheBlockPreparerMatches(block, cache) && CacheBlockDrainBuildsRecordsMatch(block, cache);
+}
+
+// The builds and records part of CheckPrescanCacheConverters. Each figure takes the next value from
+// `next`, so no two share one.
+void CheckPrescanBuildsAndRecordsConverters(uint64_t next) {
+  constexpr const char *name = "PrescanCacheConverters";
+  PrescanBuildStats stats;
+  for (uint64_t *count : {&stats.builds, &stats.worker_builds, &stats.in_scope, &stats.in_hold})
+    *count = next++;
+  for (double *time : {&stats.total_ms, &stats.in_scope_ms, &stats.in_hold_ms})
+    *time = static_cast<double>(next++);
+  const auto builds = PrescanBuildsReportOf(stats);
+  Require(name, "the builds",
+          builds.builds == stats.builds && builds.worker_builds == stats.worker_builds &&
+              builds.in_scope == stats.in_scope && builds.in_hold == stats.in_hold &&
+              builds.total_ms == stats.total_ms && builds.in_scope_ms == stats.in_scope_ms &&
+              builds.in_hold_ms == stats.in_hold_ms,
+          "a build figure was not copied from its own field");
+  RetainedRecordCounters counters;
+  for (uint64_t *count : {&counters.stored_first_use, &counters.retained_peak_bytes,
+                          &counters.dropped_over_cap, &counters.unused_at_exit, &counters.retained,
+                          &counters.retained_bytes})
+    *count = next++;
+  const auto records = PrescanRecordsReportOf(counters);
+  Require(name, "the records",
+          records.stored_first_use == counters.stored_first_use &&
+              records.retained_peak_bytes == counters.retained_peak_bytes &&
+              records.dropped_over_cap == counters.dropped_over_cap &&
+              records.unused_at_exit == counters.unused_at_exit,
+          "a record figure was not copied from its own field");
+}
+
+// The converters of the drain, the builds and the records copy each figure into its own place.
+// Each source figure has a value of its own, so one copied from another field, or not at all,
+// differs. The drain's figures come from the prescan's planner and its timing from the
+// generator's, so the two sources hold different values too.
+void CheckPrescanCacheConverters() {
+  constexpr const char *name = "PrescanCacheConverters";
+  StoreGen::GeneratedDrainCounters prescan;
+  StoreGen::GeneratedDrainCounters both;
+  // Away from 0 and the small counts a default would give.
+  constexpr uint64_t FIRST_VALUE = 701;
+  uint64_t next = FIRST_VALUE;
+  for (uint64_t *count : {&prescan.adopted, &prescan.duplicates, &prescan.plan_mismatch,
+                          &prescan.failed_installs, &prescan.dropped_stopped, &prescan.drain_calls,
+                          &both.drain_calls, &both.drain_over_1ms, &both.drain_over_4ms,
+                          &both.adopted})
+    *count = next++;
+  for (double *time : {&prescan.item_max_ms, &prescan.drain_max_ms, &both.drain_max_ms,
+                       &both.drain_total_ms, &both.drain_lag_ms_max, &both.item_max_ms})
+    *time = static_cast<double>(next++);
+  const auto drain = PrescanDrainReportOf(prescan, both);
+  Require(name, "the drain",
+          drain.adopted == prescan.adopted && drain.duplicates == prescan.duplicates &&
+              drain.plan_mismatch == prescan.plan_mismatch &&
+              drain.failed_installs == prescan.failed_installs &&
+              drain.dropped_stopped == prescan.dropped_stopped &&
+              drain.item_max_ms == prescan.item_max_ms && drain.both_calls == both.drain_calls &&
+              drain.both_over_1ms == both.drain_over_1ms &&
+              drain.both_over_4ms == both.drain_over_4ms &&
+              drain.both_max_ms == both.drain_max_ms &&
+              drain.both_total_ms == both.drain_total_ms &&
+              drain.both_lag_ms_max == both.drain_lag_ms_max,
+          "a drain figure was not copied from its own field and producer");
+  CheckPrescanBuildsAndRecordsConverters(next);
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
+// The cache registers its figures with the report while it runs, and hands over final ones when
+// it stops, which the report then writes. A shader store makes the prescan's module keep its
+// record, and the module is never used, so the record is only counted as unused once the stop
+// released it. The live block shows 0 unused and the final block 1, which also proves the final
+// figures are taken after the release. The pipeline build is waited for, since the final figures
+// are taken before the warm sets stop.
+//
+// What the block holds must be the cache's own figures, live and final, so it is compared with
+// GenerationStats, PrescanBuilds and the preparer's counters, and the figures that show the
+// dispatch went the whole way must not be 0. That would also pass while the source were still
+// held, so the report must hold the source alone while the cache runs and the final figures alone
+// after the stop. The baseline is the same cache with the prescan off, whose report has no prescan
+// block at all and never holds either. The mutations are to skip SetPrescanCacheFinal, and the
+// stopped cache's report still holds the source. Take the final figures before the release, and
+// the final block shows no unused record. Register no source, and the running report has no block.
+void CheckPrescanCacheReport(VulkanHarness &vulkan, GuestGpu &gpu) {
+  constexpr const char *name = "PrescanCacheReport";
+  CheckPrescanCacheConverters();
+  auto &report = Common::FirstRunReport::Global();
+  report.Reset();
+  {
+    PipelineCache cache(vulkan.RuntimeContext(), nullptr);
+    PipelineCacheTestAccess::EnableWarmCompute(cache);
+    PipelineCacheTestAccess::EnableGeneration(cache);
+    ShaderComputeInputInfo input{};
+    gpu.SendCommandSync([&] { GeneratedLookup(cache, GENERATED_STRIDE_A, input); });
+    cache.StopBuilds();
+    Require(name, "off writes nothing",
+            GlobalPrescanBlock().is_null() && !report.HoldsPrescanCacheSource() &&
+                !report.HoldsPrescanCacheFinal(),
+            "a cache without the prescan registered prescan figures");
+  }
+  const auto store = PrescanStorePath("cache_report");
+  {
+    PipelineCache cache(vulkan.RuntimeContext(), nullptr);
+    const uint64_t id = PrescanAdoptThroughHelper(gpu, cache, store, name);
+    Require(name, "the module waits for its use", id != 0,
+            "the prescan's module was not adopted with its record");
+    // The build counts its time after its count, so it is waited for as done, which is after both.
+    Require(name, "the build and the counters settle",
+            WaitForPrescan([&] {
+              return PipelineCacheTestAccess::PrescanWarmDone(cache, id) &&
+                     cache.Prescan()->Counters().adopted == 1;
+            }),
+            "the prescan's build or the preparer's adoption never showed");
+    const auto live = GlobalPrescanBlock();
+    Require(name, "a running cache is a source",
+            report.HoldsPrescanCacheSource() && !report.HoldsPrescanCacheFinal(),
+            "the running cache's report did not hold its source alone");
+    Require(name, "the live figures",
+            CacheBlockMatches(live, cache) && BlockCount(live, "/records/unused_at_exit", 0),
+            "the running cache's prescan block is not the cache's own figures");
+    cache.StopBuilds();
+    const auto final_block = GlobalPrescanBlock();
+    Require(name, "the stop hands over",
+            !report.HoldsPrescanCacheSource() && report.HoldsPrescanCacheFinal(),
+            "after the stop the report still held the cache's source, or no final figures");
+    Require(name, "the final figures",
+            CacheBlockMatches(final_block, cache) &&
+                BlockCount(final_block, "/records/unused_at_exit", 1),
+            "the final prescan block is not the stopped cache's figures, or missed the unused "
+            "record");
+  }
+  std::filesystem::remove_all(store.parent_path());
+  report.Reset();
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
+// The child block is there when the helper runs in a child process, and not with the in-process
+// transport, which is the baseline and differs only in the transport EnablePrescan makes. No
+// dispatch is sent, so no child is started and the supervisor counted nothing, and the block must
+// still be there. The mutation is to make HelperTransportFactory pass no pointer for the
+// transport, and the helper's run has no child block.
+//
+// The helper's arm is the production path, so it uses the real %TEMP%\kyty_prescan directory,
+// and its start-up cleanup removes files there that dead runs left. It starts no child and leaves
+// no file of its own. Without such a directory the prescan stays off, so the arm is skipped with a
+// note.
+void CheckPrescanChildReport(VulkanHarness &vulkan) {
+  constexpr const char *name = "PrescanChildReport";
+  auto &report = Common::FirstRunReport::Global();
+  for (const bool helper : {false, true}) {
+    if (helper && !StoreGen::PrescanHelperDirectory()) {
+      std::printf("[gpu]     %-32s helper arm skipped, no private directory for its files\n",
+                  name);
+      continue;
+    }
+    report.Reset();
+    PipelineCache cache(vulkan.RuntimeContext(), nullptr);
+    cache.EnablePrescan(helper ? StoreGen::PrescanTransportFactory{}
+                               : StoreGen::InProcessPrescanTransportFactory());
+    Require(name, "the prescan is on", cache.Prescan() != nullptr,
+            "EnablePrescan made no preparer");
+    const auto live = GlobalPrescanBlock();
+    const bool counted_nothing =
+        BlockCount(live, "/child/spawns", 0) && BlockCount(live, "/child/submitted", 0);
+    Require(name,
+            helper ? "a helper in a child has a child block" : "an in-process helper has none",
+            live.contains("preparer") && live.contains("child") == helper &&
+                (!helper || counted_nothing),
+            "the child block did not follow the transport");
+    cache.StopBuilds();
+    Require(name, "the final figures keep it", GlobalPrescanBlock().contains("child") == helper,
+            "the final figures lost or gained the child block");
+  }
+  report.Reset();
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
+// The drain block of the generation's report in the process-wide report, or null without one.
+nlohmann::json GlobalGenerationDrain() {
+  const auto json =
+      nlohmann::json::parse(Common::FirstRunReport::Global().ToJson({}, 0, 1.0, 0.0, {}));
+  const nlohmann::json::json_pointer pointer("/shader_store_generation/drain");
+  return json.contains(pointer) ? json.at(pointer) : nlohmann::json(nullptr);
+}
+
+// A generation that shares its intake with the prescan marks its drain figures, live and final,
+// so the prescan's modules are not credited to the generator. The baseline is the same generation
+// with the prescan off, whose drain has no mark at all, which keeps that report as it was. Both
+// must have a drain block, so a missing block cannot pass for a missing mark. The mutation is to
+// leave the mark unset in EnablePrescan, and the prescan's arm has no mark.
+void CheckGenerationMarksPrescan(VulkanHarness &vulkan) {
+  constexpr const char *name = "GenerationMarksPrescan";
+  auto &report = Common::FirstRunReport::Global();
+  for (const bool prescan : {false, true}) {
+    report.Reset();
+    PipelineCache cache(vulkan.RuntimeContext(), nullptr);
+    PipelineCacheTestAccess::EnableGeneration(cache);
+    PipelineCacheTestAccess::RegisterGenerationReport(cache);
+    if (prescan) cache.EnablePrescan(StoreGen::InProcessPrescanTransportFactory());
+    const auto marked = [&] {
+      const auto drain = GlobalGenerationDrain();
+      return drain.is_object() && drain.contains("includes_prescan") == prescan &&
+             (!prescan || drain["includes_prescan"] == true);
+    };
+    Require(name, prescan ? "the live drain is marked" : "the live drain has no mark", marked(),
+            "the generation's live drain block did not follow whether the prescan shares it");
+    cache.StopBuilds();
+    Require(name, prescan ? "the final drain is marked" : "the final drain has no mark", marked(),
+            "the generation's final drain block did not follow whether the prescan shares it");
+  }
+  report.Reset();
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
 // Captures two module records of one program, as CheckGeneratedModules does, and runs the
 // prescan's intake checks over them.
 void CheckPrescanIntake(VulkanHarness &vulkan) {
@@ -65068,6 +65372,9 @@ void CheckPrescanIntake(VulkanHarness &vulkan) {
       CheckPrescanNoStoreRetainsNothing(vulkan, gpu, records);
       CheckPrescanStoreLoadedSkipsCompile(vulkan);
       CheckPrescanGeneratedSkipsCompile(vulkan, gpu, records);
+      CheckPrescanCacheReport(vulkan, gpu);
+      CheckPrescanChildReport(vulkan);
+      CheckGenerationMarksPrescan(vulkan);
     });
   }
   std::filesystem::remove_all(dir);
@@ -65583,6 +65890,15 @@ void CheckPrescanReportHandOver(RenderContext &context, GuestGpu &gpu, const cha
           "the report's prescan block did not show the scanner's walks while the GPU ran");
   Require(name, "a running GPU is a source", report.HoldsPrescanScanSource() && !report.HoldsPrescanScanFinal(),
           "the running GPU's report did not hold the scanner source alone");
+  // The GPU's scanner and its cache's preparer both registered, so the one block holds both parts.
+  // The preparer took one item per list, which the wiring check waited for.
+  const auto both = GlobalPrescanBlock();
+  Require(name, "the scanner's and the cache's figures share the block",
+          BlockCount(both, "/scan/submissions", PRESCAN_GPU_LISTS) &&
+              BlockCount(both, "/preparer/items", PRESCAN_GPU_LISTS) &&
+              report.HoldsPrescanCacheSource(),
+          "the running GPU's prescan block did not hold both the scanner's and the preparer's "
+          "figures");
   gpu.Shutdown();
   Require(name, "shutdown hands over", !report.HoldsPrescanScanSource() && report.HoldsPrescanScanFinal(),
           "after Shutdown the report still held the scanner source, or no final figures");

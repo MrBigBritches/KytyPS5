@@ -403,6 +403,10 @@ struct GenerationDrain {
 	uint64_t bad_plans             = 0;
 	uint64_t undrained_at_stop     = 0;
 	uint64_t pending               = 0;
+	/// Whether the submit-time prescan posted into the same intake, so the drain's timing and the
+	/// intake's counts above cover its modules too. Only true is written, so a run without the
+	/// prescan writes the block as it always did.
+	bool includes_prescan = false;
 };
 
 /// The report's view of --generate-shader-store: plain numbers and text, since this library cannot
@@ -751,6 +755,167 @@ struct PrescanScannerReport {
 	uint64_t offers_dropped = 0;
 };
 
+/// How the preparer's state answered the dispatches it was asked about. The names are those of the
+/// state's own counts.
+struct PrescanStateReport {
+	uint64_t posted       = 0;
+	uint64_t busy         = 0;
+	uint64_t capped       = 0;
+	uint64_t settled      = 0;
+	uint64_t uncertain    = 0;
+	uint64_t dropped_full = 0;
+};
+
+/// What the preparer counted, under the names of its own counts.
+struct PrescanPreparerReport {
+	uint64_t items                 = 0;
+	uint64_t no_map_entry          = 0;
+	uint64_t zero_size             = 0;
+	uint64_t indirect_thread_dims  = 0;
+	uint64_t bad_item              = 0;
+	uint64_t backed_off            = 0;
+	uint64_t blocked               = 0;
+	uint64_t plan_requests         = 0;
+	uint64_t compile_requests      = 0;
+	uint64_t code_unreadable       = 0;
+	uint64_t code_changed          = 0;
+	uint64_t plan_failed           = 0;
+	uint64_t has_calls             = 0;
+	uint64_t srt_faults            = 0;
+	uint64_t materialize_failed    = 0;
+	uint64_t indirect_args_unknown = 0;
+	/// Snapshots refused before they were sent, by the name of the reason.
+	std::vector<std::pair<std::string, uint64_t>> invalid;
+	uint64_t variant_modules     = 0;
+	uint64_t known_variants      = 0;
+	uint64_t capped_variants     = 0;
+	uint64_t known_skipped       = 0;
+	uint64_t heap_image_variants = 0;
+	/// The new variants the prescan can stand for, which leaves out those whose image table the GPU
+	/// thread's heap may take, since the runtime then builds a module the preparer's never matches.
+	uint64_t covered_variants = 0;
+	uint64_t known_modules    = 0;
+	uint64_t known_dropped    = 0;
+	uint64_t refused_sends    = 0;
+	uint64_t never_retry      = 0;
+	uint64_t blamed           = 0;
+	uint64_t dropped          = 0;
+	uint64_t compile_failed   = 0;
+	uint64_t key_mismatch     = 0;
+	uint64_t decode_failed    = 0;
+	uint64_t adopted          = 0;
+	uint64_t taken            = 0;
+	uint64_t late_duplicates  = 0;
+	uint64_t taken_dropped    = 0;
+	uint64_t plans_dropped    = 0;
+	uint64_t forgotten        = 0;
+	bool     failed           = false;
+	bool     lane_off         = false;
+};
+
+/// The round trips of one kind of request to the helper, in milliseconds.
+struct PrescanRttFigures {
+	uint64_t count  = 0;
+	double   p50_ms = 0.0;
+	double   p90_ms = 0.0;
+	double   max_ms = 0.0;
+};
+
+/// What the supervisor of the helper's child process counted. The pipe names and process ids are
+/// left out, since they only tell one run's processes apart.
+struct PrescanChildReport {
+	uint64_t          spawns               = 0;
+	uint64_t          failed_spawns        = 0;
+	uint64_t          crashes              = 0;
+	uint64_t          hangs                = 0;
+	uint64_t          protocol_errors      = 0;
+	uint64_t          failures             = 0;
+	uint64_t          never_retry          = 0;
+	uint64_t          never_retry_programs = 0;
+	bool              lane_off             = false;
+	std::string       lane_off_reason;
+	uint64_t          submitted          = 0;
+	uint64_t          answered           = 0;
+	uint64_t          blamed             = 0;
+	uint64_t          dropped            = 0;
+	uint64_t          resent             = 0;
+	uint64_t          refused            = 0;
+	uint64_t          late_replies       = 0;
+	uint64_t          unexpected_replies = 0;
+	uint64_t          callback_failures  = 0;
+	uint64_t          peak_outstanding   = 0;
+	std::string       priority;
+	PrescanRttFigures plan_rtt;
+	PrescanRttFigures compile_rtt;
+};
+
+/// How the drain of generated modules treated the prescan's modules. The drain's timing belongs to
+/// no producer, since one drain takes both producers' modules under one budget, so it is given for
+/// both together, and it is the same timing the generator's block shows when that block exists.
+struct PrescanDrainReport {
+	uint64_t adopted = 0;
+	/// The drain's refusals as duplicates. The preparer's late_duplicates counts the notes of them
+	/// that reached it, which a full ring or a stop can drop, so the two need not be equal.
+	uint64_t duplicates      = 0;
+	uint64_t plan_mismatch   = 0;
+	uint64_t failed_installs = 0;
+	uint64_t dropped_stopped = 0;
+	double   item_max_ms     = 0.0;
+	/// The timing of every drain, of the generator's modules and the prescan's alike.
+	uint64_t both_calls      = 0;
+	uint64_t both_over_1ms   = 0;
+	uint64_t both_over_4ms   = 0;
+	double   both_max_ms     = 0.0;
+	double   both_total_ms   = 0.0;
+	double   both_lag_ms_max = 0.0;
+};
+
+/// What the prescan's pipeline builds did. in_scope, in_scope_ms, in_hold and in_hold_ms are upper
+/// bounds on the overlap with a stop of the GPU thread and with a hold of guest audio, and nothing
+/// may gate on them. They count worker builds only, so worker_builds and total_ms are what they are
+/// measured against, while builds also counts the builds the GPU thread ran itself. The final
+/// figures are taken when the pipeline cache stops its intake, before its warm sets stop, so builds
+/// still running then are left out, at most PRESCAN_BUILD_WORKERS of them. Those finish during
+/// teardown, and their overlaps would have nothing to do with gameplay.
+struct PrescanBuildsReport {
+	uint64_t builds        = 0;
+	uint64_t worker_builds = 0;
+	uint64_t in_scope      = 0;
+	uint64_t in_hold       = 0;
+	double   total_ms      = 0.0;
+	double   in_scope_ms   = 0.0;
+	double   in_hold_ms    = 0.0;
+};
+
+/// What the prescan did to the GPU thread's own stops. in_flight_at_miss_only counts the GPU
+/// thread's own compiles charged to PrescanInFlight only by the check at the lookup's miss. They
+/// are inline compiles and not prescan builds, so they are kept apart from the builds.
+struct PrescanHoldsReport {
+	uint64_t in_flight_at_miss_only = 0;
+};
+
+/// What became of the store records of the prescan's modules, which wait for each module's first
+/// use. While the cache runs these are the figures the last drain published, so a first use after
+/// the last drain shows only once a later drain, or the stop, publishes again.
+struct PrescanRecordsReport {
+	uint64_t stored_first_use    = 0;
+	uint64_t retained_peak_bytes = 0;
+	uint64_t dropped_over_cap    = 0;
+	uint64_t unused_at_exit      = 0;
+};
+
+/// The pipeline cache's part of the prescan block, as plain numbers since this library cannot see
+/// the cache. The child figures exist only when the helper runs in a child process.
+struct PrescanCacheReport {
+	PrescanStateReport                state;
+	PrescanPreparerReport             preparer;
+	std::optional<PrescanChildReport> child;
+	PrescanDrainReport                drain;
+	PrescanBuildsReport               builds;
+	PrescanHoldsReport                holds;
+	PrescanRecordsReport              records;
+};
+
 /// Figures worked out from the raw records, kept apart from JSON so tests can read them.
 struct Summary {
 	double                                                   blocked_graphics_ms = 0.0;
@@ -968,10 +1133,31 @@ public:
 	/// Whether final scanner figures are stored.
 	[[nodiscard]] bool HoldsPrescanScanFinal() const;
 
+	/// Registers the function the writer calls for the pipeline cache's part of the prescan block.
+	/// There is one slot, so a second cache's source replaces the first's, and either cache's final
+	/// figures then replace whichever source is held. Either part alone makes the block, and with
+	/// both their keys share it. The writer holds the prescan cache lock while it calls, so the
+	/// owner replaces the source with SetPrescanCacheFinal before what the function reads is
+	/// destroyed. The function must not call back into these functions.
+	void SetPrescanCacheSource(std::function<PrescanCacheReport()> source);
+	/// Stores the final figures and removes the source, in one step under the lock.
+	void SetPrescanCacheFinal(PrescanCacheReport final_figures);
+	/// Whether a pipeline cache source is registered, so a test can tell that its owner handed over
+	/// without calling a source that may be gone.
+	[[nodiscard]] bool HoldsPrescanCacheSource() const;
+	/// Whether final pipeline cache figures are stored.
+	[[nodiscard]] bool HoldsPrescanCacheFinal() const;
+
 private:
 	// The scanner's figures from the source or the final ones, or nothing when there are neither. The
 	// source is called with the prescan scan lock held.
 	[[nodiscard]] std::optional<PrescanScannerReport> PrescanScanFigures() const;
+	// The pipeline cache's figures from the source or the final ones, or nothing when there are
+	// neither. The source is called with the prescan cache lock held.
+	[[nodiscard]] std::optional<PrescanCacheReport> PrescanCacheFigures() const;
+	// Removes every registered source and its final figures, and the generation's inactive reason,
+	// for Reset.
+	void ResetSources();
 	// Moves the pause being merged to the finished ones when it belongs to another flip. Caller
 	// holds the lock.
 	void FlushPendingPauseLocked(int64_t current_flip);
@@ -1001,6 +1187,13 @@ private:
 	mutable std::mutex                           m_prescan_scan_mutex;
 	std::function<PrescanScannerReport()>        m_prescan_scan_source;
 	std::optional<PrescanScannerReport>          m_prescan_scan_final;
+
+	// Guards the two prescan cache members. It is taken on its own, never with another lock of the
+	// report held. The source takes the cache's generation state lock, the preparer's published
+	// lock and the helper supervisor's lock, and none of their holders ever waits on the report.
+	mutable std::mutex                           m_prescan_cache_mutex;
+	std::function<PrescanCacheReport()>          m_prescan_cache_source;
+	std::optional<PrescanCacheReport>            m_prescan_cache_final;
 
 	mutable std::mutex           m_mutex;
 	Phase                        m_phase = Phase::Play;

@@ -28,6 +28,15 @@
 // through a sink. It never waits for the helper and the GPU thread never waits for it, so a request
 // still in flight when the game needs its module is simply compiled by the GPU thread as before,
 // and the late answer is dropped by the intake as a duplicate.
+
+// Only named as return types here, so the report's header stays out of every file that includes
+// this.
+namespace Common::FirstRunReport {
+struct PrescanStateReport;
+struct PrescanPreparerReport;
+struct PrescanChildReport;
+} // namespace Common::FirstRunReport
+
 namespace Libs::Graphics {
 
 /// After this many modules of one program were built and none of them used yet, the program is
@@ -137,6 +146,19 @@ struct PrescanPreparerCounters {
 	/// The state's own counts.
 	PrescanCounters state;
 };
+
+/// The first-run report's view of the state's counts.
+[[nodiscard]] Common::FirstRunReport::PrescanStateReport
+PrescanStateReportOf(const PrescanCounters& counters);
+/// The first-run report's view of the preparer's counts, with each refusal by its reason's name.
+/// The covered variants are the new variants less those whose image table the GPU thread's heap
+/// may take.
+[[nodiscard]] Common::FirstRunReport::PrescanPreparerReport
+PrescanPreparerReportOf(const PrescanPreparerCounters& counters);
+/// The first-run report's view of what the helper's supervisor counted, without the pipe names and
+/// process ids, which only tell one run's processes apart.
+[[nodiscard]] Common::FirstRunReport::PrescanChildReport
+PrescanChildReportOf(const StoreGen::StreamSupervisorStats& stats);
 
 /// Looks a program up in the shader map, by its guest address.
 using PrescanMapLookup = std::function<std::optional<ShaderMapSnapshot>(uint64_t address)>;

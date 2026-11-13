@@ -93,6 +93,9 @@ struct PipelineCache::GenerationState {
 	StoreGen::GeneratedDrainCounters published_drain;
 	StoreGen::GeneratedDrainCounters published_prescan_drain;
 	uint64_t                         published_backlog = 0;
+	// The prescan's record counts, copied with the drain's, and once more at the stop, only with
+	// the prescan on. The list itself belongs to the GPU thread.
+	RetainedRecordCounters published_prescan_records;
 
 	// The rows of the report, all guarded by the mutex above. They live until the cache is
 	// destroyed, which is after the warm queue has stopped, and StopStoreGeneration never clears
@@ -104,6 +107,14 @@ struct PipelineCache::GenerationState {
 	std::deque<StoreGen::MissRow> miss_rows;
 	// Whether the report was given a source, which StopStoreGeneration must then replace.
 	bool report_registered = false;
+	// Whether the report was given the prescan's source, which StopStoreGeneration must then
+	// replace. Like report_registered it is a plain bool of the thread that owns the cache, which
+	// sets it and stops the generation, so the mutex does not guard it.
+	bool prescan_report_registered = false;
+	// Whether the prescan's preparer posts into this intake, which the generation's report marks on
+	// its drain figures. Set once by EnablePrescan and read by the report's writer on its own
+	// thread.
+	std::atomic<bool> includes_prescan {false};
 
 	// Every producer adds to these, so the handles made balance the handles destroyed once nothing
 	// waits, whoever made them.

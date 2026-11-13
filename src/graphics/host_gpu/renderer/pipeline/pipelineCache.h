@@ -269,15 +269,30 @@ inline constexpr uint32_t PRESCAN_BUILD_WORKERS = 3;
 // while it ran, and it ran on a worker. in_scope_ms and in_hold_ms are the whole time of those
 // builds, so they are upper bounds on the overlap, and nothing may gate on them. total_ms is the
 // time of the worker builds only, since it is what those two are measured against. builds counts
-// every build, on a worker or on the GPU thread.
+// every build, on a worker or on the GPU thread, and worker_builds only the workers' builds, which
+// is the count in_scope and in_hold are fractions of.
 struct PrescanBuildStats {
-	uint64_t builds      = 0;
-	uint64_t in_scope    = 0;
-	uint64_t in_hold     = 0;
-	double   total_ms    = 0.0;
-	double   in_scope_ms = 0.0;
-	double   in_hold_ms  = 0.0;
+	uint64_t builds        = 0;
+	uint64_t worker_builds = 0;
+	uint64_t in_scope      = 0;
+	uint64_t in_hold       = 0;
+	double   total_ms      = 0.0;
+	double   in_scope_ms   = 0.0;
+	double   in_hold_ms    = 0.0;
 };
+
+/// The first-run report's view of how the drain treated the prescan's modules. The timing comes
+/// from `both`, the generator's planner, which times every drain of either producer's modules,
+/// since the prescan's planner never times a drain of its own.
+[[nodiscard]] Common::FirstRunReport::PrescanDrainReport
+PrescanDrainReportOf(const StoreGen::GeneratedDrainCounters& prescan,
+                     const StoreGen::GeneratedDrainCounters& both);
+/// The first-run report's view of the prescan's builds.
+[[nodiscard]] Common::FirstRunReport::PrescanBuildsReport
+PrescanBuildsReportOf(const PrescanBuildStats& builds);
+/// The first-run report's view of what became of the prescan's store records.
+[[nodiscard]] Common::FirstRunReport::PrescanRecordsReport
+PrescanRecordsReportOf(const RetainedRecordCounters& records);
 
 // What a draw that has no pipeline yet does while the pipeline builds. A skipped draw leaves out its
 // commands, a deferred draw becomes a hole in the command stream that is recorded once the pipeline
@@ -622,9 +637,14 @@ private:
 	std::unique_ptr<PrescanHandoff>                   m_prescan_handoff;
 	std::unique_ptr<WarmBuildSet<uint64_t, Pipeline>> m_prescan_compute;
 	std::unique_ptr<PrescanPreparer>                  m_prescan;
+	// The preparer's transport when it is the helper in a child process, for the report's child
+	// figures, or null. The preparer owns it, so it lives as long as m_prescan. The factory sets it
+	// while EnablePrescan makes the preparer, and nothing changes it once that succeeded.
+	StoreGen::SupervisorPrescanTransport* m_prescan_supervisor = nullptr;
 	// Written by the prescan's build workers, read by anyone.
 	struct PrescanBuildCounters {
 		std::atomic<uint64_t> builds {0};
+		std::atomic<uint64_t> worker_builds {0};
 		std::atomic<uint64_t> in_scope {0};
 		std::atomic<uint64_t> in_hold {0};
 		std::atomic<uint64_t> total_us {0};
@@ -864,9 +884,23 @@ private:
 	// Takes posted modules into the program cache and queues their builds. GPU thread only. It takes
 	// a bounded number, and stops after a bounded time, so a drain is always short.
 	void DrainGenerated();
+	// Copies what the drain counted, and with the prescan on the prescan's record counts, under the
+	// state's mutex, where the report's writer reads them from its own thread. GPU thread only.
+	void PublishDrain();
 	// Gives the first-run report the source of the generation's figures. StartStoreGeneration calls
 	// it, and a test of the stand-in intake does the same.
 	void RegisterGenerationReport();
+	// pipelinePrescan.cpp. The prescan's figures for the first-run report. Live, the drain and
+	// record figures come from what the drain last published, and the writer's thread may call it
+	// at any time. Final, the drain figures come from the planners themselves, which is only exact
+	// once nothing drains. Call it only with the prescan on. It holds no lock across another.
+	[[nodiscard]] Common::FirstRunReport::PrescanCacheReport
+	BuildPrescanReport(bool final_figures) const;
+	// pipelinePrescan.cpp. Publishes the prescan's record counts once the stop has released the
+	// list, so the unused ones are final, and hands the report the final figures in place of the
+	// source. StopStoreGeneration calls it once nothing posts or drains. It does nothing without
+	// the prescan.
+	void FinishPrescanReport();
 	// The figures of the generation for the first-run report. Live, they come from what the drain
 	// last published, and the writer's thread may call it at any time. Final, they come from the
 	// planner itself, which is only exact once nothing drains. It takes the state's mutex briefly

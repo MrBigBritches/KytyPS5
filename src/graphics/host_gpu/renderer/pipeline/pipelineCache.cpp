@@ -1749,7 +1749,8 @@ void PipelineCache::CountPrescanBuild(bool on_worker, const StallSample& before,
 	if (!on_worker) {
 		return;
 	}
-	// Worker-only, since it is what in_scope_ms and in_hold_ms are measured against.
+	// Worker-only, since these are what in_scope, in_hold and their times are measured against.
+	m_prescan_builds.worker_builds.fetch_add(1, std::memory_order_relaxed);
 	m_prescan_builds.total_us.fetch_add(elapsed_us, std::memory_order_relaxed);
 	if (before.scope_active || after.scope_active || after.scopes != before.scopes) {
 		m_prescan_builds.in_scope.fetch_add(1, std::memory_order_relaxed);
@@ -1768,12 +1769,13 @@ PrescanBuildStats PipelineCache::PrescanBuilds() const {
 	const auto       to_ms     = [](const std::atomic<uint64_t>& micros) {
 		return static_cast<double>(micros.load(std::memory_order_relaxed)) * MS_PER_US;
 	};
-	return {.builds      = m_prescan_builds.builds.load(std::memory_order_relaxed),
-	        .in_scope    = m_prescan_builds.in_scope.load(std::memory_order_relaxed),
-	        .in_hold     = m_prescan_builds.in_hold.load(std::memory_order_relaxed),
-	        .total_ms    = to_ms(m_prescan_builds.total_us),
-	        .in_scope_ms = to_ms(m_prescan_builds.in_scope_us),
-	        .in_hold_ms  = to_ms(m_prescan_builds.in_hold_us)};
+	return {.builds        = m_prescan_builds.builds.load(std::memory_order_relaxed),
+	        .worker_builds = m_prescan_builds.worker_builds.load(std::memory_order_relaxed),
+	        .in_scope      = m_prescan_builds.in_scope.load(std::memory_order_relaxed),
+	        .in_hold       = m_prescan_builds.in_hold.load(std::memory_order_relaxed),
+	        .total_ms      = to_ms(m_prescan_builds.total_us),
+	        .in_scope_ms   = to_ms(m_prescan_builds.in_scope_us),
+	        .in_hold_ms    = to_ms(m_prescan_builds.in_hold_us)};
 }
 
 WarmBuildSet<uint64_t, PipelineCache::Pipeline>* PipelineCache::WarmSetPending(uint64_t id) const {
