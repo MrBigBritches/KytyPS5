@@ -689,6 +689,64 @@ void TestSkippedSrtLoadSendsNothing() {
 	std::puts("SkippedSrtLoadSendsNothing ok");
 }
 
+// The thread the last read of guest memory ran on, so a test can tell the preparer's own thread
+// from the test's.
+std::atomic<std::thread::id> g_reader_thread {};
+
+// Reads host memory as ReadHost does, and notes the thread it ran on.
+bool ReadHostNotingThread(void* userdata, uint64_t address, std::span<uint32_t> values) {
+	g_reader_thread.store(std::this_thread::get_id());
+	return ReadHost(userdata, address, values);
+}
+
+// A walk that faults on a guarded page skips the load on the preparer's own thread, where a running
+// prescan walks, and the snapshot sends nothing. The other guarded checks drive the passes with
+// RunOnce on the test's thread. The walk's non-faulting flag and its running walker are per thread,
+// so only a pass on the preparer's thread shows that the handler, which runs on the faulting
+// thread, finds what that thread's own walk set. The test never calls RunOnce, and the reader notes
+// the thread that copied the program's code, which must not be the test's. The handler is this
+// binary's stand-in, which routes the fault through the same SrtWalkerRouteFault the emulator's
+// handler calls. The baseline is the same page left readable, which gives one variant and one
+// Compile, so a run that sent nothing for another reason fails it. The guarded run must count the
+// fault too. The mutation is to walk without non_faulting. The stand-in then completes the load as
+// zero on the preparer's thread, and no fault is counted.
+void TestGuardedPageSkippedOnPreparerThread() {
+	const FakeGuestMemory memory;
+	const auto            program = SrtProgram();
+	for (const bool guarded: {false, true}) {
+		ProtectedPage page;
+		const auto    descriptor = Descriptor(STRIDE_A, DstSel(4, 5, 6, 7));
+		std::copy(descriptor.begin(), descriptor.end(), page.Words());
+		const uint64_t                            address = page.Address();
+		const std::array<uint32_t, POINTER_SGPRS> pointer {static_cast<uint32_t>(address),
+		                                                   static_cast<uint32_t>(address >> 32u)};
+		Harness harness({}, {}, {}, {}, ReadHostNotingThread);
+		harness.Map(program);
+		harness.transport->SetHoldCompiles(true);
+		if (guarded) {
+			page.Guard();
+		}
+		g_reader_thread.store({});
+		harness.preparer->Start();
+		harness.Push(ItemFor(program, pointer, KEY));
+		WakePreparer(*harness.handoff);
+		// A pass publishes its counters at its end, so either count showing means the snapshot was
+		// prepared and every Compile it sends was already sent.
+		CHECK(WaitFor([&] {
+			const auto counters = harness.Counters();
+			return counters.srt_faults + counters.variant_modules != 0;
+		}));
+		const auto counters = harness.Counters();
+		CHECK(counters.srt_faults == (guarded ? 1u : 0u));
+		CHECK(counters.variant_modules == (guarded ? 0u : 1u));
+		CHECK(harness.transport->Compiles() == (guarded ? 0u : 1u));
+		const auto reader = g_reader_thread.load();
+		CHECK(reader != std::thread::id {} && reader != std::this_thread::get_id());
+		harness.preparer->Stop();
+	}
+	std::puts("GuardedPageSkippedOnPreparerThread ok");
+}
+
 // ---- Skipping what the cache already has. ----
 
 // The module the preparer builds for one dispatch of the program, in a harness of its own.
@@ -2875,6 +2933,7 @@ int main(int argc, char** argv) {
 	TestSecondVariantSkipsPlan();
 	TestInvalidDescriptorNeverSent();
 	TestSkippedSrtLoadSendsNothing();
+	TestGuardedPageSkippedOnPreparerThread();
 	TestSkipKeySeparatesUserDataCount();
 	TestSkipKeyAgreesWithRecord();
 	TestReportedKeySkipsCompile();

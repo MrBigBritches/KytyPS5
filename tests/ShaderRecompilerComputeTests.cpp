@@ -66830,6 +66830,685 @@ void CheckPrescanGuestGpu(VulkanHarness &vulkan) {
   CheckPrescanSinkWithoutStore(vulkan, records[0]);
 }
 
+// ---- The prescan differential, what the prescan builds against the inline compile. ----
+
+constexpr const char *PRESCAN_DIFF_NAME = "PrescanDifferential";
+// The guest memory of the differential. The output buffer is at the start, the indirect dispatch's
+// arguments on the next page, and the image in a 64 KiB block of its own, so the buffer cache and
+// the texture cache never share a block.
+constexpr uint64_t PRESCAN_DIFF_BASE = 0x0000000205800000ull;
+constexpr uint64_t PRESCAN_DIFF_SIZE = 0x20000;
+constexpr uint64_t PRESCAN_DIFF_ALIGNMENT = 0x10000;
+constexpr uint64_t PRESCAN_DIFF_ARGS = PRESCAN_DIFF_BASE + 0x1000;
+constexpr uint64_t PRESCAN_DIFF_IMAGE = PRESCAN_DIFF_BASE + 0x10000;
+// Guest read and write access, mapped at the fixed address.
+constexpr int PRESCAN_DIFF_PROTECTION = 0x3;
+constexpr int PRESCAN_DIFF_MAP_FIXED = 0x10;
+// Two groups of 64 threads along X, so a program writes up to 128 dwords. With thread dimensions,
+// 100 threads leave the last 28 of the second group idle.
+constexpr u32 PRESCAN_DIFF_GROUP_THREADS = 64;
+constexpr u32 PRESCAN_DIFF_GROUP_SHIFT = 6;
+constexpr u32 PRESCAN_DIFF_GROUPS = 2;
+constexpr u32 PRESCAN_DIFF_DWORDS = PRESCAN_DIFF_GROUP_THREADS * PRESCAN_DIFF_GROUPS;
+constexpr u32 PRESCAN_DIFF_DIMENSION_THREADS = 100;
+// What the output holds before a dispatch, and the first value a program writes or reads.
+constexpr u32 PRESCAN_DIFF_SENTINEL = 0xa5a5a5a5u;
+constexpr u32 PRESCAN_DIFF_VALUE_BASE = 0x1000u;
+constexpr u32 PRESCAN_DIFF_TEXEL_BASE = 0x7000u;
+// One LDS allocation unit, which holds a dword for each thread of a group.
+constexpr u32 PRESCAN_DIFF_LDS_UNITS = 1;
+// How far a dword index is shifted to give its byte offset.
+constexpr u32 PRESCAN_DIFF_DWORD_SHIFT = 2;
+// Room for the longest differential program.
+constexpr size_t PRESCAN_DIFF_PROGRAM_WORDS = 64;
+// The output descriptor's raw bounds mode, which turns the range checks off, and its field shifts.
+constexpr u32 PRESCAN_DIFF_RAW_BOUNDS = 3;
+constexpr u32 PRESCAN_DIFF_FORMAT_SHIFT = 12;
+constexpr u32 PRESCAN_DIFF_BOUNDS_SHIFT = 28;
+// The fields of a linear 2D image sharp, laid out as the workgroup table check lays one out.
+constexpr u32 PRESCAN_DIFF_SHARP_DWORDS = 8;
+constexpr u32 PRESCAN_DIFF_SHARP_ADDRESS_SHIFT = 8;
+constexpr u32 PRESCAN_DIFF_SHARP_FORMAT_SHIFT = 20;
+constexpr u32 PRESCAN_DIFF_SHARP_WIDTH_LOW_SHIFT = 30;
+constexpr u32 PRESCAN_DIFF_SHARP_WIDTH_LOW_MASK = 3;
+constexpr u32 PRESCAN_DIFF_SHARP_WIDTH_HIGH_SHIFT = 2;
+constexpr u32 PRESCAN_DIFF_SHARP_HEIGHT_SHIFT = 14;
+constexpr u32 PRESCAN_DIFF_SHARP_TILE_SHIFT = 20;
+constexpr u32 PRESCAN_DIFF_SHARP_TYPE_SHIFT = 28;
+constexpr u32 PRESCAN_DIFF_SHARP_WORD5 = 0x00700000u;
+constexpr u32 PRESCAN_DIFF_IMAGE_HEIGHT = 1;
+// A DISPATCH_INDIRECT that names its arguments' address in the packet.
+constexpr u32 PRESCAN_DIFF_INDIRECT_DWORDS = 4;
+// The instructions of the differential programs.
+constexpr u32 PRESCAN_DIFF_V_MOV_B32 = 0x01;
+constexpr u32 PRESCAN_DIFF_V_LSHLREV_B32 = 0x1a;
+constexpr u32 PRESCAN_DIFF_V_XOR_B32 = 0x1d;
+constexpr u32 PRESCAN_DIFF_V_ADD_NC_U32 = 0x25;
+constexpr u32 PRESCAN_DIFF_BUFFER_STORE_DWORD = 0x1c;
+constexpr u32 PRESCAN_DIFF_DS_WRITE_B32 = 0x0d;
+constexpr u32 PRESCAN_DIFF_DS_READ_B32 = 0x36;
+constexpr u32 PRESCAN_DIFF_IMAGE_LOAD = 0x00;
+constexpr u32 PRESCAN_DIFF_S_WAITCNT = 0x0c;
+constexpr u32 PRESCAN_DIFF_S_BARRIER = 0x0a;
+constexpr u32 PRESCAN_DIFF_WAIT_ALL = 0;
+constexpr u32 PRESCAN_DIFF_DMASK_X = 0x1;
+// The registers. v0 is the thread's X in its group. The output buffer's descriptor is in s[0:3] and
+// the image's sharp in s[4:11], which an srsrc field names in units of four SGPRs.
+constexpr u32 PRESCAN_DIFF_THREAD_VGPR = 0;
+constexpr u32 PRESCAN_DIFF_ADDRESS_VGPR = 1;
+constexpr u32 PRESCAN_DIFF_VALUE_VGPR = 2;
+constexpr u32 PRESCAN_DIFF_INDEX_VGPR = 3;
+constexpr u32 PRESCAN_DIFF_RESULT_VGPR = 4;
+constexpr u32 PRESCAN_DIFF_LDS_VGPR = 5;
+constexpr u32 PRESCAN_DIFF_OTHER_VGPR = 6;
+constexpr u32 PRESCAN_DIFF_IMAGE_Y_VGPR = 7;
+constexpr u32 PRESCAN_DIFF_OUTPUT_SRSRC = 0;
+constexpr u32 PRESCAN_DIFF_IMAGE_SRSRC = 1;
+constexpr u32 PRESCAN_DIFF_BUFFER_SGPRS = 4;
+constexpr u32 PRESCAN_DIFF_IMAGE_SGPRS = PRESCAN_DIFF_BUFFER_SGPRS + PRESCAN_DIFF_SHARP_DWORDS;
+// The Lds program reads the dword of the thread whose X differs in this bit.
+constexpr u32 PRESCAN_DIFF_NEIGHBOUR = 1;
+
+// The programs of the differential. Buffer writes each thread's index plus a base to the output
+// buffer. Lds passes that value through LDS and writes the value of the thread beside it. Image
+// reads a texel of a linear image and writes it. Bare has no resources at all and only writes LDS,
+// so it has no output to compare.
+enum class DiffProgram { Buffer, Lds, Image, Bare };
+constexpr size_t PRESCAN_DIFF_PROGRAM_COUNT = static_cast<size_t>(DiffProgram::Bare) + 1;
+
+// What a program needs from its registers, its user data count, whether TGID_X_EN puts the group id
+// after the user data, and its LDS allocation units.
+struct DiffShape {
+  u32 user_sgprs;
+  bool group_id;
+  u32 lds_units;
+};
+
+// The registers a program needs. Only Bare reads no user data and no group id.
+DiffShape DiffShapeOf(DiffProgram program) {
+  switch (program) {
+    case DiffProgram::Buffer: return {PRESCAN_DIFF_BUFFER_SGPRS, true, 0};
+    case DiffProgram::Lds: return {PRESCAN_DIFF_BUFFER_SGPRS, true, PRESCAN_DIFF_LDS_UNITS};
+    case DiffProgram::Image: return {PRESCAN_DIFF_IMAGE_SGPRS, true, 0};
+    case DiffProgram::Bare: break;
+  }
+  return {0, false, PRESCAN_DIFF_LDS_UNITS};
+}
+
+// Appends v3 = group id * group size + X, the dword the thread writes. The group id is in the SGPR
+// just after the user data.
+void AppendDiffIndex(std::vector<u32> &code, u32 group_sgpr) {
+  code.push_back(EncodeVop1(PRESCAN_DIFF_V_MOV_B32, PRESCAN_DIFF_INDEX_VGPR, group_sgpr));
+  code.push_back(EncodeVop2(PRESCAN_DIFF_V_LSHLREV_B32, PRESCAN_DIFF_INDEX_VGPR,
+                            InlineU32(PRESCAN_DIFF_GROUP_SHIFT), PRESCAN_DIFF_INDEX_VGPR));
+  code.push_back(EncodeVop2(PRESCAN_DIFF_V_ADD_NC_U32, PRESCAN_DIFF_INDEX_VGPR,
+                            Vgpr(PRESCAN_DIFF_THREAD_VGPR), PRESCAN_DIFF_INDEX_VGPR));
+}
+
+// Appends v2 = the value base + the thread's index, which differs per thread, so the runtime never
+// takes the dispatch for a buffer fill.
+void AppendDiffValue(std::vector<u32> &code) {
+  AppendVMovLiteral(&code, PRESCAN_DIFF_VALUE_VGPR, PRESCAN_DIFF_VALUE_BASE);
+  code.push_back(EncodeVop2(PRESCAN_DIFF_V_ADD_NC_U32, PRESCAN_DIFF_VALUE_VGPR,
+                            Vgpr(PRESCAN_DIFF_INDEX_VGPR), PRESCAN_DIFF_VALUE_VGPR));
+}
+
+// Appends the store of a VGPR to the thread's dword of the output buffer, and the program's end.
+void AppendDiffStoreAndEnd(std::vector<u32> &code, u32 value_vgpr) {
+  code.push_back(EncodeVop2(PRESCAN_DIFF_V_LSHLREV_B32, PRESCAN_DIFF_ADDRESS_VGPR,
+                            InlineU32(PRESCAN_DIFF_DWORD_SHIFT), PRESCAN_DIFF_INDEX_VGPR));
+  code.push_back(EncodeMubuf0(PRESCAN_DIFF_BUFFER_STORE_DWORD));
+  code.push_back(EncodeMubuf1(value_vgpr, PRESCAN_DIFF_OUTPUT_SRSRC, PRESCAN_DIFF_ADDRESS_VGPR));
+  AppendEnd(&code);
+}
+
+// Appends v5 = the byte offset of the thread's dword in its group's LDS.
+void AppendDiffLdsOffset(std::vector<u32> &code) {
+  code.push_back(EncodeVop2(PRESCAN_DIFF_V_LSHLREV_B32, PRESCAN_DIFF_LDS_VGPR,
+                            InlineU32(PRESCAN_DIFF_DWORD_SHIFT), PRESCAN_DIFF_THREAD_VGPR));
+}
+
+// The middle of the Lds program. Each thread writes its value to its LDS dword and, after the
+// barrier, reads the dword of its neighbour into v4, so the result needs LDS shared by the group.
+void AppendDiffLdsExchange(std::vector<u32> &code) {
+  AppendDiffLdsOffset(code);
+  code.push_back(EncodeDs0(PRESCAN_DIFF_DS_WRITE_B32));
+  code.push_back(EncodeDs1(0, PRESCAN_DIFF_VALUE_VGPR, PRESCAN_DIFF_LDS_VGPR));
+  code.push_back(EncodeSopp(PRESCAN_DIFF_S_WAITCNT, PRESCAN_DIFF_WAIT_ALL));
+  code.push_back(EncodeSopp(PRESCAN_DIFF_S_BARRIER));
+  code.push_back(EncodeVop2(PRESCAN_DIFF_V_XOR_B32, PRESCAN_DIFF_OTHER_VGPR,
+                            InlineU32(PRESCAN_DIFF_NEIGHBOUR), PRESCAN_DIFF_THREAD_VGPR));
+  code.push_back(EncodeVop2(PRESCAN_DIFF_V_LSHLREV_B32, PRESCAN_DIFF_OTHER_VGPR,
+                            InlineU32(PRESCAN_DIFF_DWORD_SHIFT), PRESCAN_DIFF_OTHER_VGPR));
+  code.push_back(EncodeDs0(PRESCAN_DIFF_DS_READ_B32));
+  code.push_back(EncodeDs1(PRESCAN_DIFF_RESULT_VGPR, 0, PRESCAN_DIFF_OTHER_VGPR));
+  code.push_back(EncodeSopp(PRESCAN_DIFF_S_WAITCNT, PRESCAN_DIFF_WAIT_ALL));
+}
+
+// The middle of the Image program. It loads the texel at X = the thread's index and Y = 0 of the
+// sharp in s[4:11] into v4.
+void AppendDiffImageLoad(std::vector<u32> &code) {
+  code.push_back(EncodeVop1(PRESCAN_DIFF_V_MOV_B32, PRESCAN_DIFF_OTHER_VGPR,
+                            Vgpr(PRESCAN_DIFF_INDEX_VGPR)));
+  AppendVMovU32(&code, PRESCAN_DIFF_IMAGE_Y_VGPR, 0);
+  code.push_back(EncodeMimg0(PRESCAN_DIFF_IMAGE_LOAD, PRESCAN_DIFF_DMASK_X));
+  code.push_back(EncodeMimg1(PRESCAN_DIFF_RESULT_VGPR, PRESCAN_DIFF_OTHER_VGPR,
+                             PRESCAN_DIFF_IMAGE_SRSRC));
+  code.push_back(EncodeSopp(PRESCAN_DIFF_S_WAITCNT, PRESCAN_DIFF_WAIT_ALL));
+}
+
+// Builds a program's code.
+std::vector<u32> BuildDiffProgram(DiffProgram program) {
+  std::vector<u32> code;
+  if (program == DiffProgram::Bare) {
+    AppendDiffLdsOffset(code);
+    code.push_back(EncodeDs0(PRESCAN_DIFF_DS_WRITE_B32));
+    code.push_back(EncodeDs1(0, PRESCAN_DIFF_THREAD_VGPR, PRESCAN_DIFF_LDS_VGPR));
+    AppendEnd(&code);
+    return code;
+  }
+  AppendDiffIndex(code, DiffShapeOf(program).user_sgprs);
+  if (program == DiffProgram::Image) {
+    AppendDiffImageLoad(code);
+    AppendDiffStoreAndEnd(code, PRESCAN_DIFF_RESULT_VGPR);
+    return code;
+  }
+  AppendDiffValue(code);
+  if (program == DiffProgram::Lds) {
+    AppendDiffLdsExchange(code);
+    AppendDiffStoreAndEnd(code, PRESCAN_DIFF_RESULT_VGPR);
+    return code;
+  }
+  AppendDiffStoreAndEnd(code, PRESCAN_DIFF_VALUE_VGPR);
+  return code;
+}
+
+// A differential program's code, at an address COMPUTE_PGM_LO can hold.
+struct alignas(SCAN_KEY_PROGRAM_ALIGNMENT) DiffProgramStorage {
+  std::array<u32, PRESCAN_DIFF_PROGRAM_WORDS> words{};
+  size_t size = 0;
+};
+
+// A program's code. It is built and put in the shader map on first use and kept for the run, since
+// the shader map and the preparer hold its address.
+std::span<const u32> DiffProgramCode(DiffProgram program) {
+  static std::array<DiffProgramStorage, PRESCAN_DIFF_PROGRAM_COUNT> storage;
+  auto &slot = storage[static_cast<size_t>(program)];
+  if (slot.size == 0) {
+    const auto code = BuildDiffProgram(program);
+    Require(PRESCAN_DIFF_NAME, "program size", code.size() <= slot.words.size(),
+            "a differential program does not fit its storage");
+    std::copy(code.begin(), code.end(), slot.words.begin());
+    slot.size = code.size();
+    ShaderMapUserData(reinterpret_cast<uint64_t>(slot.words.data()),
+                      {.type = Prospero::ShaderBinaryType::kCs,
+                       .code_size_bytes = static_cast<u32>(slot.size * sizeof(u32))});
+  }
+  return {slot.words.data(), slot.size};
+}
+
+// The output buffer's descriptor, a raw buffer of a dword per thread.
+ShaderBufferResource DiffOutputDescriptor() {
+  ShaderBufferResource descriptor{};
+  descriptor.UpdateAddress48(PRESCAN_DIFF_BASE);
+  descriptor.fields[2] = PRESCAN_DIFF_DWORDS * sizeof(u32);
+  // DstSel(4, 5, 6, 7) is the identity channel select, x y z w.
+  descriptor.fields[3] =
+      DstSel(4, 5, 6, 7) |
+      (static_cast<u32>(Prospero::BufferFormat::k32UInt) << PRESCAN_DIFF_FORMAT_SHIFT) |
+      (PRESCAN_DIFF_RAW_BOUNDS << PRESCAN_DIFF_BOUNDS_SHIFT);
+  return descriptor;
+}
+
+// The image's sharp, a linear 2D image of 32-bit unsigned texels, one row with a texel per thread.
+// The width's low two bits go in the second dword and the rest in the third.
+ShaderTextureResource DiffImageSharp() {
+  constexpr u32 last_x = PRESCAN_DIFF_DWORDS - 1;
+  constexpr u32 last_y = PRESCAN_DIFF_IMAGE_HEIGHT - 1;
+  constexpr auto format = static_cast<u32>(Prospero::BufferFormat::k32UInt);
+  constexpr auto tile = static_cast<u32>(Prospero::TileMode::kLinear);
+  constexpr auto type = static_cast<u32>(Prospero::ImageType::kColor2D);
+  return {{static_cast<u32>(PRESCAN_DIFF_IMAGE >> PRESCAN_DIFF_SHARP_ADDRESS_SHIFT),
+           (format << PRESCAN_DIFF_SHARP_FORMAT_SHIFT) |
+               ((last_x & PRESCAN_DIFF_SHARP_WIDTH_LOW_MASK) << PRESCAN_DIFF_SHARP_WIDTH_LOW_SHIFT),
+           (last_x >> PRESCAN_DIFF_SHARP_WIDTH_HIGH_SHIFT) |
+               (last_y << PRESCAN_DIFF_SHARP_HEIGHT_SHIFT),
+           DstSel(4, 5, 6, 7) | (tile << PRESCAN_DIFF_SHARP_TILE_SHIFT) |
+               (type << PRESCAN_DIFF_SHARP_TYPE_SHIFT),
+           0, PRESCAN_DIFF_SHARP_WORD5, 0, 0}};
+}
+
+// The user data a program reads, the output's descriptor and, for Image, the sharp after it.
+std::vector<u32> DiffUserData(DiffProgram program) {
+  std::vector<u32> data;
+  if (program == DiffProgram::Bare) return data;
+  const auto output = DiffOutputDescriptor();
+  data.assign(std::begin(output.fields), std::end(output.fields));
+  if (program == DiffProgram::Image) {
+    const auto sharp = DiffImageSharp();
+    data.insert(data.end(), std::begin(sharp.fields), std::end(sharp.fields));
+  }
+  return data;
+}
+
+// One case of the differential. Each past the first differs from the plain one in one way, its
+// initiator bits, its queue, its launch or its program.
+struct DiffCase {
+  const char *label;
+  DiffProgram program;
+  u32 initiator_bits;
+  bool async;
+  bool indirect;
+};
+
+// Where each case sits in PRESCAN_DIFF_CASES, which the static_asserts below hold to its contents.
+constexpr size_t PRESCAN_DIFF_PLAIN = 0;
+constexpr size_t PRESCAN_DIFF_WAVE32 = 1;
+constexpr size_t PRESCAN_DIFF_DIMENSIONS = 2;
+constexpr size_t PRESCAN_DIFF_ASYNC = 3;
+constexpr size_t PRESCAN_DIFF_INDIRECT = 4;
+constexpr size_t PRESCAN_DIFF_LDS = 5;
+constexpr size_t PRESCAN_DIFF_IMAGE_CASE = 6;
+constexpr size_t PRESCAN_DIFF_BARE = 7;
+constexpr size_t PRESCAN_DIFF_CASE_COUNT = PRESCAN_DIFF_BARE + 1;
+constexpr std::array<DiffCase, PRESCAN_DIFF_CASE_COUNT> PRESCAN_DIFF_CASES{{
+    {"plain", DiffProgram::Buffer, 0u, false, false},
+    {"wave32", DiffProgram::Buffer, SCAN_KEY_WAVE32_BIT, false, false},
+    {"thread dimensions", DiffProgram::Buffer,
+     Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS, false, false},
+    {"async queue", DiffProgram::Buffer, 0u, true, false},
+    {"indirect", DiffProgram::Buffer, 0u, false, true},
+    {"lds", DiffProgram::Lds, 0u, false, false},
+    {"image", DiffProgram::Image, 0u, false, false},
+    {"no resources", DiffProgram::Bare, 0u, false, false}}};
+
+// Each named index must name the case it is read for. Together they cover the four programs, and
+// the count holds the enum to four.
+static_assert(PRESCAN_DIFF_CASES[PRESCAN_DIFF_PLAIN].program == DiffProgram::Buffer &&
+              PRESCAN_DIFF_CASES[PRESCAN_DIFF_PLAIN].initiator_bits == 0 &&
+              !PRESCAN_DIFF_CASES[PRESCAN_DIFF_PLAIN].async &&
+              !PRESCAN_DIFF_CASES[PRESCAN_DIFF_PLAIN].indirect);
+static_assert(PRESCAN_DIFF_CASES[PRESCAN_DIFF_WAVE32].program == DiffProgram::Buffer &&
+              PRESCAN_DIFF_CASES[PRESCAN_DIFF_WAVE32].initiator_bits == SCAN_KEY_WAVE32_BIT);
+static_assert(PRESCAN_DIFF_CASES[PRESCAN_DIFF_DIMENSIONS].program == DiffProgram::Buffer &&
+              PRESCAN_DIFF_CASES[PRESCAN_DIFF_DIMENSIONS].initiator_bits ==
+                  Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS);
+static_assert(PRESCAN_DIFF_CASES[PRESCAN_DIFF_ASYNC].program == DiffProgram::Buffer &&
+              PRESCAN_DIFF_CASES[PRESCAN_DIFF_ASYNC].async);
+static_assert(PRESCAN_DIFF_CASES[PRESCAN_DIFF_INDIRECT].program == DiffProgram::Buffer &&
+              PRESCAN_DIFF_CASES[PRESCAN_DIFF_INDIRECT].indirect);
+static_assert(PRESCAN_DIFF_CASES[PRESCAN_DIFF_LDS].program == DiffProgram::Lds);
+static_assert(PRESCAN_DIFF_CASES[PRESCAN_DIFF_IMAGE_CASE].program == DiffProgram::Image);
+static_assert(PRESCAN_DIFF_CASES[PRESCAN_DIFF_BARE].program == DiffProgram::Bare);
+static_assert(PRESCAN_DIFF_CASES.size() == PRESCAN_DIFF_CASE_COUNT &&
+              PRESCAN_DIFF_PROGRAM_COUNT == 4);
+
+// Whether the case's dispatch counts threads rather than groups.
+bool DiffThreadDimensions(const DiffCase &test) {
+  return (test.initiator_bits & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
+}
+
+// Appends the case's dispatch. A direct one names two groups, or 100 threads with thread
+// dimensions. An indirect one names its arguments in guest memory, which also say two groups.
+void AppendDiffDispatch(std::vector<u32> &list, const DiffCase &test) {
+  const u32 initiator = SCAN_KEY_INITIATOR | test.initiator_bits;
+  if (test.indirect) {
+    list.insert(list.end(),
+                {KYTY_PM4(PRESCAN_DIFF_INDIRECT_DWORDS, Pm4::IT_DISPATCH_INDIRECT, Pm4::R_ZERO),
+                 static_cast<u32>(PRESCAN_DIFF_ARGS),
+                 static_cast<u32>(PRESCAN_DIFF_ARGS >> PRESCAN_ADDRESS_HIGH_DWORD_SHIFT),
+                 initiator});
+    return;
+  }
+  const u32 count_x =
+      DiffThreadDimensions(test) ? PRESCAN_DIFF_DIMENSION_THREADS : PRESCAN_DIFF_GROUPS;
+  list.insert(list.end(), {KYTY_PM4(SCAN_KEY_DISPATCH_DWORDS, Pm4::IT_DISPATCH_DIRECT, Pm4::R_ZERO),
+                           count_x, 1u, 1u, initiator});
+}
+
+// The case's list. It makes the program current, writes its registers and user data and
+// dispatches it, as a game's list does, so the scanner and the command processor read it alike.
+std::vector<u32> DiffList(const DiffCase &test) {
+  const auto address = reinterpret_cast<uint64_t>(DiffProgramCode(test.program).data());
+  const auto shape = DiffShapeOf(test.program);
+  const u32 rsrc1 = SCAN_KEY_FLOAT_MODE << Pm4::COMPUTE_PGM_RSRC1_FLOAT_MODE_SHIFT;
+  const u32 rsrc2 = (shape.user_sgprs << Pm4::COMPUTE_PGM_RSRC2_USER_SGPR_SHIFT) |
+                    (static_cast<u32>(shape.group_id) << Pm4::COMPUTE_PGM_RSRC2_TGID_X_EN_SHIFT) |
+                    (shape.lds_units << Pm4::COMPUTE_PGM_RSRC2_LDS_SIZE_SHIFT);
+  std::vector<u32> list;
+  AppendScanKeySetSh(list, Pm4::COMPUTE_PGM_LO,
+                     {static_cast<u32>(address >> SCAN_KEY_ADDRESS_LOW_SHIFT),
+                      static_cast<u32>(address >> SCAN_KEY_ADDRESS_HIGH_SHIFT)});
+  AppendScanKeySetSh(list, Pm4::COMPUTE_PGM_RSRC1, {rsrc1, rsrc2});
+  AppendScanKeySetSh(list, Pm4::COMPUTE_NUM_THREAD_X, {PRESCAN_DIFF_GROUP_THREADS, 1u, 1u});
+  const auto user_data = DiffUserData(test.program);
+  for (u32 index = 0; index < user_data.size(); index++) {
+    AppendScanKeySetSh(list, Pm4::COMPUTE_USER_DATA_0 + index, {user_data[index]});
+  }
+  AppendDiffDispatch(list, test);
+  return list;
+}
+
+// What the output holds after the case's dispatch. Bare writes none of it, and with thread
+// dimensions the threads past the count write nothing.
+std::vector<u32> DiffExpected(const DiffCase &test) {
+  std::vector<u32> expected(PRESCAN_DIFF_DWORDS, PRESCAN_DIFF_SENTINEL);
+  if (test.program == DiffProgram::Bare) return expected;
+  const u32 written =
+      DiffThreadDimensions(test) ? PRESCAN_DIFF_DIMENSION_THREADS : PRESCAN_DIFF_DWORDS;
+  for (u32 index = 0; index < written; index++) {
+    switch (test.program) {
+      case DiffProgram::Lds:
+        expected[index] = PRESCAN_DIFF_VALUE_BASE + (index ^ PRESCAN_DIFF_NEIGHBOUR);
+        break;
+      case DiffProgram::Image: expected[index] = PRESCAN_DIFF_TEXEL_BASE + index; break;
+      default: expected[index] = PRESCAN_DIFF_VALUE_BASE + index; break;
+    }
+  }
+  return expected;
+}
+
+// Allocates and maps the differential's guest memory at its fixed address. Returns the direct
+// memory offset, which the release needs.
+int64_t MapDiffMemory() {
+  int64_t direct_offset = -1;
+  void *mapped = reinterpret_cast<void *>(PRESCAN_DIFF_BASE);
+  Require(PRESCAN_DIFF_NAME, "guest memory",
+          LibKernel::Memory::KernelAllocateDirectMemory(
+              0, LibKernel::Memory::KernelGetDirectMemorySize(), PRESCAN_DIFF_SIZE,
+              PRESCAN_DIFF_ALIGNMENT, 0, &direct_offset) == 0 &&
+              LibKernel::Memory::KernelMapDirectMemory(&mapped, PRESCAN_DIFF_SIZE,
+                                                       PRESCAN_DIFF_PROTECTION,
+                                                       PRESCAN_DIFF_MAP_FIXED, direct_offset,
+                                                       PRESCAN_DIFF_ALIGNMENT) == 0 &&
+              mapped == reinterpret_cast<void *>(PRESCAN_DIFF_BASE),
+          "the differential's guest memory could not be allocated and mapped");
+  return direct_offset;
+}
+
+// Unmaps and releases the differential's guest memory, given the offset MapDiffMemory returned.
+void ReleaseDiffMemory(int64_t direct_offset) {
+  Require(PRESCAN_DIFF_NAME, "release",
+          LibKernel::Memory::KernelMunmap(PRESCAN_DIFF_BASE, PRESCAN_DIFF_SIZE) == 0 &&
+              LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, PRESCAN_DIFF_SIZE) == 0,
+          "the differential's guest memory could not be released");
+}
+
+// Puts the sentinel in the output, two groups in the indirect arguments and a distinct value in
+// each texel. Each run starts from these, before its context maps the memory.
+void FillDiffMemory() {
+  const std::vector<u32> sentinel(PRESCAN_DIFF_DWORDS, PRESCAN_DIFF_SENTINEL);
+  const std::array<u32, 3> args{PRESCAN_DIFF_GROUPS, 1u, 1u};
+  std::vector<u32> texels(PRESCAN_DIFF_DWORDS);
+  std::iota(texels.begin(), texels.end(), PRESCAN_DIFF_TEXEL_BASE);
+  Require(PRESCAN_DIFF_NAME, "fill",
+          LibKernel::Memory::TryWriteBacking(PRESCAN_DIFF_BASE, sentinel.data(),
+                                             sentinel.size() * sizeof(u32)) &&
+              LibKernel::Memory::TryWriteBacking(PRESCAN_DIFF_ARGS, args.data(), sizeof(args)) &&
+              LibKernel::Memory::TryWriteBacking(PRESCAN_DIFF_IMAGE, texels.data(),
+                                                 texels.size() * sizeof(u32)),
+          "the differential's guest memory could not be written");
+}
+
+// What the GPU thread saw while it held a prescan run's list back. posted says the prescan's
+// module reached the intake, id is the module the drain took in, built says its build was done,
+// and compiled_before is the compile count when the hold ended.
+struct DiffHold {
+  bool posted = false;
+  uint64_t id = 0;
+  bool built = false;
+  uint64_t compiled_before = 0;
+};
+
+// What one run of a case gave. The output, the ids of the modules the cache held, the record the
+// store kept, raw and decoded, the warm takes the report holds, the modules the GPU thread
+// compiled while the list ran, and the inline compiles the prescan's miss counts saw.
+struct DiffRun {
+  std::vector<u32> output;
+  std::vector<uint64_t> ids;
+  std::vector<uint8_t> record;
+  DecodedModuleRecord decoded;
+  std::vector<Common::FirstRunReport::WarmTake> takes;
+  uint64_t compiled = 0;
+  uint64_t inline_compiles = 0;
+  DiffHold hold;
+};
+
+using DiffRuns = std::array<DiffRun, PRESCAN_DIFF_CASES.size()>;
+
+// The GPU thread's command ahead of a prescan run's list. It waits for the prescan to post its
+// module, takes it in as the drain at the top of an earlier dispatch's lookup would, and waits for
+// its build, so the list's dispatch finds the build done. A module that never comes lets the list
+// go after the wait limit, and the dispatch then compiles inline, which the checks catch.
+void HoldUntilPrescanBuilt(PipelineCache &cache, DiffHold &hold) {
+  hold.posted = WaitForPrescan([&cache] {
+    const auto stats = cache.GenerationStats();
+    return stats && stats->pending != 0;
+  });
+  if (hold.posted) {
+    PipelineCacheTestAccess::DrainGenerated(cache);
+    const auto ids = PipelineCacheTestAccess::ModuleIds(cache);
+    hold.id = ids.size() == 1 ? ids[0] : 0;
+    hold.built = hold.id != 0 && WaitForPrescan([&cache, id = hold.id] {
+                   return PipelineCacheTestAccess::PrescanWarmDone(cache, id);
+                 });
+  }
+  hold.compiled_before = ShadersCompiledSoFar();
+}
+
+// Submits the case's list on its queue, the graphics ring or an async compute queue.
+void SubmitDiffList(GuestGpu &gpu, const DiffCase &test, std::span<const u32> list) {
+  if (test.async) {
+    gpu.SubmitCompute(static_cast<uint32_t>(SCAN_KEY_ASYNC_QUEUE), list);
+  } else {
+    gpu.Submit(list);
+  }
+}
+
+// Reads what the run left in its context while the context still exists.
+void ReadDiffContext(RenderContext &context, DiffRun &run) {
+  auto &cache = context.GetPipelineCache();
+  constexpr auto bytes = PRESCAN_DIFF_DWORDS * sizeof(u32);
+  context.GetBufferCache().ReadMemory(PRESCAN_DIFF_BASE, bytes);
+  run.output.resize(PRESCAN_DIFF_DWORDS);
+  Require(PRESCAN_DIFF_NAME, "output readback",
+          LibKernel::Memory::TryReadBacking(PRESCAN_DIFF_BASE, run.output.data(), bytes),
+          "the output could not be read back");
+  run.ids = PipelineCacheTestAccess::ModuleIds(cache);
+  run.takes = Common::FirstRunReport::Global().WarmTakes();
+  run.inline_compiles = cache.PrescanMisses().InlineCompiles();
+}
+
+// Reads the one module record the run's store kept, once the context that wrote it is gone. A
+// store that kept another count leaves the record empty, which the checks refuse.
+void ReadDiffRecord(const std::filesystem::path &store, DiffRun &run) {
+  auto records = ReadStoredModuleRecords(store);
+  if (records.size() != 1) return;
+  run.decoded = std::move(records[0]);
+  run.record = StoredRecordBytesOf(store, run.decoded.id);
+}
+
+// Runs a case's list on a fresh render context with a store of its own, with the prescan or
+// without it, and reads back what it did. The guest memory, the list, the queue and the device
+// are the same for both, so the two runs differ only in the prescan.
+DiffRun RunDiffCase(VulkanHarness &vulkan, const DiffCase &test, bool prescan) {
+  const auto store = PrescanStorePath(prescan ? "diff_prescan" : "diff_inline");
+  const auto list = DiffList(test);
+  FillDiffMemory();
+  Common::FirstRunReport::Global().Reset();
+  DiffRun run;
+  {
+    RenderContext context(vulkan.RuntimeContext(), store);
+    if (prescan) {
+      InitializePrescanGpu(context, PrescanGpuOptions(true));
+    } else {
+      context.InitializeGpu(nullptr);
+      Require(PRESCAN_DIFF_NAME, "the inline run has no prescan",
+              context.GetPipelineCache().Prescan() == nullptr,
+              std::string(test.label) + ": the run without the prescan made a preparer");
+    }
+    LibKernel::Memory::InstallGpuResources(&context);
+    auto &gpu = context.GetGpu();
+    gpu.SendCommandSync([&context] { context.MapMemory(PRESCAN_DIFF_BASE, PRESCAN_DIFF_SIZE); });
+    run.hold.compiled_before = ShadersCompiledSoFar();
+    if (prescan) {
+      gpu.SendCommand(
+          [&context, &run] { HoldUntilPrescanBuilt(context.GetPipelineCache(), run.hold); });
+    }
+    SubmitDiffList(gpu, test, list);
+    gpu.WaitForIdle();
+    run.compiled = ShadersCompiledSoFar() - run.hold.compiled_before;
+    ReadDiffContext(context, run);
+    gpu.SendCommandSync([&context] {
+      context.UnmapMemory(PRESCAN_DIFF_BASE, PRESCAN_DIFF_SIZE);
+      context.GetCommandScheduler().Finish();
+    });
+    context.ShutdownGpu();
+    LibKernel::Memory::InstallGpuResources(nullptr);
+  }
+  ReadDiffRecord(store, run);
+  std::filesystem::remove_all(store.parent_path());
+  return run;
+}
+
+// The prescan run's dispatch took the prescan's own build, done, and the GPU thread compiled
+// nothing. Equal outputs, ids and SPIR-V would also pass if both runs had compiled inline, so this
+// is what makes the comparison one of the prescan's module against the inline one. The take must
+// name the module the drain took in, so a take of another build cannot pass.
+void RequirePrescanTaken(const std::string &label, const DiffRun &run) {
+  using Common::FirstRunReport::WarmTakeHow;
+  Require(PRESCAN_DIFF_NAME, "the take is done",
+          run.hold.id != 0 && run.takes.size() == 1 && run.takes[0].how == WarmTakeHow::Done &&
+              run.takes[0].id == run.hold.id,
+          label + ": the dispatch did not take the prescan's build as done");
+  Require(PRESCAN_DIFF_NAME, "nothing compiled inline",
+          run.compiled == 0 && run.inline_compiles == 0,
+          label + ": the GPU thread compiled the module itself in the prescan run");
+  Require(PRESCAN_DIFF_NAME, "the prescan built it", run.hold.posted && run.hold.built,
+          label + ": the prescan's module was not posted and built before the dispatch");
+}
+
+// The run without the prescan compiled its one module on the GPU thread and took no warm build.
+// It is the baseline for the prescan run's checks. It shows that the take list and the compile
+// count really change when the GPU thread compiles inline, so their values in the prescan run mean
+// something.
+void RequireInlineCompiled(const std::string &label, const DiffRun &run) {
+  Require(PRESCAN_DIFF_NAME, "the inline run compiles", run.takes.empty() && run.compiled == 1,
+          label + ": the run without the prescan did not compile its one module inline");
+}
+
+// The two runs ran the same module and left the same bytes. The id is the cache's. The SPIR-V is
+// compared on its own, since the id does not carry where LDS lives, and then the whole record,
+// which also holds the plan, the specialization and the bindings. The output must be what the
+// program writes, so two runs that both wrote nothing cannot pass. Bare is the exception, since it
+// writes no output, and its expected output is the sentinel.
+void RequireSameModule(const std::string &label, const DiffRun &prescan, const DiffRun &compiled,
+                       const std::vector<u32> &expected) {
+  Require(PRESCAN_DIFF_NAME, "module id",
+          compiled.ids.size() == 1 && prescan.ids == compiled.ids &&
+              prescan.decoded.id == prescan.ids[0] && compiled.decoded.id == compiled.ids[0],
+          label + ": the prescan run's module id differs from the inline one's");
+  Require(PRESCAN_DIFF_NAME, "SPIR-V",
+          !compiled.decoded.spirv.empty() && prescan.decoded.spirv == compiled.decoded.spirv,
+          label + ": the prescan's module has other SPIR-V than the inline compile");
+  Require(PRESCAN_DIFF_NAME, "record",
+          !compiled.record.empty() && prescan.record == compiled.record,
+          label + ": the prescan's stored record differs from the inline compile's");
+  Require(PRESCAN_DIFF_NAME, "output",
+          compiled.output == expected && prescan.output == compiled.output,
+          label + ": the outputs differ, or are not what the program writes");
+}
+
+// The module without resources has no push data, and its id depends on that. Its id is rebuilt
+// from the record's own fields with no push start, which must give the record's id, so the rule is
+// the one the runtime used. The same call with a push start of 0 must give another id. The two
+// calls differ only in the push start, so a prescan that gave this module start 0 would build
+// another id.
+void RequireBarePushStart(const DecodedModuleRecord &bare) {
+  using ShaderRecompiler::IR::PushData;
+  const auto id_with_start = [&bare](uint32_t push_start) {
+    return ShaderModuleId(ShaderType::Compute, bare.hash, bare.user_data_count, bare.static_state,
+                          push_start, bare.specialization, {});
+  };
+  Require(PRESCAN_DIFF_NAME, "no push data",
+          bare.info.bindings.push_data_start_dword == PushData::NoStart &&
+              id_with_start(PushData::NoStart) == bare.id,
+          "the module without resources has push data, or its id is not the one its fields give");
+  Require(PRESCAN_DIFF_NAME, "push start counts", id_with_start(0) != bare.id,
+          "a push start of 0 gives the id of the module without resources");
+}
+
+// The cases' inputs reach the module, so a prescan that lost one would build another module, whose
+// take would not be done. Wave32, thread dimensions and the async queue each give the inline run
+// another id than the plain case. An indirect dispatch keeps the plain case's module, since the
+// module does not depend on where the group counts come from, so its case shows only that the
+// prescan builds for an indirect dispatch whose plan does not read them. Thread dimensions also
+// change what is written. The buffer and the image cases' modules carry a specialization of their
+// resource, which the preparer had to make from the user data.
+void CheckDiffBaselines(const DiffRuns &compiled) {
+  const auto &plain = compiled[PRESCAN_DIFF_PLAIN];
+  for (const size_t index : {PRESCAN_DIFF_WAVE32, PRESCAN_DIFF_DIMENSIONS, PRESCAN_DIFF_ASYNC}) {
+    Require(PRESCAN_DIFF_NAME, "the input changes the module", compiled[index].ids != plain.ids,
+            std::string(PRESCAN_DIFF_CASES[index].label) +
+                ": the runtime gave it the plain case's module, so the case could not see it");
+  }
+  Require(PRESCAN_DIFF_NAME, "indirect keeps the plain module",
+          compiled[PRESCAN_DIFF_INDIRECT].ids == plain.ids,
+          "the indirect dispatch's module is not the plain case's");
+  Require(PRESCAN_DIFF_NAME, "thread dimensions change the output",
+          compiled[PRESCAN_DIFF_DIMENSIONS].output != plain.output,
+          "thread dimensions wrote what the plain dispatch writes");
+  Require(PRESCAN_DIFF_NAME, "specializations",
+          !plain.decoded.specialization.buffers.empty() &&
+              !compiled[PRESCAN_DIFF_IMAGE_CASE].decoded.specialization.images.empty(),
+          "the buffer or the image case's module has no specialization of its resource");
+  RequireBarePushStart(compiled[PRESCAN_DIFF_BARE].decoded);
+}
+
+// The prescan never changes what a game sees. Each case runs one list twice, each time on a fresh
+// render context with its own store. With the prescan, the scanner walks the list, the preparer
+// plans and compiles it through the in-process helper, the GPU thread takes the module in and its
+// build is done before the dispatch reaches it. Without it, the GPU thread compiles the module
+// inline. The outputs, the ids, the SPIR-V and the stored records must be equal, and the prescan
+// run must have taken its build done with nothing compiled inline, or both runs could have
+// compiled inline. The mutations, each with what fails, are these.
+// AdoptGenerated refusing prescan modules, and the plain case's take is not done.
+// The scanner's item carrying one more user SGPR, and the prescan builds another unit, so the
+// plain case's take is not done.
+// MakePrescanInputInfo flipping lds_storage for a program with LDS, and the lds case's SPIR-V
+// differs.
+// Specialize refusing every indirect dispatch, and the indirect case's take is not done.
+// MakePrescanInputInfo dropping the async queue or thread dimensions, and that case's take is not
+// done.
+// The scanner ignoring the wave32 bit, and the wave32 case's take is not done.
+// The helper's compile giving every module push start 0, and the case without resources has
+// another id. Its module is still found and taken, since a lookup matches a module by its program
+// key, push start and specialization and not by its id. That is safe while every codegen input is
+// equal, which it is by construction. Pipelines are filed by id, so the id comparison here guards
+// the record's id.
+// The preparer giving an image another numeric class, and the image case's take is not done.
+void CheckPrescanDifferential(VulkanHarness &vulkan) {
+  Config::Load({.printf_direction = Config::LogDirection::Silent});
+  const PrescanReportOn report;
+  Common::DebugCounters::SetEnabled(true);
+  const auto direct_offset = MapDiffMemory();
+  DiffRuns compiled;
+  for (size_t index = 0; index < PRESCAN_DIFF_CASES.size(); index++) {
+    const auto &test = PRESCAN_DIFF_CASES[index];
+    const std::string label = test.label;
+    compiled[index] = RunDiffCase(vulkan, test, false);
+    const auto prescan = RunDiffCase(vulkan, test, true);
+    RequireInlineCompiled(label, compiled[index]);
+    RequirePrescanTaken(label, prescan);
+    RequireSameModule(label, prescan, compiled[index], DiffExpected(test));
+    std::printf("[gpu]     %-32s ok\n", (std::string(PRESCAN_DIFF_NAME) + " " + label).c_str());
+  }
+  CheckDiffBaselines(compiled);
+  ReleaseDiffMemory(direct_offset);
+  Common::DebugCounters::SetEnabled(false);
+  std::printf("[gpu]     %-32s ok\n", PRESCAN_DIFF_NAME);
+}
+
 // ---- The shader store generated by a real worker (--generate-shader-store). ----
 
 // What the fake worker of the hang check does, in this binary. It writes a predict line and then
@@ -74741,6 +75420,11 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--prescan-gpu-only") == 0) {
     VulkanHarness vulkan;
     CheckPrescanGuestGpu(vulkan);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--prescan-differential-only") == 0) {
+    VulkanHarness vulkan;
+    CheckPrescanDifferential(vulkan);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--warm-pause-only") == 0) {

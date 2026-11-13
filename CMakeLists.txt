@@ -1245,6 +1245,11 @@ if(BUILD_TESTING)
 	add_test(NAME shader_recompiler_prescan_gpu
 	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --prescan-gpu-only)
 	set_tests_properties(shader_recompiler_prescan_gpu PROPERTIES TIMEOUT 180)
+	# The pre-scan's module against the inline compile, on real dispatches. Both give the same
+	# output, id and SPIR-V, and the pre-scan's build is taken done.
+	add_test(NAME shader_recompiler_prescan_differential
+	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --prescan-differential-only)
+	set_tests_properties(shader_recompiler_prescan_differential PROPERTIES TIMEOUT 300)
 	add_test(NAME shader_recompiler_submit_cadence
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --submit-cadence-only)
 	add_test(NAME shader_recompiler_submit_cadence_gpu
