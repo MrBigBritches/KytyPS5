@@ -14,6 +14,7 @@
 #include "common/crashUi.h"
 #include "common/file.h"
 #include "graphics/host_gpu/renderer/pipeline/prescanPreparer.h"
+#include "graphics/shader/moduleId.h"
 #include "graphics/shader/storegen/prescanTransport.h"
 #include "graphics/shader/storegen/shaderStoreWorker.h"
 #include "graphics/shader/storegen/storeWorkerFormat.h"
@@ -411,11 +412,13 @@ PrescanTransportFactory ScriptedFactory(Script& script) {
 
 // A preparer over a shader map of test programs, host memory and a sink that keeps what it gets.
 // The hand-off is on the heap, since its ring is large. A supervised harness passes host values
-// whose shared memory limit is the device's, since its child takes the limit from them.
+// whose shared memory limit is the device's, since its child takes the limit from them. `known` is
+// the seed of skip keys the pipeline cache would pass.
 struct Harness {
 	explicit Harness(PrescanTransportFactory factory = {}, PrescanMapLookup lookup = {},
-	                 const HostValues& host = {}) {
+	                 const HostValues& host = {}, std::vector<uint64_t> known = {}) {
 		PrescanPreparerConfig config;
+		config.known_modules = std::move(known);
 		config.lookup = std::move(lookup);
 		if (!config.lookup) {
 			config.lookup = [this](uint64_t address) {
@@ -641,6 +644,164 @@ void TestSkippedSrtLoadSendsNothing() {
 		CHECK(harness.transport->Compiles() == (guarded ? 0u : 1u));
 	}
 	std::puts("SkippedSrtLoadSendsNothing ok");
+}
+
+// ---- Skipping what the cache already has. ----
+
+// The module the preparer builds for one dispatch of the program, in a harness of its own.
+DecodedModuleRecord BuiltRecord(const Program& program, uint32_t stride) {
+	Harness harness;
+	harness.Map(program);
+	harness.Push(ItemFor(program, Descriptor(stride, DstSel(4, 5, 6, 7)), KEY));
+	harness.Drive();
+	CHECK(harness.adopted.size() == 1);
+	return harness.adopted.empty() ? DecodedModuleRecord {} : std::move(harness.adopted[0]);
+}
+
+// The skip key the pipeline cache makes for a module it loaded from this record. Its program key
+// and module take these fields from the record unchanged.
+uint64_t RecordSkipKey(const DecodedModuleRecord& record) {
+	return ShaderModuleSkipKey(record.stage, record.hash, record.user_data_count, record.static_state,
+	                           record.specialization);
+}
+
+// The skip key keeps apart two modules of a real program that differ only in their user data count,
+// which the runtime's module id covers and the static key does not. Keys that differ also come from
+// a key that is not a function of its inputs, so the baseline is the same inputs twice, which must
+// give one key. The mutation is to leave the count out of ShaderModuleSkipKey. The two counts then
+// give one key.
+void TestSkipKeySeparatesUserDataCount() {
+	const auto record = BuiltRecord(DirectProgram(MUBUF_STORE_DWORD), STRIDE_A);
+	const auto key    = [&](uint32_t user_data_count) {
+		return ShaderModuleSkipKey(record.stage, record.hash, user_data_count, record.static_state,
+		                           record.specialization);
+	};
+	CHECK(key(record.user_data_count) == key(record.user_data_count));
+	CHECK(key(record.user_data_count) != key(record.user_data_count + 1));
+	std::puts("SkipKeySeparatesUserDataCount ok");
+}
+
+// A preparer seeded with the key the cache makes from a built module's record sends no Compile for
+// the dispatch that built it, so the preparer's key and the record's agree for a real module. No
+// Compile also comes from a dispatch that never reached its specialization, so the plan must have
+// been asked for and the variant recorded. It also comes from a preparer that skips every variant
+// once it knows any key, so one baseline seeds the key of the program's other variant, built from
+// another stride, and another seeds nothing, and both must send the Compile. The mutations are to
+// make the preparer's key from an empty static key, and to never find a key known. The seeded
+// dispatch is then sent in both.
+void TestSkipKeyAgreesWithRecord() {
+	const auto program = DirectProgram(MUBUF_STORE_DWORD);
+	const auto built   = RecordSkipKey(BuiltRecord(program, STRIDE_A));
+	const auto other   = RecordSkipKey(BuiltRecord(program, STRIDE_B));
+	CHECK(built != other);
+	for (const auto& seed: {std::vector<uint64_t> {}, std::vector<uint64_t> {other},
+	                        std::vector<uint64_t> {built}}) {
+		const bool skip = !seed.empty() && seed[0] == built;
+		Harness    harness({}, {}, {}, seed);
+		harness.Map(program);
+		harness.Push(ItemFor(program, Descriptor(STRIDE_A, DstSel(4, 5, 6, 7)), KEY));
+		harness.Drive();
+		const auto counters = harness.Counters();
+		CHECK(harness.transport->Plans() == 1 && counters.variant_modules == 1);
+		CHECK(counters.known_modules == seed.size());
+		CHECK(harness.transport->Compiles() == (skip ? 0u : 1u));
+		CHECK(counters.known_skipped == (skip ? 1u : 0u));
+		CHECK(harness.adopted.size() == (skip ? 0u : 1u));
+	}
+	std::puts("SkipKeyAgreesWithRecord ok");
+}
+
+// A key the cache reports after the preparer was made, as it does for a module the generator
+// adopted, skips the Compile as a seeded one does, since every pass reads the reports before it
+// prepares. The baseline reports the key of the program's other variant and must still send the
+// Compile. The mutations are to drop the read of the reports from the pass, and to drop the push in
+// NoteKnownModule. The reported dispatch is then sent.
+void TestReportedKeySkipsCompile() {
+	const auto program = DirectProgram(MUBUF_STORE_DWORD);
+	const auto built   = RecordSkipKey(BuiltRecord(program, STRIDE_A));
+	const auto other   = RecordSkipKey(BuiltRecord(program, STRIDE_B));
+	for (const uint64_t reported: {other, built}) {
+		const bool skip = reported == built;
+		Harness    harness;
+		harness.Map(program);
+		harness.preparer->NoteKnownModule(reported);
+		harness.Push(ItemFor(program, Descriptor(STRIDE_A, DstSel(4, 5, 6, 7)), KEY));
+		harness.Drive();
+		const auto counters = harness.Counters();
+		CHECK(counters.variant_modules == 1 && counters.known_modules == 1);
+		CHECK(harness.transport->Compiles() == (skip ? 0u : 1u));
+		CHECK(counters.known_skipped == (skip ? 1u : 0u));
+	}
+	std::puts("ReportedKeySkipsCompile ok");
+}
+
+// A skipped variant still gives its admission its one outcome. Two dispatches of the unit go into
+// one pass, so the second is answered Busy while the first is open, and the skip must take that
+// answer back. A third dispatch with the same specialization is then posted, not answered Busy, and
+// found Known as a built variant is, which moves the unit towards settling. All of that also holds
+// when the variant is sent, so the baseline is the same flow without the seed, which sends one
+// Compile, and the seeded run must send none with the same answers and counts. The mutations are to
+// skip before the snapshot is recorded and park the admission, which leaves the unit in flight, so
+// the third dispatch is Busy and the second's answer stays Busy. And to skip before the snapshot is
+// recorded and let the guard drop it, so the third dispatch is New again and not Known.
+void TestSkipGivesOneOutcome() {
+	const auto program = DirectProgram(MUBUF_STORE_DWORD);
+	const auto built   = RecordSkipKey(BuiltRecord(program, STRIDE_A));
+	const auto user    = Descriptor(STRIDE_A, DstSel(4, 5, 6, 7));
+	for (const bool seeded: {false, true}) {
+		Harness harness({}, {}, {}, seeded ? std::vector<uint64_t> {built} : std::vector<uint64_t> {});
+		harness.Map(program);
+		harness.Push(ItemFor(program, user, KEY));
+		harness.Push(ItemFor(program, user, REPEAT_KEY));
+		harness.Drive();
+		CHECK(harness.Counters().state.busy == 1);
+		CHECK(harness.handoff->feedback.Read(REPEAT_KEY) == PrescanFeedback::Answer::None);
+		harness.Push(ItemFor(program, user, OTHER_KEY));
+		harness.Drive();
+		const auto counters = harness.Counters();
+		CHECK(counters.state.posted == 2 && counters.state.busy == 1);
+		CHECK(counters.variant_modules == 1 && counters.known_variants == 1);
+		CHECK(counters.known_skipped == (seeded ? 1u : 0u));
+		CHECK(harness.transport->Compiles() == (seeded ? 0u : 1u));
+	}
+	std::puts("SkipGivesOneOutcome ok");
+}
+
+// A full report ring drops the keys past its capacity and counts them. The keys all go in before
+// any pass, so nothing drains them first. The baseline is exactly PRESCAN_KNOWN_CAPACITY keys, which
+// drops none, so a count that grows with every key cannot pass. Every key that fit must reach the
+// set. The mutation is to leave known_dropped unset in DrainKnown. The overfull run then counts none.
+void TestKnownReportsOverflowCounted() {
+	for (const size_t reports: {PRESCAN_KNOWN_CAPACITY, PRESCAN_KNOWN_CAPACITY + 1}) {
+		Harness harness;
+		// Distinct nonzero keys, so the set's size counts the keys that fit.
+		for (size_t index = 0; index < reports; ++index) {
+			harness.preparer->NoteKnownModule(index + 1);
+		}
+		(void)harness.preparer->RunOnce();
+		const auto counters = harness.Counters();
+		CHECK(counters.known_dropped == reports - PRESCAN_KNOWN_CAPACITY);
+		CHECK(counters.known_modules == PRESCAN_KNOWN_CAPACITY);
+	}
+	std::puts("KnownReportsOverflowCounted ok");
+}
+
+// A stopped preparer takes no more reports, since no pass would read them. A pass after the stop is
+// driven by hand, only to read the ring. The baseline is the same report without the stop, which the
+// pass reads, so a pass that reads nothing cannot pass. The mutation is to drop the stopped check in
+// NoteKnownModule. The pass after the stop then reads the report.
+void TestStoppedTakesNoReports() {
+	for (const bool stopped: {false, true}) {
+		Harness harness;
+		if (stopped) {
+			harness.preparer->Stop();
+		}
+		CHECK(harness.preparer->Stopped() == stopped);
+		harness.preparer->NoteKnownModule(KEY);
+		(void)harness.preparer->RunOnce();
+		CHECK(harness.Counters().known_modules == (stopped ? 0u : 1u));
+	}
+	std::puts("StoppedTakesNoReports ok");
 }
 
 // What one scripted case of a test ended with.
@@ -1451,6 +1612,12 @@ int main(int argc, char** argv) {
 	TestSecondVariantSkipsPlan();
 	TestInvalidDescriptorNeverSent();
 	TestSkippedSrtLoadSendsNothing();
+	TestSkipKeySeparatesUserDataCount();
+	TestSkipKeyAgreesWithRecord();
+	TestReportedKeySkipsCompile();
+	TestSkipGivesOneOutcome();
+	TestKnownReportsOverflowCounted();
+	TestStoppedTakesNoReports();
 	TestBlamedNeverFallsBack();
 	TestRepeatsAnsweredBeforePreparing();
 	TestErrorGivesTheSnapshotBack();

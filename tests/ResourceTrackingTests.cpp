@@ -1,4 +1,5 @@
 #include "graphics/guest_gpu/gpu_defs.h"
+#include "graphics/host_gpu/renderer/pipeline/prescanHeapProbe.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
@@ -452,6 +453,30 @@ void TestInvariantIndirectImageMaterialization(bool nested) {
              "a descriptor read sharing its memory index entered the table plan");
 }
 
+// The 2D image descriptor, user data and memory of the image heap checks over the indirect image
+// fixture. The table at 0x2000 has 48-byte records and holds the descriptor at its byte 16, and the
+// selector payload at 0x3000 stays on the GPU. It is built in place and never copied, since a
+// runtime keeps pointers into it.
+struct HeapTableSetup {
+  std::array<uint32_t, 8> descriptor{};
+  std::array<uint32_t, 16> data{0x3000u, 4u << 16u, 0x100000u, 0u,
+                                0x2000u, 48u << 16u, 3u, 0u};
+  LinearTestMemory memory;
+
+  HeapTableSetup() {
+    descriptor[0] = 0x20u;
+    descriptor[1] = static_cast<uint32_t>(Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float) << 20u;
+    descriptor[2] = 3u | (3u << 14u);
+    descriptor[3] = Libs::Graphics::DstSel(4, 5, 6, 7) |
+        (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
+    std::copy_n(data.begin(), 4u, data.begin() + 12u);
+    memory.fail_address = 0x3000u;
+    std::copy(descriptor.begin(), descriptor.end(), memory.words.begin() + 0x1010u / 4u);
+  }
+  HeapTableSetup(const HeapTableSetup &) = delete;
+  HeapTableSetup &operator=(const HeapTableSetup &) = delete;
+};
+
 void TestResidentImageHeap() {
   struct FakeImageHeap final : ImageHeapSource {
     bool accept = true;
@@ -467,22 +492,14 @@ void TestResidentImageHeap() {
   auto fixture = MakeIndirectImageFixture(false, 48u, 0u, 16u);
   fixture->PlanAndTrack();
   const auto plan = ExtractResourcePlan(fixture->program);
-  std::array<uint32_t, 8> descriptor{};
-  descriptor[0] = 0x20u;
-  descriptor[1] = static_cast<uint32_t>(Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float) << 20u;
-  descriptor[2] = 3u | (3u << 14u);
-  descriptor[3] = Libs::Graphics::DstSel(4, 5, 6, 7) |
-      (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
+  HeapTableSetup setup;
+  const auto &descriptor = setup.descriptor;
+  auto &data = setup.data;
+  auto &memory = setup.memory;
   auto cube = descriptor;
   cube[3] = Libs::Graphics::DstSel(4, 5, 6, 7) |
       (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kCube) << 28u);
-  std::array<uint32_t, 16> data{0x3000u, 4u << 16u, 0x100000u, 0u,
-                                0x2000u, 48u << 16u, 3u, 0u};
-  std::copy_n(data.begin(), 4u, data.begin() + 12u);
-  LinearTestMemory memory;
-  memory.fail_address = 0x3000u;
   memory.watched_address = 0x2000u;
-  std::copy(descriptor.begin(), descriptor.end(), memory.words.begin() + 0x1010u / 4u);
   FakeImageHeap heap;
   heap.kinds = {{descriptor, 8u}, {cube, 8u}};
   SrtRuntime runtime{.user_data = data, .userdata = &memory,
@@ -529,6 +546,36 @@ void TestResidentImageHeap() {
             snapshot.images.size() == 2u && !specialization.images[0].heap &&
             snapshot.images[1].dwords == descriptor,
         "a declined heap was not materialized entry by entry");
+}
+
+// The prescan's heap probe is offered a table exactly where a heap would be, and declining it leaves
+// the specialization that a walk with no heap gives. Equal specializations also come from two failed
+// walks, so both walks must succeed. An offer is also reported by a probe that always says yes, so
+// the baseline is the same table read through a storage image, which no heap takes, and which must
+// not be offered. The mutations are to leave the offer unrecorded in Acquire, and the sampled table
+// is not reported, and to accept the table, and the specialization is no longer the one without a
+// heap.
+void TestPrescanHeapProbe() {
+  for (const auto access : {ValueOpcode::ImageWrite, ValueOpcode::ImageSampleRaw}) {
+    auto fixture = MakeIndirectImageFixture(false, 48u, 0u, 16u, false, access);
+    fixture->PlanAndTrack();
+    const auto plan = ExtractResourcePlan(fixture->program);
+    HeapTableSetup setup;
+    SrtRuntime runtime{.user_data = setup.data, .userdata = &setup.memory,
+                       .read_specialization_memory = ReadLinearTestMemory};
+    ResourceSnapshot plain_snapshot;
+    ResourceSpecialization plain;
+    const bool plain_built = MaterializeResources(plan, runtime, plain_snapshot, plain);
+    Libs::Graphics::PrescanHeapProbe probe;
+    runtime.image_heap = &probe;
+    ResourceSnapshot probed_snapshot;
+    ResourceSpecialization probed;
+    const bool probed_built = MaterializeResources(plan, runtime, probed_snapshot, probed);
+    const bool sampled = access == ValueOpcode::ImageSampleRaw;
+    Check(plain_built && probed_built && probed == plain && probe.Offered() == sampled,
+          sampled ? "the probe was not offered a heap table, or declining it changed the specialization"
+                  : "the probe was offered a table no heap takes, or changed the specialization");
+  }
 }
 
 void TestImageHeapKinds() {
@@ -9220,6 +9267,7 @@ int main() {
     Run("invariant indirect images", [] { TestInvariantIndirectImageMaterialization(true); });
     Run("unbounded material image keys", [] { TestInvariantIndirectImageMaterialization(false); });
     Run("resident image heap", TestResidentImageHeap);
+    Run("prescan heap probe", TestPrescanHeapProbe);
     Run("image heap kinds", TestImageHeapKinds);
     Run("bounded image view eligibility", TestBoundedImageViewEligibility);
     Run("exact unfiltered image candidates", TestExactUnfilteredImageCandidates);

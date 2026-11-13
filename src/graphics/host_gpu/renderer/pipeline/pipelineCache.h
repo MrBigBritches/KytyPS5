@@ -445,6 +445,12 @@ public:
 	// Modules it builds enter the generated intake, which is made if the generator did not make it.
 	// Calling it again does nothing. Nothing calls it yet, since the scanner that fills the
 	// hand-off is wired later.
+	// Call it after WarmUp and on the thread that owns the program cache. The preparer is seeded
+	// with the skip keys of every module the cache holds then, which reads the program cache. Before
+	// WarmUp the seed is empty and each loaded record is reported through a ring of
+	// PRESCAN_KNOWN_CAPACITY, which a big store overflows, so some stored modules are compiled again.
+	// On another thread the seed would race the GPU thread's adoptions. WarmUp logs a store loaded
+	// after the prescan started.
 	void EnablePrescan(StoreGen::PrescanTransportFactory make_transport = {});
 	// The hand-off the scanner pushes into, or null without the prescan. It lives as long as the
 	// cache, and the scanner must be joined before StopPrescan.
@@ -735,9 +741,21 @@ private:
 	void StopWarmBuilds();
 	// Stops one warm set, destroys the pipelines in it that nobody took and resets it.
 	void StopWarmSet(std::unique_ptr<WarmBuildSet<uint64_t, Pipeline>>& set);
-	// The preparer's settings, taken from this device and Config.
+	// The preparer's settings, taken from this device and Config, with the skip keys of the modules
+	// the cache already holds.
 	[[nodiscard]] PrescanPreparerConfig
 	MakePrescanConfig(StoreGen::PrescanTransportFactory make_transport);
+	// pipelinePrescan.cpp. The prescan's skip key of a module of the program cache, through the one
+	// function the preparer makes it with.
+	[[nodiscard]] static uint64_t SkipKeyOf(const ProgramKey& key, const ShaderModule& module);
+	// The skip keys of every compute module without GPU-selected calls in the program cache, which
+	// seed a new preparer. Only the thread that owns the program cache calls it.
+	[[nodiscard]] std::vector<uint64_t> KnownModuleKeys() const;
+	// Tells the prescan's preparer the skip key of a compute module the cache took in from the
+	// shader store or the generator, so it sends no Compile for that module. It does nothing without
+	// the prescan, whose seed covers what was taken in before it started, and nothing once the
+	// preparer stopped. Only the thread that owns the program cache calls it.
+	void NoteKnownModule(const ProgramKey& key, const ShaderModule& module);
 	// pipelineGeneration.cpp. Makes the module of a prescan record on the preparer's thread and posts
 	// it, as PostGeneratedModule does for the generator. The record's bytes, as the helper encoded
 	// them, travel with the module so its first use can store them without encoding them again. Empty

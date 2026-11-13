@@ -300,7 +300,8 @@ void PipelineCache::AdoptGenerated(GeneratedModule&& item) {
 }
 
 // Puts an adopted module in its program and queues its build. A prescan module has no generator
-// row and builds on the prescan's set, at the front, since the scan found it about to run.
+// row and builds on the prescan's set, at the front, since the scan found it about to run. A
+// generator module is reported to the prescan, so it does not build the same module again.
 void PipelineCache::TakeGeneratedIn(GeneratedModule&& item, Program& program) {
 	const bool        prescan = item.order.prescan;
 	StoreGen::GenRow* row     = prescan ? nullptr : NoteAdopted(item);
@@ -311,6 +312,8 @@ void PipelineCache::TakeGeneratedIn(GeneratedModule&& item, Program& program) {
 		StartPrescanCompute(program.modules.back());
 		return;
 	}
+	// The prescan's own modules stay out, since its variant tracker already knows them.
+	NoteKnownModule(item.key, program.modules.back());
 	// Narrow bases and wide partials go to the back lane and never delay the others.
 	StartWarmCompute(program.modules.back(), row, WarmLaneOf(item.order));
 }

@@ -64482,6 +64482,103 @@ void CheckPrescanNoStoreRetainsNothing(VulkanHarness &vulkan, GuestGpu &gpu,
   std::printf("[gpu]     %-32s ok\n", name);
 }
 
+// ---- Skipping what the store or the generator has. ----
+
+// Writes a shader store that holds the GeneratedLookup module of one stride, compiled inline.
+void WritePrescanStore(VulkanHarness &vulkan, const std::filesystem::path &store, u32 stride) {
+  PipelineCache writer(vulkan.RuntimeContext(), nullptr);
+  writer.WarmUp(store);
+  ShaderComputeInputInfo input{};
+  GeneratedLookup(writer, stride, input);
+  writer.StopBuilds();
+}
+
+// Sends the stride A dispatch to a cache's preparer and waits until its snapshot gave its variant,
+// which the preparer publishes after the pass that sent or skipped the Compile.
+PrescanPreparerCounters PrescanVariantOutcome(PipelineCache &cache, const char *name) {
+  PushPrescanDispatch(cache, GENERATED_STRIDE_A);
+  Require(name, "the snapshot gives its variant",
+          WaitForPrescan([&] { return cache.Prescan()->Counters().variant_modules == 1; }),
+          "the preparer never specialized the dispatch");
+  return cache.Prescan()->Counters();
+}
+
+// How a store check's cache comes by its store. None loads an empty store, Other one holding the
+// stride B module, and Loaded and LoadedLater one holding the stride A module the dispatch needs,
+// loaded before the prescan starts as a real run does, or after it.
+enum class PrescanStoreCase { None, Other, Loaded, LoadedLater };
+
+// A module the shader store loaded is not compiled again by the prescan. The baseline is the same
+// dispatch without that module in the store, which sends exactly one Compile, once with an empty
+// store and once with the program's other variant stored, so neither a store nor a known key of the
+// program alone stops the send. No Compile also comes from a dispatch that never reached its
+// specialization, so the plan must have been asked for and the variant recorded in every case. The
+// store's module was compiled by the runtime, so this is the record side and the preparer side
+// agreeing for a real module. The mutations are to drop the seed from MakePrescanConfig, and the
+// Loaded case sends a Compile. Drop the report from LoadModuleRecord, and LoadedLater sends one.
+void CheckPrescanStoreLoadedSkipsCompile(VulkanHarness &vulkan) {
+  constexpr const char *name = "PrescanStoreLoadedSkipsCompile";
+  for (const auto store_case : {PrescanStoreCase::None, PrescanStoreCase::Other, PrescanStoreCase::Loaded,
+                                PrescanStoreCase::LoadedLater}) {
+    const bool loaded = store_case == PrescanStoreCase::Loaded || store_case == PrescanStoreCase::LoadedLater;
+    const auto store = PrescanStorePath("known_store");
+    if (store_case != PrescanStoreCase::None)
+      WritePrescanStore(vulkan, store, loaded ? GENERATED_STRIDE_A : GENERATED_STRIDE_B);
+    {
+      PipelineCache cache(vulkan.RuntimeContext(), nullptr);
+      PipelineCacheTestAccess::SetPrescanTweak(
+          cache, [](PrescanPreparerConfig &config) { config.read_memory = ReadHostForPrescan; });
+      StoreGen::InProcessPrescanTransport *transport = nullptr;
+      if (store_case != PrescanStoreCase::LoadedLater) cache.WarmUp(store);
+      cache.EnablePrescan(StoreGen::InProcessPrescanTransportFactory(&transport));
+      if (store_case == PrescanStoreCase::LoadedLater) cache.WarmUp(store);
+      const auto counters = PrescanVariantOutcome(cache, name);
+      Require(name, loaded ? "a stored module is not compiled again" : "a module not in the store is compiled",
+              transport->Plans() == 1 && transport->Compiles() == (loaded ? 0u : 1u) &&
+                  counters.known_skipped == (loaded ? 1u : 0u),
+              "the prescan compiled a module the store had loaded, or skipped one it had not");
+      cache.StopBuilds();
+    }
+    std::filesystem::remove_all(store.parent_path());
+  }
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
+// A module the generator made and the GPU thread adopted is not compiled again by the prescan. The
+// baseline is the same dispatch with no generator module, and with the program's other variant
+// adopted, both of which send exactly one Compile, so neither an adoption nor a known key of the
+// program alone stops the send. The adoption must be counted in each case that posts one, and the
+// variant recorded in every case. The mutation is to drop the report from TakeGeneratedIn. The
+// adopted module is then compiled again.
+void CheckPrescanGeneratedSkipsCompile(VulkanHarness &vulkan, GuestGpu &gpu,
+                                       const std::vector<DecodedModuleRecord> &records) {
+  constexpr const char *name = "PrescanGeneratedSkipsCompile";
+  for (const int adopted_index : {-1, 1, 0}) {
+    PipelineCache cache(vulkan.RuntimeContext(), nullptr);
+    PipelineCacheTestAccess::EnableWarmCompute(cache);
+    PipelineCacheTestAccess::EnableGeneration(cache);
+    PipelineCacheTestAccess::SetPrescanTweak(
+        cache, [](PrescanPreparerConfig &config) { config.read_memory = ReadHostForPrescan; });
+    StoreGen::InProcessPrescanTransport *transport = nullptr;
+    cache.EnablePrescan(StoreGen::InProcessPrescanTransportFactory(&transport));
+    if (adopted_index >= 0) {
+      cache.PostGeneratedModule(DecodedModuleRecord(records[adopted_index]));
+      gpu.SendCommandSync([&] { PipelineCacheTestAccess::DrainGenerated(cache); });
+      Require(name, "the generator's module is adopted", cache.GenerationStats()->drain.adopted == 1,
+              "the drain did not adopt the generator's module");
+    }
+    // records[0] is the stride A module the dispatch needs.
+    const bool same = adopted_index == 0;
+    const auto counters = PrescanVariantOutcome(cache, name);
+    Require(name, same ? "an adopted module is not compiled again" : "a module not adopted is compiled",
+            transport->Plans() == 1 && transport->Compiles() == (same ? 0u : 1u) &&
+                counters.known_skipped == (same ? 1u : 0u),
+            "the prescan compiled a module the generator had made, or skipped one it had not");
+    cache.StopBuilds();
+  }
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
 // Captures two module records of one program, as CheckGeneratedModules does, and runs the
 // prescan's intake checks over them.
 void CheckPrescanIntake(VulkanHarness &vulkan) {
@@ -64515,6 +64612,8 @@ void CheckPrescanIntake(VulkanHarness &vulkan) {
       CheckPrescanRecordRoundTrip(vulkan, gpu);
       CheckPrescanRetainCap(vulkan, gpu, records);
       CheckPrescanNoStoreRetainsNothing(vulkan, gpu, records);
+      CheckPrescanStoreLoadedSkipsCompile(vulkan);
+      CheckPrescanGeneratedSkipsCompile(vulkan, gpu, records);
     });
   }
   std::filesystem::remove_all(dir);

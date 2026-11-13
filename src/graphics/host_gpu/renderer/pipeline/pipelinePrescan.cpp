@@ -5,6 +5,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/prescanPreparer.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/shader/moduleId.h"
 #include "kernel/memory.h"
 
 #include <optional>
@@ -70,7 +71,52 @@ PipelineCache::MakePrescanConfig(StoreGen::PrescanTransportFactory make_transpor
 	config.sink = [this](DecodedModuleRecord&& record, std::vector<uint8_t>&& record_bytes) {
 		PostPrescanModule(std::move(record), std::move(record_bytes));
 	};
+	// EnablePrescan runs after WarmUp, so the seed holds every record the shader store loaded, with
+	// what the generator adopted so far. Taken here and not as each record loads, so a run without
+	// the prescan computes no keys at all.
+	config.known_modules = KnownModuleKeys();
 	return config;
+}
+
+// The module's specialization is the one it was compiled with, and the key's fields are the ones
+// its id was made from, so this is the key the preparer makes for the same module before compiling.
+uint64_t PipelineCache::SkipKeyOf(const ProgramKey& key, const ShaderModule& module) {
+	return ShaderModuleSkipKey(key.stage, key.hash, key.user_data_count, key.static_state,
+	                           module.specialization);
+}
+
+// Every module counts, whoever made it, since the drain refuses a duplicate of any of them. Only
+// compute modules without GPU-selected calls, since the prescan builds nothing else. The helper
+// refuses a program with calls at its Plan, so no snapshot of one ever asks for its key. The keys
+// are counted first, so the store's thousands of modules fill the vector without regrowing it.
+std::vector<uint64_t> PipelineCache::KnownModuleKeys() const {
+	size_t count = 0;
+	for (const auto& [key, program]: m_program_cache) {
+		count += key.stage == ShaderType::Compute ? program.modules.size() : 0;
+	}
+	std::vector<uint64_t> keys;
+	keys.reserve(count);
+	for (const auto& [key, program]: m_program_cache) {
+		if (key.stage != ShaderType::Compute) {
+			continue;
+		}
+		for (const auto& module: program.modules) {
+			if (module.function_code.empty()) {
+				keys.push_back(SkipKeyOf(key, module));
+			}
+		}
+	}
+	return keys;
+}
+
+// A stopped preparer reads no more reports, so the key is not even hashed then. A module with
+// GPU-selected calls stays out, as it does from the seed.
+void PipelineCache::NoteKnownModule(const ProgramKey& key, const ShaderModule& module) {
+	if (m_prescan == nullptr || key.stage != ShaderType::Compute || !module.function_code.empty() ||
+	    m_prescan->Stopped()) {
+		return;
+	}
+	m_prescan->NoteKnownModule(SkipKeyOf(key, module));
 }
 
 void PipelineCache::EnablePrescan(StoreGen::PrescanTransportFactory make_transport) {

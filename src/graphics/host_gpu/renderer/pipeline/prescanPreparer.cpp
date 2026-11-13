@@ -3,6 +3,8 @@
 #include "common/hostException.h"
 #include "common/logging/log.h"
 #include "common/threadPriority.h"
+#include "graphics/host_gpu/renderer/pipeline/prescanHeapProbe.h"
+#include "graphics/shader/moduleId.h"
 #include "graphics/shader/recompiler/ir/Serialize.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "graphics/shader/storegen/streamWorker.h"
@@ -197,6 +199,8 @@ struct PrescanPreparer::Impl {
 
 	bool DrainNotes();
 	void NoteModule(const ModuleNote& note);
+	bool DrainKnown();
+	bool IsKnown(const PlanEntry& entry, const PrescanSpec& spec) const;
 	bool AdmitRing();
 	void AdmitItem(PrescanItem item);
 	bool Skipped(const PrescanItem& item, const std::optional<ShaderMapSnapshot>& mapped);
@@ -223,7 +227,7 @@ struct PrescanPreparer::Impl {
 	void RequestPlan(PlanEntry& entry, const Snapshot& snapshot, AdmissionGuard& guard);
 	bool CopyCode(PlanEntry& entry, const PrescanItem& item);
 	void Specialize(PlanEntry& entry, const Snapshot& snapshot, AdmissionGuard& guard);
-	bool Materialize(PlanEntry& entry, const PrescanItem& item, PrescanSpec& spec);
+	bool Materialize(PlanEntry& entry, const PrescanItem& item, PrescanSpec& spec, bool& heap_image);
 	void CountOutcome(Outcome outcome);
 	void SendCompile(PlanEntry& entry, const Snapshot& snapshot, const PrescanSpec& spec);
 	StreamRequest      MakeRequest(const PlanEntry& entry, const PrescanItem& item,
@@ -243,6 +247,10 @@ struct PrescanPreparer::Impl {
 	std::atomic<bool> completion_lost {false};
 	// Filled by the GPU thread, read by the preparer.
 	Common::SpscRing<ModuleNote, PRESCAN_TAKEN_CAPACITY> notes;
+	// Skip keys of the modules the cache took in, filled by the thread that owns the program cache
+	// and read by the preparer into known_modules. A ring and not a shared set, so the GPU thread
+	// never takes a lock the lower-priority preparer could be holding.
+	Common::SpscRing<uint64_t, PRESCAN_KNOWN_CAPACITY> known_notes;
 
 	// The preparer's own.
 	std::unordered_map<uint64_t, PlanEntry>                      plans;
@@ -251,6 +259,7 @@ struct PrescanPreparer::Impl {
 	std::unordered_set<uint64_t>                                 blocked_units;
 	std::unordered_map<uint64_t, uint32_t>                       untaken_by_unit;
 	std::unordered_map<uint64_t, uint64_t>                       unit_of_module;
+	std::unordered_set<uint64_t>                                 known_modules;
 	std::deque<Snapshot>                                         ready;
 	uint64_t                                                     next_tag = 1;
 	uint64_t                                                     pass     = 0;
@@ -271,6 +280,10 @@ PrescanPreparer::Impl::Impl(PrescanHandoff& shared, PrescanPreparerConfig suppli
 	if (!config.make_transport || !config.lookup || !config.sink) {
 		throw std::invalid_argument("PrescanPreparer needs a transport factory, a lookup and a sink");
 	}
+	// The seed lives on in the set only, so the config's copy is freed.
+	known_modules.insert(config.known_modules.begin(), config.known_modules.end());
+	std::vector<uint64_t>().swap(config.known_modules);
+	counters.known_modules = known_modules.size();
 	transport = config.make_transport(config.host, config.device, [this](StreamCompletion&& done) {
 		OnComplete(std::move(done));
 	});
@@ -281,6 +294,8 @@ PrescanPreparer::Impl::Impl(PrescanHandoff& shared, PrescanPreparerConfig suppli
 
 // One pass. The ring goes first and whole, so every item is answered before any is prepared. The
 // answers go before the preparation, so snapshots whose plan just came are prepared in this pass.
+// The cache's module reports go after the ring, so a key whose report happens before an admitted
+// item's push is known when that item is prepared.
 // Once the helper's lane is off nothing could be sent, so a pass does nothing.
 bool PrescanPreparer::Impl::RunOnce() {
 	if (counters.lane_off) {
@@ -293,6 +308,7 @@ bool PrescanPreparer::Impl::RunOnce() {
 	bool worked = DrainNotes();
 	worked      = AdmitRing() || worked;
 	worked      = DrainCompletions() || worked;
+	worked      = DrainKnown() || worked;
 	worked      = PrepareReady() || worked;
 	Publish();
 	return worked;
@@ -428,6 +444,32 @@ void PrescanPreparer::Impl::NoteModule(const ModuleNote& note) {
 		untaken_by_unit.erase(untaken);
 	}
 	unit_of_module.erase(found);
+}
+
+// Takes the keys of the modules the cache took in since the last pass. It runs after the ring was
+// admitted and just before the snapshots are prepared. When the key's report happens before the
+// dispatch's push, on one thread or ordered by other synchronization, the preparer's acquire of
+// the item pairs with that push's release and this drain's acquire of the key ring sees the key.
+// Reports and pushes from threads that nothing orders can still race, and a key that loses only
+// costs a duplicate Compile, which the drain refuses.
+bool PrescanPreparer::Impl::DrainKnown() {
+	uint64_t key = 0;
+	bool     any = false;
+	while (known_notes.TryPop(key)) {
+		any = true;
+		known_modules.insert(key);
+	}
+	counters.known_modules = known_modules.size();
+	counters.known_dropped = known_notes.Dropped();
+	return any;
+}
+
+// Whether the cache already has the module of a new specialization. The key is made by the one
+// function the cache makes it with, from the unit's fields the Compile would echo.
+bool PrescanPreparer::Impl::IsKnown(const PlanEntry& entry, const PrescanSpec& spec) const {
+	return !known_modules.empty() &&
+	       known_modules.contains(ShaderModuleSkipKey(ShaderType::Compute, entry.code_hash,
+	                                                  entry.user_data_count, entry.static_state, spec));
 }
 
 // Takes every item the scanner pushed and asks the state about each.
@@ -852,7 +894,10 @@ bool PrescanPreparer::Impl::CopyCode(PlanEntry& entry, const PrescanItem& item) 
 }
 
 // Specializes a snapshot against the program's plan, refuses what would crash the helper, records
-// the specialization and sends a new one as a Compile.
+// the specialization and sends a new one as a Compile. A new one whose module the cache already has
+// is recorded as built, so later snapshots that give it count towards settling, and it is not sent,
+// since the drain would refuse the answer as a duplicate. The admission's outcome is the snapshot
+// either way, so the skip neither leaves the unit in flight nor counts as a refusal.
 void PrescanPreparer::Impl::Specialize(PlanEntry& entry, const Snapshot& snapshot,
                                        AdmissionGuard& guard) {
 	if (snapshot.item.inputs.indirect && ReadsGroupCounts(entry.plan)) {
@@ -861,7 +906,8 @@ void PrescanPreparer::Impl::Specialize(PlanEntry& entry, const Snapshot& snapsho
 		return;
 	}
 	PrescanSpec spec;
-	if (!Materialize(entry, snapshot.item, spec)) {
+	bool        heap_image = false;
+	if (!Materialize(entry, snapshot.item, spec, heap_image)) {
 		guard.Reject();
 		return;
 	}
@@ -872,28 +918,38 @@ void PrescanPreparer::Impl::Specialize(PlanEntry& entry, const Snapshot& snapsho
 	}
 	const auto outcome = guard.Snapshot(spec);
 	CountOutcome(outcome);
-	if (outcome == Outcome::New) {
-		SendCompile(entry, snapshot, spec);
+	if (outcome != Outcome::New) {
+		return;
 	}
+	counters.heap_image_variants += heap_image ? 1 : 0;
+	if (IsKnown(entry, spec)) {
+		counters.known_skipped++;
+		return;
+	}
+	SendCompile(entry, snapshot, spec);
 }
 
-// Materializes with a walk that never faults and never waits, and no image heap, which belongs to
-// the GPU thread. A walk that skipped a load read zeros, so its specialization is a guess and is
-// neither recorded nor sent. It is rejected, which counts towards settling the program.
+// Materializes with a walk that never faults and never waits. The image heap belongs to the GPU
+// thread, so the walk gets a probe that declines every table, which specializes exactly as no heap
+// would, and says whether the GPU thread's heap would have been offered one. A walk that skipped a
+// load read zeros, so its specialization is a guess and is neither recorded nor sent. It is
+// rejected, which counts towards settling the program.
 bool PrescanPreparer::Impl::Materialize(PlanEntry& entry, const PrescanItem& item,
-                                        PrescanSpec& spec) {
+                                        PrescanSpec& spec, bool& heap_image) {
+	PrescanHeapProbe     heap;
 	const IR::SrtRuntime runtime {
 	    .user_data             = std::span<const uint32_t>(item.user_data.value, item.user_data_count),
 	    .shader_base           = item.program_address,
 	    .read_specialization_memory = config.read_memory,
 	    .workgroup_counts      = item.inputs.workgroup_counts,
 	    .indirect_args_address = item.inputs.indirect_args_address,
-	    .image_heap            = nullptr,
+	    .image_heap            = &heap,
 	};
 	IR::ResourceSnapshot resources;
 	uint32_t             skipped = 0;
 	const bool           built   = IR::MaterializeResources(
         entry.plan, runtime, resources, spec, {.non_faulting = true, .skipped_loads = &skipped});
+	heap_image = heap.Offered();
 	if (skipped != 0) {
 		counters.srt_faults++;
 		return false;
@@ -1003,6 +1059,18 @@ void PrescanPreparer::NoteTaken(uint64_t module_id) noexcept {
 
 void PrescanPreparer::NoteDuplicate(uint64_t module_id) noexcept {
 	(void)m_impl->notes.TryPush({.id = module_id, .duplicate = true});
+}
+
+void PrescanPreparer::NoteKnownModule(uint64_t skip_key) noexcept {
+	if (Stopped()) {
+		return;
+	}
+	(void)m_impl->known_notes.TryPush(skip_key);
+}
+
+// The acquire pairs with the release in TurnOff, Fail and Stop.
+bool PrescanPreparer::Stopped() const noexcept {
+	return m_impl->handoff.preparer_stopped.load(std::memory_order_acquire);
 }
 
 PrescanPreparerCounters PrescanPreparer::Counters() const {

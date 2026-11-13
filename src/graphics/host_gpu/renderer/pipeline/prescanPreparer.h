@@ -23,10 +23,11 @@
 // The pre-scan's preparer. It takes the dispatches the scanner found, decides with PrescanState
 // which snapshots to prepare, asks the helper for each program's resource plan once, specializes
 // every posted snapshot against it in this process, refuses descriptors that would crash the
-// helper, and asks the helper to compile each new specialization. A compiled module goes to the
-// pipeline cache's intake through a sink. It never waits for the helper and the GPU thread never
-// waits for it, so a request still in flight when the game needs its module is simply compiled by
-// the GPU thread as before, and the late answer is dropped by the intake as a duplicate.
+// helper, and asks the helper to compile each new specialization the cache does not already have
+// from the shader store or the generator. A compiled module goes to the pipeline cache's intake
+// through a sink. It never waits for the helper and the GPU thread never waits for it, so a request
+// still in flight when the game needs its module is simply compiled by the GPU thread as before,
+// and the late answer is dropped by the intake as a duplicate.
 namespace Libs::Graphics {
 
 /// After this many modules of one program were built and none of them used yet, the program is
@@ -37,6 +38,11 @@ inline constexpr uint32_t PRESCAN_UNTAKEN_LIMIT = 3;
 /// How many module reports the GPU thread can make before the preparer reads them. A full ring
 /// drops the report, which only keeps a program backed off a little longer.
 inline constexpr size_t PRESCAN_TAKEN_CAPACITY = 1024;
+/// How many skip keys can be reported before the preparer reads them. Reports never wake the
+/// preparer, so many of the GPU thread's drains of generator modules can come between two passes,
+/// and each adopts a few. A full ring drops the key, which only costs a Compile whose answer the
+/// drain then refuses as a duplicate.
+inline constexpr size_t PRESCAN_KNOWN_CAPACITY = 4096;
 /// The most programs whose plans the preparer keeps. Past it the oldest idle plans are dropped,
 /// which only costs a Plan request again.
 inline constexpr size_t PRESCAN_PLAN_CACHE_CAP = 4096;
@@ -87,6 +93,19 @@ struct PrescanPreparerCounters {
 	uint64_t variant_modules = 0;
 	uint64_t known_variants  = 0;
 	uint64_t capped_variants = 0;
+	/// New variants whose module the cache already had, from the shader store or the generator, so
+	/// no Compile was sent. They are part of variant_modules.
+	uint64_t known_skipped = 0;
+	/// New variants whose walk offered an image table to the heap. The GPU thread's heap may keep
+	/// such a table resident and then builds a module the preparer's never matches, so these are
+	/// part of variant_modules but are not covered by the prescan. It is an upper bound on the
+	/// variants lost that way, since the GPU thread's heap can still decline a table, and the
+	/// runtime then builds the preparer's module.
+	uint64_t heap_image_variants = 0;
+	/// Keys of the modules the cache had, from the seed and the GPU thread's reports, and reports
+	/// the full ring dropped.
+	uint64_t known_modules = 0;
+	uint64_t known_dropped = 0;
 	/// Requests the transport refused for now (lane off, queue full, stopped), and for good.
 	uint64_t refused_sends = 0;
 	uint64_t never_retry   = 0;
@@ -142,6 +161,10 @@ struct PrescanPreparerConfig {
 	StoreGen::PrescanTransportFactory make_transport;
 	/// Takes each compiled module.
 	PrescanSink sink;
+	/// The ShaderModuleSkipKey of every compute module the cache holds when the preparer is made.
+	/// A new variant with one of these keys is not sent, since the drain would refuse its module as
+	/// a duplicate. Later modules come through NoteKnownModule.
+	std::vector<uint64_t> known_modules;
 };
 
 /// Prepares the scanner's dispatches on its own thread, or on the caller's when a test drives it
@@ -153,8 +176,10 @@ struct PrescanPreparerConfig {
 /// first snapshot copies its code, checks the hash and sends a Plan. The plan is the preparer's own
 /// copy, since the walker writes scratch through a const plan. Each snapshot is specialized with a
 /// non-faulting walk and no image heap. A walk that skipped a load gives no variant and nothing is
-/// sent. A specialization the emitter would refuse is not sent. A new one is sent as a Compile, and
-/// its answer is checked against the preparer's own static key before the sink gets it.
+/// sent. A specialization the emitter would refuse is not sent. A new one whose module the cache
+/// already has from the shader store or the generator is recorded like a built one and not sent.
+/// Any other new one is sent as a Compile, and its answer is checked against the preparer's own
+/// static key before the sink gets it.
 ///
 /// Blamed and NeverRetry answers retire the program and are never retried here or in this process.
 /// QueueFull, Stopped and Dropped only skip the snapshot, and the GPU thread compiles the module
@@ -201,6 +226,15 @@ public:
 	/// compiled it. The answer came late but the guess was right, so it does not count towards the
 	/// back-off. Only the GPU thread may call it. It never waits.
 	void NoteDuplicate(uint64_t module_id) noexcept;
+	/// Reports the ShaderModuleSkipKey of a module the cache took in from the shader store or the
+	/// generator, so the preparer sends no Compile for it. Only the thread that owns the program
+	/// cache may call it, which is one producer. It never waits and never wakes the preparer, since
+	/// the key only matters to the next Compile, and every pass reads the reports before it prepares.
+	/// Once the preparer stopped it does nothing, since no pass would read the report.
+	void NoteKnownModule(uint64_t skip_key) noexcept;
+	/// Whether the preparer stopped for good, by Stop, an error or the helper's lane turning off. Any
+	/// thread may call it. It never waits.
+	[[nodiscard]] bool Stopped() const noexcept;
 
 	/// The counters as the last pass published them. Any thread may call it.
 	[[nodiscard]] PrescanPreparerCounters Counters() const;

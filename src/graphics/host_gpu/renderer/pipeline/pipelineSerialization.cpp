@@ -188,6 +188,13 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 	const bool reusable =
 	    records.size() >= header.size() && std::ranges::equal(records.first(header.size()), header);
 	if (reusable) {
+		// EnablePrescan belongs after WarmUp. Loaded now, the records reach the preparer one by
+		// one through a bounded ring instead of in its seed, so a big store may be compiled again.
+		// WarmUp runs once per cache, so this is logged at most once.
+		if (m_prescan != nullptr) {
+			Log::WriteToConsoleAndLog("Prescan: the shader store was loaded after the prescan started, "
+			                          "so some stored modules may be compiled again\n");
+		}
 		records = records.subspan(header.size());
 		while (LoadRecord(records)) {
 		}
@@ -279,7 +286,8 @@ bool PipelineCache::LoadRecord(std::span<const uint8_t>& records) {
 	return true;
 }
 
-// Adds a module read from the store to its program, which a first record of the program creates.
+// Adds a module read from the store to its program, which a first record of the program creates,
+// and reports it to the prescan when one runs.
 bool PipelineCache::LoadModuleRecord(DecodedModuleRecord&& decoded) {
 	ProgramKey key;
 	FillKeyFromRecord(decoded, key);
@@ -298,6 +306,9 @@ bool PipelineCache::LoadModuleRecord(DecodedModuleRecord&& decoded) {
 	module.gpl_module = CompileSplitPixelModule(m_graphics, program->first.stage, spirv);
 	m_module_record_order.push_back(module.id);
 	program->second.modules.push_back(std::move(module));
+	// WarmUp belongs before the prescan starts, whose seed then has this module, so this only
+	// matters for a store loaded while the prescan runs, which WarmUp logs.
+	NoteKnownModule(program->first, program->second.modules.back());
 	return true;
 }
 
