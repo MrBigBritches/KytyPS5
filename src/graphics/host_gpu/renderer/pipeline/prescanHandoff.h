@@ -149,8 +149,8 @@ private:
 };
 
 /// Everything the scanner thread and the preparer thread share. The scanner is the ring's one
-/// producer and the preparer its one consumer and the answer table's one writer. The owner keeps it
-/// alive until both threads are joined.
+/// producer, which TryClaimProducer enforces, and the preparer its one consumer and the answer
+/// table's one writer. The owner keeps it alive until both threads are joined.
 struct PrescanHandoff {
 	Common::SpscRing<PrescanItem, PRESCAN_RING_CAPACITY> ring;
 	PrescanFeedback                                      feedback;
@@ -163,6 +163,18 @@ struct PrescanHandoff {
 	/// the helper's lane turned off, the preparer failed or it was stopped. Nothing drains the ring
 	/// after that, so the scanner reads it with acquire once per submission and skips the walk.
 	std::atomic<bool> preparer_stopped {false};
+
+	/// Claims the ring's one producer slot for a scanner. The ring has one producer, so only the first
+	/// caller gets it, and it is never given back, so a later GuestGpu on the same cache attaches no
+	/// scanner of its own even while the preparer still runs. The test and the claim are one atomic
+	/// step, so no caller can split them.
+	/// @return true for the first caller only.
+	[[nodiscard]] bool TryClaimProducer() noexcept {
+		return !m_scanner_attached.exchange(true, std::memory_order_acq_rel);
+	}
+
+private:
+	std::atomic<bool> m_scanner_attached {false};
 	// A counter that took a lock would let a producer wait on the preparer, which the hand-off
 	// forbids. This checks the counter only. Whether a platform's notify_one takes a lock of its
 	// own is not checked here.

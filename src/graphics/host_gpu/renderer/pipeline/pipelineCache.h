@@ -443,8 +443,8 @@ public:
 	// The prescan then stays off when no private directory for the helper's files can be had.
 	// The host values come from this device and Config, as the runtime translates with them.
 	// Modules it builds enter the generated intake, which is made if the generator did not make it.
-	// Calling it again does nothing. Nothing calls it yet, since the scanner that fills the
-	// hand-off is wired later.
+	// Calling it again does nothing. A GuestGpu whose options turn the prescan on calls it before
+	// it starts its thread, and attaches the scanner that fills the hand-off.
 	// Call it after WarmUp and on the thread that owns the program cache. The preparer is seeded
 	// with the skip keys of every module the cache holds then, which reads the program cache. Before
 	// WarmUp the seed is empty and each loaded record is reported through a ring of

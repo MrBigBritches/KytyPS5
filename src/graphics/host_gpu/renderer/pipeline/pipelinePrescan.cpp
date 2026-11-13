@@ -68,8 +68,13 @@ PipelineCache::MakePrescanConfig(StoreGen::PrescanTransportFactory make_transpor
 	config.device         = {.host_subgroup_size              = HostComputeSubgroupSize(m_graphics),
 	                         .max_compute_shared_memory_bytes = max_shared};
 	config.make_transport = std::move(make_transport);
-	config.sink = [this](DecodedModuleRecord&& record, std::vector<uint8_t>&& record_bytes) {
-		PostPrescanModule(std::move(record), std::move(record_bytes));
+	// Prescan modules persist only with a shader store. Without one the record bytes are left with the
+	// preparer, which frees them, so the GPU thread never frees them at adoption. The store is opened
+	// by WarmUp, which runs before EnablePrescan, so whether there is one is known here and never
+	// changes after.
+	const bool keep_records = static_cast<bool>(m_store);
+	config.sink = [this, keep_records](DecodedModuleRecord&& record, std::vector<uint8_t>&& record_bytes) {
+		PostPrescanModule(std::move(record), keep_records ? std::move(record_bytes) : std::vector<uint8_t> {});
 	};
 	// EnablePrescan runs after WarmUp, so the seed holds every record the shader store loaded, with
 	// what the generator adopted so far. Taken here and not as each record loads, so a run without

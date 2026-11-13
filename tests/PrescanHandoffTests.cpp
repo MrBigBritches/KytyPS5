@@ -692,6 +692,17 @@ void TestFeedbackPackingKeepsEveryLowBitPattern() {
 	}
 }
 
+// The ring's producer slot goes to the first claim only, and stays taken. The first claim is the
+// baseline, so a claim that always fails is caught there, and the third shows the second's refusal is
+// not a one-off. The mutations are to return true always, and to test without storing, and both let
+// the second claim through. That the test and the store are one atomic step is checked by review only.
+void TestProducerClaimedOnce() {
+	auto handoff = std::make_unique<PrescanHandoff>();
+	CHECK(handoff->TryClaimProducer());
+	CHECK(!handoff->TryClaimProducer());
+	CHECK(!handoff->TryClaimProducer());
+}
+
 } // namespace
 
 // Counts the allocations of the tests, for TestNoAllocationAfterConstruction.
@@ -764,6 +775,7 @@ int main() {
 	TestFullRingCountedByState();
 	TestFeedbackKeysDoNotMix();
 	TestFeedbackPackingKeepsEveryLowBitPattern();
+	TestProducerClaimedOnce();
 	if (g_failures != 0) {
 		std::fprintf(stderr, "%d check(s) failed\n", g_failures);
 		return 1;

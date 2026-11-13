@@ -1237,6 +1237,10 @@ if(BUILD_TESTING)
 	add_test(NAME shader_recompiler_prescan_intake
 	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --prescan-intake-only)
 	set_tests_properties(shader_recompiler_prescan_intake PROPERTIES TIMEOUT 180)
+	# The pre-scan run from GuestGpu: the scanner wiring, the late skip, shutdown and the one producer.
+	add_test(NAME shader_recompiler_prescan_gpu
+	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --prescan-gpu-only)
+	set_tests_properties(shader_recompiler_prescan_gpu PROPERTIES TIMEOUT 180)
 	add_test(NAME shader_recompiler_submit_cadence
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --submit-cadence-only)
 	add_test(NAME shader_recompiler_submit_cadence_gpu

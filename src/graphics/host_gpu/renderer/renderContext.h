@@ -30,6 +30,7 @@ class VideoOutDriver;
 namespace Libs::Graphics {
 
 class GuestGpu;
+struct GuestGpuOptions;
 struct RenderContextTestAccess;
 
 class RenderContext {
@@ -40,7 +41,13 @@ public:
 	KYTY_CLASS_NO_COPY(RenderContext);
 
 	[[nodiscard]] GraphicContext&           GetGraphics() const noexcept { return m_graphics; }
+	/// Makes the guest GPU and its thread with the default options, which is the emulator without any
+	/// option.
 	void                                    InitializeGpu(VideoOut::VideoOutDriver* video_out);
+	/// Makes the guest GPU and its thread with the given options. Call it on the main thread, after
+	/// this context was made, since the prescan the options may start must follow the warm-up.
+	void                                    InitializeGpu(VideoOut::VideoOutDriver* video_out,
+	                                                      const GuestGpuOptions&    options);
 	void                                    ShutdownGpu();
 	[[nodiscard]] GuestGpu&                 GetGpu() const;
 	[[nodiscard]] VideoOut::VideoOutDriver& GetVideoOut() const;

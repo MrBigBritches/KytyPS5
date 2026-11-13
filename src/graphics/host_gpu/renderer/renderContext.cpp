@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/guest_gpu/guestGpuOptions.h"
 #include "graphics/presentation/videoOut.h"
 #include "libs/errno.h"
 
@@ -40,9 +41,13 @@ RenderContext::~RenderContext() {
 }
 
 void RenderContext::InitializeGpu(VideoOut::VideoOutDriver* video_out) {
+	InitializeGpu(video_out, GuestGpuOptions {});
+}
+
+void RenderContext::InitializeGpu(VideoOut::VideoOutDriver* video_out, const GuestGpuOptions& options) {
 	EXIT_IF(m_gpu != nullptr);
 	m_video_out = video_out;
-	m_gpu       = std::make_unique<GuestGpu>(*this);
+	m_gpu       = std::make_unique<GuestGpu>(*this, options);
 }
 
 void RenderContext::ShutdownGpu() {

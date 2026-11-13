@@ -10,10 +10,14 @@
 #include "common/threads.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
+#include "graphics/guest_gpu/command_processor/prescanScanner.h"
 #include "graphics/guest_gpu/command_processor/scanDifferential.h"
+#include "graphics/guest_gpu/guestGpuOptions.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/renderer/debug.h"
+#include "graphics/host_gpu/renderer/pipeline/prescanHandoff.h"
+#include "graphics/host_gpu/renderer/pipeline/prescanPreparer.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/sync.h"
@@ -30,6 +34,7 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <semaphore>
 #include <thread>
 #include <vector>
@@ -39,9 +44,26 @@ namespace Libs::Graphics {
 static thread_local Pm4Execution* g_current_execution = nullptr;
 static thread_local GuestGpu*     g_gpu_state         = nullptr;
 
-GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
+namespace {
+
+// The scanner's inner reader in a real run. It reads through the backing alias, so it never faults and
+// never waits for a readback, which makes it safe on the scanner thread.
+bool ReadBackingForPrescan(uint64_t address, void* destination, uint64_t bytes) {
+	return LibKernel::Memory::TryReadBacking(address, destination, bytes);
+}
+
+} // namespace
+
+GuestGpu::GuestGpu(RenderContext& renderer): GuestGpu(renderer, GuestGpuOptions {}) {}
+
+GuestGpu::GuestGpu(RenderContext& renderer, const GuestGpuOptions& options): m_renderer(renderer) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	m_gfx_cp = std::make_unique<CommandProcessor>(renderer, 0);
+	// Before the thread, so every enqueuer and the GPU thread see the scanner from their first use. The
+	// shader store's warm-up has run by now and the GPU thread does not yet own the program cache, which
+	// is where EnablePrescan must run. It also comes before the differential registers `this` with the
+	// report, since it can throw, and a throw after that would leave the report holding a dead object.
+	StartPrescan(options);
 	// Built before the thread starts, so the thread and every enqueuer see it from their first use.
 	m_scan_differential = ScanDifferential::Create(
 	    Config::ScanDifferentialEnabled(), QueueCount,
@@ -59,6 +81,37 @@ GuestGpu::~GuestGpu() {
 	Shutdown();
 }
 
+// The preparer may already exist, from an earlier GuestGpu on the same cache, and may have stopped. A
+// stopped preparer drains nothing, and a cache whose ring already has a producer must not get a second
+// one, so in both cases no scanner is attached and the run goes on without the prescan.
+void GuestGpu::StartPrescan(const GuestGpuOptions& options) {
+	if (!options.prescan_compute_builds) {
+		return;
+	}
+	auto& cache = m_renderer.GetPipelineCache();
+	cache.EnablePrescan(options.prescan_transport);
+	auto* inbox    = cache.PrescanInbox();
+	auto* preparer = cache.Prescan();
+	// EnablePrescan has already said why when it left the prescan off, so this only says what follows.
+	if (inbox == nullptr || preparer == nullptr || preparer->Stopped()) {
+		Log::WriteToConsoleAndLog("Prescan: no scanner attached\n");
+		return;
+	}
+	if (!inbox->TryClaimProducer()) {
+		Log::WriteToConsoleAndLog("Prescan: another GPU already attached the scanner, so this one has none\n");
+		return;
+	}
+	// If the scanner cannot be made the claim stays taken, which costs nothing, since the throw fails
+	// this constructor and so the whole GPU.
+	m_prescan_scanner = std::make_unique<PrescanScanner>(
+	    *inbox, options.prescan_reader ? options.prescan_reader : ScanMemoryReader(ReadBackingForPrescan),
+	    options.prescan_lag_bound);
+	m_prescan_enabled_here = true;
+	if (!options.defer_scanner_start_for_test) {
+		m_prescan_scanner->Start();
+	}
+}
+
 void GuestGpu::Shutdown() {
 	std::lock_guard shutdown_lock(m_shutdown_mutex);
 	if (m_shutdown_complete) {
@@ -70,8 +123,18 @@ void GuestGpu::Shutdown() {
 		m_stopping  = true;
 		m_work_available.SignalAll();
 	}
+	// The scanner stops first, so it walks no more lists while the GPU thread drains the queued ones.
+	// A list the GPU thread still begins only moves the scanner's watermark, which is safe after Stop.
+	if (m_prescan_scanner != nullptr) {
+		m_prescan_scanner->Stop();
+	}
 	if (m_thread.joinable()) {
 		m_thread.join();
+	}
+	// With the GPU thread joined nothing takes the prescan's modules in any more. This stops the
+	// preparer, then its transport and the child.
+	if (m_prescan_enabled_here) {
+		m_renderer.GetPipelineCache().StopPrescan();
 	}
 	// The report may be written after this object is gone, so it keeps the final figures.
 	if (m_scan_differential) {
@@ -398,29 +461,58 @@ void CommandProcessor::DmaData(uint8_t dst_sel, uint64_t dst_address_or_offset, 
 void GuestGpu::Enqueue(Submission submission) {
 	// Stamped before the lock, so the enqueue time does not include waiting for it.
 	submission.report = Common::FirstRunReport::SubmissionStamp::New(submission.queue_id);
-	if (!m_scan_differential) {
+	// Without either option this is behaviourally identical to a build without them.
+	if (!m_scan_differential && !m_prescan_scanner) {
 		PushSubmission(std::move(submission));
 		return;
 	}
-	// Scanned before the queue lock is taken, so the walk does not hold up the GPU thread's selection.
-	// The gate holds the queue's order lock past the push, to keep scan order the same as queue order.
-	const uint32_t queue_id = submission.queue_id;
+	// The prescan's copy is made before the gate, so a long list does not hold up the queue's other
+	// submitters. The differential scans before the queue lock is taken, so the walk does not hold up
+	// the GPU thread's selection. The gate holds the queue's order lock past the push, to keep scan
+	// order the same as queue order.
+	auto           prescan_job = PreparePrescanJob(submission);
+	const uint32_t queue_id    = submission.queue_id;
 	m_scan_order.Run(
-	    queue_id,
-	    [&]() -> uint64_t {
-		    if (submission.type == SubmissionType::Commands) {
-			    return m_scan_differential->ScanSubmission(submission.queue_id, submission.commands);
-		    }
-		    if (submission.type == SubmissionType::SuspendPoint) {
-			    // The processor resets its compute state at a suspend point, and the shadow follows.
-			    m_scan_differential->ResetShadow(submission.queue_id);
-		    }
-		    return 0;
-	    },
+	    queue_id, [&]() -> uint64_t { return ScanInGate(submission, prescan_job); },
 	    [&](uint64_t scan_seq) {
 		    submission.scan_seq = scan_seq;
 		    PushSubmission(std::move(submission));
 	    });
+}
+
+// A flip preparation changes no compute state, so it has no job. A suspend point resets the processor's
+// compute state, so its job is a reset marker.
+std::optional<PreparedScanJob> GuestGpu::PreparePrescanJob(const Submission& submission) {
+	if (m_prescan_scanner == nullptr) {
+		return std::nullopt;
+	}
+	switch (submission.type) {
+		case SubmissionType::Commands:
+			return m_prescan_scanner->PrepareCommands(submission.queue_id, submission.commands);
+		case SubmissionType::SuspendPoint:
+			return PreparedScanJob {.job = PrescanScanner::PrepareReset(submission.queue_id)};
+		case SubmissionType::FlipPreparation: break;
+	}
+	return std::nullopt;
+}
+
+// Every prepared job is pushed, even one that was not copied, so its buffer goes back to the pool. The
+// prescan's job goes first, so the number it gets follows the gate's order.
+uint64_t GuestGpu::ScanInGate(Submission& submission, std::optional<PreparedScanJob>& prescan_job) {
+	if (prescan_job) {
+		submission.prescan_seq = m_prescan_scanner->Push(std::move(prescan_job->job), prescan_job->copy_us);
+	}
+	if (m_scan_differential == nullptr) {
+		return 0;
+	}
+	if (submission.type == SubmissionType::Commands) {
+		return m_scan_differential->ScanSubmission(submission.queue_id, submission.commands);
+	}
+	if (submission.type == SubmissionType::SuspendPoint) {
+		// The processor resets its compute state at a suspend point, and the shadow follows.
+		m_scan_differential->ResetShadow(submission.queue_id);
+	}
+	return 0;
 }
 
 void GuestGpu::PushSubmission(Submission submission) {
@@ -546,6 +638,12 @@ bool GuestGpu::Process(Submission& submission) {
 	// reach the BDA draws it records.
 	m_renderer.GetBufferCache().PromoteBdaSync();
 	auto& cp = GetProcessor(submission.queue_id);
+	// The scanner skips a list the GPU thread has begun, since building for it now would come too late.
+	// A blocked submission that resumes notes the same number again, which changes nothing. A flip
+	// preparation has no job, so its number is always 0.
+	if (m_prescan_scanner != nullptr && submission.prescan_seq != 0) {
+		m_prescan_scanner->NoteBegan(submission.queue_id, submission.prescan_seq);
+	}
 
 	// Only command lists count toward submissions per flip, and only on their first run.
 	Common::FirstRunReport::SubmissionScope report_scope(submission.report,

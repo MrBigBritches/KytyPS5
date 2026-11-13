@@ -42,7 +42,10 @@
 #include "graphics/shader/recompiler/ir/Serialize.h"
 #include "graphics/shader/shaderStoreRecord.h"
 #include "graphics/guest_gpu/command_processor/prescanDispatchInputs.h"
+#include "graphics/guest_gpu/command_processor/prescanScanner.h"
 #include "graphics/guest_gpu/command_processor/submitScan.h"
+#include "graphics/guest_gpu/guestGpuOptions.h"
+#include "graphics/host_gpu/renderer/pipeline/prescanHandoff.h"
 #include "graphics/shader/storegen/computeCompile.h"
 #include "graphics/shader/storegen/computeTranslation.h"
 #include "graphics/shader/storegen/ebootShaderScan.h"
@@ -1413,6 +1416,20 @@ struct PipelineCacheTestAccess {
     item->plan_hash ^= 1u;
     cache.PushGenerated(std::move(*item));
   }
+  // Whether the cache made the intake of generated modules, which EnablePrescan makes too.
+  static bool HasGeneration(const PipelineCache &cache) { return cache.m_generation != nullptr; }
+  // How many modules wait in the intake for a drain, and the record bytes they carry, summed. Read
+  // under the state's lock, which is the one the posting thread takes.
+  static std::pair<size_t, uint64_t> InboxRecordBytes(PipelineCache &cache) {
+    std::scoped_lock lock(cache.m_generation->mutex);
+    size_t waiting = 0;
+    uint64_t bytes = 0;
+    for (const auto &item : cache.m_generation->inbox) {
+      waiting++;
+      bytes += item.module.retained ? item.module.retained.record->bytes.size() : 0;
+    }
+    return {waiting, bytes};
+  }
 
   // How many modules the program cache holds, and how many programs.
   static size_t ModuleCount(const PipelineCache &cache) {
@@ -1723,6 +1740,14 @@ struct PipelineCacheTestAccess {
       while (job->GetState() != PipelineBuildQueue::State::Done) std::this_thread::yield();
     }
   }
+};
+
+// The prescan's side of a GuestGpu, which the prescan's GuestGpu checks read.
+struct GuestGpuTestAccess {
+  // The scanner the GPU attached, or null.
+  static PrescanScanner *Scanner(GuestGpu &gpu) { return gpu.m_prescan_scanner.get(); }
+  // Whether the GPU attached the scanner, which makes its Shutdown stop the cache's preparer.
+  static bool PrescanEnabledHere(const GuestGpu &gpu) { return gpu.m_prescan_enabled_here; }
 };
 
 namespace {
@@ -65027,6 +65052,397 @@ void CheckScannedKeyMatchesRuntimeKey(VulkanHarness &vulkan) {
   std::printf("[gpu]     %-32s ok\n", name);
 }
 
+// ---- The prescan run from GuestGpu. ----
+
+// How many lists the wiring check submits, each with a program of its own.
+constexpr u32 PRESCAN_GPU_LISTS = 3;
+// The programs of the GuestGpu checks are never mapped, and their dispatches have no groups, so the
+// command processor skips them and the preparer drops them before the state sees them. The addresses
+// are aligned as COMPUTE_PGM_LO needs.
+constexpr uint64_t PRESCAN_GPU_PROGRAM_BASE = 0x0000007000000000ull;
+constexpr uint64_t PRESCAN_GPU_PROGRAM_STEP = SCAN_KEY_PROGRAM_ALIGNMENT;
+// A lag bound no test comes near, since a scanner thread below normal priority can be starved on a
+// loaded machine, and none of these checks is about the bound.
+constexpr auto PRESCAN_GPU_LAG_BOUND = std::chrono::minutes(1);
+// How long the shutdown check's reader takes over its one read, and how long ShutdownGpu may take.
+constexpr auto PRESCAN_SHUTDOWN_READ_DELAY = std::chrono::milliseconds(500);
+constexpr auto PRESCAN_SHUTDOWN_WATCHDOG = std::chrono::seconds(5);
+constexpr u32 PRESCAN_IB_DWORDS = 4;
+constexpr u32 PRESCAN_NOP_DWORDS = 2;
+// The shift that takes the high dword of a 64-bit address, as INDIRECT_BUFFER's third dword holds it.
+constexpr u32 PRESCAN_ADDRESS_HIGH_DWORD_SHIFT = 32;
+
+// A list that only makes an unmapped program current.
+std::vector<u32> PrescanGpuProgramList(uint64_t program_address) {
+  std::vector<u32> list;
+  AppendScanKeySetSh(list, Pm4::COMPUTE_PGM_LO,
+                     {static_cast<u32>(program_address >> SCAN_KEY_ADDRESS_LOW_SHIFT),
+                      static_cast<u32>(program_address >> SCAN_KEY_ADDRESS_HIGH_SHIFT)});
+  return list;
+}
+
+// Appends a dispatch of no groups of whatever program is current.
+void AppendPrescanGpuDispatch(std::vector<u32> &list) {
+  list.insert(list.end(), {KYTY_PM4(SCAN_KEY_DISPATCH_DWORDS, Pm4::IT_DISPATCH_DIRECT, Pm4::R_ZERO), 0u, 0u,
+                           0u, SCAN_KEY_INITIATOR});
+}
+
+// A list that makes an unmapped program current and dispatches no groups of it.
+std::vector<u32> PrescanGpuList(uint64_t program_address) {
+  auto list = PrescanGpuProgramList(program_address);
+  AppendPrescanGpuDispatch(list);
+  return list;
+}
+
+// The options of a GuestGpu check, with the prescan on the in-process transport and the long lag bound.
+GuestGpuOptions PrescanGpuOptions(bool prescan) {
+  GuestGpuOptions options;
+  options.prescan_compute_builds = prescan;
+  options.prescan_transport = StoreGen::InProcessPrescanTransportFactory();
+  options.prescan_lag_bound = PRESCAN_GPU_LAG_BOUND;
+  return options;
+}
+
+// Makes a context's GPU with the options, after giving its preparer the host memory reader. Each
+// context makes its own cache, so no check sees another's preparer or scanner.
+void InitializePrescanGpu(RenderContext &context, const GuestGpuOptions &options) {
+  PipelineCacheTestAccess::SetPrescanTweak(
+      context.GetPipelineCache(), [](PrescanPreparerConfig &config) { config.read_memory = ReadHostForPrescan; });
+  context.InitializeGpu(nullptr, options);
+}
+
+// Holds the GPU thread on a command until `ready` holds or the wait limit passes. Commands run before
+// submissions, so the lists submitted meanwhile wait, and the scanner reaches them before the GPU
+// thread begins them, which would otherwise make it skip them as late.
+void HoldGpuUntil(GuestGpu &gpu, std::function<bool()> ready) {
+  gpu.SendCommand([ready = std::move(ready)] { (void)WaitForPrescan(ready); });
+}
+
+// The options' prescan builds what the GuestGpu needs and nothing more. With it off there is no
+// preparer, hand-off, scanner or intake, which is the baseline for a flag-off run being unchanged.
+void CheckPrescanGuestGpuWiringOff(RenderContext &context, const char *name) {
+  auto &cache = context.GetPipelineCache();
+  auto &gpu = context.GetGpu();
+  Require(name, "off makes nothing",
+          cache.Prescan() == nullptr && cache.PrescanInbox() == nullptr &&
+              GuestGpuTestAccess::Scanner(gpu) == nullptr && !GuestGpuTestAccess::PrescanEnabledHere(gpu) &&
+              !PipelineCacheTestAccess::HasGeneration(cache),
+          "with the prescan off the GPU made a preparer, a hand-off, a scanner or the intake");
+}
+
+// Each list submitted to the GPU reaches the scanner, is walked once and its dispatch reaches the
+// preparer. The programs differ, so the scanner's cache keeps none of the dispatches out, and N
+// items cannot come from fewer lists. The GPU thread is held until the scanner has taken every list,
+// so none is skipped as late. The baseline is the same lists with the option off, which makes
+// nothing at all. The mutation is to make Enqueue always take the fast path. The scanner then gets
+// no list and the hold runs out.
+void CheckPrescanGuestGpuWiring(VulkanHarness &vulkan) {
+  constexpr const char *name = "PrescanGuestGpuWiring";
+  for (const bool prescan : {false, true}) {
+    RenderContext context(vulkan.RuntimeContext(), std::filesystem::path{});
+    InitializePrescanGpu(context, PrescanGpuOptions(prescan));
+    auto &gpu = context.GetGpu();
+    auto *scanner = GuestGpuTestAccess::Scanner(gpu);
+    if (prescan) {
+      Require(name, "on attaches a scanner", scanner != nullptr && GuestGpuTestAccess::PrescanEnabledHere(gpu),
+              "with the prescan on the GPU attached no scanner");
+      HoldGpuUntil(gpu, [scanner] { return scanner->Stats().jobs >= PRESCAN_GPU_LISTS; });
+    }
+    // The GPU borrows each list until it ran it, so the outer vector never reallocates.
+    std::vector<std::vector<u32>> lists;
+    lists.reserve(PRESCAN_GPU_LISTS);
+    for (u32 index = 0; index < PRESCAN_GPU_LISTS; index++) {
+      lists.push_back(PrescanGpuList(PRESCAN_GPU_PROGRAM_BASE + index * PRESCAN_GPU_PROGRAM_STEP));
+      gpu.Submit(lists.back());
+    }
+    gpu.WaitForIdle();
+    if (!prescan) {
+      CheckPrescanGuestGpuWiringOff(context, name);
+      context.ShutdownGpu();
+      continue;
+    }
+    const auto stats = scanner->Stats();
+    Require(name, "every list is walked once",
+            stats.jobs == PRESCAN_GPU_LISTS && stats.scan.submissions == PRESCAN_GPU_LISTS &&
+                stats.scan.dispatches == PRESCAN_GPU_LISTS && stats.scan.dispatches_cached == 0 &&
+                stats.lag_skipped == 0 && stats.queue.late_skipped == 0 &&
+                stats.offers_posted == PRESCAN_GPU_LISTS,
+            "the scanner did not walk and post each submitted list exactly once");
+    auto *preparer = context.GetPipelineCache().Prescan();
+    Require(name, "the preparer takes every dispatch",
+            WaitForPrescan([preparer] { return preparer->Counters().items == PRESCAN_GPU_LISTS; }),
+            "the preparer did not take one item per submitted list");
+    context.ShutdownGpu();
+  }
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
+// A list the GPU thread has begun is skipped by the scanner. The scanner is started only after the GPU
+// thread ran the list, which noted it as begun, so the scanner skips it and posts nothing. Nothing
+// posted also passes if the scanner never ran, so the skip itself is counted. The baseline differs only
+// in the scanner running first, with the GPU thread held until it walked the list, which posts it. The
+// mutation is to drop NoteBegan from Process. The late list is then walked and posted.
+void CheckPrescanNoteBeganSkipsLate(VulkanHarness &vulkan) {
+  constexpr const char *name = "PrescanNoteBeganSkipsLate";
+  for (const bool late : {false, true}) {
+    RenderContext context(vulkan.RuntimeContext(), std::filesystem::path{});
+    auto options = PrescanGpuOptions(true);
+    options.defer_scanner_start_for_test = late;
+    InitializePrescanGpu(context, options);
+    auto &gpu = context.GetGpu();
+    auto *scanner = GuestGpuTestAccess::Scanner(gpu);
+    auto *preparer = context.GetPipelineCache().Prescan();
+    Require(name, "a scanner is attached", scanner != nullptr, "the GPU attached no scanner");
+    if (!late) HoldGpuUntil(gpu, [scanner] { return scanner->Stats().jobs >= 1; });
+    const auto list = PrescanGpuList(PRESCAN_GPU_PROGRAM_BASE);
+    gpu.Submit(list);
+    gpu.WaitForIdle();
+    if (late) {
+      scanner->Start();
+      Require(name, "the late list is skipped",
+              WaitForPrescan([scanner] { return scanner->Stats().queue.late_skipped == 1; }),
+              "the scanner did not skip a list the GPU thread had already begun");
+    } else {
+      Require(name, "the early list is posted",
+              WaitForPrescan([preparer] { return preparer->Counters().items == 1; }),
+              "the preparer did not take the dispatch of a list the scanner reached first");
+    }
+    const auto stats = scanner->Stats();
+    Require(name, late ? "a late list posts nothing" : "an early list is walked",
+            stats.queue.late_skipped == (late ? 1u : 0u) && stats.jobs == (late ? 0u : 1u) &&
+                stats.offers_posted == (late ? 0u : 1u) && preparer->Counters().items == (late ? 0u : 1u),
+            "the scanner walked a late list, or skipped one it reached in time");
+    context.ShutdownGpu();
+  }
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
+// A suspend point between two lists reaches the scanner as a reset marker, which resets the queue's
+// shadow as the command processor resets its compute state. List A sets the program and list B only
+// dispatches, so B posts nothing after the reset, since its shadow has no program. Nothing posted also
+// passes if B was never walked, so all three jobs must be taken and B's dispatch counted as having no
+// program. The baseline differs only in having no suspend point. Two jobs are pushed and B posts A's
+// program, so B's post depends on the reset alone. The GPU thread is held until the scanner took every
+// job. The mutation is to give a suspend point no job in PreparePrescanJob. Then only two jobs are
+// pushed and B posts A's program.
+void CheckPrescanSuspendPointResets(VulkanHarness &vulkan) {
+  constexpr const char *name = "PrescanSuspendPointResets";
+  for (const bool suspend : {false, true}) {
+    const uint64_t jobs = suspend ? 3u : 2u;
+    RenderContext context(vulkan.RuntimeContext(), std::filesystem::path{});
+    InitializePrescanGpu(context, PrescanGpuOptions(true));
+    auto &gpu = context.GetGpu();
+    auto *scanner = GuestGpuTestAccess::Scanner(gpu);
+    auto *preparer = context.GetPipelineCache().Prescan();
+    Require(name, "a scanner is attached", scanner != nullptr, "the GPU attached no scanner");
+    HoldGpuUntil(gpu, [scanner, jobs] { return scanner->Stats().jobs >= jobs; });
+    const auto list_a = PrescanGpuProgramList(PRESCAN_GPU_PROGRAM_BASE);
+    std::vector<u32> list_b;
+    AppendPrescanGpuDispatch(list_b);
+    gpu.Submit(list_a);
+    if (suspend) gpu.SuspendPoint();
+    gpu.Submit(list_b);
+    gpu.WaitForIdle();
+    const auto stats = scanner->Stats();
+    Require(name, suspend ? "after the reset B posts nothing" : "without a reset B posts A's program",
+            stats.queue.pushed == jobs && stats.jobs == jobs && stats.scan.dispatches == 1 &&
+                stats.scan.no_shader_state == (suspend ? 1u : 0u) && stats.offers_posted == (suspend ? 0u : 1u),
+            "the suspend point did not reach the scanner as a reset, or B's dispatch was not walked");
+    if (!suspend) {
+      Require(name, "the preparer takes B's dispatch",
+              WaitForPrescan([preparer] { return preparer->Counters().items == 1; }),
+              "the preparer did not take the dispatch B posted");
+    }
+    context.ShutdownGpu();
+  }
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
+// The reader of CheckPrescanShutdownOrder. Its first call says it started, then takes its delay, so a
+// Shutdown that does not wait for the scanner returns while it is still in the read.
+struct PrescanSlowReader {
+  std::promise<void> started;
+  std::atomic<uint32_t> calls{0};
+  std::atomic<bool> returned{false};
+
+  bool Read(uint64_t address, void *destination, uint64_t bytes) {
+    if (calls.fetch_add(1) == 0) started.set_value();
+    std::this_thread::sleep_for(PRESCAN_SHUTDOWN_READ_DELAY);
+    std::memcpy(destination, reinterpret_cast<const void *>(address), bytes);
+    returned = true;
+    return true;
+  }
+};
+
+// Runs GuestGpu::Shutdown on a thread of its own and waits for it no longer than the watchdog. A
+// Shutdown that does not return is waiting on the scanner or the preparer for good, which no later
+// check can recover from, so it ends the run.
+void PrescanShutdownWithin(GuestGpu &gpu) {
+  auto done = std::async(std::launch::async, [&gpu] { gpu.Shutdown(); });
+  if (done.wait_for(PRESCAN_SHUTDOWN_WATCHDOG) != std::future_status::ready) {
+    std::fprintf(stderr, "PrescanShutdownOrder: failed: Shutdown did not return while the scanner read\n");
+    std::abort();
+  }
+}
+
+// Shutdown stops the scanner, waits for its read, joins the GPU thread and stops the preparer, in a
+// bounded time. The context's ShutdownGpu then runs Shutdown again and destroys the GPU, and a third
+// call finds no GPU. Every step there is idempotent, so nothing is asserted about them beyond the run
+// going on. The scanner is in its read and the preparer runs when Shutdown starts, so neither ended on
+// its own. The GPU thread is held until the read started, so the list is not skipped as late. The
+// mutations are to drop the scanner's Stop from Shutdown, and Shutdown returns while the reader is
+// still in its read. Drop StopPrescan, and the preparer still runs after Shutdown.
+void CheckPrescanShutdownOrder(VulkanHarness &vulkan) {
+  constexpr const char *name = "PrescanShutdownOrder";
+  alignas(SCAN_KEY_PROGRAM_ALIGNMENT) static const std::array<u32, PRESCAN_NOP_DWORDS> buffer{
+      KYTY_PM4(PRESCAN_NOP_DWORDS, Pm4::IT_NOP, Pm4::R_ZERO), 0u};
+  const auto address = reinterpret_cast<uint64_t>(buffer.data());
+  const std::array<u32, PRESCAN_IB_DWORDS> list{KYTY_PM4(PRESCAN_IB_DWORDS, Pm4::IT_INDIRECT_BUFFER, 0),
+                                                static_cast<u32>(address),
+                                                static_cast<u32>(address >> PRESCAN_ADDRESS_HIGH_DWORD_SHIFT),
+                                                PRESCAN_NOP_DWORDS};
+  PrescanSlowReader reader;
+  auto started = reader.started.get_future().share();
+  RenderContext context(vulkan.RuntimeContext(), std::filesystem::path{});
+  auto options = PrescanGpuOptions(true);
+  options.prescan_reader = [&reader](uint64_t at, void *destination, uint64_t bytes) {
+    return reader.Read(at, destination, bytes);
+  };
+  InitializePrescanGpu(context, options);
+  auto &cache = context.GetPipelineCache();
+  auto &gpu = context.GetGpu();
+  auto *scanner = GuestGpuTestAccess::Scanner(gpu);
+  Require(name, "a scanner is attached", scanner != nullptr, "the GPU attached no scanner");
+  HoldGpuUntil(gpu,
+               [started] { return started.wait_for(std::chrono::seconds::zero()) == std::future_status::ready; });
+  gpu.Submit(list);
+  Require(name, "the scanner is in its read",
+          started.wait_for(PRESCAN_WAIT_LIMIT) == std::future_status::ready && !scanner->Finished() &&
+              !cache.Prescan()->Stopped(),
+          "the scanner never read the indirect buffer, or it or the preparer had already ended");
+  PrescanShutdownWithin(gpu);
+  Require(name, "Shutdown waits for the scanner", reader.returned.load() && scanner->Finished(),
+          "Shutdown returned while the scanner was still in its read");
+  Require(name, "Shutdown stops the preparer",
+          cache.Prescan()->Stopped() && cache.PrescanInbox()->preparer_stopped.load(),
+          "the preparer still ran after Shutdown");
+  context.ShutdownGpu();
+  context.ShutdownGpu();
+  Require(name, "one read", reader.calls.load() == 1, "the scanner read the buffer more than once");
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
+// What the GPU of a CheckPrescanSingleProducer run did. The run makes the preparer itself, and claims
+// the ring's producer slot first when `pre_claimed`, which stands for a scanner already attached by
+// someone else. The GPU then attaches none and leaves the preparer it did not start running. Without
+// the claim the GPU attaches the scanner, stores its claim, and stops the preparer at its shutdown.
+void CheckPrescanSingleProducerRun(VulkanHarness &vulkan, const char *name, bool pre_claimed) {
+  RenderContext context(vulkan.RuntimeContext(), std::filesystem::path{});
+  auto &cache = context.GetPipelineCache();
+  PipelineCacheTestAccess::SetPrescanTweak(cache,
+                                           [](PrescanPreparerConfig &config) { config.read_memory = ReadHostForPrescan; });
+  cache.EnablePrescan(StoreGen::InProcessPrescanTransportFactory());
+  Require(name, "the preparer runs", cache.PrescanInbox() != nullptr && !cache.Prescan()->Stopped(),
+          "EnablePrescan did not start the preparer");
+  if (pre_claimed) {
+    Require(name, "the test claims the slot", cache.PrescanInbox()->TryClaimProducer(),
+            "a fresh hand-off refused the first claim");
+  }
+  context.InitializeGpu(nullptr, PrescanGpuOptions(true));
+  auto &gpu = context.GetGpu();
+  const bool attached = GuestGpuTestAccess::Scanner(gpu) != nullptr && GuestGpuTestAccess::PrescanEnabledHere(gpu);
+  Require(name, pre_claimed ? "a claimed slot gets no scanner" : "a free slot gets the scanner",
+          attached == !pre_claimed, "the GPU attached a scanner to a claimed ring, or none to a free one");
+  if (!pre_claimed) {
+    Require(name, "the GPU keeps its claim", !cache.PrescanInbox()->TryClaimProducer(),
+            "a claim after the GPU attached its scanner succeeded, so the GPU's claim was not stored");
+  }
+  context.ShutdownGpu();
+  Require(name, pre_claimed ? "a GPU without the scanner leaves the preparer" : "the scanner's GPU stops the preparer",
+          cache.Prescan()->Stopped() == !pre_claimed,
+          "a GPU that attached no scanner stopped the preparer, or the one that did left it running");
+}
+
+// A cache's ring has one producer, so a GPU whose ring was already claimed attaches no scanner and
+// leaves the preparer it did not start running at its shutdown. The baseline is the same steps without
+// the claim, where the GPU attaches the scanner and its claim is stored, so a later claim fails. A GPU
+// made after that one's shutdown attaches none either, though the stopped preparer already prevents it
+// there. The baseline runs first, so a mutation that breaks both runs fails in the baseline. The
+// mutations are to attach without claiming, and the GPU stores no claim, so the baseline's later claim
+// succeeds and the claimed run would attach a scanner. Claim without storing, and the same happens.
+// Stop the preparer at every GPU's shutdown, and the claimed run's preparer is stopped.
+void CheckPrescanSingleProducer(VulkanHarness &vulkan) {
+  constexpr const char *name = "PrescanSingleProducer";
+  CheckPrescanSingleProducerRun(vulkan, name, false);
+  CheckPrescanSingleProducerRun(vulkan, name, true);
+  RenderContext context(vulkan.RuntimeContext(), std::filesystem::path{});
+  InitializePrescanGpu(context, PrescanGpuOptions(true));
+  Require(name, "the first GPU attaches the scanner", GuestGpuTestAccess::Scanner(context.GetGpu()) != nullptr,
+          "the first GPU attached no scanner");
+  context.ShutdownGpu();
+  context.InitializeGpu(nullptr, PrescanGpuOptions(true));
+  Require(name, "a GPU after the shutdown attaches none", GuestGpuTestAccess::Scanner(context.GetGpu()) == nullptr,
+          "a GPU made after the first one's shutdown attached a scanner");
+  context.ShutdownGpu();
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
+// Without a shader store the preparer's sink passes no record bytes, so the GPU thread never frees them
+// at adoption. The sink is taken from the preparer's settings and called by hand, and the module it
+// posts waits in the intake, since nothing drains it. No bytes also pass if nothing was posted, so one
+// module must wait. The baseline is a context with a store, whose module carries every byte. The
+// mutation is to always forward the bytes, and the module without a store carries them.
+void CheckPrescanSinkWithoutStore(VulkanHarness &vulkan, const DecodedModuleRecord &record) {
+  constexpr const char *name = "PrescanSinkWithoutStore";
+  const auto bytes = PrescanRecordBytes(record);
+  for (const bool with_store : {true, false}) {
+    const auto store = PrescanStorePath("sink");
+    {
+      RenderContext context(vulkan.RuntimeContext(), with_store ? store : std::filesystem::path{});
+      PrescanSink sink;
+      PipelineCacheTestAccess::SetPrescanTweak(context.GetPipelineCache(), [&sink](PrescanPreparerConfig &config) {
+        config.read_memory = ReadHostForPrescan;
+        sink = config.sink;
+      });
+      context.InitializeGpu(nullptr, PrescanGpuOptions(true));
+      Require(name, "the sink was taken", static_cast<bool>(sink), "the preparer's settings had no sink");
+      // The sink belongs to the preparer's thread. Calling it here is safe only because nothing was
+      // submitted, so the preparer has no items and never calls it at the same time.
+      sink(DecodedModuleRecord(record), std::vector<uint8_t>(bytes));
+      const auto [waiting, kept] = PipelineCacheTestAccess::InboxRecordBytes(context.GetPipelineCache());
+      Require(name, with_store ? "with a store the bytes travel" : "without a store no bytes travel",
+              !bytes.empty() && waiting == 1 && kept == (with_store ? bytes.size() : 0u),
+              "the sink forwarded record bytes without a store, or dropped them with one");
+      context.ShutdownGpu();
+    }
+    std::filesystem::remove_all(store.parent_path());
+  }
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
+// The prescan run from GuestGpu. The sink check needs a module record, which is captured from a store
+// written as CheckPrescanIntake writes its own.
+void CheckPrescanGuestGpu(VulkanHarness &vulkan) {
+  Config::Load({.printf_direction = Config::LogDirection::Silent});
+  CheckPrescanGuestGpuWiring(vulkan);
+  CheckPrescanNoteBeganSkipsLate(vulkan);
+  CheckPrescanSuspendPointResets(vulkan);
+  CheckPrescanShutdownOrder(vulkan);
+  CheckPrescanSingleProducer(vulkan);
+  const auto store = PrescanStorePath("gpu_record");
+  {
+    PipelineCache writer(vulkan.RuntimeContext(), nullptr);
+    writer.WarmUp(store);
+    ShaderComputeInputInfo input{};
+    GeneratedLookup(writer, GENERATED_STRIDE_A, input);
+    writer.StopBuilds();
+  }
+  const auto records = ReadStoredModuleRecords(store);
+  std::filesystem::remove_all(store.parent_path());
+  Require("PrescanGuestGpu", "one record", records.size() == 1, "the store did not hold the one module");
+  CheckPrescanSinkWithoutStore(vulkan, records[0]);
+}
+
 // ---- The shader store generated by a real worker (--generate-shader-store). ----
 
 // What the fake worker of the hang check does, in this binary. It writes a predict line and then
@@ -72932,6 +73348,11 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--prescan-intake-only") == 0) {
     VulkanHarness vulkan;
     CheckPrescanIntake(vulkan);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--prescan-gpu-only") == 0) {
+    VulkanHarness vulkan;
+    CheckPrescanGuestGpu(vulkan);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--warm-pause-only") == 0) {

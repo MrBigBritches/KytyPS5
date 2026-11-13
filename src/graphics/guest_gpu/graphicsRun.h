@@ -15,6 +15,7 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <semaphore>
 #include <span>
 #include <thread>
@@ -23,10 +24,18 @@ namespace Libs::Graphics {
 
 class RenderContext;
 class ScanDifferential;
+class PrescanScanner;
+struct PreparedScanJob;
+struct GuestGpuOptions;
+struct GuestGpuTestAccess;
 
 class GuestGpu final {
 public:
+	/// Makes the GPU thread with the default options, which is the emulator without any option.
 	explicit GuestGpu(RenderContext& renderer);
+	/// Makes the GPU thread with the given options. The submit-time prescan, when the options turn it
+	/// on, is started here on the main thread before the GPU thread, after the shader store's warm-up.
+	GuestGpu(RenderContext& renderer, const GuestGpuOptions& options);
 	~GuestGpu();
 	KYTY_CLASS_NO_COPY(GuestGpu);
 
@@ -71,8 +80,20 @@ private:
 		// The sequence number --scan-differential gave the submission's scan, or 0 when it was not
 		// scanned. Kept when a blocked submission goes back to the queue.
 		uint64_t scan_seq = 0;
+		// The number the prescan's job queue gave the submission's job, or 0 when none was pushed. It is
+		// apart from scan_seq, which --scan-differential numbers on its own. Kept when a blocked
+		// submission goes back to the queue.
+		uint64_t prescan_seq = 0;
 	};
 
+	// Starts the prescan when the options turn it on. Main thread, before the GPU thread starts.
+	void              StartPrescan(const GuestGpuOptions& options);
+	// The prescan's job for a submission, copied outside the order gate, or nothing when there is no
+	// scanner or the submission has no job.
+	[[nodiscard]] std::optional<PreparedScanJob> PreparePrescanJob(const Submission& submission);
+	// The order gate's scan step. Pushes the prescan's job first, then runs --scan-differential's scan
+	// or reset, and returns the differential's sequence number.
+	uint64_t          ScanInGate(Submission& submission, std::optional<PreparedScanJob>& prescan_job);
 	void              Enqueue(Submission submission);
 	// Puts a submission on its queue and wakes the GPU thread.
 	void              PushSubmission(Submission submission);
@@ -110,11 +131,19 @@ private:
 	// Null unless --scan-differential is on, and then every use is behind a null check, so a run without
 	// the flag does nothing more for it.
 	std::unique_ptr<ScanDifferential> m_scan_differential;
-	// With the flag on, Enqueue runs the scan or shadow reset and the push to the queue through this, so
-	// the scans run in the order the submissions queue. A SuspendPoint and the command lists around it
-	// can come from different game threads, and a reset scanned out of order would leave the shadow with
-	// the wrong registers. The lock order is the gate's queue lock, then m_queue_mutex.
+	// With --scan-differential or the prescan on, Enqueue runs the scan or shadow reset and the push to
+	// the queue through this, so the scans run in the order the submissions queue. A SuspendPoint and
+	// the command lists around it can come from different game threads, and a reset scanned out of order
+	// would leave the shadow with the wrong registers. The lock order is the gate's queue lock, then
+	// m_queue_mutex.
 	ScanOrderGate m_scan_order;
+	// Null unless the options turn the prescan on and this GPU attached the cache's only scanner, and
+	// then every use is behind a null check. Made before the GPU thread starts and destroyed with this
+	// object, so the GPU thread's NoteBegan never outlives it.
+	std::unique_ptr<PrescanScanner> m_prescan_scanner;
+	// Whether this GPU attached the scanner, so its Shutdown stops the cache's preparer after the
+	// scanner and the GPU thread are joined.
+	bool m_prescan_enabled_here = false;
 	// The queue and scan sequence of the submission the GPU thread is processing, which the command
 	// processor reports its dispatches under. GPU thread only. A sequence of 0 means none.
 	uint32_t        m_scan_queue = 0;
@@ -122,6 +151,7 @@ private:
 	std::jthread    m_thread;
 
 	friend class CommandProcessor;
+	friend struct GuestGpuTestAccess;
 };
 } // namespace Libs::Graphics
 
