@@ -2792,27 +2792,31 @@ void CheckNativeFloatMinMaxConfig() {
   std::printf("[host]    %-32s ok\n", name);
 }
 
-// What the three async pipeline accessors answer for the Config that is loaded.
+// What the three async pipeline accessors, and the per-view history that prefer-skip turns on,
+// answer for the Config that is loaded.
 struct AsyncPipelineAccessors {
   bool async = false;
   bool depth_only = false;
   bool prefer_skip = false;
+  bool view_history = false;
   bool operator==(const AsyncPipelineAccessors &) const = default;
 };
 
-// Loads `options` with printf silenced and reads the three async pipeline accessors.
+// Loads `options` with printf silenced and reads the three async pipeline accessors and the
+// per-view history switch.
 AsyncPipelineAccessors LoadAsyncPipelineAccessors(Config::ConfigOptions options) {
   options.printf_direction = Config::LogDirection::Silent;
   Config::Load(options);
   return {Config::AsyncPipelinesEnabled(), Config::AsyncPipelinesDepthOnly(),
-          Config::AsyncPipelinesPreferSkip()};
+          Config::AsyncPipelinesPreferSkip(), ViewHistoryEnabled()};
 }
 
-// --async-pipelines-prefer-skip is off by default, and its field alone turns on its own accessor
-// and background builds but not depth-only. The default Config is the baseline, so an accessor
-// that always answers on fails there. The two sibling flags are loaded alone too, so a prefer-skip
-// accessor that reads either of their fields, or the combined async answer, fails on them. The CLI
-// test only proves the flag name is accepted, so this pins what its field does.
+// --async-pipelines-prefer-skip is off by default, and its field alone turns on its own accessor,
+// the per-view history and background builds but not depth-only. The default Config is the
+// baseline, so an accessor or view history switch that always answers on fails there. The two
+// sibling flags are loaded alone too, so a prefer-skip accessor or view history switch that reads
+// either of their fields, or the combined async answer, fails on them. The CLI test only proves
+// the flag name is accepted, so this pins what its field does.
 void CheckAsyncPipelinesPreferSkipConfig() {
   constexpr const char *name = "AsyncPipelinesPreferSkipConfig";
   const auto baseline = LoadAsyncPipelineAccessors({});
@@ -2821,12 +2825,15 @@ void CheckAsyncPipelinesPreferSkipConfig() {
   const auto depth_only = LoadAsyncPipelineAccessors({.async_pipelines_depth_only_enabled = true});
   Config::Load({.printf_direction = Config::LogDirection::Silent});
   Require(name, "off by default", baseline == AsyncPipelineAccessors{},
-          "a default Config turned on prefer-skip or background builds");
+          "a default Config turned on prefer-skip, view history or background builds");
   Require(name, "the flag implies async only",
-          prefer == AsyncPipelineAccessors{.async = true, .depth_only = false, .prefer_skip = true},
-          "the prefer-skip field did not turn on prefer-skip and background builds alone");
+          prefer == AsyncPipelineAccessors{.async = true, .depth_only = false, .prefer_skip = true,
+                                           .view_history = true},
+          "the prefer-skip field did not turn on prefer-skip, view history and background builds alone");
   Require(name, "siblings leave it off", !async_only.prefer_skip && !depth_only.prefer_skip,
           "the prefer-skip accessor answered on for another async pipeline flag");
+  Require(name, "siblings leave view history off", !async_only.view_history && !depth_only.view_history,
+          "per-view history turned on for another async pipeline flag");
   std::printf("[host]    %-32s ok\n", name);
 }
 
@@ -20914,6 +20921,211 @@ public:
     }
   }
 
+  // One frame's draws into one layer range of a layered gate case, colour and depth both viewed as the
+  // range, with the depth clear set on each draw when `clear`.
+  struct RangeDraws {
+    uint32_t base_layer = 0;
+    uint32_t layers = 1;
+    uint32_t draws = MIN_DRAWS_FOR_SKIP;
+    bool clear = true;
+  };
+  using RangeScript = std::vector<std::vector<RangeDraws>>;
+  // The layers of the image every view-history case draws into.
+  static constexpr uint32_t RangeImageLayers = 4;
+
+  // The draw of a layered gate case into one range.
+  DrawRenderState RangeState(GateRig &rig, const GateTargets &targets, const RangeDraws &range) {
+    DrawRenderState state{};
+    state.vertex_info[0].stage = {&rig.other_module, &rig.other_resources};
+    state.color_count = 1;
+    state.color_info[0] = targets.color;
+    state.depth_info = targets.depth;
+    for (auto *info : {&state.color_info[0].desc.view_info, &state.depth_info.desc.view_info}) {
+      info->base_layer = range.base_layer;
+      info->layer_count = range.layers;
+    }
+    state.depth_info.depth_clear_enable = range.clear;
+    return state;
+  }
+
+  // The targets of a fresh layered case at `slot`, which no other case uses, so histories never mix.
+  GateTargets RangeTargets(GateRig &rig, uint32_t slot) {
+    return MakeGateTargets(rig.Cache(), rig.next_case++,
+                           {.layers = RangeImageLayers, .view_layers = RangeImageLayers, .slot = slot});
+  }
+
+  // Plays the frames on the case's targets and asks about one more draw into `asked`, which is not noted.
+  SkipRefusal RangeRefusal(GateRig &rig, const GateTargets &targets, const RangeScript &frames,
+                           const RangeDraws &asked) {
+    for (size_t index = 0; index < frames.size(); index++) {
+      for (const auto &range : frames[index]) {
+        const auto state = RangeState(rig, targets, range);
+        for (uint32_t draw = 0; draw < range.draws; draw++) NoteDrawTargets(rig.Cache(), state);
+      }
+      if (index + 1 < frames.size()) rig.Cache().RunGarbageCollector();
+    }
+    return ExplainSkipRefusal(rig.Cache(), RangeState(rig, targets, asked), false);
+  }
+
+  // Loads the Config of the gate rig with --async-pipelines-prefer-skip as given, which turns the
+  // per-view history on or off as a run sets it. Nothing else differs from the rig's own Config.
+  static void LoadGatePreferSkip(bool on) {
+    Config::Load({.printf_direction = Config::LogDirection::Silent, .async_pipelines_prefer_skip_enabled = on});
+  }
+
+  // The view history, which --async-pipelines-prefer-skip turns on. One layer drawn and cleared in two
+  // frames in a row is allowed with the flag and refused as a partial view without it, the baseline
+  // that differs only in the flag. Every other case differs from the allowed one in one thing: whose
+  // history it is, the clear, the draw count, or room in the table. Each case has an image of its own.
+  void CheckAsyncGateViewHistory(GateRig &rig) {
+    constexpr const char *name = "AsyncGateViewHistory";
+    const RangeDraws layer_two{.base_layer = 2};
+    const RangeScript steady{{layer_two}, {layer_two}};
+    LoadGatePreferSkip(false);
+    Require(name, "flag off", RangeRefusal(rig, RangeTargets(rig, 3), steady, layer_two) == SkipRefusal::PartialView,
+            "a layer view was judged by a history of its own with the flag off");
+    LoadGatePreferSkip(true);
+    Require(name, "own history", RangeRefusal(rig, RangeTargets(rig, 4), steady, layer_two) == SkipRefusal::None,
+            "a layer drawn and cleared in two frames in a row was refused with the flag on");
+    const RangeDraws layer_one{.base_layer = 1};
+    Require(name, "another layer",
+            RangeRefusal(rig, RangeTargets(rig, 5), {{layer_one}, {layer_one}}, layer_two) == SkipRefusal::PartialView,
+            "the history of another layer vouched for this layer");
+    const RangeDraws uncleared_two{.base_layer = 2, .clear = false};
+    Require(name, "another layer's clear",
+            RangeRefusal(rig, RangeTargets(rig, 6), {{layer_one, uncleared_two}, {layer_one, uncleared_two}}, layer_two) ==
+                SkipRefusal::DepthNotCleared,
+            "a clear of another layer counted as a clear of this one");
+    const RangeDraws whole{.layers = RangeImageLayers};
+    Require(name, "whole view lends nothing",
+            RangeRefusal(rig, RangeTargets(rig, 7), {{whole}, {whole}}, layer_two) == SkipRefusal::PartialView,
+            "the whole image's history vouched for one of its layers");
+    Require(name, "layer lends nothing to the whole",
+            RangeRefusal(rig, RangeTargets(rig, 8), steady, whole) != SkipRefusal::None,
+            "a layer's history vouched for the whole image");
+    const RangeDraws first_two{.layers = 2};
+    const RangeDraws first_one{.layers = 1};
+    Require(name, "overlapping range",
+            RangeRefusal(rig, RangeTargets(rig, 9), {{first_two}, {first_two}}, first_one) == SkipRefusal::PartialView,
+            "a range overlapping the view vouched for it");
+    const RangeDraws few_two{.base_layer = 2, .draws = MIN_DRAWS_FOR_SKIP - 1};
+    Require(name, "too few draws",
+            RangeRefusal(rig, RangeTargets(rig, 10), {{few_two}, {few_two}}, layer_two) == SkipRefusal::TooFewDraws,
+            "a layer with too few draws was allowed");
+    CheckAsyncGateViewTable(rig);
+    CheckAsyncGateViewReport(rig);
+    CheckAsyncGateViewSkipMark(rig);
+    CheckClassifyViewRange();
+    LoadGatePreferSkip(false);
+  }
+
+  // How a range is placed against its image. Each case differs from the whole view of a one-level,
+  // four-layer image in one field, and a range past the image is outside, so it never gets a history.
+  static void CheckClassifyViewRange() {
+    constexpr const char *name = "ClassifyViewRange";
+    const auto range = [](uint32_t base_level, uint32_t levels, uint32_t base_layer, uint32_t layers) {
+      ImageViewInfo view;
+      view.base_level = base_level;
+      view.level_count = levels;
+      view.base_layer = base_layer;
+      view.layer_count = layers;
+      return view;
+    };
+    Require(name, "whole", ClassifyViewRange(1, 4, range(0, 1, 0, 4)) == ViewRangeScope::Whole, "the whole view was not whole");
+    Require(name, "layer", ClassifyViewRange(1, 4, range(0, 1, 2, 1)) == ViewRangeScope::Layer, "one layer was not a layer view");
+    Require(name, "mip of a chain", ClassifyViewRange(2, 4, range(0, 1, 0, 4)) == ViewRangeScope::Mip,
+            "level 0 of a two-level image was not a mip view");
+    Require(name, "later mip", ClassifyViewRange(2, 4, range(1, 1, 0, 4)) == ViewRangeScope::Mip,
+            "level 1 was not a mip view");
+    Require(name, "level past the image", ClassifyViewRange(1, 4, range(1, 1, 0, 4)) == ViewRangeScope::Outside,
+            "a level past the image's one level was not outside");
+    Require(name, "layers past the image", ClassifyViewRange(1, 4, range(0, 1, 3, 2)) == ViewRangeScope::Outside,
+            "layers past the image were not outside");
+    Require(name, "no layers", ClassifyViewRange(1, 4, range(0, 1, 0, 0)) == ViewRangeScope::Outside,
+            "a range of no layers was not outside");
+  }
+
+  // The table keeps VIEW_HISTORY_SLOTS ranges per image. With every single layer tracked, a two-layer
+  // range finds no slot and stays a partial view, and the report counts its notes and each full table
+  // once. Colour and depth are two images with a table each, so both count, over two frames of draws.
+  // A tracked layer of the same kind of image is the baseline, and is allowed.
+  void CheckAsyncGateViewTable(GateRig &rig) {
+    constexpr const char *name = "AsyncGateViewTable";
+    static_assert(VIEW_HISTORY_SLOTS == RangeImageLayers, "the case fills the table with single layers");
+    std::vector<RangeDraws> singles;
+    for (uint32_t layer = 0; layer < RangeImageLayers; layer++) singles.push_back({.base_layer = layer});
+    auto with_pair = singles;
+    const RangeDraws pair{.layers = 2};
+    with_pair.push_back(pair);
+    Common::FirstRunReport::Configure(true, false);
+    Common::FirstRunReport::Global().Reset();
+    const auto refused = RangeRefusal(rig, RangeTargets(rig, 11), {with_pair, with_pair}, pair);
+    const auto counts = Common::FirstRunReport::Global().Summarize().view_history;
+    Common::FirstRunReport::Configure(false, false);
+    using Common::FirstRunReport::ViewHistoryCount;
+    Require(name, "range past the table", refused == SkipRefusal::PartialView,
+            "a range with no slot in the table was judged");
+    constexpr uint32_t targets = 2;
+    constexpr uint32_t frames = 2;
+    Require(name, "counted",
+            counts[static_cast<size_t>(ViewHistoryCount::NotesNotFitted)] == targets * frames * MIN_DRAWS_FOR_SKIP &&
+                counts[static_cast<size_t>(ViewHistoryCount::TablesFull)] == targets,
+            "the notes that found no slot, or the full tables, were not counted");
+    Require(name, "tracked range",
+            RangeRefusal(rig, RangeTargets(rig, 12), {singles, singles}, singles.back()) == SkipRefusal::None,
+            "a range that has a slot was refused");
+  }
+
+  // An allowed draw judged through a layer's own history is counted once for its depth and once for its
+  // colour target, both layer views. The same draw with the flag off, refused, counts nothing.
+  void CheckAsyncGateViewReport(GateRig &rig) {
+    constexpr const char *name = "AsyncGateViewReport";
+    using Common::FirstRunReport::ViewHistoryCount;
+    const RangeDraws layer_two{.base_layer = 2};
+    const auto counted = [&](bool on, uint32_t slot) {
+      // Loading the Config resets the report switch, which is set again below.
+      LoadGatePreferSkip(on);
+      const auto targets = RangeTargets(rig, slot);
+      Common::FirstRunReport::Configure(true, false);
+      Common::FirstRunReport::Global().Reset();
+      (void)RangeRefusal(rig, targets, {{layer_two}, {layer_two}}, layer_two);
+      const auto counts = Common::FirstRunReport::Global().Summarize().view_history;
+      Common::FirstRunReport::Configure(false, false);
+      return counts;
+    };
+    const auto off = counted(false, 13);
+    const auto on = counted(true, 14);
+    Require(name, "off counts nothing", std::ranges::all_of(off, [](uint64_t count) { return count == 0; }),
+            "a draw refused with the flag off was counted as judged by a view history");
+    Require(name, "on counts each target",
+            on[static_cast<size_t>(ViewHistoryCount::DepthLayer)] == 1 &&
+                on[static_cast<size_t>(ViewHistoryCount::ColorLayer)] == 1 &&
+                on[static_cast<size_t>(ViewHistoryCount::DepthMip)] == 0 &&
+                on[static_cast<size_t>(ViewHistoryCount::ColorMip)] == 0,
+            "the allowed draw was not counted once for each layer view target");
+  }
+
+  // A clear of one layer repairs only that layer, so the image's skip mark, which may stand for a
+  // skipped draw into another layer, stays. A clear of the whole image is the baseline, and takes it.
+  void CheckAsyncGateViewSkipMark(GateRig &rig) {
+    constexpr const char *name = "AsyncGateViewSkipMark";
+    const auto targets = RangeTargets(rig, 15);
+    auto &cache = rig.Cache();
+    const auto mark_then_clear = [&](uint32_t layers) {
+      (void)cache.NoteSkippedTarget(targets.depth.image_id, true);
+      auto view = targets.depth.desc.view_info;
+      view.base_layer = 0;
+      view.layer_count = layers;
+      cache.NoteRenderTargetUse(targets.depth.image_id, view, true);
+      bool depth = false;
+      return cache.TakeSkippedDraws(targets.depth.image_id, &depth);
+    };
+    Require(name, "layer clear keeps the mark", mark_then_clear(1) == 1,
+            "a clear of one layer took the image's skip mark");
+    Require(name, "whole clear takes it", mark_then_clear(RangeImageLayers) == 0,
+            "a clear of the whole image did not take its skip mark");
+  }
+
   // Runs the gate checks on one render context.
   void CheckAsyncGate() {
     GateRig rig(*this);
@@ -20922,6 +21134,7 @@ public:
     CheckAsyncGateLayers(rig);
     CheckAsyncGateReasons(rig);
     CheckAsyncGateWriters(rig);
+    CheckAsyncGateViewHistory(rig);
     std::printf("[gpu]     %-32s ok\n", "AsyncGate");
   }
 

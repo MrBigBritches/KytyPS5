@@ -31,6 +31,12 @@ enum class Kind : uint8_t { Graphics, Compute };
 enum class Phase : uint8_t { Boot, Play };
 enum class Thread : uint8_t { Gpu, Worker };
 enum class SkipKind : uint8_t { Draw, Dispatch };
+/// The view-history counts (--async-pipelines-prefer-skip). The first four count targets of draws the
+/// skip rule allowed through a partial view's own history, by depth or colour and layer or mip view.
+/// TablesFull counts images whose range table was first found full, NotesNotFitted the draws whose
+/// range found no slot.
+enum class ViewHistoryCount : uint8_t { DepthLayer, DepthMip, ColorLayer, ColorMip, TablesFull, NotesNotFitted, Count };
+inline constexpr size_t VIEW_HISTORY_COUNT = static_cast<size_t>(ViewHistoryCount::Count);
 
 /// Pause lengths in ms that start a histogram bucket. A pause counts in the highest bucket whose
 /// bound it reaches, and a shorter one counts as under the first bound.
@@ -1007,6 +1013,8 @@ struct Summary {
 	std::array<uint32_t, 2>                                  skips {};
 	std::vector<std::pair<std::string, uint32_t>>            skips_by_target;
 	std::vector<std::pair<std::string, uint32_t>>            sampled_after_skip_by_target;
+	// The view-history counts, indexed by ViewHistoryCount.
+	std::array<uint64_t, VIEW_HISTORY_COUNT>                 view_history {};
 	std::vector<Refusal>                                     refusals;
 	// Filled only by --deferred-pipeline-draws. Empty or zero otherwise.
 	std::vector<DeferredResolve>                             deferred_resolves;
@@ -1116,6 +1124,8 @@ public:
 	void AddSkip(SkipKind kind, std::string_view target_class);
 	/// Records skipped draws whose target was then read as a texture, against a target class.
 	void AddSampledAfterSkip(std::string_view target_class, uint32_t draws);
+	/// Adds one to a view-history count.
+	void AddViewHistoryCount(ViewHistoryCount which);
 	/// Records a draw that missed its pipeline and was refused a skip, and how long it waited.
 	void AddRefusal(std::string_view reason, double blocked_ms);
 	/// Records one resolve of deferred draws.
@@ -1291,6 +1301,7 @@ private:
 	std::array<uint32_t, 2>      m_skips {};
 	std::vector<std::pair<std::string, uint32_t>> m_skips_by_target;
 	std::vector<std::pair<std::string, uint32_t>> m_sampled_after_skip;
+	std::array<uint64_t, VIEW_HISTORY_COUNT>      m_view_history {};
 	std::vector<Refusal>                          m_refusals;
 	std::vector<DeferredResolve>                  m_deferred_resolves;
 	std::vector<uint32_t>                         m_deferred_resolves_per_flip;
@@ -1631,6 +1642,13 @@ inline void AddDeferredRefusedSkip(std::string_view reason, double waited_ms) {
 inline void AddSampledAfterSkip(std::string_view target_class, uint32_t draws) {
 	if (Enabled()) {
 		Global().AddSampledAfterSkip(target_class, draws);
+	}
+}
+
+/// Adds one to a view-history count when the report is on.
+inline void AddViewHistoryCount(ViewHistoryCount which) {
+	if (Enabled()) {
+		Global().AddViewHistoryCount(which);
 	}
 }
 

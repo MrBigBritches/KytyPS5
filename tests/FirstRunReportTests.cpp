@@ -299,6 +299,32 @@ void TestJsonContents() {
   }
 }
 
+// The view-history counts sit under skips.view_history, one key each. An empty report writes zeros, the
+// baseline, and each count given a different number shows it lands under its own key. Reset forgets them.
+void TestViewHistorySkips() {
+	using Common::FirstRunReport::ViewHistoryCount;
+	auto report = std::make_unique<Report>();
+	const auto empty = nlohmann::json::parse(report->ToJson({}, 0, 1.0, 0.0, {}))["skips"]["view_history"];
+	Check(empty.size() == Common::FirstRunReport::VIEW_HISTORY_COUNT && empty["depth_layer"] == 0 && empty["color_mip"] == 0 &&
+	          empty["tables_full"] == 0 && empty["notes_not_fitted"] == 0,
+	      "an empty report had view-history counts, or lacked a key");
+	const std::array<std::pair<ViewHistoryCount, int>, Common::FirstRunReport::VIEW_HISTORY_COUNT> times {
+	    {{ViewHistoryCount::DepthLayer, 1}, {ViewHistoryCount::DepthMip, 2}, {ViewHistoryCount::ColorLayer, 3},
+	     {ViewHistoryCount::ColorMip, 4}, {ViewHistoryCount::TablesFull, 5}, {ViewHistoryCount::NotesNotFitted, 6}}};
+	for (const auto& [which, count]: times) {
+		for (int index = 0; index < count; index++) {
+			report->AddViewHistoryCount(which);
+		}
+	}
+	const auto counted = nlohmann::json::parse(report->ToJson({}, 0, 1.0, 0.0, {}))["skips"]["view_history"];
+	Check(counted["depth_layer"] == 1 && counted["depth_mip"] == 2 && counted["color_layer"] == 3 &&
+	          counted["color_mip"] == 4 && counted["tables_full"] == 5 && counted["notes_not_fitted"] == 6,
+	      "a view-history count landed under another key");
+	report->Reset();
+	Check(report->Summarize().view_history == std::array<uint64_t, Common::FirstRunReport::VIEW_HISTORY_COUNT> {},
+	      "Reset kept the view-history counts");
+}
+
 // A resolve row counts its holes per skip verdict, a hole without one as unknown, and names the first
 // critical hole's verdict. Two rules with different counts show each hole lands under its own rule, so
 // a row that put every hole under one rule fails. Two critical holes with different rules show the
@@ -2802,6 +2828,7 @@ int main() {
   TestDeferredDrawsSection();
   TestDeferredRefusedSkip();
   TestResolveRefusals();
+  TestViewHistorySkips();
   TestWarmTakeRows();
   TestIneligibleWaits();
   TestPipelineLibraryState();

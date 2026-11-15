@@ -38,6 +38,21 @@ namespace BcAlias {
 void Resolve(TextureCache& cache, ImageId cached, ImageId merged);
 } // namespace BcAlias
 
+/// Whether --async-pipelines-prefer-skip is on, which also turns on per-view history. With it, a
+/// render target view that is not the whole image, such as one layer or one mip, keeps a history of
+/// its own exact range while the image's table has room, and the skip rule judges it by that history
+/// instead of refusing it as a partial view. Config is fixed after load, so any drawing thread may
+/// read it, like the other skip rule flags.
+[[nodiscard]] bool ViewHistoryEnabled();
+
+/// How a view relates to its image for the history. Whole is one level with every layer, of an image
+/// with one level. Layer selects some layers of that level, Mip any other level selection, and Outside
+/// a range past the image or of no levels or layers.
+enum class ViewRangeScope : uint8_t { Whole, Layer, Mip, Outside };
+
+/// Places a view range against an image of `levels` levels and `layers` layers.
+[[nodiscard]] ViewRangeScope ClassifyViewRange(uint32_t levels, uint32_t layers, const ImageViewInfo& view);
+
 class TextureCache {
 public:
 	enum class BindingType : uint8_t { Texture, Storage, RenderTarget, DepthTarget, VideoOut };
@@ -73,9 +88,14 @@ public:
 	/// the whole target came first when `cleared`. Called on the GPU thread for the draws that ran,
 	/// while pipelines build in the background. A frame is one guest flip. A view that is not the
 	/// whole image of one level and all its layers is ignored, because the history belongs to the
-	/// image and a layer or mip drawn every frame would vouch for one drawn once.
+	/// image and a layer or mip drawn every frame would vouch for one drawn once. With
+	/// --async-pipelines-prefer-skip such a view is noted in the history of its own exact range
+	/// instead, while the table has room. Its clear repairs only that range, so it leaves the
+	/// image's skip mark.
 	void NoteRenderTargetUse(ImageId id, const ImageViewInfo& view, bool cleared,
 	                         bool htile_cleared = false);
+	/// How the view relates to its image, see ClassifyViewRange.
+	[[nodiscard]] ViewRangeScope ViewScopeOf(ImageId id, const ImageViewInfo& view);
 	/// How a target's recent frames judge it for the gate. Only Rebuilt lets a draw skip.
 	enum class RebuildVerdict : uint8_t {
 		Rebuilt,
@@ -93,7 +113,9 @@ public:
 	};
 	/// Judges the view. It needs at least `min_draws` draws into it in this frame and in the one
 	/// before, and, when `needs_clear`, a clear of the whole target in both. The draws asked about
-	/// are not yet noted, so they are not their own evidence.
+	/// are not yet noted, so they are not their own evidence. With --async-pipelines-prefer-skip a
+	/// partial view is judged the same way by the history of its exact range, and is a partial view
+	/// only when that range has none.
 	[[nodiscard]] RebuildVerdict JudgeRebuiltEveryFrame(ImageId id, const ImageViewInfo& view,
 	                                                    bool needs_clear, uint32_t min_draws);
 	/// Notes that a draw into the image was skipped, as a depth target when `depth`. Returns true

@@ -125,7 +125,9 @@ struct ConfigOptions {
 	// without their pipeline.
 	bool                   async_pipelines_depth_only_enabled = false;
 	// Like async_pipelines_enabled, which it implies, but a draw the skip rules allow to go without
-	// its pipeline is skipped even when it could be deferred, so a resolve never waits on it.
+	// its pipeline is skipped even when it could be deferred, so a resolve never waits on it. A
+	// partial view, such as one layer or mip of an image, is judged by the history of its exact
+	// range instead of being refused.
 	bool                   async_pipelines_prefer_skip_enabled = false;
 	// Builds the compute pipelines of the shader store on low priority workers while the game runs,
 	// instead of making boot wait for all of them.
@@ -267,8 +269,11 @@ bool AsyncPipelinesEnabled();
 /// Whether only draws with no color target may go without a pipeline. It implies background builds.
 bool AsyncPipelinesDepthOnly();
 /// True when --async-pipelines-prefer-skip asks for a draw the skip rules allow to be skipped
-/// rather than deferred. It implies background builds, and only differs from --async-pipelines
-/// when --deferred-pipeline-draws is also on, because nothing can be deferred without it.
+/// rather than deferred. It implies background builds. The skip rules then also judge a partial
+/// view, such as one layer or mip of an image, by the history of its exact range while the image's
+/// table has room, where without the flag they refuse it. The partial-view part differs from
+/// --async-pipelines on its own, while skipping before deferring only differs when
+/// --deferred-pipeline-draws is also on.
 bool AsyncPipelinesPreferSkip();
 /// True when --background-warm-up builds the shader store's compute pipelines after boot.
 bool BackgroundWarmUpEnabled();

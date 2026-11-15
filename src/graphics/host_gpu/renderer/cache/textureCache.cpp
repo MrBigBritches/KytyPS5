@@ -23,7 +23,6 @@
 #include <array>
 #include <bit>
 #include <cinttypes>
-#include <cstring>
 #include <limits>
 #include <mutex>
 #include <span>
@@ -1886,13 +1885,113 @@ bool ViewIsWholeImage(const Image& image, const ImageViewInfo& view) {
 	       view.base_layer == 0 && view.layer_count == resources.layers;
 }
 
+// The history of the view's exact range, or null. A slot with the same levels but other layers, or
+// the reverse, is another range, so overlapping views never lend each other evidence.
+const ViewRangeHistory* FindViewHistory(const Image& image, const ImageViewInfo& view) {
+	if (image.view_histories == nullptr) {
+		return nullptr;
+	}
+	for (const auto& range: *image.view_histories) {
+		if (range.level_count != 0 && range.base_level == view.base_level && range.level_count == view.level_count &&
+		    range.base_layer == view.base_layer && range.layer_count == view.layer_count) {
+			return &range;
+		}
+	}
+	return nullptr;
+}
+
+// The history of the view's exact range, taking a free slot for a new one, or null when the table is
+// full. Slots are never given back, so a range keeps its history for the image's life.
+ViewRangeHistory* TakeViewHistory(Image& image, const ImageViewInfo& view) {
+	if (const auto* found = FindViewHistory(image, view)) {
+		return const_cast<ViewRangeHistory*>(found);
+	}
+	if (image.view_histories == nullptr) {
+		image.view_histories = std::make_unique<std::array<ViewRangeHistory, VIEW_HISTORY_SLOTS>>();
+	}
+	for (auto& range: *image.view_histories) {
+		if (range.level_count == 0) {
+			range = {.base_level = view.base_level, .level_count = view.level_count,
+			         .base_layer = view.base_layer, .layer_count = view.layer_count};
+			return &range;
+		}
+	}
+	return nullptr;
+}
+
+// Notes a draw into a partial view in its range's history. A range past the image has
+// none. A range with no free slot is counted, and the image once when its table is first full. The
+// clear repairs only this range, so the image's skip mark, which may stand for other layers or
+// levels, is left for a clear of the whole image.
+void NoteViewRangeUse(Image& image, const ImageViewInfo& view, bool cleared, bool htile_cleared, uint64_t tick) {
+	const auto& resources = image.info.resources;
+	if (ClassifyViewRange(resources.levels, resources.layers, view) == ViewRangeScope::Outside) {
+		return;
+	}
+	auto* range = TakeViewHistory(image, view);
+	if (range == nullptr) {
+		Common::FirstRunReport::AddViewHistoryCount(Common::FirstRunReport::ViewHistoryCount::NotesNotFitted);
+		if (!std::exchange(image.view_histories_full, true)) {
+			Common::FirstRunReport::AddViewHistoryCount(Common::FirstRunReport::ViewHistoryCount::TablesFull);
+		}
+		return;
+	}
+	range->attached_frames.Note(tick);
+	if (htile_cleared) {
+		range->htile_cleared_frames.Note(tick);
+	}
+	if (cleared) {
+		range->cleared_frames.Note(tick);
+	}
+}
+
+// The verdict of one set of histories at `tick`, the same rule for a whole image and a view range.
+TextureCache::RebuildVerdict JudgeHistories(const FrameHistory& attached, const FrameHistory& cleared_frames,
+                                            const FrameHistory& htile_cleared, uint64_t tick, bool needs_clear,
+                                            uint32_t min_draws) {
+	using RebuildVerdict = TextureCache::RebuildVerdict;
+	const bool cleared = cleared_frames.InConsecutiveFrames(tick, 1);
+	if (!attached.InConsecutiveFrames(tick, min_draws)) {
+		// The frame before is the evidence that does not depend on this frame's own first draw.
+		const bool cleared_before = tick > 0 && cleared_frames.HappenedIn(tick - 1);
+		return needs_clear && !cleared_before ? RebuildVerdict::TooFewDrawsUncleared : RebuildVerdict::TooFewDraws;
+	}
+	if (needs_clear && !cleared) {
+		return htile_cleared.InConsecutiveFrames(tick, 1) ? RebuildVerdict::HtileClearedOnly
+		                                                  : RebuildVerdict::NotCleared;
+	}
+	return RebuildVerdict::Rebuilt;
+}
+
 } // namespace
+
+bool ViewHistoryEnabled() {
+	// Part of prefer-skip because both trade a missing pipeline for a skip more often, and the
+	// per-view history only matters to the skip rules that flag leans on.
+	return Config::AsyncPipelinesPreferSkip();
+}
+
+// A render target view always has one level, so any level selection other than level 0 of a
+// one-level image is a mip view, whatever its layers.
+ViewRangeScope ClassifyViewRange(uint32_t levels, uint32_t layers, const ImageViewInfo& view) {
+	if (view.level_count == 0 || view.layer_count == 0 || view.base_level + view.level_count > levels ||
+	    view.base_layer + view.layer_count > layers) {
+		return ViewRangeScope::Outside;
+	}
+	if (levels != 1 || view.base_level != 0 || view.level_count != 1) {
+		return ViewRangeScope::Mip;
+	}
+	return view.base_layer == 0 && view.layer_count == layers ? ViewRangeScope::Whole : ViewRangeScope::Layer;
+}
 
 void TextureCache::NoteRenderTargetUse(ImageId id, const ImageViewInfo& view, bool cleared,
                                        bool htile_cleared) {
 	std::scoped_lock lock {m_lock};
 	auto&            image = m_slot_images[id];
 	if (!ViewIsWholeImage(image, view)) {
+		if (ViewHistoryEnabled()) {
+			NoteViewRangeUse(image, view, cleared, htile_cleared, m_gc_tick);
+		}
 		return;
 	}
 	image.attached_frames.Note(m_gc_tick);
@@ -1906,6 +2005,12 @@ void TextureCache::NoteRenderTargetUse(ImageId id, const ImageViewInfo& view, bo
 	}
 }
 
+ViewRangeScope TextureCache::ViewScopeOf(ImageId id, const ImageViewInfo& view) {
+	std::scoped_lock lock {m_lock};
+	const auto&      resources = m_slot_images[id].info.resources;
+	return ClassifyViewRange(resources.levels, resources.layers, view);
+}
+
 TextureCache::RebuildVerdict TextureCache::JudgeRebuiltEveryFrame(ImageId id,
                                                                   const ImageViewInfo& view,
                                                                   bool needs_clear,
@@ -1913,21 +2018,15 @@ TextureCache::RebuildVerdict TextureCache::JudgeRebuiltEveryFrame(ImageId id,
 	std::scoped_lock lock {m_lock};
 	const auto&      image = m_slot_images[id];
 	if (!ViewIsWholeImage(image, view)) {
-		return RebuildVerdict::PartialView;
+		const auto* range = ViewHistoryEnabled() ? FindViewHistory(image, view) : nullptr;
+		if (range == nullptr) {
+			return RebuildVerdict::PartialView;
+		}
+		return JudgeHistories(range->attached_frames, range->cleared_frames, range->htile_cleared_frames, m_gc_tick,
+		                      needs_clear, min_draws);
 	}
-	const bool cleared = image.cleared_frames.InConsecutiveFrames(m_gc_tick, 1);
-	if (!image.attached_frames.InConsecutiveFrames(m_gc_tick, min_draws)) {
-		// The frame before is the evidence that does not depend on this frame's own first draw.
-		const bool cleared_before = m_gc_tick > 0 && image.cleared_frames.HappenedIn(m_gc_tick - 1);
-		return needs_clear && !cleared_before ? RebuildVerdict::TooFewDrawsUncleared
-		                                      : RebuildVerdict::TooFewDraws;
-	}
-	if (needs_clear && !cleared) {
-		return image.htile_cleared_frames.InConsecutiveFrames(m_gc_tick, 1)
-		           ? RebuildVerdict::HtileClearedOnly
-		           : RebuildVerdict::NotCleared;
-	}
-	return RebuildVerdict::Rebuilt;
+	return JudgeHistories(image.attached_frames, image.cleared_frames, image.htile_cleared_frames, m_gc_tick,
+	                      needs_clear, min_draws);
 }
 
 bool TextureCache::NoteSkippedTarget(ImageId id, bool depth) {

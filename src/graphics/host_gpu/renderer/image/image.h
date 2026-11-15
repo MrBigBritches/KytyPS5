@@ -8,9 +8,11 @@
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <compare>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <span>
 #include <utility>
@@ -66,6 +68,22 @@ struct FrameHistory {
 		return latest == tick && previous != Never && previous + 1u == tick &&
 		       latest_count >= min_count && previous_count >= min_count;
 	}
+};
+
+// How many view ranges of one image keep a history of their own with --async-pipelines-prefer-skip.
+// A range past them gets none and is refused as a partial view, as without the flag.
+inline constexpr size_t VIEW_HISTORY_SLOTS = 4;
+
+// The histories of one exact view range of an image, its levels and layers, kept like the image's own
+// for a whole view. A slot with no levels is free.
+struct ViewRangeHistory {
+	uint32_t     base_level  = 0;
+	uint32_t     level_count = 0;
+	uint32_t     base_layer  = 0;
+	uint32_t     layer_count = 0;
+	FrameHistory attached_frames;
+	FrameHistory cleared_frames;
+	FrameHistory htile_cleared_frames;
 };
 
 struct ImageBinding {
@@ -237,6 +255,10 @@ public:
 	// Draws skipped into the image since a clear of the whole target, and whether they drew depth.
 	uint32_t         skipped_draws    = 0;
 	bool             skipped_as_depth = false;
+	// Histories of partial views by exact range (--async-pipelines-prefer-skip), made on the first
+	// partial view noted, and whether a range ever found the table full. Same writer as above.
+	std::unique_ptr<std::array<ViewRangeHistory, VIEW_HISTORY_SLOTS>> view_histories;
+	bool                                                               view_histories_full = false;
 	// Resident image heap elements that select this image.
 	std::atomic<uint32_t> heap_refs {0};
 

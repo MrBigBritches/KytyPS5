@@ -392,6 +392,11 @@ void Report::AddSampledAfterSkip(std::string_view target_class, uint32_t draws) 
 	}
 }
 
+void Report::AddViewHistoryCount(ViewHistoryCount which) {
+	std::lock_guard lock(m_mutex);
+	m_view_history[static_cast<size_t>(which)]++;
+}
+
 void Report::AddRefusal(std::string_view reason, double blocked_ms) {
 	std::lock_guard lock(m_mutex);
 	const auto found = std::ranges::find(m_refusals, reason, &Refusal::reason);
@@ -644,6 +649,7 @@ void Report::Reset() {
 	m_skips             = {};
 	m_skips_by_target.clear();
 	m_sampled_after_skip.clear();
+	m_view_history = {};
 	m_refusals.clear();
 	m_deferred_resolves.clear();
 	m_deferred_resolves_per_flip.clear();
@@ -795,6 +801,7 @@ Summary Report::Summarize() const {
 	summary.skips               = m_skips;
 	summary.skips_by_target     = m_skips_by_target;
 	summary.sampled_after_skip_by_target = m_sampled_after_skip;
+	summary.view_history                 = m_view_history;
 	summary.refusals                     = m_refusals;
 	CopyDeferredLocked(summary);
 	summary.submit_leads = SummarizeSubmitLeads(m_compiles);
@@ -916,6 +923,17 @@ nlohmann::json PausesToJson(const Summary& summary) {
 	        {"top", top}};
 }
 
+// Writes the view-history counts, one key per ViewHistoryCount in its order.
+nlohmann::json ViewHistoryToJson(const std::array<uint64_t, VIEW_HISTORY_COUNT>& counts) {
+	constexpr std::array<std::string_view, VIEW_HISTORY_COUNT> NAMES {
+	    "depth_layer", "depth_mip", "color_layer", "color_mip", "tables_full", "notes_not_fitted"};
+	nlohmann::json result = nlohmann::json::object();
+	for (size_t index = 0; index < VIEW_HISTORY_COUNT; index++) {
+		result[std::string(NAMES[index])] = counts[index];
+	}
+	return result;
+}
+
 nlohmann::json SkipsToJson(const Summary& summary) {
 	nlohmann::json by_target = nlohmann::json::object();
 	for (const auto& [target, count]: summary.skips_by_target) {
@@ -933,7 +951,8 @@ nlohmann::json SkipsToJson(const Summary& summary) {
 	        {"dispatch", summary.skips[static_cast<size_t>(SkipKind::Dispatch)]},
 	        {"by_target_class", by_target},
 	        {"sampled_after_skip_by_target_class", sampled},
-	        {"refused", refused}};
+	        {"refused", refused},
+	        {"view_history", ViewHistoryToJson(summary.view_history)}};
 }
 
 // Writes one row per draw that could not be deferred and waited for its pipeline.

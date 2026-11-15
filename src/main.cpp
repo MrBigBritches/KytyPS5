@@ -99,8 +99,11 @@ static void PrintUsage() {
 	::printf("  --async-pipelines-prefer-skip        Like --async-pipelines, but a draw the skip rules\n"
 	         "                                       allow is skipped even when it could be deferred,\n"
 	         "                                       so a resolve never waits for it (experimental).\n"
-	         "                                       Only differs from --async-pipelines together\n"
-	         "                                       with --deferred-pipeline-draws.\n");
+	         "                                       A partial view, one layer or mip of an image, is\n"
+	         "                                       judged by the history of its exact range instead\n"
+	         "                                       of being refused.\n"
+	         "                                       Skipping before deferring only differs with\n"
+	         "                                       --deferred-pipeline-draws.\n");
 	::printf("  --background-warm-up                 Build the shader store's compute pipelines on low\n"
 	         "                                       priority workers while the game runs, instead of\n"
 	         "                                       making boot wait for them (experimental).\n");

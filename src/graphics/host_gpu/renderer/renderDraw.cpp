@@ -527,6 +527,28 @@ static SkipRefusal DepthRefusal(TextureCache::RebuildVerdict verdict) {
 	return SkipRefusal::None;
 }
 
+// Counts, for the report, each target of a draw the rule allowed that was judged by its view's own
+// history, which --async-pipelines-prefer-skip turns on. Without the flag a partial view is never
+// allowed, so every partial view of an allowed draw came through that history.
+static void NoteViewHistoryVerdict(TextureCache& cache, const DrawRenderState& state) {
+	if (!ViewHistoryEnabled() || !Common::FirstRunReport::Enabled()) {
+		return;
+	}
+	using Common::FirstRunReport::ViewHistoryCount;
+	const auto note = [&](ImageId id, const ImageViewInfo& view, bool depth) {
+		const auto scope = cache.ViewScopeOf(id, view);
+		if (scope == ViewRangeScope::Layer) {
+			Common::FirstRunReport::AddViewHistoryCount(depth ? ViewHistoryCount::DepthLayer : ViewHistoryCount::ColorLayer);
+		} else if (scope == ViewRangeScope::Mip) {
+			Common::FirstRunReport::AddViewHistoryCount(depth ? ViewHistoryCount::DepthMip : ViewHistoryCount::ColorMip);
+		}
+	};
+	note(state.depth_info.image_id, state.depth_info.desc.view_info, true);
+	for (const auto& color: std::span {state.color_info, state.color_count}) {
+		note(color.image_id, color.desc.view_info, false);
+	}
+}
+
 SkipRefusal ExplainSkipRefusal(TextureCache& cache, const DrawRenderState& state, bool depth_only) {
 	// A color-only pass shows no sign of being rebuilt, because a color clear is applied by the GPU
 	// and the CPU never sees it. It waits for the pipeline. In depth-only mode so does every draw
@@ -557,6 +579,7 @@ SkipRefusal ExplainSkipRefusal(TextureCache& cache, const DrawRenderState& state
 			return SkipRefusal::ColorHistory;
 		}
 	}
+	NoteViewHistoryVerdict(cache, state);
 	return SkipRefusal::None;
 }
 

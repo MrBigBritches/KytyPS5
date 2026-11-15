@@ -36,7 +36,8 @@ void NoteDrawTargets(TextureCache& cache, const DrawRenderState& state);
 ///    beside a depth buffer that is cleared, passes, and a skipped draw into it is lost for good.
 ///    That risk is accepted, and the report counts skipped draws that are sampled afterwards.
 ///  - Each target is viewed whole, as one level with all its layers, because the history belongs
-///    to the image.
+///    to the image. With --async-pipelines-prefer-skip a partial view, such as one layer or mip, is
+///    judged instead by the history of its exact range.
 /// With `depth_only` a draw with any color target waits too.
 ///
 /// The rule that refused a draw. None means the draw may skip. The order is the order of the checks,
