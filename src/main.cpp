@@ -96,6 +96,11 @@ static void PrintUsage() {
 	::printf("  --async-pipelines-depth-only         Like --async-pipelines, but only draws with no color\n"
 	         "                                       target go without a pipeline (experimental). Wins\n"
 	         "                                       over --async-pipelines when both are given.\n");
+	::printf("  --async-pipelines-prefer-skip        Like --async-pipelines, but a draw the skip rules\n"
+	         "                                       allow is skipped even when it could be deferred,\n"
+	         "                                       so a resolve never waits for it (experimental).\n"
+	         "                                       Only differs from --async-pipelines together\n"
+	         "                                       with --deferred-pipeline-draws.\n");
 	::printf("  --background-warm-up                 Build the shader store's compute pipelines on low\n"
 	         "                                       priority workers while the game runs, instead of\n"
 	         "                                       making boot wait for them (experimental).\n");
@@ -283,6 +288,7 @@ static constexpr Flag FLAGS[] = {
     {"--cold-pipelines", &ConfigOptions::cold_pipelines_enabled},
     {"--async-pipelines", &ConfigOptions::async_pipelines_enabled},
     {"--async-pipelines-depth-only", &ConfigOptions::async_pipelines_depth_only_enabled},
+    {"--async-pipelines-prefer-skip", &ConfigOptions::async_pipelines_prefer_skip_enabled},
     {"--background-warm-up", &ConfigOptions::background_warm_up_enabled},
     {"--generate-shader-store", &ConfigOptions::generate_shader_store_enabled},
     {"--deferred-pipeline-draws", &ConfigOptions::deferred_pipeline_draws_enabled},

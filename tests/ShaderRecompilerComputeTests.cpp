@@ -2792,6 +2792,44 @@ void CheckNativeFloatMinMaxConfig() {
   std::printf("[host]    %-32s ok\n", name);
 }
 
+// What the three async pipeline accessors answer for the Config that is loaded.
+struct AsyncPipelineAccessors {
+  bool async = false;
+  bool depth_only = false;
+  bool prefer_skip = false;
+  bool operator==(const AsyncPipelineAccessors &) const = default;
+};
+
+// Loads `options` with printf silenced and reads the three async pipeline accessors.
+AsyncPipelineAccessors LoadAsyncPipelineAccessors(Config::ConfigOptions options) {
+  options.printf_direction = Config::LogDirection::Silent;
+  Config::Load(options);
+  return {Config::AsyncPipelinesEnabled(), Config::AsyncPipelinesDepthOnly(),
+          Config::AsyncPipelinesPreferSkip()};
+}
+
+// --async-pipelines-prefer-skip is off by default, and its field alone turns on its own accessor
+// and background builds but not depth-only. The default Config is the baseline, so an accessor
+// that always answers on fails there. The two sibling flags are loaded alone too, so a prefer-skip
+// accessor that reads either of their fields, or the combined async answer, fails on them. The CLI
+// test only proves the flag name is accepted, so this pins what its field does.
+void CheckAsyncPipelinesPreferSkipConfig() {
+  constexpr const char *name = "AsyncPipelinesPreferSkipConfig";
+  const auto baseline = LoadAsyncPipelineAccessors({});
+  const auto prefer = LoadAsyncPipelineAccessors({.async_pipelines_prefer_skip_enabled = true});
+  const auto async_only = LoadAsyncPipelineAccessors({.async_pipelines_enabled = true});
+  const auto depth_only = LoadAsyncPipelineAccessors({.async_pipelines_depth_only_enabled = true});
+  Config::Load({.printf_direction = Config::LogDirection::Silent});
+  Require(name, "off by default", baseline == AsyncPipelineAccessors{},
+          "a default Config turned on prefer-skip or background builds");
+  Require(name, "the flag implies async only",
+          prefer == AsyncPipelineAccessors{.async = true, .depth_only = false, .prefer_skip = true},
+          "the prefer-skip field did not turn on prefer-skip and background builds alone");
+  Require(name, "siblings leave it off", !async_only.prefer_skip && !depth_only.prefer_skip,
+          "the prefer-skip accessor answered on for another async pipeline flag");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 // What the four deferred draw accessors answer for the Config that is loaded.
 struct DeferredDrawAccessors {
   bool deferred = false;
@@ -61565,9 +61603,12 @@ struct RefusingPolicy final : PipelineSkipPolicy {
 
 // Whether the cache rigs below also run with --deferred-pipeline-draws.
 inline bool g_cache_rig_deferred = false;
+// Whether the cache rigs below also run with --async-pipelines-prefer-skip, which implies async.
+inline bool g_cache_rig_prefer_skip = false;
 
-// Runs `body` on the GPU thread of a fresh render context, with the async flag as given and the
-// first-run report on. The context is destroyed on return, so `body` cannot see teardown.
+// Runs `body` on the GPU thread of a fresh render context, with the async flag as given, the two
+// rig flags above as they stand, and the first-run report on. The context is destroyed on return,
+// so `body` cannot see teardown.
 template <typename Body>
 void WithAsyncCache(VulkanHarness &vulkan, bool async, const std::filesystem::path &store,
                     Body &&body) {
@@ -61596,6 +61637,7 @@ void WithAsyncCache(VulkanHarness &vulkan, bool async, const std::filesystem::pa
   Config::Load({.printf_direction = Config::LogDirection::Silent,
                 .first_run_report_enabled = true,
                 .async_pipelines_enabled = async,
+                .async_pipelines_prefer_skip_enabled = g_cache_rig_prefer_skip,
                 .deferred_pipeline_draws_enabled = g_cache_rig_deferred});
   Common::FirstRunReport::Global().Reset();
   {
@@ -61873,29 +61915,36 @@ void CheckDeferredPolicy(VulkanHarness &vulkan) {
   std::printf("[gpu]     %-32s ok\n", name);
 }
 
-// What a deferred draw carries to its hole for the report, and how its resolve counts it. A draw the
-// skip rules allow is deferred under policy B, carries allowed and is counted as one S2 would have
-// skipped. One they refuse carries the refusing rule's name and is counted under it. Without
-// --async-pipelines the rules are never asked, so the draw carries not_asked and nothing is counted,
-// which is the baseline that differs only in the async flag and shows both counts follow it.
-void CheckDeferredSkipVerdict(VulkanHarness &vulkan) {
-  constexpr const char *name = "DeferredSkipVerdict";
+// --async-pipelines-prefer-skip, set through the Config as a run sets it. A draw that could be
+// deferred is skipped when the flag and the skip rules allow it. The case without the flag is the
+// baseline that differs only in the flag, and it defers. The flag implies the async flag, so the
+// flag alone skips too, against a baseline with neither that defers without asking the rules. Each
+// deferred draw is resolved, and the report then counts it as one S2 would have skipped or, with
+// the async flag, under the rule that refused it. Without the async flag a refusing policy is never
+// asked, so nothing is counted, which shows the counter follows the flag.
+void CheckPreferSkip(VulkanHarness &vulkan) {
+  constexpr const char *name = "PreferSkip";
   struct Case {
     const char *label;
-    bool async, skip_rules_allow;
+    bool async, prefer, skip_rules_allow;
     DrawFate expected;
     uint32_t skip_rule_asks, would_skip, refused_deferred;
-    // The verdict the deferred draw carries to its hole.
+    // The verdict the deferred draw carries to its hole, null for a draw that is not deferred.
     const char *verdict;
   };
   const Case cases[] = {
-      {"an allowed draw defers and counts as would skip", true, true, DrawFate::Defer, 1, 1, 0, "allowed"},
-      {"without async it defers unasked", false, true, DrawFate::Defer, 0, 0, 0, "not_asked"},
-      {"a refused deferred draw is counted under its rule", true, false, DrawFate::Defer, 1, 0, 1, "probe_rule"},
-      {"nothing is counted without async", false, false, DrawFate::Defer, 0, 0, 0, "not_asked"},
+      {"the flag skips a draw that could defer", true, true, true, DrawFate::Skip, 1, 0, 0, nullptr},
+      {"without the flag it defers", true, false, true, DrawFate::Defer, 1, 1, 0, "allowed"},
+      {"the flag without --async-pipelines skips", false, true, true, DrawFate::Skip, 1, 0, 0, nullptr},
+      {"without the flag or async it defers unasked", false, false, true, DrawFate::Defer, 0, 0, 0, "not_asked"},
+      {"the flag defers a refused draw and counts it", true, true, false, DrawFate::Defer, 1, 0, 1, "probe_rule"},
+      {"a refused deferred draw is counted without the flag", true, false, false, DrawFate::Defer, 1, 0, 1,
+       "probe_rule"},
+      {"nothing is counted without async", false, false, false, DrawFate::Defer, 0, 0, 0, "not_asked"},
   };
   g_cache_rig_deferred = true;
   for (const auto &test : cases) {
+    g_cache_rig_prefer_skip = test.prefer;
     WithAsyncCache(vulkan, test.async, {}, [&](const AsyncCacheRig &rig) {
       const auto state = rig.State(vk::PrimitiveTopology::eTriangleList);
       ProbePolicy policy;
@@ -61910,7 +61959,9 @@ void CheckDeferredSkipVerdict(VulkanHarness &vulkan) {
               "the skip rules were asked a different number of times than expected");
       // The three verdicts differ across the cases, so a draw that always got one of them fails.
       Require(name, test.label,
-              deferred.skip_verdict != nullptr && std::strcmp(deferred.skip_verdict, test.verdict) == 0,
+              test.verdict == nullptr ? deferred.skip_verdict == nullptr
+                                      : deferred.skip_verdict != nullptr &&
+                                            std::strcmp(deferred.skip_verdict, test.verdict) == 0,
               "the deferred draw carried another skip verdict than expected");
       if (deferred.active) {
         PipelineCache::DeferredAcquireStats stats;
@@ -61924,10 +61975,17 @@ void CheckDeferredSkipVerdict(VulkanHarness &vulkan) {
                   summary.deferred_refused_skip.size() == (test.refused_deferred != 0 ? 1u : 0u),
               "the deferred draw was counted under the wrong verdict, or not at all");
       Require(name, test.label, summary.refusals.empty(),
-              "a deferred draw was counted as a refused draw that waited");
+              "a deferred or skipped draw was counted as a refused draw that waited");
     });
   }
   g_cache_rig_deferred = false;
+  g_cache_rig_prefer_skip = false;
+  // The flag is a run-time policy A, so the table with it on asks for the skip first.
+  Require(name, "table",
+          ChooseDrawFate({.defer_allowed = true, .skip_allowed = true, .prefer_skip = true}) == DrawFate::Skip &&
+              ChooseDrawFate({.defer_allowed = true, .skip_allowed = false, .prefer_skip = true}) == DrawFate::Defer &&
+              ChooseDrawFate({.defer_allowed = false, .skip_allowed = false, .prefer_skip = true}) == DrawFate::Block,
+          "the flag did not ask for the skip first, or asked for one the rules refused");
   std::printf("[gpu]     %-32s ok\n", name);
 }
 
@@ -68346,7 +68404,7 @@ void CheckAsyncPipelines(VulkanHarness &vulkan) {
   };
   run("AsyncPipelinesOff", [&] { CheckAsyncPipelinesOff(vulkan); });
   run("DeferredPolicy", [&] { CheckDeferredPolicy(vulkan); });
-  run("DeferredSkipVerdict", [&] { CheckDeferredSkipVerdict(vulkan); });
+  run("PreferSkip", [&] { CheckPreferSkip(vulkan); });
   run("AsyncPipelineBuild", [&] { CheckAsyncPipelineBuild(vulkan); });
   run("AsyncPipelineClaim", [&] { CheckAsyncPipelineClaim(vulkan); });
   run("AsyncPipelineWait", [&] { CheckAsyncPipelineWait(vulkan); });
@@ -75330,6 +75388,7 @@ int main(int argc, char **argv) {
   }
   CheckModuleIdGolden();
   CheckNativeFloatMinMaxConfig();
+  CheckAsyncPipelinesPreferSkipConfig();
   CheckDeferredDrawFlagsConfig();
   CheckSpirvProfileNativeFloatMinMax();
   CheckSpirvProfileSingleCompareRecordGuardBytes();

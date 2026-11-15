@@ -1075,6 +1075,8 @@ if(BUILD_TESTING)
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --async-pipelines)
 	add_test(NAME emulator_async_pipelines_depth_only_cli
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --async-pipelines-depth-only)
+	add_test(NAME emulator_async_pipelines_prefer_skip_cli
+	         COMMAND $<TARGET_FILE:kyty_emulator> --help --async-pipelines-prefer-skip)
 	add_test(NAME emulator_background_warm_up_cli
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --background-warm-up)
 	add_test(NAME emulator_generate_shader_store_cli

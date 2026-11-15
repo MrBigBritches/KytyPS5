@@ -309,14 +309,16 @@ struct DrawFateInputs {
 	bool defer_allowed = false;
 	// --async-pipelines is on, and the S2 rules allow the draw to go without its pipeline.
 	bool skip_allowed = false;
+	// --async-pipelines-prefer-skip is on, which asks for policy A at run time.
+	bool prefer_skip = false;
 };
 
 // Decides the fate of a draw. Policy B is the default and defers a draw first, so no geometry is
 // lost, and falls back to an S2 skip only for a draw that cannot be deferred. Policy A asks for the
-// skip first. It is one constant away.
+// skip first. It is one constant away, or --async-pipelines-prefer-skip away for one run.
 inline constexpr bool SKIP_BEFORE_DEFER = false;
 [[nodiscard]] constexpr DrawFate ChooseDrawFate(const DrawFateInputs& inputs) noexcept {
-	if (SKIP_BEFORE_DEFER && inputs.skip_allowed) {
+	if ((SKIP_BEFORE_DEFER || inputs.prefer_skip) && inputs.skip_allowed) {
 		return DrawFate::Skip;
 	}
 	if (inputs.defer_allowed) {

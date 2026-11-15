@@ -1405,7 +1405,9 @@ DrawFate PipelineCache::ChooseMissedDrawFate(const GraphicsPipelineKey& key, con
 	if (blocker != nullptr) {
 		Common::FirstRunReport::AddDeferredIneligible(blocker);
 	}
-	return ChooseDrawFate({.defer_allowed = wants_defer && blocker == nullptr, .skip_allowed = may_skip});
+	return ChooseDrawFate({.defer_allowed = wants_defer && blocker == nullptr,
+	                       .skip_allowed  = may_skip,
+	                       .prefer_skip   = Config::AsyncPipelinesPreferSkip()});
 }
 
 PipelineCache::Pipeline* PipelineCache::AcquireBuiltPipeline(const GraphicsPipelineKey& key,

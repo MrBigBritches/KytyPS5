@@ -281,8 +281,13 @@ bool AsyncPipelinesDepthOnly() {
 	return g_config->async_pipelines_depth_only_enabled;
 }
 
+bool AsyncPipelinesPreferSkip() {
+	return g_config->async_pipelines_prefer_skip_enabled;
+}
+
 bool AsyncPipelinesEnabled() {
-	return g_config->async_pipelines_enabled || g_config->async_pipelines_depth_only_enabled;
+	return g_config->async_pipelines_enabled || g_config->async_pipelines_depth_only_enabled ||
+	       g_config->async_pipelines_prefer_skip_enabled;
 }
 
 bool BackgroundWarmUpEnabled() {

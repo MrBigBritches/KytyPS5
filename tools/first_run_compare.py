@@ -48,10 +48,10 @@ import sys
 MEASUREMENT_FLAGS = {"--first-run-report", "--cold-pipelines"}
 # Flags that define an arm. These always show in its name, or a set of reports from one arm would be
 # labelled baseline. Add each new strategy's flag here.
-STRATEGY_FLAGS = {"--async-pipelines", "--async-pipelines-depth-only", "--background-warm-up",
-                  "--deferred-pipeline-draws", "--pause-warm-up-for-draws", "--deferred-non-push-draws",
-                  "--deferred-mesh-draws", "--deferred-indirect-draws", "--graphics-pipeline-library",
-                  "--generate-shader-store"}
+STRATEGY_FLAGS = {"--async-pipelines", "--async-pipelines-depth-only", "--async-pipelines-prefer-skip",
+                  "--background-warm-up", "--deferred-pipeline-draws", "--pause-warm-up-for-draws",
+                  "--deferred-non-push-draws", "--deferred-mesh-draws", "--deferred-indirect-draws",
+                  "--graphics-pipeline-library", "--generate-shader-store"}
 # Histogram buckets whose lower bound is at least one second.
 LONG_PAUSE_BUCKETS = ("1000", "2500", "5000", "10000")
 MS_PER_SECOND = 1000.0

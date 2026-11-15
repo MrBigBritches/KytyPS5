@@ -124,6 +124,9 @@ struct ConfigOptions {
 	// Like async_pipelines_enabled, which it implies, but only draws with no color target ever go
 	// without their pipeline.
 	bool                   async_pipelines_depth_only_enabled = false;
+	// Like async_pipelines_enabled, which it implies, but a draw the skip rules allow to go without
+	// its pipeline is skipped even when it could be deferred, so a resolve never waits on it.
+	bool                   async_pipelines_prefer_skip_enabled = false;
 	// Builds the compute pipelines of the shader store on low priority workers while the game runs,
 	// instead of making boot wait for all of them.
 	bool                   background_warm_up_enabled  = false;
@@ -263,6 +266,10 @@ bool ColdPipelinesEnabled();
 bool AsyncPipelinesEnabled();
 /// Whether only draws with no color target may go without a pipeline. It implies background builds.
 bool AsyncPipelinesDepthOnly();
+/// True when --async-pipelines-prefer-skip asks for a draw the skip rules allow to be skipped
+/// rather than deferred. It implies background builds, and only differs from --async-pipelines
+/// when --deferred-pipeline-draws is also on, because nothing can be deferred without it.
+bool AsyncPipelinesPreferSkip();
 /// True when --background-warm-up builds the shader store's compute pipelines after boot.
 bool BackgroundWarmUpEnabled();
 /// The warm-up worker count --warm-workers asked for, or zero when the warm-up sizes it itself.
