@@ -567,11 +567,13 @@ bool DrawMaySkipPipeline(TextureCache& cache, const DrawRenderState& state, bool
 namespace {
 
 // The parts of a draw that keep it from becoming a hole and that are known before its pipeline.
-// Mesh draws upload their task parameters and indirect draws read an arguments buffer, and no
-// hole records either yet, so version 1 of deferred draws leaves both to block.
+// Indirect draws read an arguments buffer, and task mesh draws, which are indirect, upload their
+// task parameters when they are met. Version 1 of deferred draws leaves indirect and all mesh draws
+// to block, and the report counts task and direct mesh draws apart.
 struct DeferFacts {
-	bool mesh     = false;
-	bool indirect = false;
+	bool mesh      = false;
+	bool indirect  = false;
+	bool mesh_task = false;
 };
 
 // Lets a draw go without its pipeline when the gate allows it, keeps the rule that refused it, and
@@ -600,11 +602,17 @@ public:
 		if (m_context.GetOcclusionQueries().HasOpenQuery()) {
 			return "open_query";
 		}
-		if (m_facts.mesh) {
-			return "mesh";
+		// The arguments buffer and the task flag come first, so a task draw is never counted as a
+		// plain mesh draw, and the mesh counts say how many direct mesh draws could be deferred.
+		// A task draw is indirect too, and has its own reason.
+		if (m_facts.mesh_task) {
+			return "mesh_task";
 		}
 		if (m_facts.indirect) {
 			return "indirect";
+		}
+		if (m_facts.mesh && !m_facts.mesh_task) {
+			return "mesh_direct";
 		}
 		if (!m_context.GetCommandScheduler().CanSplitHere()) {
 			return "thread";
@@ -1469,7 +1477,7 @@ const PipelineCache::Pipeline* RenderExecutor::PrepareDraw(
 	}
 	const auto args     = AcquireIndirectArgs(m_context, draw, emit);
 	auto*      pipeline = AcquireDrawPipeline(m_context, buffer, state,
-	                                          {mesh->active, args.first != nullptr}, deferred);
+	                                          {mesh->active, args.first != nullptr, mesh->task}, deferred);
 	const bool is_hole  = deferred != nullptr && deferred->active;
 	vk::ImageAspectFlags feedback_aspects;
 	// Runs even for a skipped draw, since it applies the clears the draw consumes and moves the

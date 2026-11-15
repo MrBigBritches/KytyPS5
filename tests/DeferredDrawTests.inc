@@ -1549,12 +1549,119 @@
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  // Makes the rig's vertex stage the NGG mesh shader of the GpuMeshIndirectDraw test (a copy), whose
+  // subgroups carry two triangles. Only vertex ids 8 and 9 with instance id 5 cover the target, after
+  // the shader adds the bases 7 and 5 it reads from user SGPRs 0 and 1, so a direct draw of three
+  // vertices covers it and an indirect record of zeros draws nothing.
+  static void UseMeshVertexStage(AsyncDrawRig &rig) {
+    static const auto mesh_code = [] {
+      std::vector<u32> code{
+          EncodeSop2(0x20, 0, 2, InlineU32(12)), EncodeSop2(0x0e, 0, 0, 255), 0x3ffu,
+          EncodeSop2(0x20, 1, 2, InlineU32(22)), EncodeSop2(0x1e, 1, 1, InlineU32(12)),
+          EncodeSop2(0x10, 124, 0, 1), EncodeSopp(0x10, 9),
+          EncodeVop2(0x16, 10, InlineU32(2), 0), EncodeVop2(0x1b, 10, 255, 10), 0x1ffu,
+          EncodeVop2(0x16, 11, InlineU32(18), 0), EncodeVop2(0x1a, 11, InlineU32(10), 11),
+          EncodeVop2(0x1c, 10, Vgpr(11), 10), EncodeVop2(0x16, 11, InlineU32(2), 1),
+          EncodeVop2(0x1a, 11, InlineU32(20), 11), EncodeVop2(0x1c, 10, Vgpr(11), 10),
+          EncodeExp0(0x14, 0x1, false), EncodeExp1(10, 0, 0, 0),
+          EncodeVop2(0x25, 5, 8, 5), EncodeVop2(0x25, 8, 9, 8)};
+      AppendVMovLiteral(&code, 1, 0xbf800000u);
+      AppendVMovLiteral(&code, 2, 0x40400000u);
+      code.insert(code.end(),
+                  {EncodeVopc(0xc2, InlineU32(8), 5), EncodeVop2(0x01, 3, Vgpr(1), 2),
+                   EncodeVopc(0xc2, InlineU32(9), 5), EncodeVop2(0x01, 4, Vgpr(1), 2),
+                   EncodeVopc(0xc2, InlineU32(5), 8), EncodeVop2(0x01, 3, Vgpr(1), 3),
+                   EncodeVop2(0x01, 4, Vgpr(1), 4)});
+      AppendVMovU32(&code, 0, 0);
+      AppendVMovLiteral(&code, 6, 0x3f800000u);
+      code.insert(code.end(), {EncodeExp0(0x0c, 0xf), EncodeExp1(3, 4, 0, 6)});
+      for (u32 parameter = 0; parameter < 8; parameter++) {
+        code.insert(code.end(), {EncodeExp0(0x20 + parameter, 0xf), EncodeExp1(0, 0, 0, 0)});
+      }
+      AppendEnd(&code);
+      return code;
+    }();
+    static ShaderUserData mesh_user_data{};
+    const auto mesh_address = reinterpret_cast<uint64_t>(mesh_code.data());
+    ShaderMapUserData(mesh_address, {.type = Prospero::ShaderBinaryType::kGs, .user_data = &mesh_user_data,
+                                     .code_size_bytes = static_cast<uint32_t>(mesh_code.size() * sizeof(u32))});
+    rig.shaders.SetEsShaderBase(mesh_address);
+    rig.shaders.SetGsShaderResource2({.user_sgpr = 2, .lds_size = 1});
+    rig.shaders.SetGsUserSgpr(0, 7);
+    rig.shaders.SetGsUserSgpr(1, 5);
+    rig.registers.SetMaxOutputPerSubgroup(6);
+    rig.registers.SetNggSubgrpCntl(1);
+    rig.registers.SetGsOutPrimType(2);
+    rig.user_config.SetGeControl({2, 6});
+  }
+
+  // What one mesh draw with its pipeline held did: holes left, the ineligible reasons, and the colour
+  // target once the scheduler finished.
+  struct MeshDrawRun {
+    uint32_t         holes = 0;
+    IneligibleCounts ineligible;
+    std::vector<u32> pixels;
+  };
+
+  // How a mesh draw of RunMeshDraw is made.
+  enum class MeshDrawKind { Direct, Indirect };
+
+  // Makes one mesh draw of `kind` with its pipeline held and deferred draws on, and returns what it
+  // left once the scheduler finished.
+  MeshDrawRun RunMeshDraw(const char *name, MeshDrawKind kind) {
+    PipelineCacheTestAccess::BuildHold hold;
+    // The mesh pipeline's layout is predicted not to push, so --deferred-non-push-draws is on, as in
+    // the measured runs, or the draw would be refused as non_push before the mesh question.
+    AsyncDrawRig rig(*this, false, false, false, false, true, true);
+    auto &scheduler = rig.Scheduler();
+    CommandSchedulerTestAccess::AllowThisThread(scheduler);
+    rig.PaintSentinels();
+    UseMeshVertexStage(rig);
+    PipelineCacheTestAccess::HoldBuildQueue(rig.Pipelines(), hold);
+    Common::FirstRunReport::Global().Reset();
+    // A record of zeros in the rig's zeroed memory, far past the targets.
+    constexpr uint64_t data_offset   = 0x200000;
+    constexpr uint32_t args_stride   = 32;
+    const uint64_t data_address = AsyncBase + data_offset;
+    bool drawn = false;
+    if (kind == MeshDrawKind::Indirect) {
+      drawn = rig.Draw({.indirect = {data_address + args_stride, 1, args_stride, {}}});
+    } else {
+      drawn = rig.Draw({.vertex_count = 3, .instance_count = 1});
+    }
+    Require(name, "mesh draw", drawn, "the draw reported failure");
+    MeshDrawRun run{.holes = static_cast<uint32_t>(scheduler.PendingHoleCount()), .ineligible = DeferredIneligible()};
+    hold.release = true;
+    scheduler.Finish();
+    run.pixels = rig.ReadColor();
+    return run;
+  }
+
+  // A direct mesh draw whose pipeline is still building blocks, counted as mesh_direct, and draws.
+  // The indirect mesh draw, a task draw, is the baseline that differs only in being indirect, and is
+  // counted as mesh_task, so neither name can stand for both kinds.
+  void CheckDeferredMeshDraws() {
+    constexpr const char *name = "DeferredMeshDraws";
+    const auto blocking = RunMeshDraw(name, MeshDrawKind::Direct);
+    Require(name, "direct blocks",
+            blocking.holes == 0 && blocking.ineligible == IneligibleCounts{{"mesh_direct", 1}} &&
+                AllDrawn(blocking.pixels),
+            "the direct mesh draw was deferred, miscounted, or did not draw");
+
+    const auto indirect = RunMeshDraw(name, MeshDrawKind::Indirect);
+    Require(name, "indirect blocks",
+            indirect.holes == 0 && indirect.ineligible == IneligibleCounts{{"mesh_task", 1}},
+            "an indirect mesh draw was deferred, or not counted as mesh_task, which an indirect mesh draw is");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckDeferredDraws() {
     CheckDeferredOrderEquivalence();
     CheckDeferredDepthClear();
     CheckDeferredStencilClear();
     CheckDeferredHtileClear();
     CheckDeferredEligibility();
+    CheckDeferredMeshDraws();
     CheckDeferredRegistersAfterHole();
     CheckDeferredQueryOpenedAfterHole();
     CheckDeferredFlagStandsAlone();
