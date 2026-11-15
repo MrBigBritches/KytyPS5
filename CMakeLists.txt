@@ -598,6 +598,19 @@ add_executable(graphics_library_cache_tests EXCLUDE_FROM_ALL
 target_link_libraries(graphics_library_cache_tests common Vulkan::Headers xxhash fmt::fmt)
 target_include_directories(graphics_library_cache_tests PRIVATE ${inc_headers})
 
+# The draw-time pixel input helpers the GPU thread and the graphics prescan share. They read only the
+# context registers and the render target formats, so this links them and the format tables.
+add_executable(pixel_inputs_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/PixelInputsTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/pixelInputs.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/blendMapping.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/image/textureCommon.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/vulkanCommon.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/gpu_format.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/shaderPixelParameter.cpp")
+target_link_libraries(pixel_inputs_tests common Vulkan::Headers fmt::fmt)
+target_include_directories(pixel_inputs_tests PRIVATE ${inc_headers})
+
 add_executable(descriptor_set_layout_cache_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/DescriptorSetLayoutCacheTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/descriptorSetLayoutCache.cpp")
@@ -1198,6 +1211,7 @@ if(BUILD_TESTING)
 	add_test(NAME shader_recompiler_compute COMMAND $<TARGET_FILE:shader_recompiler_compute_tests>)
 	add_test(NAME shader_store_scan COMMAND $<TARGET_FILE:shader_store_scan_tests>)
 	add_test(NAME submit_scan COMMAND $<TARGET_FILE:submit_scan_tests>)
+	add_test(NAME pixel_inputs COMMAND $<TARGET_FILE:pixel_inputs_tests>)
 	add_test(NAME scan_differential COMMAND $<TARGET_FILE:scan_differential_tests>)
 	add_test(NAME prescan COMMAND $<TARGET_FILE:prescan_tests>)
 	# The whole test runs in about a second, so a ring that loses track of an item and leaves the
@@ -1386,6 +1400,7 @@ if(BUILD_TESTING)
 		shader_recompiler_compute_tests
 		shader_store_scan_tests
 		submit_scan_tests
+		pixel_inputs_tests
 		scan_differential_tests
 		prescan_tests
 		prescan_handoff_tests

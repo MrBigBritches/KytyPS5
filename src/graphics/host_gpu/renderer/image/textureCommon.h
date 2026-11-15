@@ -4,6 +4,8 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
+#include <optional>
+
 namespace Libs::Graphics {
 
 struct RenderTargetFormatInfo {
@@ -25,6 +27,11 @@ SurfaceFormatInfo      TextureGetSurfaceFormatInfo(Prospero::BufferFormat format
 RenderTargetFormatInfo TextureGetRenderTargetFormat(Prospero::ChannelLayout layout,
                                                     Prospero::ChannelType   type,
                                                     Prospero::ChannelOrder  order);
+/// The render target format TextureGetRenderTargetFormat gives, or nothing where it would EXIT, for a
+/// caller off the GPU thread that reads guest state it cannot vouch for.
+[[nodiscard]] std::optional<RenderTargetFormatInfo>
+TryTextureGetRenderTargetFormat(Prospero::ChannelLayout layout, Prospero::ChannelType type,
+                                Prospero::ChannelOrder order);
 
 } // namespace Libs::Graphics
 

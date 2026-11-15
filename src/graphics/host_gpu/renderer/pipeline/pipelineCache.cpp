@@ -18,6 +18,7 @@
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
 #include "graphics/host_gpu/renderer/pipeline/generationState.h"
 #include "graphics/host_gpu/renderer/pipeline/graphicsLibraryCache.h"
+#include "graphics/host_gpu/renderer/pipeline/pixelInputs.h"
 #include "graphics/host_gpu/renderer/pipeline/prescanPreparer.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -785,6 +786,9 @@ void PipelineCache::Save() {
 	                 Common::PathToString(m_driver_cache_path));
 }
 
+// The pixel input helpers count targets on their own, so they must count what the renderer does.
+static_assert(PIXEL_COLOR_TARGETS == RENDER_COLOR_ATTACHMENTS_MAX);
+
 void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRenderState& state) {
 	const auto& context           = command.GetRegisters();
 	const auto& user_config       = command.GetUserConfig();
@@ -794,24 +798,9 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 	auto&       vertex_info       = state.vertex_info;
 	auto&       pixel_info        = state.ps_input_info;
 	const bool  object_primitive_id = context.HasObjectPrimitiveIdOutput();
-	const auto  write_mask          = context.GetRenderTargetMask() & sh.m_cbShaderMask;
-	uint32_t    color_output_mask   = object_primitive_id ? 1u << 7u : 0;
-	for (uint32_t index = 0; index < RENDER_COLOR_ATTACHMENTS_MAX; index++) {
-		const auto slot = ShaderPixelExportTarget(sh.m_cbShaderMask, index);
-		if (slot >= RENDER_COLOR_ATTACHMENTS_MAX) {
-			break;
-		}
-		if (sh.target_output_mode[index] != 0 && render_target_mask_slot(write_mask, slot) != 0) {
-			color_output_mask |= 1u << slot;
-		}
-	}
-	const auto& db = sh.db_shader_control;
-	// Without color outputs, a pixel shader still runs for its depth or coverage side effects.
-	const bool pixel_active =
-	    pixel_regs.ps_regs.data_addr != 0 &&
-	    (color_output_mask != 0 || db.shader_kill_enable || db.shader_z_export_enable ||
-	     db.shader_mask_export_enable || db.shader_dual_export_enable ||
-	     db.shader_execute_on_noop || sh.AlphaToMask());
+	// The graphics prescan works these out with the same helpers, so its keys match these.
+	const uint32_t color_output_mask = PixelColorOutputMask(context);
+	const bool     pixel_active      = PixelStageActive(context, pixel_regs, color_output_mask);
 	state.ps_active = pixel_active;
 	const bool tess_active = user_config.GetPrimType() == Prospero::PrimitiveType::kPatch;
 	std::array<ShaderParams, 3> vertex_params;
@@ -884,88 +873,18 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 	}
 	ShaderParams pixel_params;
 	if (pixel_active) {
-		std::array<Prospero::ColorComponentMapping, RENDER_COLOR_ATTACHMENTS_MAX>
-		    target_export_mapping {};
-		for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
-			const auto& rt = context.GetRenderTarget(slot);
-			if ((color_output_mask & (1u << slot)) != 0 && rt.base.addr != 0) {
-				target_export_mapping[slot] =
-				    TextureGetRenderTargetFormat(rt.info.format, rt.info.channel_type,
-				                                 rt.info.channel_order)
-				        .export_mapping;
-			}
-		}
+		const auto target_export_mapping = PixelTargetExportMappingOf(context, color_output_mask);
 		pixel_params      = PrepareProgram(pixel_regs, sh, target_export_mapping, pixel_info);
-		pixel_info.object_primitive_id = object_primitive_id;
-		for (uint32_t export_index = 0; export_index < 8u; export_index++) {
-			const auto slot = ShaderPixelExportTarget(pixel_info.target_shader_mask, export_index);
-			if (slot >= 8u || pixel_info.target_output_mode[export_index] == 0u) continue;
-			const auto& rt = context.GetRenderTarget(slot);
-			const auto target_mask = render_target_mask_slot(context.GetRenderTargetMask(), slot);
-			if (rt.base.addr == 0 || target_mask == 0u) continue;
-			if (rt.info.channel_type == Prospero::ChannelType::kUInt) {
-				pixel_info.target_uint_mask |= 1u << export_index;
-			} else if (rt.info.channel_type == Prospero::ChannelType::kSInt) {
-				pixel_info.target_sint_mask |= 1u << export_index;
-			}
-			const auto format = Prospero::ResolveRenderTargetFormat(rt.info.format, rt.info.channel_type);
-			if (format.buffer_format != Prospero::BufferFormat::k11_11_10UNorm) continue;
-			const auto mapping = pixel_info.target_export_mapping[export_index];
-			const auto shader_mask = render_target_mask_slot(pixel_info.target_shader_mask, slot);
-			const bool blend = context.GetBlendControl(slot).enable && !rt.info.blend_bypass;
-			if (blend || (mapping.ApplyMask(target_mask) & 7u) != 7u ||
-			    (mapping.ApplyMask(shader_mask) & 7u) != 7u ||
-			    pixel_info.target_output_mode[export_index] != 9u) {
-				EXIT("unsupported packed UNorm render-target export: slot=%u export=%u mode=%u "
-				     "target_mask=0x%x shader_mask=0x%x mapping=0x%02x blend=%u\n",
-				     slot, export_index, pixel_info.target_output_mode[export_index], target_mask,
-				     shader_mask, mapping.packed, static_cast<uint32_t>(blend));
-			}
-			pixel_info.target_packed_unorm_mask |= 1u << export_index;
-			pixel_info.target_round_mode |= static_cast<uint8_t>(rt.info.round_mode) << export_index;
-		}
-		if (!mesh_active && !tess_active && Prospero::IsRectList(user_config.GetPrimType())) {
-			pixel_info.parameter_mode = ShaderPixelParameterMode::Rectangle;
-		} else if (context.GetModeControl().provoking_vtx_last) {
-			pixel_info.parameter_mode = ShaderPixelParameterMode::LastVertex;
-		} else {
-			pixel_info.parameter_mode = ShaderPixelParameterMode::FirstVertex;
-		}
-		const auto& blend = context.GetBlendControl(0);
-		pixel_info.dual_source_blending =
-		    blend.enable && !context.GetRenderTarget(0).info.blend_bypass &&
-		    (BlendFactorIsDualSource(blend.color_srcblend) ||
-		     BlendFactorIsDualSource(blend.color_destblend) ||
-		     (blend.separate_alpha_blend && (BlendFactorIsDualSource(blend.alpha_srcblend) ||
-		                                     BlendFactorIsDualSource(blend.alpha_destblend))));
-		if (pixel_info.dual_source_blending) {
-			// MRT1 supplies the second blend source for target 0; blended targets are not integer.
-			pixel_info.target_output_mode[1]    = pixel_info.target_output_mode[0];
-			pixel_info.target_export_mapping[1] = pixel_info.target_export_mapping[0];
-			pixel_info.target_uint_mask &= ~2u;
-			pixel_info.target_sint_mask &= ~2u;
-		} else if (blend.enable && !context.GetRenderTarget(0).info.blend_bypass &&
-		           pixel_info.target_output_mode[0] != 0 && pixel_info.target_output_mode[0] != 7 &&
-		           std::all_of(std::begin(pixel_info.target_output_mode) + 1,
-		                       std::end(pixel_info.target_output_mode),
-		                       [](uint8_t mode) { return mode == 0; })) {
-			switch (ClassifyBlendMapping(blend, pixel_info.target_export_mapping[0])) {
-				case BlendMappingSupport::SourceAlpha:
-					pixel_info.alpha_blend_source = ShaderAlphaBlendSource::SourceAlpha;
-					break;
-				case BlendMappingSupport::SourceAlphaOne:
-					pixel_info.alpha_blend_source = ShaderAlphaBlendSource::SourceAlphaOne;
-					break;
-				case BlendMappingSupport::SourceAlphaZero:
-					pixel_info.alpha_blend_source = ShaderAlphaBlendSource::SourceAlphaZero;
-					break;
-				default: break;
-			}
-			if (pixel_info.alpha_blend_source != ShaderAlphaBlendSource::None) {
-				pixel_info.dual_source_blending     = true;
-				pixel_info.target_output_mode[1]    = pixel_info.target_output_mode[0];
-				pixel_info.target_export_mapping[1] = {};
-			}
+		PackedUnormRejection rejected;
+		const PixelDrawShape shape {.primitive_type      = user_config.GetPrimType(),
+		                            .object_primitive_id = object_primitive_id,
+		                            .mesh_active         = mesh_active,
+		                            .tess_active         = tess_active};
+		if (FinishPixelInputInfo(context, shape, pixel_info, &rejected) != PixelInputStatus::Ok) {
+			EXIT("unsupported packed UNorm render-target export: slot=%u export=%u mode=%u "
+			     "target_mask=0x%x shader_mask=0x%x mapping=0x%02x blend=%u\n",
+			     rejected.slot, rejected.export_index, rejected.mode, rejected.target_mask,
+			     rejected.shader_mask, rejected.mapping, static_cast<uint32_t>(rejected.blend));
 		}
 	}
 	auto&       last_stage   = vertex_info[tess_active ? 2u : 0u];
