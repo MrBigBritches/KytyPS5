@@ -309,6 +309,10 @@ bool DeferredNonPushDrawsEnabled() {
 	return g_config->deferred_non_push_draws_enabled;
 }
 
+bool DeferredMeshDrawsEnabled() {
+	return g_config->deferred_mesh_draws_enabled;
+}
+
 bool GraphicsPipelineLibraryEnabled() {
 	return g_config->graphics_pipeline_library_enabled;
 }

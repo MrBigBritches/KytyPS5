@@ -144,6 +144,10 @@ struct ConfigOptions {
 	// Lets a draw whose descriptors go in a descriptor set, not pushed, be deferred too. Its set is
 	// allocated and written when the hole is recorded. Needs --deferred-pipeline-draws.
 	bool                   deferred_non_push_draws_enabled = false;
+	// Lets a direct mesh draw be deferred too. Its view keeps the groups, index address and draw
+	// dwords its recording reads. Task mesh draws still block. Needs --deferred-pipeline-draws, and
+	// usually --deferred-non-push-draws, because mesh pipelines are seldom predicted to push.
+	bool                   deferred_mesh_draws_enabled = false;
 	// Asks for graphics pipelines built from separately compiled stage libraries, so a stage shared
 	// by several pipelines compiles once. It does nothing on a device that misses any requirement.
 	bool                   graphics_pipeline_library_enabled = false;
@@ -270,6 +274,9 @@ bool PauseWarmUpForDrawsEnabled();
 /// True when --deferred-non-push-draws lets draws with a descriptor set be deferred. It does nothing
 /// without --deferred-pipeline-draws.
 bool DeferredNonPushDrawsEnabled();
+/// True when --deferred-mesh-draws lets a direct mesh draw be deferred. Task mesh draws still block.
+/// It does nothing without --deferred-pipeline-draws, which it does not turn on.
+bool DeferredMeshDrawsEnabled();
 /// True when --graphics-pipeline-library asks for pipelines built from stage libraries. The device
 /// decides whether that happens.
 bool GraphicsPipelineLibraryEnabled();

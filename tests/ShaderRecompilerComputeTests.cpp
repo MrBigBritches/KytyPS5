@@ -2785,6 +2785,44 @@ void CheckNativeFloatMinMaxConfig() {
   std::printf("[host]    %-32s ok\n", name);
 }
 
+// What the three deferred draw accessors answer for the Config that is loaded.
+struct DeferredDrawAccessors {
+  bool deferred = false;
+  bool non_push = false;
+  bool mesh = false;
+  bool operator==(const DeferredDrawAccessors &) const = default;
+};
+
+// Loads `options` with printf silenced and reads the three deferred draw accessors.
+DeferredDrawAccessors LoadDeferredDrawAccessors(Config::ConfigOptions options) {
+  options.printf_direction = Config::LogDirection::Silent;
+  Config::Load(options);
+  return {Config::DeferredPipelineDrawsEnabled(), Config::DeferredNonPushDrawsEnabled(),
+          Config::DeferredMeshDrawsEnabled()};
+}
+
+// --deferred-mesh-draws is off by default, and its field turns on its own accessor alone. The default
+// Config is the baseline, so an accessor that always answers on fails there. It is loaded next to the
+// two sibling deferral flags, so an accessor that reads a sibling's field fails on the sibling, and one
+// that turns on --deferred-pipeline-draws, which the flag needs but does not imply, fails on its own
+// load. The CLI test only proves the flag name is accepted, so this pins what its field does.
+void CheckDeferredDrawFlagsConfig() {
+  constexpr const char *name = "DeferredDrawFlagsConfig";
+  const auto baseline = LoadDeferredDrawAccessors({});
+  const auto mesh = LoadDeferredDrawAccessors({.deferred_mesh_draws_enabled = true});
+  const auto deferred = LoadDeferredDrawAccessors({.deferred_pipeline_draws_enabled = true});
+  const auto non_push = LoadDeferredDrawAccessors({.deferred_non_push_draws_enabled = true});
+  Config::Load({.printf_direction = Config::LogDirection::Silent});
+  Require(name, "off by default", baseline == DeferredDrawAccessors{},
+          "a default Config turned on a deferred draw flag");
+  Require(name, "mesh alone", mesh == DeferredDrawAccessors{.mesh = true},
+          "the mesh field did not turn on the mesh accessor alone");
+  Require(name, "siblings leave them off",
+          deferred == DeferredDrawAccessors{.deferred = true} && non_push == DeferredDrawAccessors{.non_push = true},
+          "a mesh accessor answered on for another deferral flag");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 constexpr uint32_t AmdVendorIdForTests = 0x1002u;
 constexpr uint32_t AppleVendorIdForTests = 0x106bu;
 
@@ -19810,8 +19848,10 @@ public:
     // `depth_only` turns on the second mode instead. `use_htile` gives the depth target HTILE.
     // `deferred` turns on --deferred-pipeline-draws, with or without `async`.
     // `deferred_non_push` turns on --deferred-non-push-draws, which does nothing without `deferred`.
+    // `deferred_mesh` turns on --deferred-mesh-draws, which also does nothing without `deferred`.
     AsyncDrawRig(VulkanHarness &owner, bool async, bool use_htile = false, bool occlusion = false,
-                 bool depth_only = false, bool deferred = false, bool deferred_non_push = false)
+                 bool depth_only = false, bool deferred = false, bool deferred_non_push = false,
+                 bool deferred_mesh = false)
         : harness(owner), htile(use_htile) {
       Config::Load({.printf_direction = Config::LogDirection::Silent,
                     .occlusion_queries_enabled = occlusion,
@@ -19819,7 +19859,8 @@ public:
                     .async_pipelines_enabled = async,
                     .async_pipelines_depth_only_enabled = depth_only,
                     .deferred_pipeline_draws_enabled = deferred,
-                    .deferred_non_push_draws_enabled = deferred_non_push});
+                    .deferred_non_push_draws_enabled = deferred_non_push,
+                    .deferred_mesh_draws_enabled = deferred_mesh});
       Common::FirstRunReport::Global().Reset();
       harness.EnsureRuntimeContext();
       harness.SetOcclusionQueries(occlusion);
@@ -75216,6 +75257,7 @@ int main(int argc, char **argv) {
   }
   CheckModuleIdGolden();
   CheckNativeFloatMinMaxConfig();
+  CheckDeferredDrawFlagsConfig();
   CheckSpirvProfileNativeFloatMinMax();
   CheckSpirvProfileSingleCompareRecordGuardBytes();
   CheckSpirvProfileSingleCompareRecordGuardOption();

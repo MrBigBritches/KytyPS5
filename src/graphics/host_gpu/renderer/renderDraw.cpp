@@ -567,9 +567,11 @@ bool DrawMaySkipPipeline(TextureCache& cache, const DrawRenderState& state, bool
 namespace {
 
 // The parts of a draw that keep it from becoming a hole and that are known before its pipeline.
-// Indirect draws read an arguments buffer, and task mesh draws, which are indirect, upload their
-// task parameters when they are met. Version 1 of deferred draws leaves indirect and all mesh draws
-// to block, and the report counts task and direct mesh draws apart.
+// Indirect draws read an arguments buffer, and version 1 of deferred draws leaves them to block. Task
+// mesh draws, which are indirect, upload their task parameters when they are met, and always block. A
+// direct mesh draw keeps everything its recording reads in the view (groups, index address, draw
+// dwords), so it may become a hole when --deferred-mesh-draws asks for it (experimental), and blocks
+// otherwise.
 struct DeferFacts {
 	bool mesh      = false;
 	bool indirect  = false;
@@ -611,7 +613,7 @@ public:
 		if (m_facts.indirect) {
 			return "indirect";
 		}
-		if (m_facts.mesh && !m_facts.mesh_task) {
+		if (m_facts.mesh && !m_facts.mesh_task && !Config::DeferredMeshDrawsEnabled()) {
 			return "mesh_direct";
 		}
 		if (!m_context.GetCommandScheduler().CanSplitHere()) {

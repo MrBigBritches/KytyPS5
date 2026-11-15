@@ -1114,6 +1114,8 @@ if(BUILD_TESTING)
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --pause-warm-up-for-draws)
 	add_test(NAME emulator_deferred_non_push_draws_cli
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --deferred-non-push-draws)
+	add_test(NAME emulator_deferred_mesh_draws_cli
+	         COMMAND $<TARGET_FILE:kyty_emulator> --help --deferred-mesh-draws)
 	add_test(NAME emulator_graphics_pipeline_library_cli
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --graphics-pipeline-library)
 	add_test(NAME emulator_skip_redundant_unmap_drains_cli

@@ -1603,31 +1603,47 @@
     std::vector<u32> pixels;
   };
 
-  // How a mesh draw of RunMeshDraw is made.
-  enum class MeshDrawKind { Direct, Indirect };
+  // How a mesh draw of RunMeshDraw is made. The indexed ones read 32-bit indices {5, 5, 5, 5, 5, 5, 0,
+  // 1, 2}: from the seventh index they give vertex ids 0 to 2, which cover the target, and from the
+  // first 5, 5, 5, which draws nothing, so a draw that reads the wrong indices is seen.
+  enum class MeshDrawKind { Direct, Indexed, IndexedFromStart, Indirect };
 
   // Makes one mesh draw of `kind` with its pipeline held and deferred draws on, and returns what it
   // left once the scheduler finished.
-  MeshDrawRun RunMeshDraw(const char *name, MeshDrawKind kind) {
+  MeshDrawRun RunMeshDraw(const char *name, bool deferred_mesh, MeshDrawKind kind) {
     PipelineCacheTestAccess::BuildHold hold;
     // The mesh pipeline's layout is predicted not to push, so --deferred-non-push-draws is on, as in
     // the measured runs, or the draw would be refused as non_push before the mesh question.
-    AsyncDrawRig rig(*this, false, false, false, false, true, true);
+    // `deferred_mesh` sets --deferred-mesh-draws for the run.
+    AsyncDrawRig rig(*this, false, false, false, false, true, true, deferred_mesh);
     auto &scheduler = rig.Scheduler();
     CommandSchedulerTestAccess::AllowThisThread(scheduler);
     rig.PaintSentinels();
     UseMeshVertexStage(rig);
     PipelineCacheTestAccess::HoldBuildQueue(rig.Pipelines(), hold);
     Common::FirstRunReport::Global().Reset();
-    // A record of zeros in the rig's zeroed memory, far past the targets.
+    // Indices and a record of zeros in the rig's zeroed memory, far past the targets.
     constexpr uint64_t data_offset   = 0x200000;
     constexpr uint32_t args_stride   = 32;
+    constexpr uint32_t covering_from = 6;
+    constexpr std::array<u32, 9> indices{5, 5, 5, 5, 5, 5, 0, 1, 2};
     const uint64_t data_address = AsyncBase + data_offset;
+    std::memcpy(reinterpret_cast<void *>(data_address), indices.data(), sizeof(indices));
     bool drawn = false;
     if (kind == MeshDrawKind::Indirect) {
-      drawn = rig.Draw({.indirect = {data_address + args_stride, 1, args_stride, {}}});
-    } else {
+      drawn = rig.Draw({.indirect = {data_address + sizeof(indices) + args_stride, 1, args_stride, {}}});
+    } else if (kind == MeshDrawKind::Direct) {
       drawn = rig.Draw({.vertex_count = 3, .instance_count = 1});
+    } else {
+      const uint32_t first = kind == MeshDrawKind::Indexed ? covering_from : 0;
+      drawn = RenderExecutorTestAccess::DrawIndex(
+          rig.context->GetRenderExecutor(), scheduler.Current(),
+          {.index_count = 3, .index_addr = reinterpret_cast<const void *>(data_address + first * sizeof(u32)), .instance_count = 1,
+           .index_type_and_size = 1});
+      // A larger buffer over the indices replaces the one the draw registered before the hole is
+      // recorded, so a hole that read through a stale mapping would show it.
+      (void)rig.context->GetBufferCache().ObtainBuffer(data_address - BufferCache::CACHING_PAGESIZE,
+                                                       BufferCache::CACHING_PAGESIZE * 4, false);
     }
     Require(name, "mesh draw", drawn, "the draw reported failure");
     MeshDrawRun run{.holes = static_cast<uint32_t>(scheduler.PendingHoleCount()), .ineligible = DeferredIneligible()};
@@ -1637,18 +1653,38 @@
     return run;
   }
 
-  // A direct mesh draw whose pipeline is still building blocks, counted as mesh_direct, and draws.
-  // The indirect mesh draw, a task draw, is the baseline that differs only in being indirect, and is
-  // counted as mesh_task, so neither name can stand for both kinds.
+  // With --deferred-mesh-draws on, a direct mesh draw whose pipeline is still building becomes a hole,
+  // and once resolved it drew exactly what the same draw drew blocking with the flag off, which is
+  // counted as mesh_direct. The indirect mesh draw is the baseline that blocks either way, counted as
+  // mesh_task, so only direct mesh draws are let through.
+  // An indexed direct mesh draw does the same: blocking it covers the target, which reading from the
+  // first index does not, so the indices it read are the ones asked for. Its hole, recorded after a
+  // larger buffer replaced the indices' buffer, draws exactly the same pixels.
   void CheckDeferredMeshDraws() {
     constexpr const char *name = "DeferredMeshDraws";
-    const auto blocking = RunMeshDraw(name, MeshDrawKind::Direct);
-    Require(name, "direct blocks",
+    const auto blocking = RunMeshDraw(name, false, MeshDrawKind::Direct);
+    Require(name, "off blocks",
             blocking.holes == 0 && blocking.ineligible == IneligibleCounts{{"mesh_direct", 1}} &&
                 AllDrawn(blocking.pixels),
-            "the direct mesh draw was deferred, miscounted, or did not draw");
+            "with the flag off the direct mesh draw was deferred, miscounted, or did not draw");
+    const auto deferred = RunMeshDraw(name, true, MeshDrawKind::Direct);
+    Require(name, "on defers", deferred.holes == 1 && deferred.ineligible.empty(),
+            "with the flag on the direct mesh draw was not deferred");
+    Require(name, "hole draws the same", deferred.pixels == blocking.pixels,
+            "the resolved mesh hole drew something other than the blocking draw");
 
-    const auto indirect = RunMeshDraw(name, MeshDrawKind::Indirect);
+    const auto indexed_blocking = RunMeshDraw(name, false, MeshDrawKind::Indexed);
+    const auto from_start       = RunMeshDraw(name, false, MeshDrawKind::IndexedFromStart);
+    Require(name, "indexed blocking covers",
+            indexed_blocking.holes == 0 && AllDrawn(indexed_blocking.pixels) && from_start.holes == 0 &&
+                AllSentinelColor(from_start.pixels),
+            "the indexed mesh draw did not show which indices it read");
+    const auto indexed_deferred = RunMeshDraw(name, true, MeshDrawKind::Indexed);
+    Require(name, "indexed hole draws the same",
+            indexed_deferred.holes == 1 && indexed_deferred.pixels == indexed_blocking.pixels,
+            "the indexed mesh hole was not deferred, or read other indices than the blocking draw");
+
+    const auto indirect = RunMeshDraw(name, true, MeshDrawKind::Indirect);
     Require(name, "indirect blocks",
             indirect.holes == 0 && indirect.ineligible == IneligibleCounts{{"mesh_task", 1}},
             "an indirect mesh draw was deferred, or not counted as mesh_task, which an indirect mesh draw is");
