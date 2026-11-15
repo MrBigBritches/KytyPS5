@@ -1691,6 +1691,156 @@
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  // Dispatches a compute shader that stores the four words {3, 1, 0, 0}, a draw record of three
+  // vertices and one instance, to guest memory at `address`, so the record exists only on the GPU.
+  void RecordComputeArgs(AsyncDrawRig &rig, uint64_t address) {
+    static const auto code = [] {
+      std::vector<u32> shader;
+      AppendVMovU32(&shader, 1, 3);
+      AppendVMovU32(&shader, 2, 1);
+      AppendVMovU32(&shader, 3, 0);
+      AppendVMovU32(&shader, 4, 0);
+      AppendVMovU32(&shader, 20, 0);
+      shader.insert(shader.end(), {EncodeMubuf0(0x1e), EncodeMubuf1(1, 0, 20)});
+      AppendEnd(&shader);
+      return shader;
+    }();
+    const auto code_address = reinterpret_cast<uint64_t>(code.data());
+    ShaderMapUserData(code_address, {.type = Prospero::ShaderBinaryType::kCs,
+                                     .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
+    ShaderBufferResource output{};
+    output.UpdateAddress48(address);
+    output.fields[2] = 4 * sizeof(u32);
+    output.fields[3] = DstSel(4, 5, 6, 7) | (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u);
+    rig.shaders.SetCsShader({.data_addr = code_address, .num_thread_x = 1, .num_thread_y = 1,
+                             .num_thread_z = 1, .wave_size = 64, .user_sgpr = 4});
+    for (u32 field = 0; field < 4; ++field) rig.shaders.SetCsUserSgpr(field, output.fields[field]);
+    rig.context->GetRenderExecutor().DispatchDirect(rig.Scheduler().Current(), 1, 1, 1, 0x41u, false);
+  }
+
+  // The indirect draws of RunIndirectDraw. Auto reads {3, 1, 0, 0} written by the CPU, and
+  // AutoFromCompute the same record written by a compute dispatch just before the draw. Indexed
+  // reads indices {0, 0, 0, 0, 1, 2} from the record's first index 3, so only the record's own first
+  // index covers the target. MeshTask is the task mesh draw of the GpuMeshIndirectDraw test.
+  enum class IndirectDrawKind { Auto, AutoFromCompute, Indexed, MeshTask };
+
+  // Makes one indirect draw of `kind` with its pipeline held and deferred draws on, and returns what
+  // it left once the scheduler finished. `indirect` sets --deferred-indirect-draws for the run.
+  MeshDrawRun RunIndirectDraw(const char *name, bool indirect, IndirectDrawKind kind) {
+    PipelineCacheTestAccess::BuildHold hold;
+    AsyncDrawRig rig(*this, false, false, false, false, true, true, false, indirect);
+    auto &scheduler = rig.Scheduler();
+    CommandSchedulerTestAccess::AllowThisThread(scheduler);
+    std::optional<GpuScope> gpu;
+    if (kind == IndirectDrawKind::AutoFromCompute) gpu.emplace(rig);
+    rig.PaintSentinels();
+    if (kind == IndirectDrawKind::MeshTask) {
+      UseMeshVertexStage(rig);
+    }
+    PipelineCacheTestAccess::HoldBuildQueue(rig.Pipelines(), hold);
+    Common::FirstRunReport::Global().Reset();
+    // The records sit a little into a page of zeros, so a draw that ignored their offset in the
+    // buffer would read zeros and draw nothing.
+    constexpr uint64_t data_offset = 0x200000;
+    constexpr uint64_t args_into   = 0x100;
+    constexpr uint32_t stride      = 32;
+    const uint64_t data_address = AsyncBase + data_offset;
+    const uint64_t args_address = data_address + args_into;
+    bool drawn = false;
+    if (kind == IndirectDrawKind::Auto || kind == IndirectDrawKind::AutoFromCompute) {
+      if (kind == IndirectDrawKind::Auto) {
+        const vk::DrawIndirectCommand record{3, 1, 0, 0};
+        std::memcpy(reinterpret_cast<void *>(args_address), &record, sizeof(record));
+        // A buffer from the page start, so the record sits at a non-zero offset in the buffer the
+        // draw finds, as the compute case's does.
+        (void)rig.context->GetBufferCache().ObtainBuffer(data_address, BufferCache::CACHING_PAGESIZE * 2, false);
+      } else {
+        RecordComputeArgs(rig, args_address);
+      }
+      drawn = rig.Draw({.indirect = {args_address, 1, stride, {}}});
+    } else if (kind == IndirectDrawKind::Indexed) {
+      constexpr std::array<u32, 6> indices{0, 0, 0, 0, 1, 2};
+      const uint64_t index_address = data_address + 0x800;
+      std::memcpy(reinterpret_cast<void *>(index_address), indices.data(), sizeof(indices));
+      const vk::DrawIndexedIndirectCommand record{3, 1, 3, 0, 0};
+      std::memcpy(reinterpret_cast<void *>(args_address), &record, sizeof(record));
+      drawn = RenderExecutorTestAccess::DrawIndex(
+          rig.context->GetRenderExecutor(), scheduler.Current(),
+          {.index_count = static_cast<u32>(indices.size()), .index_addr = reinterpret_cast<const void *>(index_address),
+           .index_type_and_size = 1, .indirect = {args_address, 1, stride, {}}});
+    } else {
+      // As in GpuMeshIndirectDraw: an empty record, then vertices 1 to 9 with first instance 5, which
+      // the packet patches into user SGPRs 0 and 1. The records are cached rather than streamed.
+      const vk::DrawIndirectCommand records[]{{0, 1, 0, 0}, {9, 1, 1, 5}};
+      std::memcpy(reinterpret_cast<void *>(args_address), records, sizeof(records));
+      rig.shaders.SetGsUserSgpr(0, 0);
+      rig.shaders.SetGsUserSgpr(1, 0);
+      (void)rig.context->GetBufferCache().ObtainBuffer(data_address, BufferCache::CACHING_PAGESIZE * 2, false);
+      drawn = rig.Draw({.indirect = {args_address, 2, stride, {0, 1}}});
+    }
+    Require(name, "indirect draw", drawn, "the draw reported failure");
+    // A larger buffer over the records replaces the one the draw obtained before the hole is
+    // recorded, so a hole that read a stale buffer would show it.
+    (void)rig.context->GetBufferCache().ObtainBuffer(data_address - BufferCache::CACHING_PAGESIZE,
+                                                     BufferCache::CACHING_PAGESIZE * 4, false);
+    MeshDrawRun run{.holes = static_cast<uint32_t>(scheduler.PendingHoleCount()), .ineligible = DeferredIneligible()};
+    hold.release = true;
+    scheduler.Finish();
+    run.pixels = rig.ReadColor();
+    if (kind == IndirectDrawKind::AutoFromCompute) {
+      // Read back while the guest GPU is still there, which also shows the dispatch wrote the record
+      // the draw read, where the CPU copy held zeros.
+      rig.context->GetBufferCache().ReadMemory(args_address, 4 * sizeof(u32));
+      std::array<u32, 4> words{};
+      Require(name, "compute record",
+              LibKernel::Memory::TryReadBacking(args_address, words.data(), sizeof(words)) &&
+                  words == std::array<u32, 4>{3, 1, 0, 0},
+              "the compute dispatch did not write the draw record");
+    }
+    return run;
+  }
+
+  // With --deferred-indirect-draws off each GPU-read indirect draw blocks, counted as indirect, and
+  // covers the target. With it on each becomes a hole that, once resolved, drew exactly the blocking draw's
+  // pixels: records written by the CPU, records written by a compute dispatch before the draw, and an
+  // indexed record whose first index decides coverage. Each record sits at a non-zero offset in its
+  // buffer, and in each a larger buffer replaced the records' buffer before the resolve.
+  void CheckDeferredIndirectDraws() {
+    constexpr const char *name = "DeferredIndirectDraws";
+    const std::array<std::pair<IndirectDrawKind, const char *>, 3> kinds{{
+        {IndirectDrawKind::Auto, "auto"},
+        {IndirectDrawKind::AutoFromCompute, "compute args"},
+        {IndirectDrawKind::Indexed, "indexed"},
+    }};
+    for (const auto &[kind, label] : kinds) {
+      const auto blocking = RunIndirectDraw(name, false, kind);
+      const auto deferred = RunIndirectDraw(name, true, kind);
+      if (blocking.holes != 0 || !AllDrawn(blocking.pixels) || deferred.holes != 1 ||
+          deferred.pixels != blocking.pixels) {
+        std::fprintf(stderr, "DeferredIndirectDraws: %s blocking holes=%u covered=%d deferred holes=%u same=%d\n",
+                     label, blocking.holes, AllDrawn(blocking.pixels) ? 1 : 0, deferred.holes,
+                     deferred.pixels == blocking.pixels ? 1 : 0);
+      }
+      Require(name, "off blocks and covers",
+              blocking.holes == 0 && blocking.ineligible == IneligibleCounts{{"indirect", 1}} &&
+                  AllDrawn(blocking.pixels),
+              "an indirect draw was deferred with the flag off, miscounted, or did not cover");
+      Require(name, "on defers and draws the same",
+              deferred.holes == 1 && deferred.ineligible.empty() && deferred.pixels == blocking.pixels,
+              "an indirect hole was not made, or drew other pixels than the blocking draw");
+    }
+    CheckDeferredMeshTaskDraws(name);
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // The task mesh draw stays blocked, counted as mesh_task, with --deferred-indirect-draws on.
+  void CheckDeferredMeshTaskDraws(const char *name) {
+    const auto indirect_only = RunIndirectDraw(name, true, IndirectDrawKind::MeshTask);
+    Require(name, "task blocks under indirect",
+            indirect_only.holes == 0 && indirect_only.ineligible == IneligibleCounts{{"mesh_task", 1}},
+            "a task mesh draw was deferred by the indirect switch, or not counted as mesh_task");
+  }
+
   void CheckDeferredDraws() {
     CheckDeferredOrderEquivalence();
     CheckDeferredDepthClear();
@@ -1698,6 +1848,7 @@
     CheckDeferredHtileClear();
     CheckDeferredEligibility();
     CheckDeferredMeshDraws();
+    CheckDeferredIndirectDraws();
     CheckDeferredRegistersAfterHole();
     CheckDeferredQueryOpenedAfterHole();
     CheckDeferredFlagStandsAlone();

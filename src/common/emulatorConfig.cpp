@@ -313,6 +313,10 @@ bool DeferredMeshDrawsEnabled() {
 	return g_config->deferred_mesh_draws_enabled;
 }
 
+bool DeferredIndirectDrawsEnabled() {
+	return g_config->deferred_indirect_draws_enabled;
+}
+
 bool GraphicsPipelineLibraryEnabled() {
 	return g_config->graphics_pipeline_library_enabled;
 }

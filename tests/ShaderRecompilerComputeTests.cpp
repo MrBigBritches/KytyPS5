@@ -2785,31 +2785,34 @@ void CheckNativeFloatMinMaxConfig() {
   std::printf("[host]    %-32s ok\n", name);
 }
 
-// What the three deferred draw accessors answer for the Config that is loaded.
+// What the four deferred draw accessors answer for the Config that is loaded.
 struct DeferredDrawAccessors {
   bool deferred = false;
   bool non_push = false;
   bool mesh = false;
+  bool indirect = false;
   bool operator==(const DeferredDrawAccessors &) const = default;
 };
 
-// Loads `options` with printf silenced and reads the three deferred draw accessors.
+// Loads `options` with printf silenced and reads the four deferred draw accessors.
 DeferredDrawAccessors LoadDeferredDrawAccessors(Config::ConfigOptions options) {
   options.printf_direction = Config::LogDirection::Silent;
   Config::Load(options);
   return {Config::DeferredPipelineDrawsEnabled(), Config::DeferredNonPushDrawsEnabled(),
-          Config::DeferredMeshDrawsEnabled()};
+          Config::DeferredMeshDrawsEnabled(), Config::DeferredIndirectDrawsEnabled()};
 }
 
-// --deferred-mesh-draws is off by default, and its field turns on its own accessor alone. The default
-// Config is the baseline, so an accessor that always answers on fails there. It is loaded next to the
-// two sibling deferral flags, so an accessor that reads a sibling's field fails on the sibling, and one
-// that turns on --deferred-pipeline-draws, which the flag needs but does not imply, fails on its own
-// load. The CLI test only proves the flag name is accepted, so this pins what its field does.
+// --deferred-mesh-draws and --deferred-indirect-draws are off by default, and each field turns on its
+// own accessor alone. The default Config is the baseline, so an accessor that always answers on fails
+// there. Each is loaded next to the other and to the two sibling deferral flags, so an accessor that
+// reads a sibling's field fails on the sibling, and one that turns on --deferred-pipeline-draws, which
+// the flags need but do not imply, fails on its own load. The CLI tests only prove the flag names are
+// accepted, so this pins what their fields do.
 void CheckDeferredDrawFlagsConfig() {
   constexpr const char *name = "DeferredDrawFlagsConfig";
   const auto baseline = LoadDeferredDrawAccessors({});
   const auto mesh = LoadDeferredDrawAccessors({.deferred_mesh_draws_enabled = true});
+  const auto indirect = LoadDeferredDrawAccessors({.deferred_indirect_draws_enabled = true});
   const auto deferred = LoadDeferredDrawAccessors({.deferred_pipeline_draws_enabled = true});
   const auto non_push = LoadDeferredDrawAccessors({.deferred_non_push_draws_enabled = true});
   Config::Load({.printf_direction = Config::LogDirection::Silent});
@@ -2817,9 +2820,11 @@ void CheckDeferredDrawFlagsConfig() {
           "a default Config turned on a deferred draw flag");
   Require(name, "mesh alone", mesh == DeferredDrawAccessors{.mesh = true},
           "the mesh field did not turn on the mesh accessor alone");
+  Require(name, "indirect alone", indirect == DeferredDrawAccessors{.indirect = true},
+          "the indirect field did not turn on the indirect accessor alone");
   Require(name, "siblings leave them off",
           deferred == DeferredDrawAccessors{.deferred = true} && non_push == DeferredDrawAccessors{.non_push = true},
-          "a mesh accessor answered on for another deferral flag");
+          "a mesh or indirect accessor answered on for another deferral flag");
   std::printf("[host]    %-32s ok\n", name);
 }
 
@@ -19848,10 +19853,11 @@ public:
     // `depth_only` turns on the second mode instead. `use_htile` gives the depth target HTILE.
     // `deferred` turns on --deferred-pipeline-draws, with or without `async`.
     // `deferred_non_push` turns on --deferred-non-push-draws, which does nothing without `deferred`.
-    // `deferred_mesh` turns on --deferred-mesh-draws, which also does nothing without `deferred`.
+    // `deferred_mesh` and `deferred_indirect` turn on --deferred-mesh-draws and
+    // --deferred-indirect-draws, which also do nothing without `deferred`.
     AsyncDrawRig(VulkanHarness &owner, bool async, bool use_htile = false, bool occlusion = false,
                  bool depth_only = false, bool deferred = false, bool deferred_non_push = false,
-                 bool deferred_mesh = false)
+                 bool deferred_mesh = false, bool deferred_indirect = false)
         : harness(owner), htile(use_htile) {
       Config::Load({.printf_direction = Config::LogDirection::Silent,
                     .occlusion_queries_enabled = occlusion,
@@ -19860,7 +19866,8 @@ public:
                     .async_pipelines_depth_only_enabled = depth_only,
                     .deferred_pipeline_draws_enabled = deferred,
                     .deferred_non_push_draws_enabled = deferred_non_push,
-                    .deferred_mesh_draws_enabled = deferred_mesh});
+                    .deferred_mesh_draws_enabled = deferred_mesh,
+                    .deferred_indirect_draws_enabled = deferred_indirect});
       Common::FirstRunReport::Global().Reset();
       harness.EnsureRuntimeContext();
       harness.SetOcclusionQueries(occlusion);

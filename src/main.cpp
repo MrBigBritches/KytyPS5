@@ -121,6 +121,9 @@ static void PrintUsage() {
 	         "                                       wait. Needs --deferred-pipeline-draws and does not\n"
 	         "                                       turn it on. Mesh draws usually also need\n"
 	         "                                       --deferred-non-push-draws (experimental).\n");
+	::printf("  --deferred-indirect-draws            Also defer indirect draws. Task mesh draws still\n"
+	         "                                       wait. Needs --deferred-pipeline-draws and does not\n"
+	         "                                       turn it on (experimental).\n");
 	::printf("  --graphics-pipeline-library          Enable graphics pipeline libraries on GPUs that link\n"
 	         "                                       them fast, to share stage compiles (experimental).\n");
 	::printf("  --gpu-submit-cadence                 Submit GPU work periodically while a long command\n"
@@ -286,6 +289,7 @@ static constexpr Flag FLAGS[] = {
     {"--pause-warm-up-for-draws", &ConfigOptions::pause_warm_up_for_draws_enabled},
     {"--deferred-non-push-draws", &ConfigOptions::deferred_non_push_draws_enabled},
     {"--deferred-mesh-draws", &ConfigOptions::deferred_mesh_draws_enabled},
+    {"--deferred-indirect-draws", &ConfigOptions::deferred_indirect_draws_enabled},
     {"--graphics-pipeline-library", &ConfigOptions::graphics_pipeline_library_enabled},
     {"--gpu-submit-cadence", &ConfigOptions::gpu_submit_cadence_enabled},
     {"--native-float-minmax", &ConfigOptions::native_float_min_max_enabled},

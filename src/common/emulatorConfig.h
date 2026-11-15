@@ -148,6 +148,9 @@ struct ConfigOptions {
 	// dwords its recording reads. Task mesh draws still block. Needs --deferred-pipeline-draws, and
 	// usually --deferred-non-push-draws, because mesh pipelines are seldom predicted to push.
 	bool                   deferred_mesh_draws_enabled = false;
+	// Lets an indirect draw be deferred too. Its view keeps the arguments buffer and offset, so the
+	// hole reads the records the GPU sees. Task mesh draws still block. Needs --deferred-pipeline-draws.
+	bool                   deferred_indirect_draws_enabled = false;
 	// Asks for graphics pipelines built from separately compiled stage libraries, so a stage shared
 	// by several pipelines compiles once. It does nothing on a device that misses any requirement.
 	bool                   graphics_pipeline_library_enabled = false;
@@ -277,6 +280,9 @@ bool DeferredNonPushDrawsEnabled();
 /// True when --deferred-mesh-draws lets a direct mesh draw be deferred. Task mesh draws still block.
 /// It does nothing without --deferred-pipeline-draws, which it does not turn on.
 bool DeferredMeshDrawsEnabled();
+/// True when --deferred-indirect-draws lets an indirect draw that is not a task mesh draw be
+/// deferred. It does nothing without --deferred-pipeline-draws, which it does not turn on.
+bool DeferredIndirectDrawsEnabled();
 /// True when --graphics-pipeline-library asks for pipelines built from stage libraries. The device
 /// decides whether that happens.
 bool GraphicsPipelineLibraryEnabled();
