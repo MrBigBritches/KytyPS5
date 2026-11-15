@@ -127,6 +127,114 @@ TEST(Assert, ExitMacrosEvaluateOnceAndExitWithTheFatalStatus) {
 	EXPECT_EXIT(EXIT("%d\n", evaluations), testing::ExitedWithCode(FATAL_EXIT_STATUS), "");
 }
 
+// The value the ExitRejectScope cases pass to the EXIT macros, so each macro's text is its own.
+constexpr int REJECTED_VALUE = 7;
+
+// What `exit_call` threw, or an ExitRejected with no file when it threw nothing.
+template <typename ExitCall>
+Common::ExitRejected RejectionOf(ExitCall exit_call) {
+	try {
+		exit_call();
+	} catch (const Common::ExitRejected& rejected) {
+		return rejected;
+	}
+	return {};
+}
+
+// What one EXIT macro threw and the line it sits on. The macros sit in these functions rather than
+// inside EXPECT_EXIT because __LINE__ in a macro argument that spans lines is not reliable.
+struct Raised {
+	Common::ExitRejected rejected;
+	int                  line = 0;
+};
+
+Raised RaiseExit() {
+	const int line = __LINE__ + 1;
+	return {RejectionOf([] { EXIT("%d rejected", REJECTED_VALUE); }), line};
+}
+
+Raised RaiseExitIf() {
+	const int line = __LINE__ + 1;
+	return {RejectionOf([] { EXIT_IF(REJECTED_VALUE > 0); }), line};
+}
+
+Raised RaiseNotImplemented() {
+	const int line = __LINE__ + 1;
+	return {RejectionOf([] { EXIT_NOT_IMPLEMENTED(REJECTED_VALUE != 0); }), line};
+}
+
+// True when `raised` names this file, its own line and `text`. Otherwise it writes what came back
+// to stderr, which EXPECT_EXIT shows when the child's exit code is wrong.
+bool RaisedHere(const Raised& raised, const std::string& text) {
+	const auto& rejected = raised.rejected;
+	const bool  matches = rejected.file != nullptr && std::string_view(rejected.file) == __FILE__ &&
+	                     rejected.line == raised.line && rejected.text == text;
+	if (!matches) {
+		std::fprintf(stderr, "got %s:%d \"%s\", wanted line %d \"%s\"\n",
+		             rejected.file != nullptr ? rejected.file : "(nothing thrown)", rejected.line,
+		             rejected.text.c_str(), raised.line, text.c_str());
+	}
+	return matches;
+}
+
+// Under a scope each macro throws instead of ending the process. The baseline is the case above,
+// where the same macros with no scope exit with the fatal status. A macro that still exits ends the
+// child with that status, and a wrong file, line or text ends it with 1, so both fail here.
+TEST(Assert, ExitRejectScopeTurnsEachExitMacroIntoAThrow) {
+	EXPECT_EXIT(
+	    {
+		    const Common::ExitRejectScope scope;
+		    // Bitwise & so every macro is raised and reported, not just the first mismatch.
+		    const bool all =
+		        RaisedHere(RaiseExit(), std::to_string(REJECTED_VALUE) + " rejected") &
+		        RaisedHere(RaiseExitIf(), "Error: condition (REJECTED_VALUE > 0) is true") &
+		        RaisedHere(RaiseNotImplemented(), "Not implemented (REJECTED_VALUE != 0)");
+		    std::_Exit(all ? 0 : 1);
+	    },
+	    testing::ExitedWithCode(0), "");
+}
+
+// A scope that has ended leaves EXIT fatal. A throw that escapes instead ends the child some other
+// way, which fails the exit code check.
+TEST(Assert, ExitRejectScopeLeavesExitFatalOnceItEnds) {
+	EXPECT_EXIT(
+	    {
+		    {
+			    const Common::ExitRejectScope ended;
+		    }
+		    EXIT("%d after the scope", REJECTED_VALUE);
+	    },
+	    testing::ExitedWithCode(FATAL_EXIT_STATUS), "");
+}
+
+// Closing an inner scope leaves the outer one in force. A depth that is reset rather than counted
+// down makes this EXIT fatal. A depth that is never counted down also passes here, and the case
+// above catches that.
+TEST(Assert, ExitRejectScopesNest) {
+	EXPECT_EXIT(
+	    {
+		    const Common::ExitRejectScope outer;
+		    {
+			    const Common::ExitRejectScope inner;
+		    }
+		    std::_Exit(RaiseExit().rejected.file != nullptr ? 0 : 1);
+	    },
+	    testing::ExitedWithCode(0), "");
+}
+
+// A scope covers only the thread that holds it, so EXIT on another thread still ends the process.
+// A depth shared between threads makes the other thread throw, and the uncaught throw ends the
+// child some other way.
+TEST(Assert, ExitRejectScopeCoversOnlyItsOwnThread) {
+	EXPECT_EXIT(
+	    {
+		    const Common::ExitRejectScope held_here;
+		    std::thread([] { EXIT("%d on another thread", REJECTED_VALUE); }).join();
+		    std::_Exit(0);
+	    },
+	    testing::ExitedWithCode(FATAL_EXIT_STATUS), "");
+}
+
 TEST(File, MissingFileStaysInvalidAndCreatedFileRoundTrips) {
 	const auto path = std::filesystem::temp_directory_path() / "kyty_common_file_test.bin";
 	std::filesystem::remove(path);

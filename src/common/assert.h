@@ -4,6 +4,7 @@
 #include "common/common.h"
 #include "common/logging/log.h"
 
+#include <string>
 #include <string_view>
 
 namespace Common {
@@ -11,6 +12,27 @@ namespace Common {
 [[noreturn]] void DbgExitHandler(char const* file, int line, std::string_view text);
 [[noreturn]] void DbgExitIfHandler(char const* expr, char const* file, int line);
 [[noreturn]] void DbgNotImplementedHandler(char const* expr, char const* file, int line);
+
+/// What the three handlers above throw instead of exiting while an ExitRejectScope is active on the
+/// calling thread (experimental).
+struct ExitRejected {
+	const char* file = nullptr;
+	int         line = 0;
+	std::string text;
+};
+
+/// Makes EXIT, EXIT_IF and EXIT_NOT_IMPLEMENTED on this thread throw ExitRejected instead of ending the
+/// process while it lives (experimental). The graphics prescan's worker holds one around translation and
+/// compilation, whose inputs come from guest memory read ahead of the draw, so a check that fails
+/// there drops one job instead of the run. It must never be held where a throw cannot unwind, such as
+/// through generated code or a noexcept frame. Scopes nest.
+class ExitRejectScope {
+public:
+	ExitRejectScope() noexcept;
+	~ExitRejectScope();
+	ExitRejectScope(const ExitRejectScope&)            = delete;
+	ExitRejectScope& operator=(const ExitRejectScope&) = delete;
+};
 
 } // namespace Common
 
