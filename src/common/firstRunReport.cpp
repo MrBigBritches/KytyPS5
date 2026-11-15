@@ -397,6 +397,11 @@ void Report::AddViewHistoryCount(ViewHistoryCount which) {
 	m_view_history[static_cast<size_t>(which)]++;
 }
 
+void Report::AddColorCompletedFrames(uint32_t targets) {
+	std::lock_guard lock(m_mutex);
+	m_color_completed_frames += targets;
+}
+
 void Report::AddRefusal(std::string_view reason, double blocked_ms) {
 	std::lock_guard lock(m_mutex);
 	const auto found = std::ranges::find(m_refusals, reason, &Refusal::reason);
@@ -654,6 +659,7 @@ void Report::Reset() {
 	m_skips_by_target.clear();
 	m_sampled_after_skip.clear();
 	m_view_history = {};
+	m_color_completed_frames = 0;
 	m_refusals.clear();
 	m_deferred_resolves.clear();
 	m_deferred_resolves_per_flip.clear();
@@ -806,6 +812,7 @@ Summary Report::Summarize() const {
 	summary.skips_by_target     = m_skips_by_target;
 	summary.sampled_after_skip_by_target = m_sampled_after_skip;
 	summary.view_history                 = m_view_history;
+	summary.color_completed_frames       = m_color_completed_frames;
 	summary.refusals                     = m_refusals;
 	CopyDeferredLocked(summary);
 	summary.submit_leads = SummarizeSubmitLeads(m_compiles);
@@ -956,7 +963,8 @@ nlohmann::json SkipsToJson(const Summary& summary) {
 	        {"by_target_class", by_target},
 	        {"sampled_after_skip_by_target_class", sampled},
 	        {"refused", refused},
-	        {"view_history", ViewHistoryToJson(summary.view_history)}};
+	        {"view_history", ViewHistoryToJson(summary.view_history)},
+	        {"color_completed_frames", summary.color_completed_frames}};
 }
 
 // Writes one row per draw that could not be deferred and waited for its pipeline.
@@ -1011,6 +1019,7 @@ nlohmann::json SkipTargetToJson(const SkipTargetFacts& facts) {
 	        {"history", facts.history},
 	        {"draws_this_frame", facts.draws_this_frame},
 	        {"draws_last_frame", facts.draws_last_frame},
+	        {"draws_frame_before_last", facts.draws_frame_before_last},
 	        {"cleared_this_frame", facts.cleared_this_frame},
 	        {"cleared_last_frame", facts.cleared_last_frame},
 	        {"latest_attached_ago", facts.latest_attached_ago},

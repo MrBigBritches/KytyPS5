@@ -21240,6 +21240,271 @@ public:
             "a clear of the whole image did not take its skip mark");
   }
 
+  // Colour draws so far in the frame of a draw early in its colour pass, as a game run showed.
+  static constexpr uint32_t GatePartialColorDraws = 3;
+  // Colour draws in the frame of a target drawn now and then, which a game run showed refused.
+  static constexpr uint32_t GateIntermittentColorDraws = 6;
+  // Colour draws two frames back in the facts case, unlike any other frame's count there.
+  static constexpr uint32_t GateBeforeLastColorDraws = 5;
+
+  // A fresh history with `counts[f]` events noted in frame f, from tick 0. A count of 0 leaves a gap.
+  static FrameHistory NotedHistory(std::initializer_list<uint32_t> counts) {
+    FrameHistory history;
+    uint64_t tick = 0;
+    for (const uint32_t count : counts) {
+      for (uint32_t event = 0; event < count; event++) history.Note(tick);
+      tick++;
+    }
+    return history;
+  }
+
+  // The completed frames of a history. Eight events in each of two frames and three so far in a third
+  // pass at that third frame, where the rule of this frame and the last refuses the same history, the
+  // baseline. Each other case differs from it in one frame. A history with three distinct counts
+  // keeps all three, while HappenedIn still knows only the last two frames that had events.
+  static void CheckFrameHistoryCompletedFrames() {
+    constexpr const char *name = "FrameHistoryCompletedFrames";
+    constexpr uint32_t few = MIN_DRAWS_FOR_SKIP - 1;
+    constexpr uint32_t partial = GatePartialColorDraws;
+    const auto steady = NotedHistory({MIN_DRAWS_FOR_SKIP, MIN_DRAWS_FOR_SKIP, partial});
+    Require(name, "partial frame", steady.InLastTwoCompletedFrames(2, MIN_DRAWS_FOR_SKIP),
+            "eight events in each of the two frames before a partial frame did not pass");
+    Require(name, "old rule refuses it", !steady.InConsecutiveFrames(2, MIN_DRAWS_FOR_SKIP),
+            "the rule of this frame and the last passed a frame with three events");
+    Require(name, "nothing this frame",
+            NotedHistory({MIN_DRAWS_FOR_SKIP, MIN_DRAWS_FOR_SKIP}).InLastTwoCompletedFrames(2, MIN_DRAWS_FOR_SKIP),
+            "two full frames did not pass before this frame's first event");
+    Require(name, "frame before last short",
+            !NotedHistory({few, MIN_DRAWS_FOR_SKIP, partial}).InLastTwoCompletedFrames(2, MIN_DRAWS_FOR_SKIP),
+            "a frame before last with too few events passed");
+    Require(name, "last frame short",
+            !NotedHistory({MIN_DRAWS_FOR_SKIP, few, partial}).InLastTwoCompletedFrames(2, MIN_DRAWS_FOR_SKIP),
+            "a last frame with too few events passed");
+    // The full frame two back is older than the gap, so a history that kept it as the frame before
+    // last would pass. With no gap, the baseline, it passes.
+    Require(name, "gap before last",
+            !NotedHistory({MIN_DRAWS_FOR_SKIP, 0, MIN_DRAWS_FOR_SKIP, partial})
+                 .InLastTwoCompletedFrames(3, MIN_DRAWS_FOR_SKIP) &&
+                NotedHistory({MIN_DRAWS_FOR_SKIP, MIN_DRAWS_FOR_SKIP, MIN_DRAWS_FOR_SKIP, partial})
+                    .InLastTwoCompletedFrames(3, MIN_DRAWS_FOR_SKIP),
+            "a frame with no events counted as the frame before last");
+    const auto distinct = NotedHistory({MIN_DRAWS_FOR_SKIP + 1, MIN_DRAWS_FOR_SKIP + 2, partial});
+    Require(name, "three counts",
+            distinct.CountIn(0) == MIN_DRAWS_FOR_SKIP + 1 && distinct.CountIn(1) == MIN_DRAWS_FOR_SKIP + 2 &&
+                distinct.CountIn(2) == partial && distinct.CountIn(3) == 0,
+            "a frame's count was lost or taken from another frame");
+    Require(name, "HappenedIn unchanged",
+            !distinct.HappenedIn(0) && distinct.HappenedIn(1) && distinct.HappenedIn(2),
+            "HappenedIn now reaches past the last two frames that had events");
+  }
+
+  // Plays frames into one layer of the layered case at `slot`. In frame f the colour view is drawn
+  // color_draws[f] times and the depth view MIN_DRAWS_FOR_SKIP times with its clear. Then asks about
+  // one more draw into that layer, which is not noted.
+  SkipRefusal RangeColourRefusal(GateRig &rig, uint32_t slot, std::initializer_list<uint32_t> color_draws) {
+    const auto state = RangeState(rig, RangeTargets(rig, slot), {.base_layer = 2});
+    size_t frame = 0;
+    for (const uint32_t colour : color_draws) {
+      for (uint32_t draw = 0; draw < std::max(colour, MIN_DRAWS_FOR_SKIP); draw++) {
+        auto drawn = state;
+        if (draw >= colour) drawn.color_count = 0;
+        if (draw >= MIN_DRAWS_FOR_SKIP) drawn.depth_info = {};
+        NoteDrawTargets(rig.Cache(), drawn);
+      }
+      if (++frame < color_draws.size()) rig.Cache().RunGarbageCollector();
+    }
+    return ExplainSkipRefusal(rig.Cache(), state, false);
+  }
+
+  // The completed-frames colour rule of --async-pipelines-prefer-skip. A colour target with eight
+  // draws in each of two frames and three so far in this one passes with the flag and is refused
+  // without it, the baseline that differs only in the flag. Every other colour case differs from it
+  // in one frame and is refused with the flag on too. The intermittent target is refused both ways,
+  // where the same six draws after two full frames pass. The range history follows the same rule.
+  void CheckAsyncGateCompletedColour(GateRig &rig) {
+    constexpr const char *name = "AsyncGateCompletedFrames";
+    const GateFrame good;
+    const uint32_t few = MIN_DRAWS_FOR_SKIP - 1;
+    const GateFrame partial{.color_draws = GatePartialColorDraws};
+    const GateFrame intermittent{.color_draws = GateIntermittentColorDraws};
+    const GateFrame not_drawn{.color = false};
+    LoadGatePreferSkip(false);
+    Require(name, "flag off", GateRefusal(rig, {good, good, partial}) == SkipRefusal::ColorHistory,
+            "a colour target with three draws this frame passed without the flag");
+    Require(name, "intermittent, flag off",
+            GateRefusal(rig, {good, not_drawn, intermittent}) == SkipRefusal::ColorHistory,
+            "a colour target not drawn last frame passed without the flag");
+    LoadGatePreferSkip(true);
+    Require(name, "flag on", GateRefusal(rig, {good, good, partial}) == SkipRefusal::None,
+            "a colour target with eight draws in each completed frame was refused with the flag");
+    Require(name, "one completed frame", GateRefusal(rig, {good, partial}) == SkipRefusal::ColorHistory,
+            "a colour target with one completed frame passed");
+    Require(name, "frame before last short",
+            GateRefusal(rig, {GateFrame{.color_draws = few}, good, partial}) == SkipRefusal::ColorHistory,
+            "a colour target with too few draws in the frame before last passed");
+    Require(name, "last frame short",
+            GateRefusal(rig, {good, GateFrame{.color_draws = few}, partial}) == SkipRefusal::ColorHistory,
+            "a colour target with too few draws last frame passed");
+    Require(name, "six after two full frames", GateRefusal(rig, {good, good, intermittent}) == SkipRefusal::None,
+            "six draws after two full frames were refused with the flag");
+    Require(name, "intermittent, flag on",
+            GateRefusal(rig, {good, not_drawn, intermittent}) == SkipRefusal::ColorHistory,
+            "a colour target not drawn last frame passed with the flag");
+    Require(name, "range passes",
+            RangeColourRefusal(rig, 0, {MIN_DRAWS_FOR_SKIP, MIN_DRAWS_FOR_SKIP, GatePartialColorDraws}) ==
+                SkipRefusal::None,
+            "a layer view with eight draws in each completed frame was refused with the flag");
+    Require(name, "range, one completed frame",
+            RangeColourRefusal(rig, 1, {MIN_DRAWS_FOR_SKIP, GatePartialColorDraws}) == SkipRefusal::ColorHistory,
+            "a layer view with one completed frame passed");
+  }
+
+  // The depth rule is not widened. With the flag, a depth target with too few draws this frame after
+  // two full frames is still refused, and the cache judges its history as too few draws. The same
+  // history judged as a target that needs no clear, the baseline, passes on its completed frames.
+  void CheckAsyncGateCompletedDepth(GateRig &rig) {
+    constexpr const char *name = "AsyncGateCompletedFrames";
+    const GateFrame good;
+    const uint32_t few = MIN_DRAWS_FOR_SKIP - 1;
+    LoadGatePreferSkip(true);
+    DrawRenderState asked{};
+    Require(name, "depth refused",
+            GateRefusal(rig, {good, good, GateFrame{.depth_draws = few}}, {}, false, &asked) ==
+                SkipRefusal::TooFewDraws,
+            "a depth target with too few draws this frame was not refused with the flag");
+    // The assertion above cannot see a leak of the rule to depth, because DepthRefusal turns a
+    // completed-frames verdict on the depth target into TooFewDraws as a safety net. The direct verdict
+    // below is the check that catches such a leak, so it is not redundant and must stay.
+    auto &cache = rig.Cache();
+    const auto &depth = asked.depth_info;
+    Require(name, "depth verdict",
+            cache.JudgeRebuiltEveryFrame(depth.image_id, depth.desc.view_info, true, MIN_DRAWS_FOR_SKIP) ==
+                    TextureCache::RebuildVerdict::TooFewDraws &&
+                cache.JudgeRebuiltEveryFrame(depth.image_id, depth.desc.view_info, false, MIN_DRAWS_FOR_SKIP) ==
+                    TextureCache::RebuildVerdict::RebuiltInCompletedFrames,
+            "the depth rule leaned on completed frames, or the same history without a clear did not");
+  }
+
+  // The report counts each colour target let through by its completed frames. A draw the rule of this
+  // frame and the last allows counts nothing, nor does the partial frame without the flag or with the
+  // report off, the baselines for the rule, the flag and the report switch.
+  void CheckAsyncGateCompletedReport(GateRig &rig) {
+    constexpr const char *name = "AsyncGateCompletedFrames";
+    const GateFrame good;
+    const GateFrame partial{.color_draws = GatePartialColorDraws};
+    const auto counted = [&](bool on, bool report_on, const GateScript &frames) {
+      // Loading the Config resets the report switch, which is set again below.
+      LoadGatePreferSkip(on);
+      Common::FirstRunReport::Configure(report_on, false);
+      Common::FirstRunReport::Global().Reset();
+      (void)GateRefusal(rig, frames);
+      const auto count = Common::FirstRunReport::Global().Summarize().color_completed_frames;
+      Common::FirstRunReport::Configure(false, false);
+      return count;
+    };
+    Require(name, "counted", counted(true, true, {good, good, partial}) == 1,
+            "a colour target let through by its completed frames was not counted once");
+    Require(name, "old rule not counted", counted(true, true, {good, good, good}) == 0,
+            "a colour target the rule of this frame and the last allowed was counted");
+    Require(name, "flag off not counted", counted(false, true, {good, good, partial}) == 0,
+            "a refused draw without the flag was counted");
+    Require(name, "report off not counted", counted(true, false, {good, good, partial}) == 0,
+            "the count grew with the report off");
+    CheckAsyncGateCompletedTwoColour(rig);
+  }
+
+  // The frames of the two-colour case, three per colour target.
+  using TwoColourDraws = std::array<std::array<uint32_t, 3>, 2>;
+
+  // A draw into a depth target and two colour targets of fresh gate cases. In frame f colour target c
+  // is drawn draws[c][f] times and the depth target MIN_DRAWS_FOR_SKIP times with its clear. Asks
+  // about one more draw into all three with the flag and the report on, and returns the refusal and
+  // the completed-frames count it left.
+  std::pair<SkipRefusal, uint64_t> TwoColourCompleted(GateRig &rig, const TwoColourDraws &draws) {
+    const auto first = MakeGateTargets(rig.Cache(), rig.next_case++);
+    const auto second = MakeGateTargets(rig.Cache(), rig.next_case++);
+    const std::array colors{first.color, second.color};
+    const auto state_of = [&](size_t frame, uint32_t draw) {
+      DrawRenderState state{};
+      state.vertex_info[0].stage = {&rig.other_module, &rig.other_resources};
+      state.depth_info = first.depth;
+      state.depth_info.depth_clear_enable = true;
+      for (uint32_t slot = 0; slot < colors.size(); slot++) {
+        if (draw >= draws[slot][frame]) continue;
+        state.color_info[state.color_count] = colors[slot];
+        state.color_info[state.color_count].target_slot = slot;
+        state.color_count++;
+      }
+      return state;
+    };
+    constexpr size_t frames = std::tuple_size_v<TwoColourDraws::value_type>;
+    for (size_t frame = 0; frame < frames; frame++) {
+      for (uint32_t draw = 0; draw < MIN_DRAWS_FOR_SKIP; draw++) NoteDrawTargets(rig.Cache(), state_of(frame, draw));
+      if (frame + 1 < frames) rig.Cache().RunGarbageCollector();
+    }
+    // Both colour targets are drawn in frame 0, so its first draw is the draw into all three.
+    const auto asked = state_of(0, 0);
+    LoadGatePreferSkip(true);
+    Common::FirstRunReport::Configure(true, false);
+    Common::FirstRunReport::Global().Reset();
+    const auto refusal = ExplainSkipRefusal(rig.Cache(), asked, false);
+    const auto count = Common::FirstRunReport::Global().Summarize().color_completed_frames;
+    Common::FirstRunReport::Configure(false, false);
+    return {refusal, count};
+  }
+
+  // The count is only for a draw the rule allows. Colour target 0 passes on its completed frames and
+  // colour target 1, not drawn last frame, is refused, so the draw is refused and nothing is counted.
+  // The same draw with colour target 1 steady, the baseline, is allowed and counts colour target 0.
+  void CheckAsyncGateCompletedTwoColour(GateRig &rig) {
+    constexpr const char *name = "AsyncGateCompletedFrames";
+    const std::array<uint32_t, 3> completed{MIN_DRAWS_FOR_SKIP, MIN_DRAWS_FOR_SKIP, GatePartialColorDraws};
+    const std::array<uint32_t, 3> intermittent{MIN_DRAWS_FOR_SKIP, 0, GateIntermittentColorDraws};
+    const std::array<uint32_t, 3> steady{MIN_DRAWS_FOR_SKIP, MIN_DRAWS_FOR_SKIP, MIN_DRAWS_FOR_SKIP};
+    const auto refused = TwoColourCompleted(rig, {completed, intermittent});
+    Require(name, "refused draw not counted",
+            refused.first == SkipRefusal::ColorHistory && refused.second == 0,
+            "a draw another colour target refused counted the target let through by its completed frames");
+    const auto allowed = TwoColourCompleted(rig, {completed, steady});
+    Require(name, "allowed draw counted", allowed.first == SkipRefusal::None && allowed.second == 1,
+            "an allowed draw did not count its one target let through by its completed frames");
+  }
+
+  // A colour history refusal keeps the draws of the frame before last, the completed-frames rule's
+  // other input. Five, eight and three draws in the three frames differ, so a count taken from another
+  // frame fails. With only two frames, the baseline, there is no frame before last and it is zero.
+  void CheckAsyncGateBeforeLastFacts(GateRig &rig) {
+    constexpr const char *name = "AsyncGateCompletedFrames";
+    const GateFrame good;
+    const GateFrame partial{.color_draws = GatePartialColorDraws};
+    LoadGatePreferSkip(true);
+    const auto three = GateRefusalTargets(rig, {GateFrame{.color_draws = GateBeforeLastColorDraws}, good, partial}, true);
+    Require(name, "before last kept",
+            three.first == SkipRefusal::ColorHistory && three.second != nullptr &&
+                three.second->color.draws_frame_before_last == GateBeforeLastColorDraws &&
+                three.second->color.draws_last_frame == MIN_DRAWS_FOR_SKIP &&
+                three.second->color.draws_this_frame == GatePartialColorDraws &&
+                three.second->depth.draws_frame_before_last == MIN_DRAWS_FOR_SKIP,
+            "the colour target's draws two frames back were not kept, or came from another frame");
+    const auto two = GateRefusalTargets(rig, {good, partial}, true);
+    Require(name, "no frame before last",
+            two.second != nullptr && two.second->color.draws_frame_before_last == 0,
+            "a target with two frames had draws two frames back");
+  }
+
+  // Runs the completed-frames checks on a render context of their own, since the cases of
+  // CheckAsyncGate fill the first one's target addresses.
+  void CheckAsyncGateCompletedFrames() {
+    CheckFrameHistoryCompletedFrames();
+    GateRig rig(*this);
+    CheckAsyncGateCompletedColour(rig);
+    CheckAsyncGateCompletedDepth(rig);
+    CheckAsyncGateCompletedReport(rig);
+    CheckAsyncGateBeforeLastFacts(rig);
+    LoadGatePreferSkip(false);
+    std::printf("[gpu]     %-32s ok\n", "AsyncGateCompletedFrames");
+  }
+
   // Runs the gate checks on one render context.
   void CheckAsyncGate() {
     GateRig rig(*this);
@@ -68761,6 +69026,7 @@ void CheckAsyncPipelines(VulkanHarness &vulkan) {
   run("WarmUpRecordOrder", [&] { CheckWarmUpRecordOrder(vulkan); });
   run("WarmWorkersOption", [&] { CheckWarmWorkersOption(vulkan); });
   vulkan.CheckAsyncGate();
+  vulkan.CheckAsyncGateCompletedFrames();
   vulkan.CheckAsyncDrawsOff();
   vulkan.CheckAsyncDraws();
   vulkan.CheckAsyncDrawIsNotItsOwnEvidence();

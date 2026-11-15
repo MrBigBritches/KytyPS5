@@ -271,8 +271,16 @@ bool AsyncPipelinesDepthOnly();
 /// True when --async-pipelines-prefer-skip asks for a draw the skip rules allow to be skipped
 /// rather than deferred. It implies background builds. The skip rules then also judge a partial
 /// view, such as one layer or mip of an image, by the history of its exact range while the image's
-/// table has room, where without the flag they refuse it. The partial-view part differs from
-/// --async-pipelines on its own, while skipping before deferring only differs when
+/// table has room, where without the flag they refuse it. They also let a color target pass on
+/// enough draws in each of the two completed frames before this one, because a draw early in a color
+/// pass sees only the start of its frame. The depth target rule is unchanged. The risk is that a
+/// skipped draw into a color target that is redrawn every frame but not cleared leaves that object
+/// missing for a frame. The skipped draw can be the frame's first into the target, a full-screen pass
+/// that sets it up, so the target keeps stale content for the frame, and for longer when the game
+/// reads it back as history, as TAA and trail effects do. The first-run report's
+/// skips.sampled_after_skip_by_target_class count is the signal to watch, though it only sees
+/// targets that are sampled later. The partial-view and completed-frames parts differ from
+/// --async-pipelines on their own, while skipping before deferring only differs when
 /// --deferred-pipeline-draws is also on.
 bool AsyncPipelinesPreferSkip();
 /// True when --background-warm-up builds the shader store's compute pipelines after boot.

@@ -440,6 +440,54 @@ void TestResolveRefusalTargets() {
 	      "the depth target object lost or swapped a field");
 }
 
+// The completed-frames count sits under skips.color_completed_frames, beside view_history and not in it.
+// An empty report writes zero, the baseline. Adds of one and two targets write three, so an add that
+// overwrote or counted calls fails, while every view-history count stays zero. Reset forgets them.
+void TestColorCompletedFramesSkips() {
+	constexpr uint32_t first_add  = 1;
+	constexpr uint32_t second_add = 2;
+	auto report = std::make_unique<Report>();
+	const auto empty = nlohmann::json::parse(report->ToJson({}, 0, 1.0, 0.0, {}))["skips"];
+	Check(empty.contains("color_completed_frames") && empty["color_completed_frames"] == 0,
+	      "an empty report lacked the completed-frames count or had one");
+	report->AddColorCompletedFrames(first_add);
+	report->AddColorCompletedFrames(second_add);
+	const auto counted = nlohmann::json::parse(report->ToJson({}, 0, 1.0, 0.0, {}))["skips"];
+	const auto& views  = counted["view_history"];
+	Check(counted["color_completed_frames"] == first_add + second_add &&
+	          views.size() == Common::FirstRunReport::VIEW_HISTORY_COUNT &&
+	          std::ranges::all_of(views, [](const nlohmann::json& count) { return count == 0; }),
+	      "the completed-frames count was not written as added, or landed in view_history");
+	report->Reset();
+	Check(report->Summarize().color_completed_frames == 0, "Reset kept the completed-frames count");
+}
+
+// A refusing target writes the draws of its frame before last under their own key. The colour and depth
+// targets carry different counts, and both differ from their draws of this frame and the last, so a
+// writer that swapped the targets or wrote another frame's count fails.
+void TestSkipTargetBeforeLast() {
+	using Common::FirstRunReport::DeferredResolve;
+	using Common::FirstRunReport::HoleVerdict;
+	constexpr uint32_t color_before_last = 5;
+	constexpr uint32_t depth_before_last = 9;
+	constexpr uint32_t color_this_frame   = 7;
+	auto targets                          = TestSkipTargets(color_this_frame);
+	targets.color.draws_frame_before_last = color_before_last;
+	targets.depth.draws_frame_before_last = depth_before_last;
+	const std::vector<HoleVerdict> holes {{"color_history", true, &targets}};
+	DeferredResolve                row {.trigger = "submit", .holes = 1};
+	Common::FirstRunReport::AddHoleVerdicts(row, holes);
+	auto report = std::make_unique<Report>();
+	report->AddDeferredResolve(row);
+	const auto rows  = nlohmann::json::parse(report->ToJson({}, 0, 1.0, 0.0, {}))["deferred_draws"]["resolves"];
+	const auto& color = rows[0]["critical_color_target"];
+	const auto& depth = rows[0]["critical_depth_target"];
+	Check(color["draws_frame_before_last"] == color_before_last && depth["draws_frame_before_last"] == depth_before_last &&
+	          color["draws_last_frame"] == targets.color.draws_last_frame &&
+	          color["draws_this_frame"] == color_this_frame,
+	      "the draws of the frame before last were not written under their own target and key");
+}
+
 // Deferred draws the S2 rules refused are kept per rule with their waits. An empty report writes an
 // empty object, the baseline. Two rules with distinct counts and waits show that each draw lands under
 // its own rule and adds its own wait, and the would-skip figures stay at 0, so the refusals are not
@@ -2895,6 +2943,8 @@ int main() {
   TestDeferredRefusedSkip();
   TestResolveRefusals();
   TestResolveRefusalTargets();
+  TestSkipTargetBeforeLast();
+  TestColorCompletedFramesSkips();
   TestViewHistorySkips();
   TestWarmTakeRows();
   TestIneligibleWaits();

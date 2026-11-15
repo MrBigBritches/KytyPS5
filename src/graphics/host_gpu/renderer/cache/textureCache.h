@@ -49,6 +49,12 @@ void Resolve(TextureCache& cache, ImageId cached, ImageId merged);
 /// read it, like the other skip rule flags.
 [[nodiscard]] bool ViewHistoryEnabled();
 
+/// Whether --async-pipelines-prefer-skip is on, which also lets a colour target pass on its two
+/// completed frames, the frame before this one and the one before that, when this frame has too few
+/// draws so far. A draw early in a colour pass sees only the start of this frame. A depth target is
+/// never judged this way.
+[[nodiscard]] bool ColorCompletedFramesEnabled();
+
 /// How a view relates to its image for the history. Whole is one level with every layer, of an image
 /// with one level. Layer selects some layers of that level, Mip any other level selection, and Outside
 /// a range past the image or of no levels or layers.
@@ -100,9 +106,13 @@ public:
 	                         bool htile_cleared = false);
 	/// How the view relates to its image, see ClassifyViewRange.
 	[[nodiscard]] ViewRangeScope ViewScopeOf(ImageId id, const ImageViewInfo& view);
-	/// How a target's recent frames judge it for the gate. Only Rebuilt lets a draw skip.
+	/// How a target's recent frames judge it for the gate. Only Rebuilt, and for a colour target
+	/// RebuiltInCompletedFrames, let a draw skip.
 	enum class RebuildVerdict : uint8_t {
 		Rebuilt,
+		/// Too few draws in this frame so far, but enough in each of the two completed frames before
+		/// it. Given only for a target that needs no clear, and only when ColorCompletedFramesEnabled.
+		RebuiltInCompletedFrames,
 		/// The view is not the whole image, as one level with all its layers.
 		PartialView,
 		/// Fewer than the minimum draws in this frame or in the one before.
@@ -119,12 +129,14 @@ public:
 	/// before, and, when `needs_clear`, a clear of the whole target in both. The draws asked about
 	/// are not yet noted, so they are not their own evidence. With --async-pipelines-prefer-skip a
 	/// partial view is judged the same way by the history of its exact range, and is a partial view
-	/// only when that range has none.
+	/// only when that range has none. With that flag a view that does not `needs_clear` also passes,
+	/// as RebuiltInCompletedFrames, on `min_draws` draws in each of the two frames before this one.
 	[[nodiscard]] RebuildVerdict JudgeRebuiltEveryFrame(ImageId id, const ImageViewInfo& view,
 	                                                    bool needs_clear, uint32_t min_draws);
 	/// What the first-run report keeps of a target the skip rule refused a draw for. That is the image's
 	/// size, layers, levels and format, how the view relates to it, and the draws and clears of this
-	/// frame and the one before in the same history JudgeRebuiltEveryFrame reads. It judges nothing.
+	/// frame and the one before, and the draws of the frame before that, in the same history
+	/// JudgeRebuiltEveryFrame reads. It judges nothing.
 	[[nodiscard]] Common::FirstRunReport::SkipTargetFacts DescribeSkipTarget(ImageId id, const ImageViewInfo& view);
 	/// Notes that a draw into the image was skipped, as a depth target when `depth`. Returns true
 	/// when a resident image heap references the image, which then gets no mark. The heap resolves

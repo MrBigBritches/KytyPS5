@@ -173,8 +173,11 @@ struct Refusal {
 /// viewed it whole, as a layer, as a mip or outside it. The draw counts and clears come from the
 /// history the rule judged, the image's own for a whole view and its range's for a partial one, which
 /// `history` names as image, range or none. FrameHistory keeps only the last two frames that had a
-/// draw, so the frame the target was first attached cannot be told. latest_attached_ago and
+/// draw, and the count of the frame right before the earlier of them, so the frame the target was
+/// first attached cannot be told. latest_attached_ago and
 /// previous_attached_ago say how many frames ago those two were, -1 when the frame is not known.
+/// draws_frame_before_last is the draws two frames back, which with draws_last_frame are the inputs
+/// of the completed-frames colour rule of --async-pipelines-prefer-skip.
 struct SkipTargetFacts {
 	uint32_t    width                 = 0;
 	uint32_t    height                = 0;
@@ -185,6 +188,7 @@ struct SkipTargetFacts {
 	std::string history;
 	uint32_t    draws_this_frame      = 0;
 	uint32_t    draws_last_frame      = 0;
+	uint32_t    draws_frame_before_last = 0;
 	bool        cleared_this_frame    = false;
 	bool        cleared_last_frame    = false;
 	int64_t     latest_attached_ago   = -1;
@@ -1051,6 +1055,8 @@ struct Summary {
 	std::vector<std::pair<std::string, uint32_t>>            sampled_after_skip_by_target;
 	// The view-history counts, indexed by ViewHistoryCount.
 	std::array<uint64_t, VIEW_HISTORY_COUNT>                 view_history {};
+	// Colour targets of allowed draws that passed only on their two completed frames.
+	uint64_t                                                 color_completed_frames = 0;
 	std::vector<Refusal>                                     refusals;
 	// Filled only by --deferred-pipeline-draws. Empty or zero otherwise.
 	std::vector<DeferredResolve>                             deferred_resolves;
@@ -1162,6 +1168,10 @@ public:
 	void AddSampledAfterSkip(std::string_view target_class, uint32_t draws);
 	/// Adds one to a view-history count.
 	void AddViewHistoryCount(ViewHistoryCount which);
+	/// Counts `targets` colour targets of an allowed draw that passed only on their two completed
+	/// frames, the rule --async-pipelines-prefer-skip adds, where the rule of this frame and the last
+	/// refused them.
+	void AddColorCompletedFrames(uint32_t targets);
 	/// Records a draw that missed its pipeline and was refused a skip, and how long it waited.
 	void AddRefusal(std::string_view reason, double blocked_ms);
 	/// Records one resolve of deferred draws.
@@ -1338,6 +1348,7 @@ private:
 	std::vector<std::pair<std::string, uint32_t>> m_skips_by_target;
 	std::vector<std::pair<std::string, uint32_t>> m_sampled_after_skip;
 	std::array<uint64_t, VIEW_HISTORY_COUNT>      m_view_history {};
+	uint64_t                                      m_color_completed_frames = 0;
 	std::vector<Refusal>                          m_refusals;
 	std::vector<DeferredResolve>                  m_deferred_resolves;
 	std::vector<uint32_t>                         m_deferred_resolves_per_flip;
@@ -1685,6 +1696,14 @@ inline void AddSampledAfterSkip(std::string_view target_class, uint32_t draws) {
 inline void AddViewHistoryCount(ViewHistoryCount which) {
 	if (Enabled()) {
 		Global().AddViewHistoryCount(which);
+	}
+}
+
+/// Counts colour targets that passed only on their completed frames when the report is on. A draw
+/// with none takes no lock.
+inline void AddColorCompletedFrames(uint32_t targets) {
+	if (targets != 0 && Enabled()) {
+		Global().AddColorCompletedFrames(targets);
 	}
 }
 

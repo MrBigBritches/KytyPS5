@@ -1946,12 +1946,18 @@ void NoteViewRangeUse(Image& image, const ImageViewInfo& view, bool cleared, boo
 }
 
 // The verdict of one set of histories at `tick`, the same rule for a whole image and a view range.
+// With `completed_frames` the two frames before `tick` may stand in for this frame and the one before.
 TextureCache::RebuildVerdict JudgeHistories(const FrameHistory& attached, const FrameHistory& cleared_frames,
                                             const FrameHistory& htile_cleared, uint64_t tick, bool needs_clear,
-                                            uint32_t min_draws) {
+                                            uint32_t min_draws, bool completed_frames) {
 	using RebuildVerdict = TextureCache::RebuildVerdict;
 	const bool cleared = cleared_frames.InConsecutiveFrames(tick, 1);
 	if (!attached.InConsecutiveFrames(tick, min_draws)) {
+		// A draw early in its pass sees only the start of this frame, so frames that are over vouch
+		// for the target instead. Only draws are judged, which is why the caller keeps it to colour.
+		if (completed_frames && attached.InLastTwoCompletedFrames(tick, min_draws)) {
+			return RebuildVerdict::RebuiltInCompletedFrames;
+		}
 		// The frame before is the evidence that does not depend on this frame's own first draw.
 		const bool cleared_before = tick > 0 && cleared_frames.HappenedIn(tick - 1);
 		return needs_clear && !cleared_before ? RebuildVerdict::TooFewDrawsUncleared : RebuildVerdict::TooFewDraws;
@@ -1966,17 +1972,6 @@ TextureCache::RebuildVerdict JudgeHistories(const FrameHistory& attached, const 
 // How many frames before `tick` a noted frame was, or -1 when the history does not know it.
 int64_t FramesAgo(uint64_t frame, uint64_t tick) {
 	return frame == FrameHistory::Never || frame > tick ? -1 : static_cast<int64_t>(tick - frame);
-}
-
-// The events a history noted in `frame`, 0 when it noted none or no longer remembers the frame.
-uint32_t EventsIn(const FrameHistory& history, uint64_t frame) {
-	if (frame == FrameHistory::Never) {
-		return 0;
-	}
-	if (history.latest == frame) {
-		return history.latest_count;
-	}
-	return history.previous == frame ? history.previous_count : 0;
 }
 
 // The report's name of how a view relates to its image.
@@ -1994,8 +1989,10 @@ const char* ViewScopeName(ViewRangeScope scope) {
 void DescribeHistories(const FrameHistory& attached, const FrameHistory& cleared, uint64_t tick,
                        Common::FirstRunReport::SkipTargetFacts& facts) {
 	const uint64_t before         = tick > 0 ? tick - 1 : FrameHistory::Never;
-	facts.draws_this_frame        = EventsIn(attached, tick);
-	facts.draws_last_frame        = EventsIn(attached, before);
+	const uint64_t before_last    = tick > 1 ? tick - 2 : FrameHistory::Never;
+	facts.draws_this_frame        = attached.CountIn(tick);
+	facts.draws_last_frame        = attached.CountIn(before);
+	facts.draws_frame_before_last = attached.CountIn(before_last);
 	facts.cleared_this_frame      = cleared.HappenedIn(tick);
 	facts.cleared_last_frame      = cleared.HappenedIn(before);
 	facts.latest_attached_ago     = FramesAgo(attached.latest, tick);
@@ -2007,6 +2004,11 @@ void DescribeHistories(const FrameHistory& attached, const FrameHistory& cleared
 bool ViewHistoryEnabled() {
 	// Part of prefer-skip because both trade a missing pipeline for a skip more often, and the
 	// per-view history only matters to the skip rules that flag leans on.
+	return Config::AsyncPipelinesPreferSkip();
+}
+
+bool ColorCompletedFramesEnabled() {
+	// Part of prefer-skip because it too trades a missing pipeline for a skip more often.
 	return Config::AsyncPipelinesPreferSkip();
 }
 
@@ -2056,16 +2058,19 @@ TextureCache::RebuildVerdict TextureCache::JudgeRebuiltEveryFrame(ImageId id,
                                                                   uint32_t min_draws) {
 	std::scoped_lock lock {m_lock};
 	const auto&      image = m_slot_images[id];
+	// Only a target that needs no clear, a colour target, may lean on its completed frames. The depth
+	// rule judges its clears in this frame too, so it stays as it was.
+	const bool completed_frames = !needs_clear && ColorCompletedFramesEnabled();
 	if (!ViewIsWholeImage(image, view)) {
 		const auto* range = ViewHistoryEnabled() ? FindViewHistory(image, view) : nullptr;
 		if (range == nullptr) {
 			return RebuildVerdict::PartialView;
 		}
 		return JudgeHistories(range->attached_frames, range->cleared_frames, range->htile_cleared_frames, m_gc_tick,
-		                      needs_clear, min_draws);
+		                      needs_clear, min_draws, completed_frames);
 	}
 	return JudgeHistories(image.attached_frames, image.cleared_frames, image.htile_cleared_frames, m_gc_tick,
-	                      needs_clear, min_draws);
+	                      needs_clear, min_draws, completed_frames);
 }
 
 // Picks the history the same way JudgeRebuiltEveryFrame does, so the facts are those the rule saw.

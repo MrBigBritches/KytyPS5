@@ -40,6 +40,17 @@ void NoteDrawTargets(TextureCache& cache, const DrawRenderState& state);
 ///    is written every frame but never cleared, such as an accumulation or trail buffer drawn
 ///    beside a depth buffer that is cleared, passes, and a skipped draw into it is lost for good.
 ///    That risk is accepted, and the report counts skipped draws that are sampled afterwards.
+///    With --async-pipelines-prefer-skip a color target also passes when it was drawn into that many
+///    times in each of the two completed frames, the frame before this one and the one before that,
+///    whatever this frame holds so far. A draw early in a color pass sees only the start of its
+///    frame, so this frame's count says little. It widens the risk above. A skipped draw into a color
+///    target that is redrawn every frame but not cleared leaves that object missing for a frame. It
+///    can also skip the very first draw of the frame into the target. That draw may be a full-screen
+///    pass that sets up the whole target, which then keeps stale content for the frame, and for
+///    longer when the game reads the target back as history, as TAA and trail effects do. The
+///    skips.sampled_after_skip_by_target_class count of the first-run report is the signal to watch
+///    for this, though it only sees targets that are sampled later. The depth rule is not widened,
+///    so it still needs this frame and its clears.
 ///  - Each target is viewed whole, as one level with all its layers, because the history belongs
 ///    to the image. With --async-pipelines-prefer-skip a partial view, such as one layer or mip, is
 ///    judged instead by the history of its exact range.
@@ -68,7 +79,8 @@ enum class SkipRefusal : uint8_t {
 	/// Fewer draws too, and no register clear in the frame before either, so a lower floor would
 	/// not have helped. A draw is blamed on one of the two, never both.
 	TooFewDrawsAlsoUncleared,
-	/// A color target without enough draws in both frames.
+	/// A color target without enough draws in both frames, nor with --async-pipelines-prefer-skip in
+	/// both completed frames.
 	ColorHistory,
 };
 

@@ -39,6 +39,8 @@ struct ImageUsage {
 
 // The last two frames, as texture cache ticks, in which something happened to an image, with how
 // many times it happened in each. A frame is one tick because the cache ticks once per guest flip.
+// It also keeps the count of the frame right before `previous`, so the two frames before a frame in
+// progress stay known after that frame's first event pushes them back.
 struct FrameHistory {
 	static constexpr uint64_t Never = std::numeric_limits<uint64_t>::max();
 
@@ -46,16 +48,44 @@ struct FrameHistory {
 	uint64_t previous       = Never;
 	uint32_t latest_count   = 0;
 	uint32_t previous_count = 0;
+	// The events of the frame `previous - 1`, or 0 when it had none or is not known. Its frame is
+	// always the one right before `previous`, so it needs no tick of its own. With padding it grows
+	// the history by 8 bytes, from 24 to 32.
+	uint32_t before_previous_count = 0;
 
 	// Notes one event in `tick`.
 	void Note(uint64_t tick) noexcept {
 		if (latest != tick) {
-			previous       = latest;
-			previous_count = latest_count;
-			latest         = tick;
-			latest_count   = 0;
+			// The old previous is the frame right before the new previous only when it came right
+			// before the old latest. Any gap means that frame had no events.
+			before_previous_count = previous != Never && previous + 1u == latest ? previous_count : 0;
+			previous              = latest;
+			previous_count        = latest_count;
+			latest                = tick;
+			latest_count          = 0;
 		}
 		latest_count++;
+	}
+
+	// The events noted in `frame`, or 0 when it had none or is too old for the history to know.
+	[[nodiscard]] uint32_t CountIn(uint64_t frame) const noexcept {
+		if (frame == Never) {
+			return 0;
+		}
+		if (latest == frame) {
+			return latest_count;
+		}
+		if (previous == frame) {
+			return previous_count;
+		}
+		return previous != Never && frame + 1u == previous ? before_previous_count : 0;
+	}
+
+	// Whether the event happened at least `min_count` times in each of the two frames before `tick`,
+	// the last two that are over, whatever `tick` itself holds so far.
+	[[nodiscard]] bool InLastTwoCompletedFrames(uint64_t tick, uint32_t min_count) const noexcept {
+		constexpr uint64_t COMPLETED_FRAMES = 2;
+		return tick >= COMPLETED_FRAMES && CountIn(tick - 1) >= min_count && CountIn(tick - 2) >= min_count;
 	}
 
 	// Whether the event happened at all in the frame `frame`, whatever else happened.

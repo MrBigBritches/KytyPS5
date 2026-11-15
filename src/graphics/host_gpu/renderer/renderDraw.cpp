@@ -523,6 +523,9 @@ static SkipRefusal DepthRefusal(TextureCache::RebuildVerdict verdict) {
 			return SkipRefusal::TooFewDrawsAlsoUncleared;
 		case TextureCache::RebuildVerdict::NotCleared: return SkipRefusal::DepthNotCleared;
 		case TextureCache::RebuildVerdict::HtileClearedOnly: return SkipRefusal::HtileOnlyClear;
+		// The depth rule never asks for the completed frames, and one given anyway still means too
+		// few draws this frame, so it refuses rather than lean on frames whose clears were not judged.
+		case TextureCache::RebuildVerdict::RebuiltInCompletedFrames: return SkipRefusal::TooFewDraws;
 	}
 	return SkipRefusal::None;
 }
@@ -569,6 +572,8 @@ SkipRefusal ExplainSkipRefusal(TextureCache& cache, const DrawRenderState& state
 	if (const auto refusal = DepthRefusal(verdict); refusal != SkipRefusal::None) {
 		return refusal;
 	}
+	// Colour targets that passed only on their completed frames, counted once the draw is allowed.
+	uint32_t completed_frames = 0;
 	for (uint32_t index = 0; index < state.color_count; index++) {
 		const auto& color  = state.color_info[index];
 		const auto  judged = cache.JudgeRebuiltEveryFrame(color.image_id, color.desc.view_info,
@@ -576,7 +581,9 @@ SkipRefusal ExplainSkipRefusal(TextureCache& cache, const DrawRenderState& state
 		if (judged == TextureCache::RebuildVerdict::PartialView) {
 			return SkipRefusal::PartialView;
 		}
-		if (judged != TextureCache::RebuildVerdict::Rebuilt) {
+		if (judged == TextureCache::RebuildVerdict::RebuiltInCompletedFrames) {
+			completed_frames++;
+		} else if (judged != TextureCache::RebuildVerdict::Rebuilt) {
 			if (refusing_color != nullptr) {
 				*refusing_color = index;
 			}
@@ -584,6 +591,7 @@ SkipRefusal ExplainSkipRefusal(TextureCache& cache, const DrawRenderState& state
 		}
 	}
 	NoteViewHistoryVerdict(cache, state);
+	Common::FirstRunReport::AddColorCompletedFrames(completed_frames);
 	return SkipRefusal::None;
 }
 
