@@ -267,6 +267,11 @@ void Report::SetEpoch(int64_t epoch_ns) {
 	m_epoch_ns = epoch_ns;
 }
 
+int64_t Report::EpochNs() const {
+	std::lock_guard lock(m_mutex);
+	return m_epoch_ns;
+}
+
 void Report::AddCompile(Kind kind, uint64_t id, uint64_t id_ps, double create_ms, Thread thread,
                         int64_t start_ns, CompileContext context) {
 	std::lock_guard lock(m_mutex);
@@ -471,6 +476,26 @@ void AddHoleVerdicts(DeferredResolve& row, std::span<const HoleVerdict> holes) {
 	}
 }
 
+void Report::AddPrescanMissRow(const PrescanMissRow& row) {
+	std::lock_guard lock(m_mutex);
+	if (m_prescan_miss_rows.size() >= PRESCAN_MISS_ROW_LIMIT) {
+		m_prescan_miss_rows_dropped++;
+		return;
+	}
+	m_prescan_miss_rows.push_back(row);
+	m_prescan_miss_rows.back().flip = m_flip;
+}
+
+std::vector<PrescanMissRow> Report::PrescanMissRows() const {
+	std::lock_guard lock(m_mutex);
+	return m_prescan_miss_rows;
+}
+
+uint64_t Report::PrescanMissRowsDropped() const {
+	std::lock_guard lock(m_mutex);
+	return m_prescan_miss_rows_dropped;
+}
+
 void Report::AddDeferredRefusedSkip(std::string_view reason, double waited_ms) {
 	std::lock_guard lock(m_mutex);
 	auto            found = m_deferred_refused_skip.find(reason);
@@ -607,6 +632,49 @@ bool Report::HoldsPrescanCacheFinal() const {
 	return m_prescan_cache_final.has_value();
 }
 
+void Report::SetGraphicsPrescanSource(GraphicsPrescanPart part,
+                                      std::function<PrescanGraphicsReport()> source) {
+	const auto      index = static_cast<size_t>(part);
+	std::lock_guard lock(m_graphics_prescan_mutex);
+	m_graphics_prescan_source[index] = std::move(source);
+	m_graphics_prescan_final[index].reset();
+}
+
+void Report::SetGraphicsPrescanFinal(GraphicsPrescanPart part, PrescanGraphicsReport final_figures) {
+	const auto      index = static_cast<size_t>(part);
+	std::lock_guard lock(m_graphics_prescan_mutex);
+	m_graphics_prescan_source[index] = nullptr;
+	m_graphics_prescan_final[index]  = std::move(final_figures);
+}
+
+bool Report::HoldsGraphicsPrescanSource(GraphicsPrescanPart part) const {
+	std::lock_guard lock(m_graphics_prescan_mutex);
+	return static_cast<bool>(m_graphics_prescan_source[static_cast<size_t>(part)]);
+}
+
+std::optional<PrescanGraphicsReport> Report::GraphicsPrescanFigures() const {
+	std::lock_guard                      lock(m_graphics_prescan_mutex);
+	std::optional<PrescanGraphicsReport> merged;
+	for (size_t part = 0; part < GRAPHICS_PRESCAN_PART_COUNT; part++) {
+		std::optional<PrescanGraphicsReport> figures;
+		if (m_graphics_prescan_source[part]) {
+			figures = m_graphics_prescan_source[part]();
+		} else {
+			figures = m_graphics_prescan_final[part];
+		}
+		if (!figures) {
+			continue;
+		}
+		if (!merged) {
+			merged.emplace();
+		}
+		for (auto& group: figures->groups) {
+			merged->groups.push_back(std::move(group));
+		}
+	}
+	return merged;
+}
+
 // Each pair is cleared under its own lock, one lock at a time, as every writer of it takes them.
 void Report::ResetSources() {
 	{
@@ -623,6 +691,13 @@ void Report::ResetSources() {
 		std::lock_guard lock(m_prescan_cache_mutex);
 		m_prescan_cache_source = nullptr;
 		m_prescan_cache_final.reset();
+	}
+	{
+		std::lock_guard lock(m_graphics_prescan_mutex);
+		for (size_t part = 0; part < GRAPHICS_PRESCAN_PART_COUNT; part++) {
+			m_graphics_prescan_source[part] = nullptr;
+			m_graphics_prescan_final[part].reset();
+		}
 	}
 	std::lock_guard lock(m_generation_mutex);
 	m_generation_inactive.reset();
@@ -666,6 +741,8 @@ void Report::Reset() {
 	m_deferred_resolves_this_flip   = 0;
 	m_deferred_ineligible.clear();
 	m_deferred_ineligible_waits.clear();
+	m_prescan_miss_rows.clear();
+	m_prescan_miss_rows_dropped = 0;
 	m_deferred_ineligible_waited_ms.clear();
 	m_deferred_would_skip_draws     = 0;
 	m_deferred_would_skip_waited_ms = 0.0;
@@ -1693,6 +1770,55 @@ std::optional<nlohmann::json> PrescanBlockToJson(const std::optional<PrescanScan
 	return block;
 }
 
+// The prescan_graphics block, one object per group. A whole number is written as an integer, so a
+// count reads as a count, and any other as a number rounded to three places.
+nlohmann::json GraphicsPrescanToJson(const PrescanGraphicsReport& figures) {
+	// Doubles hold integers exactly up to 2^53.
+	constexpr double exact_integer_limit = 9007199254740992.0;
+	nlohmann::json   block               = nlohmann::json::object();
+	for (const auto& group: figures.groups) {
+		auto& object = block[group.name];
+		object       = nlohmann::json::object();
+		const auto number = [&](double value) {
+			const bool whole = value >= 0.0 && value < exact_integer_limit && value == std::floor(value);
+			return whole ? nlohmann::json(static_cast<uint64_t>(value)) : nlohmann::json(Round3(value));
+		};
+		for (const auto& [name, value]: group.figures) {
+			object[name] = number(value);
+		}
+		for (const auto& [name, values]: group.series) {
+			auto& array = object[name];
+			array       = nlohmann::json::array();
+			for (const double value: values) {
+				array.push_back(number(value));
+			}
+		}
+	}
+	return block;
+}
+
+// The graphics prescan's miss rows (experimental). An ago time that did not happen is left out.
+nlohmann::json PrescanMissRowsToJson(const std::vector<PrescanMissRow>& rows, int64_t epoch_ns) {
+	nlohmann::json result = nlohmann::json::array();
+	for (const auto& entry: rows) {
+		nlohmann::json row = {{"stage", entry.stage}, {"id", Hex(entry.id)},   {"hash", Hex(entry.hash)},
+		                      {"kind", entry.kind},   {"flip", entry.flip},    {"seen", entry.seen},
+		                      {"scan", entry.scan},   {"job", entry.job}};
+		if (entry.at_ns != NO_TIME_NS) {
+			row["at_ms"] = RunMs(entry.at_ns, epoch_ns);
+		}
+		for (const auto& [name, ms]: {std::pair {"first_seen_ago_ms", entry.first_seen_ago_ms},
+		                              std::pair {"offered_ago_ms", entry.offered_ago_ms},
+		                              std::pair {"posted_ago_ms", entry.posted_ago_ms}}) {
+			if (ms >= 0.0) {
+				row[name] = Round3(ms);
+			}
+		}
+		result.push_back(std::move(row));
+	}
+	return result;
+}
+
 // The guest audio underruns with each one's time from the run start. count includes the ones that
 // came past the capacity and have no time.
 nlohmann::json AudioUnderrunsToJson(const AudioUnderruns& underruns, int64_t epoch_ns) {
@@ -1911,6 +2037,8 @@ std::string Report::ToJson(const Metadata& metadata, uint64_t audio_holds, doubl
 	}
 	// The prescan block exists only when a scanner or a pipeline cache registered its figures.
 	auto prescan = PrescanBlockToJson(PrescanScanFigures(), PrescanCacheFigures());
+	// The prescan_graphics block exists only when the scanner or the cache registered a part of it.
+	const auto graphics_prescan = GraphicsPrescanFigures();
 
 	// Read once, so the two blocks that come from it agree.
 	const auto machine = ReadMachineInfo();
@@ -1966,6 +2094,14 @@ std::string Report::ToJson(const Metadata& metadata, uint64_t audio_holds, doubl
 	}
 	if (prescan) {
 		report["prescan"] = std::move(*prescan);
+	}
+	// The miss rows join the prescan_graphics block, which they make when no part registered one.
+	const auto miss_rows = PrescanMissRows();
+	if (graphics_prescan || !miss_rows.empty()) {
+		auto block = graphics_prescan ? GraphicsPrescanToJson(*graphics_prescan) : nlohmann::json::object();
+		block["miss_rows"]         = PrescanMissRowsToJson(miss_rows, epoch_ns);
+		block["miss_rows_dropped"] = PrescanMissRowsDropped();
+		report["prescan_graphics"] = std::move(block);
 	}
 	// The title id is not filtered, so bytes that are not UTF-8 are replaced instead of throwing.
 	return report.dump(JSON_INDENT, ' ', false, nlohmann::json::error_handler_t::replace);

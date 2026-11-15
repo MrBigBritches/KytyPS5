@@ -488,6 +488,61 @@ void TestSkipTargetBeforeLast() {
 	      "the draws of the frame before last were not written under their own target and key");
 }
 
+// Miss rows are stamped with the flip and written in the prescan_graphics block, which they make on
+// their own. Two rows with every field different show each lands in its own row, and an ago time of -1
+// is left out where one of 0 or more is written. Up to the limit every row is kept, the baseline, and
+// past it only the rows over the limit are dropped and counted. Reset forgets both.
+void TestPrescanMissRows() {
+	using Common::FirstRunReport::PRESCAN_MISS_ROW_LIMIT;
+	using Common::FirstRunReport::PrescanMissRow;
+	// kMs is defined further down, with the tests that first used it.
+	constexpr int64_t ns_per_ms = 1000000;
+	constexpr int64_t epoch     = 1000 * ns_per_ms;
+	auto              report    = std::make_unique<Report>();
+	report->SetEpoch(epoch);
+	report->OnFlip(3);
+	report->AddPrescanMissRow({.stage = "ps", .id = 0x802fe889a05be672ull, .hash = 0xab, .kind = "unpredicted",
+	                           .at_ns = epoch + 2 * ns_per_ms, .seen = true, .scan = {"recorded", "no_pixel_stage"},
+	                           .job = "too_many_user_data", .first_seen_ago_ms = 1.5, .offered_ago_ms = 0.0});
+	report->OnFlip(4);
+	report->AddPrescanMissRow({.stage = "vs", .id = 0x04618f9b7af84212ull, .hash = 0xcd, .kind = "late",
+	                           .at_ns = epoch + 5 * ns_per_ms, .seen = false, .posted_ago_ms = 9.25});
+	const auto block = nlohmann::json::parse(report->ToJson({}, 0, 1.0, 0.0, {}))["prescan_graphics"];
+	const auto& rows = block["miss_rows"];
+	Check(rows.size() == 2 && block["miss_rows_dropped"] == 0, "the miss rows were not written, or one was dropped");
+	Check(rows[0]["stage"] == "ps" && rows[0]["id"] == "802fe889a05be672" && rows[0]["hash"] == "00000000000000ab" &&
+	          rows[0]["kind"] == "unpredicted" && rows[0]["flip"] == 3 && rows[0]["at_ms"] == 2.0 &&
+	          rows[0]["seen"] == true && rows[0]["scan"] == nlohmann::json::array({"recorded", "no_pixel_stage"}) &&
+	          rows[0]["job"] == "too_many_user_data" &&
+	          rows[0]["first_seen_ago_ms"] == 1.5 && rows[0]["offered_ago_ms"] == 0.0 &&
+	          !rows[0].contains("posted_ago_ms"),
+	      "the first miss row lost a field, or wrote an ago time that did not happen");
+	Check(rows[1]["stage"] == "vs" && rows[1]["id"] == "04618f9b7af84212" && rows[1]["kind"] == "late" &&
+	          rows[1]["flip"] == 4 && rows[1]["seen"] == false && rows[1]["scan"] == nlohmann::json::array({"unknown"}) &&
+	          rows[1]["job"] == "unknown" && rows[1]["posted_ago_ms"] == 9.25 && !rows[1].contains("offered_ago_ms") &&
+	          !rows[1].contains("first_seen_ago_ms"),
+	      "the second miss row lost a field, or took the first row's");
+
+	auto full = std::make_unique<Report>();
+	for (size_t index = 0; index < PRESCAN_MISS_ROW_LIMIT; index++) {
+		full->AddPrescanMissRow({.stage = "ps", .id = index, .kind = "unpredicted"});
+	}
+	Check(full->PrescanMissRows().size() == PRESCAN_MISS_ROW_LIMIT && full->PrescanMissRowsDropped() == 0,
+	      "rows up to the limit were not all kept");
+	constexpr uint64_t over = 3;
+	for (uint64_t index = 0; index < over; index++) {
+		full->AddPrescanMissRow({.stage = "ps", .id = PRESCAN_MISS_ROW_LIMIT + index, .kind = "unpredicted"});
+	}
+	const auto capped = nlohmann::json::parse(full->ToJson({}, 0, 1.0, 0.0, {}))["prescan_graphics"];
+	Check(full->PrescanMissRows().size() == PRESCAN_MISS_ROW_LIMIT && capped["miss_rows"].size() == PRESCAN_MISS_ROW_LIMIT &&
+	          capped["miss_rows_dropped"] == over && full->PrescanMissRows().back().id == PRESCAN_MISS_ROW_LIMIT - 1,
+	      "rows past the limit were kept, or not counted as dropped");
+	full->Reset();
+	Check(full->PrescanMissRows().empty() && full->PrescanMissRowsDropped() == 0 &&
+	          !nlohmann::json::parse(full->ToJson({}, 0, 1.0, 0.0, {})).contains("prescan_graphics"),
+	      "Reset kept the miss rows or their dropped count");
+}
+
 // Deferred draws the S2 rules refused are kept per rule with their waits. An empty report writes an
 // empty object, the baseline. Two rules with distinct counts and waits show that each draw lands under
 // its own rule and adds its own wait, and the would-skip figures stay at 0, so the refusals are not
@@ -2927,7 +2982,97 @@ void TestPrescanCacheFinalWaitsForAWriterInTheSource() {
 	Check(handed_over && left_source, "the hand-over or the writer never finished");
 }
 
+// The prescan_graphics block exists only once a part registered a source, which is the baseline
+// difference. With a source, its groups are written, a count as an integer and a time rounded. With
+// both parts, the scanner's groups and the cache's share the block. Final figures keep the block
+// after the source is gone, and Reset drops it.
+void TestGraphicsPrescanBlock() {
+  using Common::FirstRunReport::GraphicsPrescanPart;
+  using Common::FirstRunReport::PrescanGraphicsReport;
+  Report report;
+  const auto none = nlohmann::json::parse(report.ToJson({}, 0, 1.0, 0.0, {}));
+  Check(!none.contains("prescan_graphics"), "a report with no graphics prescan source had the block");
+
+  report.SetGraphicsPrescanSource(GraphicsPrescanPart::Cache, [] {
+    return PrescanGraphicsReport {{{"worker", {{"posted", 7.0}, {"translate_ms", 1.23456}}}}};
+  });
+  const auto cache_only = nlohmann::json::parse(report.ToJson({}, 0, 1.0, 0.0, {}));
+  Check(cache_only.contains("prescan_graphics") &&
+            cache_only["prescan_graphics"]["worker"]["posted"] == 7 &&
+            cache_only["prescan_graphics"]["worker"]["posted"].is_number_integer() &&
+            cache_only["prescan_graphics"]["worker"]["translate_ms"] == 1.235,
+        "the graphics prescan source's figures were not written");
+
+  report.SetGraphicsPrescanSource(GraphicsPrescanPart::Scanner, [] {
+    return PrescanGraphicsReport {{{"scanner", {{"draws_offered", 3.0}}}}};
+  });
+  report.SetGraphicsPrescanFinal(GraphicsPrescanPart::Cache,
+                                 PrescanGraphicsReport {{{"worker", {{"posted", 9.0}}}}});
+  const auto both = nlohmann::json::parse(report.ToJson({}, 0, 1.0, 0.0, {}))["prescan_graphics"];
+  Check(both["scanner"]["draws_offered"] == 3 && both["worker"]["posted"] == 9 &&
+            !report.HoldsGraphicsPrescanSource(GraphicsPrescanPart::Cache),
+        "the scanner part and the cache's final figures did not share the block");
+
+  report.Reset();
+  const auto reset = nlohmann::json::parse(report.ToJson({}, 0, 1.0, 0.0, {}));
+  Check(!reset.contains("prescan_graphics"), "Reset kept the graphics prescan block");
+}
+
+// A group's series are written as JSON arrays beside its figures, each value as a figure is, a whole
+// number as an integer and any other rounded, and an empty series as an empty array. The baseline is
+// the same group with no series, which writes only its figure, so a series never written, or written
+// as something other than an array, differs.
+void TestGraphicsPrescanSeries() {
+  using Common::FirstRunReport::GraphicsPrescanPart;
+  using Common::FirstRunReport::PrescanGraphicsReport;
+  PrescanGraphicsReport figures {{{"timeline", {{"bins", 3.0}}}}};
+  auto                  report = std::make_unique<Report>();
+  report->SetGraphicsPrescanFinal(GraphicsPrescanPart::Cache, figures);
+  auto baseline = nlohmann::json::parse(report->ToJson({}, 0, 1.0, 0.0, {}))["prescan_graphics"]["timeline"];
+  Check(baseline == nlohmann::json {{"bins", 3}}, "a group with no series wrote more than its figure");
+
+  figures.groups[0].series = {{"busy_ms", {500.0, 0.5, 1.23456}}, {"peak", {}}};
+  report->SetGraphicsPrescanFinal(GraphicsPrescanPart::Cache, figures);
+  auto timeline = nlohmann::json::parse(report->ToJson({}, 0, 1.0, 0.0, {}))["prescan_graphics"]["timeline"];
+  Check(timeline["bins"] == 3 && timeline["busy_ms"] == nlohmann::json::array({500, 0.5, 1.235}) &&
+            timeline["busy_ms"][0].is_number_integer() && timeline["busy_ms"][1].is_number_float() &&
+            timeline["peak"].is_array() && timeline["peak"].empty(),
+        "a series was not written as an array beside the figures, or its values lost their form");
+}
+
+// EpochNs gives back what SetEpoch stored, for a source that keeps its own times from the run start.
+// A new report has no epoch, the baseline, so a getter that never reads the stored epoch differs.
+void TestEpochNsGivesBackTheEpoch() {
+  constexpr int64_t epoch = 1234 * kMs;
+  Report            report;
+  Check(report.EpochNs() == NO_TIME_NS, "a new report already had an epoch");
+  report.SetEpoch(epoch);
+  Check(report.EpochNs() == epoch, "EpochNs did not give back the epoch SetEpoch stored");
+}
+
+// The free AddPrescanMissRow records into the global report only while the report is on. With it off
+// the row is not kept, the baseline, and with it on a second row is, so a wrapper that never forwards
+// or one that ignores the flag differs.
+void TestPrescanMissRowFollowsTheFlag() {
+  auto& global = Common::FirstRunReport::Global();
+  Common::FirstRunReport::Configure(false, false);
+  global.Reset();
+  Common::FirstRunReport::AddPrescanMissRow({.stage = "ps", .id = 1, .kind = "late"});
+  const bool kept_while_off = !global.PrescanMissRows().empty();
+  Common::FirstRunReport::Configure(true, false);
+  Common::FirstRunReport::AddPrescanMissRow({.stage = "vs", .id = 2, .kind = "late"});
+  const auto rows = global.PrescanMissRows();
+  Common::FirstRunReport::Configure(false, false);
+  global.Reset();
+  Check(!kept_while_off && rows.size() == 1 && rows[0].id == 2,
+        "a miss row was kept while the report was off, or lost while it was on");
+}
+
 int main() {
+  TestGraphicsPrescanBlock();
+  TestGraphicsPrescanSeries();
+  TestEpochNsGivesBackTheEpoch();
+  TestPrescanMissRowFollowsTheFlag();
   TestPausesMergeByFlip();
   TestPendingPauseCounts();
   TestOnlyGpuThreadBlocks();
@@ -2945,6 +3090,7 @@ int main() {
   TestResolveRefusalTargets();
   TestSkipTargetBeforeLast();
   TestColorCompletedFramesSkips();
+  TestPrescanMissRows();
   TestViewHistorySkips();
   TestWarmTakeRows();
   TestIneligibleWaits();

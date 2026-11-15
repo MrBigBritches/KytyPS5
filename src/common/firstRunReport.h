@@ -831,6 +831,57 @@ struct PrescanScannerReport {
 	uint64_t offers_dropped = 0;
 };
 
+/// One part of the prescan_graphics block (experimental), as named groups of named numbers, so the
+/// prescan's figures can change without this library knowing each one. A whole number is written
+/// as an integer and any other as a number rounded to three places.
+struct PrescanGraphicsReport {
+	struct Group {
+		std::string                                  name;
+		std::vector<std::pair<std::string, double>> figures;
+		/// Named arrays of the group, such as a timeline, written as JSON arrays beside the figures.
+		std::vector<std::pair<std::string, std::vector<double>>> series;
+	};
+	std::vector<Group> groups;
+};
+
+/// The most graphics prescan miss rows the report keeps. Past it a miss is only counted as dropped.
+inline constexpr size_t PRESCAN_MISS_ROW_LIMIT = 512;
+
+/// The scan or job outcome of a miss row whose shader address the prescan has no sighting of, because
+/// the walk never reached a draw that used it or the sightings were not kept.
+inline constexpr std::string_view PRESCAN_OUTCOME_UNKNOWN = "unknown";
+/// The scan or job outcome of a miss row whose address was sighted, but not by that side.
+inline constexpr std::string_view PRESCAN_OUTCOME_NONE = "none";
+
+/// One shader the GPU thread compiled itself although the graphics prescan was on (experimental). stage
+/// is ps or vs, id the module id as ps and vs are written elsewhere, hash the program's code hash and
+/// kind late, id_differs or unpredicted. Every kind carries what the prescan sighted of the shader's
+/// code address, not only unpredicted. seen says it sighted a draw using that address, scan lists
+/// every verdict the walk gave such draws, empty when only the pipeline cache noted it and just
+/// PRESCAN_OUTCOME_UNKNOWN when nothing was sighted, and job is what the pipeline cache last did with
+/// one. The ago times run back from the miss to the first sighting, the first queued job and the last
+/// posted module of that address, and are -1 when that did not happen. flip is stamped by the report
+/// when the row is added.
+struct PrescanMissRow {
+	std::string              stage;
+	uint64_t                 id   = 0;
+	uint64_t                 hash = 0;
+	std::string              kind;
+	int64_t                  at_ns = NO_TIME_NS;
+	bool                     seen  = false;
+	std::vector<std::string> scan {std::string(PRESCAN_OUTCOME_UNKNOWN)};
+	std::string              job = std::string(PRESCAN_OUTCOME_UNKNOWN);
+	double                   first_seen_ago_ms = -1.0;
+	double                   offered_ago_ms    = -1.0;
+	double                   posted_ago_ms     = -1.0;
+	int64_t                  flip              = 0;
+};
+
+/// Who fills a part of the prescan_graphics block. The scanner knows the draws it walked and offered,
+/// and the pipeline cache what its workers and the GPU thread made of them.
+enum class GraphicsPrescanPart : uint8_t { Scanner, Cache, Count };
+inline constexpr size_t GRAPHICS_PRESCAN_PART_COUNT = static_cast<size_t>(GraphicsPrescanPart::Count);
+
 /// How the preparer's state answered the dispatches it was asked about. The names are those of the
 /// state's own counts.
 struct PrescanStateReport {
@@ -1155,6 +1206,9 @@ public:
 	void BeginSubmission(const SubmissionStamp& stamp, bool count);
 	/// Sets the point in the run that start_ms is counted from, on the NowNs clock.
 	void SetEpoch(int64_t epoch_ns);
+	/// The run's epoch on the NowNs clock, or NO_TIME_NS before SetEpoch, for a source that keeps its
+	/// own times from the run start.
+	[[nodiscard]] int64_t EpochNs() const;
 	/// Notes that the GPU thread is outside any submission.
 	void EndSubmission();
 	/// Records GPU-thread time spent waiting for a compile that a worker was running. It counts as
@@ -1181,6 +1235,12 @@ public:
 	/// Records a draw that could not be deferred and waited for its pipeline, and adds the wait to
 	/// its reason's total. The flip field is ignored and replaced by the current flip.
 	void AddDeferredIneligibleWait(const IneligibleWait& wait);
+	/// Adds a graphics prescan miss row and stamps its flip, or past PRESCAN_MISS_ROW_LIMIT rows only
+	/// counts it as dropped.
+	void AddPrescanMissRow(const PrescanMissRow& row);
+	/// The graphics prescan miss rows so far, in the order they were added, and how many were dropped.
+	[[nodiscard]] std::vector<PrescanMissRow> PrescanMissRows() const;
+	[[nodiscard]] uint64_t                    PrescanMissRowsDropped() const;
 	/// Records a deferred draw that S2 would have skipped, and how long it waited for its pipeline.
 	void AddDeferredWouldSkip(double waited_ms);
 	/// Records a deferred draw that S2 refused under `reason`, and how long it waited for its pipeline.
@@ -1274,6 +1334,16 @@ public:
 	/// Whether final pipeline cache figures are stored.
 	[[nodiscard]] bool HoldsPrescanCacheFinal() const;
 
+	/// Registers the function the writer calls for one part of the prescan_graphics block (experimental).
+	/// With no part registered the report has no such block. The writer holds the block's lock while
+	/// it calls, so the owner replaces the source with SetGraphicsPrescanFinal before what the
+	/// function reads is destroyed. The function must not call back into these functions.
+	void SetGraphicsPrescanSource(GraphicsPrescanPart part, std::function<PrescanGraphicsReport()> source);
+	/// Stores the final figures of a part and removes its source, in one step under the lock.
+	void SetGraphicsPrescanFinal(GraphicsPrescanPart part, PrescanGraphicsReport final_figures);
+	/// Whether a part has a source registered, for tests.
+	[[nodiscard]] bool HoldsGraphicsPrescanSource(GraphicsPrescanPart part) const;
+
 private:
 	// The scanner's figures from the source or the final ones, or nothing when there are neither. The
 	// source is called with the prescan scan lock held.
@@ -1281,6 +1351,9 @@ private:
 	// The pipeline cache's figures from the source or the final ones, or nothing when there are
 	// neither. The source is called with the prescan cache lock held.
 	[[nodiscard]] std::optional<PrescanCacheReport> PrescanCacheFigures() const;
+	// The groups of every registered part of the prescan_graphics block in part order, or nothing
+	// when no part has a source or final figures. Sources are called with the block's lock held.
+	[[nodiscard]] std::optional<PrescanGraphicsReport> GraphicsPrescanFigures() const;
 	// Removes every registered source and its final figures, and the generation's inactive reason,
 	// for Reset.
 	void ResetSources();
@@ -1321,6 +1394,12 @@ private:
 	std::function<PrescanCacheReport()>          m_prescan_cache_source;
 	std::optional<PrescanCacheReport>            m_prescan_cache_final;
 
+	// Guards the prescan_graphics parts. It is taken on its own, never with another lock of the report
+	// held, and the sources read only atomics and their owners' own stats locks.
+	mutable std::mutex m_graphics_prescan_mutex;
+	std::array<std::function<PrescanGraphicsReport()>, GRAPHICS_PRESCAN_PART_COUNT> m_graphics_prescan_source;
+	std::array<std::optional<PrescanGraphicsReport>, GRAPHICS_PRESCAN_PART_COUNT>   m_graphics_prescan_final;
+
 	mutable std::mutex           m_mutex;
 	Phase                        m_phase = Phase::Play;
 	int64_t                      m_flip  = 0;
@@ -1355,6 +1434,8 @@ private:
 	uint32_t                                      m_deferred_resolves_this_flip = 0;
 	std::vector<std::pair<std::string, uint32_t>> m_deferred_ineligible;
 	std::vector<IneligibleWait>                   m_deferred_ineligible_waits;
+	std::vector<PrescanMissRow>                   m_prescan_miss_rows;
+	uint64_t                                      m_prescan_miss_rows_dropped = 0;
 	std::vector<std::pair<std::string, double>>   m_deferred_ineligible_waited_ms;
 	uint32_t                                      m_deferred_would_skip_draws = 0;
 	double                                        m_deferred_would_skip_waited_ms = 0.0;
@@ -1633,6 +1714,13 @@ inline void AddRefusal(std::string_view reason, double blocked_ms) {
 inline void AddDeferredResolve(const DeferredResolve& resolve) {
 	if (Enabled()) {
 		Global().AddDeferredResolve(resolve);
+	}
+}
+
+/// Records one graphics prescan miss row.
+inline void AddPrescanMissRow(const PrescanMissRow& row) {
+	if (Enabled()) {
+		Global().AddPrescanMissRow(row);
 	}
 }
 
