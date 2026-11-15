@@ -441,6 +441,32 @@ void Report::AddDeferredWouldSkip(double waited_ms) {
 	m_deferred_would_skip_waited_ms += waited_ms;
 }
 
+// A resolve has a handful of verdicts at most, so a linear search keeps them in first-met order.
+void AddHoleVerdicts(DeferredResolve& row, std::span<const HoleVerdict> holes) {
+	for (const auto& hole: holes) {
+		const std::string_view name = hole.verdict != nullptr ? std::string_view(hole.verdict) : HOLE_VERDICT_UNKNOWN;
+		auto found = std::ranges::find_if(row.refused, [&](const auto& entry) { return entry.first == name; });
+		if (found == row.refused.end()) {
+			row.refused.emplace_back(std::string(name), 0);
+			found = std::prev(row.refused.end());
+		}
+		found->second++;
+		if (hole.critical && row.critical_refusal.empty()) {
+			row.critical_refusal = std::string(name);
+		}
+	}
+}
+
+void Report::AddDeferredRefusedSkip(std::string_view reason, double waited_ms) {
+	std::lock_guard lock(m_mutex);
+	auto            found = m_deferred_refused_skip.find(reason);
+	if (found == m_deferred_refused_skip.end()) {
+		found = m_deferred_refused_skip.emplace(std::string(reason), DeferredRefusal {}).first;
+	}
+	found->second.draws++;
+	found->second.waited_ms += waited_ms;
+}
+
 void Report::AddDeferredWarmInline(bool over_hold_threshold) {
 	std::lock_guard lock(m_mutex);
 	m_deferred_warm_inline++;
@@ -627,6 +653,7 @@ void Report::Reset() {
 	m_deferred_ineligible_waited_ms.clear();
 	m_deferred_would_skip_draws     = 0;
 	m_deferred_would_skip_waited_ms = 0.0;
+	m_deferred_refused_skip.clear();
 	m_deferred_warm_inline          = 0;
 	m_deferred_warm_inline_over     = 0;
 	m_warm_inline_total             = 0;
@@ -743,6 +770,7 @@ void Report::CopyDeferredLocked(Summary& summary) const {
 	summary.deferred_ineligible_waited_ms            = m_deferred_ineligible_waited_ms;
 	summary.deferred_would_skip_draws                = m_deferred_would_skip_draws;
 	summary.deferred_would_skip_waited_ms            = m_deferred_would_skip_waited_ms;
+	summary.deferred_refused_skip                    = m_deferred_refused_skip;
 	summary.deferred_warm_inline                     = m_deferred_warm_inline;
 	summary.deferred_warm_inline_over_hold_threshold = m_deferred_warm_inline_over;
 	summary.warm_inline_total                        = m_warm_inline_total;
@@ -922,6 +950,15 @@ nlohmann::json IneligibleWaitsToJson(const std::vector<IneligibleWait>& waits) {
 	return rows;
 }
 
+// Writes the deferred draws the S2 rules refused, one object per rule with its draws and waits.
+nlohmann::json RefusedDeferredToJson(const std::map<std::string, DeferredRefusal, std::less<>>& refused) {
+	nlohmann::json result = nlohmann::json::object();
+	for (const auto& [reason, refusal]: refused) {
+		result[reason] = {{"draws", refusal.draws}, {"waited_ms", Round3(refusal.waited_ms)}};
+	}
+	return result;
+}
+
 // Writes the waits of the draws that could not be deferred, summed per reason.
 nlohmann::json IneligibleWaitedMsToJson(const std::vector<std::pair<std::string, double>>& totals) {
 	nlohmann::json waited = nlohmann::json::object();
@@ -929,6 +966,26 @@ nlohmann::json IneligibleWaitedMsToJson(const std::vector<std::pair<std::string,
 		waited[reason] = Round3(ms);
 	}
 	return waited;
+}
+
+// Writes a resolve's holes per skip verdict as one object, a verdict to its hole count.
+nlohmann::json ResolveRefusedToJson(const std::vector<std::pair<std::string, uint32_t>>& refused) {
+	nlohmann::json result = nlohmann::json::object();
+	for (const auto& [verdict, holes]: refused) {
+		result[verdict] = holes;
+	}
+	return result;
+}
+
+// Adds a resolve row's skip verdicts, its critical key's stage ids when it had one, and its critical
+// refusal.
+void AddVerdictFields(nlohmann::json& row, const DeferredResolve& resolve) {
+	if (resolve.has_critical) {
+		row["critical_vs"] = Hex(resolve.critical_vs);
+		row["critical_ps"] = Hex(resolve.critical_ps);
+	}
+	row["refused"]          = ResolveRefusedToJson(resolve.refused);
+	row["critical_refusal"] = resolve.critical_refusal.empty() ? "none" : resolve.critical_refusal;
 }
 
 // Writes the deferred-draw figures, which are empty or zero unless --deferred-pipeline-draws ran.
@@ -951,6 +1008,7 @@ nlohmann::json DeferredToJson(const Summary& summary) {
 		if (resolve.submission != NO_SUBMISSION) {
 			row["submission"] = resolve.submission;
 		}
+		AddVerdictFields(row, resolve);
 		resolves.push_back(std::move(row));
 	}
 	nlohmann::json ineligible = nlohmann::json::object();
@@ -965,6 +1023,7 @@ nlohmann::json DeferredToJson(const Summary& summary) {
 	        {"s2_would_skip",
 	         {{"draws", summary.deferred_would_skip_draws},
 	          {"waited_ms", Round3(summary.deferred_would_skip_waited_ms)}}},
+	        {"s2_refused_deferred", RefusedDeferredToJson(summary.deferred_refused_skip)},
 	        {"warm_inline",
 	         {{"during_pause", summary.deferred_warm_inline},
 	          {"over_hold_threshold", summary.deferred_warm_inline_over_hold_threshold},

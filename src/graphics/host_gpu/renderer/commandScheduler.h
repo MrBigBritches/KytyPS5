@@ -194,6 +194,10 @@ private:
 	/// the report row. This is the only part of a resolve that holds guest audio.
 	[[nodiscard]] std::vector<PipelineCache::Pipeline>
 	AcquireHolePipelines(Common::FirstRunReport::DeferredResolve& row);
+	/// Counts every unrecorded hole's skip verdict into the report row, and names the verdict of the
+	/// first hole of the critical key. Does nothing with the first-run report off.
+	void NoteHoleVerdicts(Common::FirstRunReport::DeferredResolve&   row,
+	                      const PipelineCache::DeferredAcquireStats& stats) const;
 	/// Records every unrecorded hole into its buffer against the pipeline at the same place in `built`.
 	void RecordHoles(std::span<const PipelineCache::Pipeline> built);
 	/// Whether the calling thread may split or resolve. That is the GPU thread, any thread once

@@ -1632,7 +1632,7 @@ void RenderExecutor::RecordBlockingDraw(CommandBuffer& buffer, const DrawView& v
 // The caller must not use a command buffer it fetched before this call, since the scheduler ends
 // it here and starts another.
 void RenderExecutor::CreateDrawHole(CommandBuffer& buffer, DrawView& view,
-                                    const GraphicsPipelineKey& key) {
+                                    const GraphicsPipelineKey& key, const char* skip_verdict) {
 	if (RenderStateClears(view.rendering)) {
 		// The clear was consumed from the registers when the draw was met, so it is applied here, in
 		// the pass before the hole. The hole's own pass loads, as it would after any earlier pass.
@@ -1643,7 +1643,7 @@ void RenderExecutor::CreateDrawHole(CommandBuffer& buffer, DrawView& view,
 	auto& scheduler = m_context.GetCommandScheduler();
 	// Counted where the draw is met, since the hole is recorded later and the cadence counts now.
 	scheduler.NoteRecordedWork();
-	scheduler.SplitForHole(std::make_unique<DrawHole>(view, key));
+	scheduler.SplitForHole(std::make_unique<DrawHole>(view, key, skip_verdict));
 }
 
 // Records one prepared draw. Resources are prepared and the targets acquired for every draw. With
@@ -1662,7 +1662,7 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	const auto* pipeline = PrepareDraw(buffer, draw, state, emit, index_source, true, view,
 	                                   Config::DeferredPipelineDrawsEnabled() ? &deferred : nullptr);
 	if (deferred.active) {
-		CreateDrawHole(buffer, view, deferred.key);
+		CreateDrawHole(buffer, view, deferred.key, deferred.skip_verdict);
 		return;
 	}
 	if (pipeline != nullptr) {

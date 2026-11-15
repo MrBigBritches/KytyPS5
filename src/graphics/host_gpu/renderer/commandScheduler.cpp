@@ -7,6 +7,7 @@
 #include "common/logging/log.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineParts.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 
@@ -454,9 +455,32 @@ CommandScheduler::AcquireHolePipelines(Common::FirstRunReport::DeferredResolve& 
 	row.distinct_keys   = stats.distinct_keys;
 	row.resolve_wait_ms = stats.wait_ms;
 	row.save_ms         = stats.save_ms;
+	if (stats.has_critical) {
+		row.has_critical = true;
+		row.critical_vs  = stats.critical_key.stage_ids[VERTEX_STAGE_INDEX];
+		row.critical_ps  = stats.critical_key.stage_ids[PIXEL_STAGE_INDEX];
+	}
+	NoteHoleVerdicts(row, stats);
 	// The image heap's set is bound in the segment's buffer, which the hole's buffer lacks.
 	EXIT_IF(std::ranges::any_of(built, [](const auto& pipeline) { return pipeline.uses_image_heap; }));
 	return built;
+}
+
+// The holes are the same unrecorded ones AcquireHolePipelines collected, in the same order, so the
+// first one whose key is the critical key is the one the resolve first waited on for it.
+void CommandScheduler::NoteHoleVerdicts(Common::FirstRunReport::DeferredResolve&   row,
+                                        const PipelineCache::DeferredAcquireStats& stats) const {
+	if (!Common::FirstRunReport::Enabled()) {
+		return;
+	}
+	std::vector<Common::FirstRunReport::HoleVerdict> verdicts;
+	verdicts.reserve(m_pending_holes);
+	for (const auto& held: m_held) {
+		if (held.hole != nullptr && !held.recorded) {
+			verdicts.push_back(held.hole->Verdict(stats.has_critical && held.hole->Key() == stats.critical_key));
+		}
+	}
+	Common::FirstRunReport::AddHoleVerdicts(row, verdicts);
 }
 
 void CommandScheduler::RecordHoles(std::span<const PipelineCache::Pipeline> built) {

@@ -774,7 +774,8 @@ struct RenderExecutorTestAccess {
   // so the caller records the view and then resets the bindings.
   static const PipelineCache::Pipeline *PrepareAutoDraw(
       RenderExecutor &executor, CommandBuffer &command, const DrawAutoArgs &args,
-      vk::PrimitiveTopology topology, DrawView &view, bool bind_vertex_buffers = true) {
+      vk::PrimitiveTopology topology, DrawView &view, bool bind_vertex_buffers = true,
+      PipelineCache::DeferredDraw *deferred = nullptr) {
     auto &context = executor.m_context;
     context.GetCommandScheduler().PopPendingOperations();
     Common::LockGuard lock(context.GetMutex());
@@ -786,7 +787,7 @@ struct RenderExecutorTestAccess {
         command.GetUserConfig().GetIndexOffset(), state.vertex_info[0]);
     const DrawEmitInfo emit{vertex_offset + static_cast<int32_t>(args.first_vertex),
                             instance_offset};
-    return executor.PrepareDraw(command, draw, state, emit, {}, bind_vertex_buffers, view);
+    return executor.PrepareDraw(command, draw, state, emit, {}, bind_vertex_buffers, view, deferred);
   }
 
   // Draws like DrawAuto, but lets `between` see and change the view after the eager half and
@@ -1106,6 +1107,12 @@ struct RenderExecutorTestAccess {
 
   static void ResetBindings(RenderExecutor &executor) {
     executor.ResetBindings();
+  }
+
+  // Makes a hole of a draw PrepareAutoDraw deferred, as ExecutePreparedDraw does.
+  static void CreateDrawHole(RenderExecutor &executor, CommandBuffer &command, DrawView &view,
+                             const GraphicsPipelineKey &key, const char *verdict) {
+    executor.CreateDrawHole(command, view, key, verdict);
   }
 
   static bool ResolveColorTargets(RenderExecutor &executor, CommandBuffer &buffer) {
@@ -61866,6 +61873,64 @@ void CheckDeferredPolicy(VulkanHarness &vulkan) {
   std::printf("[gpu]     %-32s ok\n", name);
 }
 
+// What a deferred draw carries to its hole for the report, and how its resolve counts it. A draw the
+// skip rules allow is deferred under policy B, carries allowed and is counted as one S2 would have
+// skipped. One they refuse carries the refusing rule's name and is counted under it. Without
+// --async-pipelines the rules are never asked, so the draw carries not_asked and nothing is counted,
+// which is the baseline that differs only in the async flag and shows both counts follow it.
+void CheckDeferredSkipVerdict(VulkanHarness &vulkan) {
+  constexpr const char *name = "DeferredSkipVerdict";
+  struct Case {
+    const char *label;
+    bool async, skip_rules_allow;
+    DrawFate expected;
+    uint32_t skip_rule_asks, would_skip, refused_deferred;
+    // The verdict the deferred draw carries to its hole.
+    const char *verdict;
+  };
+  const Case cases[] = {
+      {"an allowed draw defers and counts as would skip", true, true, DrawFate::Defer, 1, 1, 0, "allowed"},
+      {"without async it defers unasked", false, true, DrawFate::Defer, 0, 0, 0, "not_asked"},
+      {"a refused deferred draw is counted under its rule", true, false, DrawFate::Defer, 1, 0, 1, "probe_rule"},
+      {"nothing is counted without async", false, false, DrawFate::Defer, 0, 0, 0, "not_asked"},
+  };
+  g_cache_rig_deferred = true;
+  for (const auto &test : cases) {
+    WithAsyncCache(vulkan, test.async, {}, [&](const AsyncCacheRig &rig) {
+      const auto state = rig.State(vk::PrimitiveTopology::eTriangleList);
+      ProbePolicy policy;
+      policy.skip_rules_allow = test.skip_rules_allow;
+      PipelineCache::DeferredDraw deferred;
+      Common::FirstRunReport::Global().Reset();
+      const auto *pipeline = rig.cache.AcquireGraphicsPipeline(rig.command, state, &policy, &deferred);
+      const auto fate = deferred.active ? DrawFate::Defer
+                        : pipeline != nullptr ? DrawFate::Block : DrawFate::Skip;
+      Require(name, test.label, fate == test.expected, "the draw met another fate than expected");
+      Require(name, test.label, policy.skip_rule_asks == test.skip_rule_asks,
+              "the skip rules were asked a different number of times than expected");
+      // The three verdicts differ across the cases, so a draw that always got one of them fails.
+      Require(name, test.label,
+              deferred.skip_verdict != nullptr && std::strcmp(deferred.skip_verdict, test.verdict) == 0,
+              "the deferred draw carried another skip verdict than expected");
+      if (deferred.active) {
+        PipelineCache::DeferredAcquireStats stats;
+        (void)rig.cache.AcquireDeferredPipelines(std::span(&deferred.key, 1), false, stats);
+      }
+      const auto summary = Common::FirstRunReport::Global().Summarize();
+      const auto refused = summary.deferred_refused_skip.find("probe_rule");
+      const uint32_t refused_draws = refused == summary.deferred_refused_skip.end() ? 0 : refused->second.draws;
+      Require(name, test.label,
+              summary.deferred_would_skip_draws == test.would_skip && refused_draws == test.refused_deferred &&
+                  summary.deferred_refused_skip.size() == (test.refused_deferred != 0 ? 1u : 0u),
+              "the deferred draw was counted under the wrong verdict, or not at all");
+      Require(name, test.label, summary.refusals.empty(),
+              "a deferred draw was counted as a refused draw that waited");
+    });
+  }
+  g_cache_rig_deferred = false;
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
 // A pipeline is built in the background while the draws that want it go without. A worker's
 // compile is recorded as worker time and does not block the GPU thread, and the finished pipeline
 // is taken by the next request.
@@ -68281,6 +68346,7 @@ void CheckAsyncPipelines(VulkanHarness &vulkan) {
   };
   run("AsyncPipelinesOff", [&] { CheckAsyncPipelinesOff(vulkan); });
   run("DeferredPolicy", [&] { CheckDeferredPolicy(vulkan); });
+  run("DeferredSkipVerdict", [&] { CheckDeferredSkipVerdict(vulkan); });
   run("AsyncPipelineBuild", [&] { CheckAsyncPipelineBuild(vulkan); });
   run("AsyncPipelineClaim", [&] { CheckAsyncPipelineClaim(vulkan); });
   run("AsyncPipelineWait", [&] { CheckAsyncPipelineWait(vulkan); });

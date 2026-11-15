@@ -299,6 +299,77 @@ void TestJsonContents() {
   }
 }
 
+// A resolve row counts its holes per skip verdict, a hole without one as unknown, and names the first
+// critical hole's verdict. Two rules with different counts show each hole lands under its own rule, so
+// a row that put every hole under one rule fails. Two critical holes with different rules show the
+// first is taken. The same holes with none critical, the baseline, leave the critical refusal empty,
+// which the JSON writes as none, and a row with no verdicts writes an empty object. The row with a
+// critical key writes its vertex and pixel ids, which differ so a swap shows, and the row without one,
+// the baseline, writes neither, so the ids come only from a critical key.
+void TestResolveRefusals() {
+	using Common::FirstRunReport::DeferredResolve;
+	using Common::FirstRunReport::HoleVerdict;
+	constexpr uint64_t critical_vs = 0x1234;
+	constexpr uint64_t critical_ps = 0xabcd;
+	const std::vector<HoleVerdict> holes {{"no_depth", false}, {nullptr, false}, {"color_history", true},
+	                                      {"no_depth", true}, {"not_asked", false}};
+	DeferredResolve row {.trigger = "submit", .holes = 5};
+	row.has_critical = true;
+	row.critical_vs  = critical_vs;
+	row.critical_ps  = critical_ps;
+	Common::FirstRunReport::AddHoleVerdicts(row, holes);
+	const std::vector<std::pair<std::string, uint32_t>> expected {
+	    {"no_depth", 2}, {"unknown", 1}, {"color_history", 1}, {"not_asked", 1}};
+	Check(row.refused == expected, "the holes were not counted per verdict in first-met order");
+	Check(row.critical_refusal == "color_history", "the first critical hole's verdict was not taken");
+	std::vector<HoleVerdict> no_critical = holes;
+	for (auto& hole: no_critical) {
+		hole.critical = false;
+	}
+	DeferredResolve plain {.trigger = "submit", .holes = 5};
+	Common::FirstRunReport::AddHoleVerdicts(plain, no_critical);
+	Check(plain.critical_refusal.empty(), "a resolve with no critical hole named a critical refusal");
+
+	auto report = std::make_unique<Report>();
+	report->AddDeferredResolve(row);
+	report->AddDeferredResolve({.trigger = "submit", .holes = 1});
+	const auto rows = nlohmann::json::parse(report->ToJson({}, 0, 1.0, 0.0, {}))["deferred_draws"]["resolves"];
+	Check(rows[0].contains("refused") && rows[0].contains("critical_refusal") && rows[1].contains("refused") &&
+	          rows[1].contains("critical_refusal"),
+	      "a resolve row has no refused or critical refusal field");
+	Check(rows[0]["refused"]["no_depth"] == 2 && rows[0]["refused"]["color_history"] == 1 &&
+	          rows[0]["refused"]["unknown"] == 1 && rows[0]["refused"]["not_asked"] == 1 &&
+	          rows[0]["critical_refusal"] == "color_history",
+	      "the resolve row lost its verdict counts or its critical refusal");
+	Check(rows[1]["refused"].is_object() && rows[1]["refused"].empty() && rows[1]["critical_refusal"] == "none",
+	      "a resolve without verdicts wrote counts or a critical refusal");
+	Check(rows[0]["critical_vs"] == "0000000000001234" && rows[0]["critical_ps"] == "000000000000abcd" &&
+	          !rows[1].contains("critical_vs") && !rows[1].contains("critical_ps"),
+	      "the critical key's stage ids were lost, swapped, or written for a resolve without one");
+}
+
+// Deferred draws the S2 rules refused are kept per rule with their waits. An empty report writes an
+// empty object, the baseline. Two rules with distinct counts and waits show that each draw lands under
+// its own rule and adds its own wait, and the would-skip figures stay at 0, so the refusals are not
+// counted as would-skip draws. Reset forgets them.
+void TestDeferredRefusedSkip() {
+	auto report = std::make_unique<Report>();
+	const auto empty = nlohmann::json::parse(report->ToJson({}, 0, 1.0, 0.0, {}))["deferred_draws"];
+	Check(empty["s2_refused_deferred"].is_object() && empty["s2_refused_deferred"].empty(),
+	      "an empty report had refused deferred draws");
+	report->AddDeferredRefusedSkip("no_depth", 4.0);
+	report->AddDeferredRefusedSkip("color_history", 7.0);
+	report->AddDeferredRefusedSkip("no_depth", 2.5);
+	const auto section = nlohmann::json::parse(report->ToJson({}, 0, 1.0, 0.0, {}))["deferred_draws"];
+	const auto& refused = section["s2_refused_deferred"];
+	Check(refused.size() == 2 && refused["no_depth"]["draws"] == 2 && refused["no_depth"]["waited_ms"] == 6.5 &&
+	          refused["color_history"]["draws"] == 1 && refused["color_history"]["waited_ms"] == 7.0,
+	      "a refused deferred draw was not counted under its rule with its wait");
+	Check(section["s2_would_skip"]["draws"] == 0, "a refused deferred draw counted as a would-skip draw");
+	report->Reset();
+	Check(report->Summarize().deferred_refused_skip.empty(), "Reset kept the refused deferred draws");
+}
+
 // The deferred-draw section is written with every figure empty or zero when nothing was recorded,
 // which is the baseline. Recorded resolves, ineligible reasons and would-skip draws then appear
 // with their own numbers, so only the recording can have put them there, and Reset forgets them.
@@ -2729,6 +2800,8 @@ int main() {
   TestSkipsAndFlips();
   TestJsonContents();
   TestDeferredDrawsSection();
+  TestDeferredRefusedSkip();
+  TestResolveRefusals();
   TestWarmTakeRows();
   TestIneligibleWaits();
   TestPipelineLibraryState();

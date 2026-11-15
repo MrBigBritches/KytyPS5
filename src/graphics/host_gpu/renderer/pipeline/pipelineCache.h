@@ -394,6 +394,9 @@ public:
 	struct DeferredDraw {
 		bool                active = false;
 		GraphicsPipelineKey key {};
+		// For the report, what the S2 rules said of the draw, the refusing rule's name or one of the
+		// first-run report's HOLE_VERDICT names. A static string, set with `active`.
+		const char*         skip_verdict = nullptr;
 	};
 	// Like GetGraphicsPipeline, but returns null instead of waiting when a background build has
 	// not finished and the draw may go without. Without a policy, or when builds are not in the
@@ -412,6 +415,10 @@ public:
 		uint32_t distinct_keys = 0;
 		double   wait_ms       = 0.0;
 		double   save_ms       = 0.0;
+		// The critical key, the one with a build whose own acquire took longest, so the report can find
+		// the holes that waited on it. Looked for only with the first-run report on.
+		GraphicsPipelineKey critical_key {};
+		bool                has_critical = false;
 	};
 	// Returns a copy of the pipeline for each key, in the same order, waiting for the background
 	// builds in the order the keys are given. The builds were requested when their draws were met, so
@@ -596,11 +603,13 @@ private:
 	// Null unless --async-pipelines or --deferred-pipeline-draws is on. Only CreatePipelineInternal
 	// runs on its workers.
 	std::unique_ptr<PipelineBuildQueue>                                          m_build_queue;
-	// A deferred draw that the S2 rules would have skipped, kept until its resolve reports it. Only
-	// the GPU thread touches it.
+	// A deferred draw that the S2 rules would have skipped, or with --async-pipelines one they refused,
+	// kept until its resolve reports it. `refusal` is the refusing rule's name, null for a draw they
+	// would have skipped. Only the GPU thread touches it.
 	struct WouldSkip {
 		std::shared_ptr<GraphicsBuild>        build;
 		std::chrono::steady_clock::time_point deferred_at;
+		const char*                           refusal = nullptr;
 	};
 	std::vector<WouldSkip> m_would_skip;
 	// Builds not yet taken into m_graphics_pipelines. Only the GPU thread touches it, like
@@ -766,9 +775,13 @@ private:
 	                                            const PipelineSkipPolicy* policy,
 	                                            const DeferredDraw* deferred, bool& may_skip,
 	                                            const char*& blocker);
-	// Notes that the S2 rules would have skipped a draw that was deferred, to report how long it
-	// waited once its build is done.
-	void NoteDeferredWouldSkip(const std::shared_ptr<GraphicsBuild>& build);
+	// Notes a deferred draw the S2 rules would have skipped, or refused under `refusal`, to report how
+	// long it waited once its build is done.
+	void NoteDeferredWouldSkip(const std::shared_ptr<GraphicsBuild>& build, const char* refusal = nullptr);
+	// Notes a deferred draw for the report by what the S2 rules said of it, nothing when they were not
+	// asked, which is without --async-pipelines. Returns the verdict for the draw's hole.
+	[[nodiscard]] const char* NoteDeferredSkipVerdict(const std::shared_ptr<GraphicsBuild>& build,
+	                                                  const PipelineSkipPolicy* policy, bool may_skip);
 	// Reports the draws noted by NoteDeferredWouldSkip, which a resolve has just waited for.
 	void ReportDeferredWouldSkip();
 	// Queues the build of a key that has none and stores its record.
@@ -788,6 +801,11 @@ private:
 	// The pipeline of one key of a resolve. See AcquireDeferredPipelines.
 	[[nodiscard]] Pipeline AcquireDeferredPipeline(const GraphicsPipelineKey& key,
 	                                               double&                    waited_ms);
+	// AcquireDeferredPipeline, timed, keeping a key with a build whose acquire took longer than
+	// `critical_ms` as the critical one and raising `critical_ms` to it.
+	void AcquireTimedDeferredPipeline(const GraphicsPipelineKey& key, double& waited_ms,
+	                                  std::vector<Pipeline>& built, double& critical_ms,
+	                                  DeferredAcquireStats& stats);
 	// Moves a finished build's pipeline into m_graphics_pipelines. GPU thread only.
 	Pipeline& AdoptBuild(std::shared_ptr<GraphicsBuild> build);
 	// Takes every finished build the workers have published.

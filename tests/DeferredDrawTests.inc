@@ -1283,6 +1283,13 @@
             scheduler.PendingHoleCount() == 0 && !scheduler.HoleFlushRequested() && rows.size() == 1 &&
                 rows[0].trigger == "cap" && rows[0].holes == cap,
             "the flush did not resolve every hole under the cap trigger, or left the request set");
+    // Skips are off in this rig, so each hole carries not_asked from the cache to the row. A hole that
+    // lost its verdict on the way is counted as unknown instead, and all holes share the critical key.
+    using RefusedCounts = std::vector<std::pair<std::string, uint32_t>>;
+    Require(name, "hole verdicts",
+            rows[0].refused == RefusedCounts{{"not_asked", static_cast<uint32_t>(cap)}} &&
+                rows[0].critical_refusal == "not_asked",
+            "the resolve row did not count every hole as not asked, or named another critical refusal");
     UsePixelColor(rig, {0.3f, 0.6f, 0.9f, 1.0f});
     Require(name, "defers again", rig.Draw() && scheduler.PendingHoleCount() == 1 &&
                                       !scheduler.HoleFlushRequested() &&
@@ -1290,6 +1297,61 @@
             "the draw after the flush was not deferred, or the cap's request outlived the resolve");
     hold.release = true;
     scheduler.Finish();
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // The resolve row of one hole made through CreateDrawHole of a deferred draw, while its build is
+  // held so its key is the one the resolve waits on. Nothing when the draw was not deferred or the
+  // resolve added no single row. `key` receives the hole's pipeline key.
+  std::optional<Common::FirstRunReport::DeferredResolve>
+  ResolveRowOfHole(GraphicsPipelineKey *key = nullptr) {
+    PipelineCacheTestAccess::BuildHold hold;
+    AsyncDrawRig rig(*this, false, false, false, false, true);
+    auto &scheduler = rig.Scheduler();
+    CommandSchedulerTestAccess::AllowThisThread(scheduler);
+    rig.PaintSentinels();
+    PipelineCacheTestAccess::HoldBuildQueue(rig.Pipelines(), hold);
+    Common::FirstRunReport::Global().Reset();
+    auto &executor = rig.context->GetRenderExecutor();
+    DrawView view;
+    PipelineCache::DeferredDraw deferred;
+    (void)RenderExecutorTestAccess::PrepareAutoDraw(executor, scheduler.Current(), {.vertex_count = 3, .instance_count = 1},
+                                                    vk::PrimitiveTopology::eTriangleList, view, true, &deferred);
+    if (deferred.active) {
+      if (key != nullptr) {
+        *key = deferred.key;
+      }
+      RenderExecutorTestAccess::CreateDrawHole(executor, scheduler.Current(), view, deferred.key, "color_history");
+    }
+    RenderExecutorTestAccess::ResetBindings(executor);
+    scheduler.Flush();
+    const auto rows = Common::FirstRunReport::Global().Summarize().deferred_resolves;
+    hold.release = true;
+    scheduler.Finish();
+    if (!deferred.active || rows.size() != 1) return std::nullopt;
+    return rows[0];
+  }
+
+  // A hole made through CreateDrawHole with a verdict brings it to its resolve row, where its key is
+  // the critical one, as the row's critical refusal. The rig asks no skip rules, so the cache alone
+  // would give not_asked, and only the verdict the hole was made with can name color_history. The row
+  // also names the critical key's vertex and pixel stage ids. They differ and are not zero, so ids
+  // taken from another stage slot, swapped, or left at zero fail.
+  void CheckHoleVerdictReachesResolve() {
+    constexpr const char *name = "HoleVerdictReachesResolve";
+    GraphicsPipelineKey key {};
+    const auto row = ResolveRowOfHole(&key);
+    Require(name, "verdict",
+            row && row->critical_refusal == "color_history" &&
+                row->refused == std::vector<std::pair<std::string, uint32_t>>{{"color_history", 1}},
+            "the hole's verdict did not reach its resolve row as its count and critical refusal");
+    const uint64_t vertex_id = key.stage_ids[VERTEX_STAGE_INDEX];
+    const uint64_t pixel_id  = key.stage_ids[PIXEL_STAGE_INDEX];
+    Require(name, "distinct stage ids", vertex_id != 0 && pixel_id != 0 && vertex_id != pixel_id,
+            "the hole's key cannot tell its vertex and pixel ids apart");
+    Require(name, "critical stage ids",
+            row && row->has_critical && row->critical_vs == vertex_id && row->critical_ps == pixel_id,
+            "the resolve row did not name the critical key's vertex and pixel stage ids");
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
@@ -1859,6 +1921,7 @@
     CheckDeferredNonPush();
     CheckDeferredNonPushPoolRetire();
     CheckDeferredHoleCap();
+    CheckHoleVerdictReachesResolve();
     CheckDeferredShutdownResolve();
     CheckDeferredStreamWrap();
     CheckDeferredWarmPause();

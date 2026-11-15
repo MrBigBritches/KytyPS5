@@ -134,16 +134,24 @@ class DrawHole {
 public:
 	// The view must come from a draw prepared without early vertex buffer binds, since the commands
 	// of the hole's buffer have to bind them. Its bindings and dynamic state are copied.
-	DrawHole(const DrawView& view, const GraphicsPipelineKey& key);
+	// `skip_verdict` is what the S2 rules said of the draw, a static name kept for the report, or null.
+	DrawHole(const DrawView& view, const GraphicsPipelineKey& key, const char* skip_verdict = nullptr);
 	KYTY_CLASS_NO_COPY(DrawHole);
 
 	/// The key of the pipeline the draw waits for.
 	[[nodiscard]] const GraphicsPipelineKey& Key() const noexcept { return m_key; }
+	/// What the S2 rules said of the draw when it was deferred, or null when nothing was kept.
+	[[nodiscard]] const char* SkipVerdict() const noexcept { return m_skip_verdict; }
+	/// The hole as the report counts it. `critical` says its key is the one the resolve waited on.
+	[[nodiscard]] Common::FirstRunReport::HoleVerdict Verdict(bool critical) const noexcept {
+		return {.verdict = m_skip_verdict, .critical = critical};
+	}
 	/// The draw to record, over this hole's own copies.
 	[[nodiscard]] const DrawView& View() const noexcept { return m_view; }
 
 private:
 	GraphicsPipelineKey                              m_key;
+	const char*                                      m_skip_verdict = nullptr;
 	DrawView                                         m_view;
 	std::array<PreparedBindings, MaxBindingStages>   m_bindings;
 	DynamicState                                     m_dynamic_state;

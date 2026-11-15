@@ -1351,8 +1351,27 @@ const char* PipelineCache::DeferBlocker(const GraphicsPipelineKey& key, const St
 	return policy != nullptr ? policy->DeferBlocker() : "unsupported";
 }
 
-void PipelineCache::NoteDeferredWouldSkip(const std::shared_ptr<GraphicsBuild>& build) {
-	m_would_skip.push_back({build, std::chrono::steady_clock::now()});
+void PipelineCache::NoteDeferredWouldSkip(const std::shared_ptr<GraphicsBuild>& build, const char* refusal) {
+	m_would_skip.push_back({build, std::chrono::steady_clock::now(), refusal});
+}
+
+// The name a refusal is counted under when the policy refused without naming its rule.
+static constexpr const char* UNNAMED_REFUSAL = "unnamed";
+
+// A deferred draw the rules allowed is one a skip would have taken. One they refused, asked only with
+// --async-pipelines, is counted under the rule, so the report says why deferral was the only way.
+const char* PipelineCache::NoteDeferredSkipVerdict(const std::shared_ptr<GraphicsBuild>& build,
+                                                   const PipelineSkipPolicy* policy, bool may_skip) {
+	if (may_skip) {
+		NoteDeferredWouldSkip(build);
+		return Common::FirstRunReport::HOLE_VERDICT_ALLOWED.data();
+	}
+	if (Config::AsyncPipelinesEnabled() && policy != nullptr) {
+		const char* refusal = policy->Refusal() != nullptr ? policy->Refusal() : UNNAMED_REFUSAL;
+		NoteDeferredWouldSkip(build, refusal);
+		return refusal;
+	}
+	return Common::FirstRunReport::HOLE_VERDICT_NOT_ASKED.data();
 }
 
 void PipelineCache::ReportDeferredWouldSkip() {
@@ -1364,7 +1383,11 @@ void PipelineCache::ReportDeferredWouldSkip() {
 		                          std::chrono::duration<double, std::milli>(noted.build->ready_ms));
 		const double waited_ms =
 		    std::max(0.0, std::chrono::duration<double, std::milli>(ready_at - noted.deferred_at).count());
-		Common::FirstRunReport::AddDeferredWouldSkip(waited_ms);
+		if (noted.refusal != nullptr) {
+			Common::FirstRunReport::AddDeferredRefusedSkip(noted.refusal, waited_ms);
+		} else {
+			Common::FirstRunReport::AddDeferredWouldSkip(waited_ms);
+		}
 	}
 	m_would_skip.clear();
 }
@@ -1425,10 +1448,9 @@ PipelineCache::Pipeline* PipelineCache::AcquireBuiltPipeline(const GraphicsPipel
 	if (fate == DrawFate::Defer) {
 		deferred->active = true;
 		deferred->key    = key;
-		// A draw that S2 would have dropped is deferred instead, which costs it a wait.
-		if (may_skip) {
-			NoteDeferredWouldSkip(pending->second.build);
-		}
+		// A draw that S2 would have dropped is deferred instead, which costs it a wait, and one S2
+		// refused had no other way.
+		deferred->skip_verdict = NoteDeferredSkipVerdict(pending->second.build, policy, may_skip);
 		return nullptr;
 	}
 	if (fate == DrawFate::Skip) {
@@ -1480,9 +1502,16 @@ PipelineCache::AcquireDeferredPipelines(std::span<const GraphicsPipelineKey> key
 		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::Count,
 		                                         Common::DebugCounters::Counter::PipelineCreateNs,
 		                                         Common::DebugCounters::Peak::PipelineCreateNs);
+		// Only the first-run report reads the critical key, so without it no clock is read per key.
+		const bool find_critical = Common::FirstRunReport::Enabled();
+		double     critical_ms   = 0.0;
 		for (const auto& key: keys) {
 			distinct.insert(key);
-			built.push_back(AcquireDeferredPipeline(key, waited_ms));
+			if (find_critical) {
+				AcquireTimedDeferredPipeline(key, waited_ms, built, critical_ms, stats);
+			} else {
+				built.push_back(AcquireDeferredPipeline(key, waited_ms));
+			}
 		}
 	}
 	const auto waited = Clock::now();
@@ -1498,6 +1527,25 @@ PipelineCache::AcquireDeferredPipelines(std::span<const GraphicsPipelineKey> key
 	stats.save_ms = std::chrono::duration<double, std::milli>(Clock::now() - waited).count() +
 	                std::chrono::duration<double, std::milli>(start - drain_start).count();
 	return built;
+}
+
+void PipelineCache::AcquireTimedDeferredPipeline(const GraphicsPipelineKey& key, double& waited_ms,
+                                                 std::vector<Pipeline>& built, double& critical_ms,
+                                                 DeferredAcquireStats& stats) {
+	using Clock = std::chrono::steady_clock;
+	// Read before the acquire, which adopts the build and erases it from the pending map.
+	const bool had_build = m_pending_graphics.contains(key);
+	const auto before    = Clock::now();
+	built.push_back(AcquireDeferredPipeline(key, waited_ms));
+	const double took_ms = std::chrono::duration<double, std::milli>(Clock::now() - before).count();
+	// Keys are acquired in hole order, so the key with the longest own acquire is the one the
+	// resolve was stuck on.
+	if (!had_build || took_ms <= critical_ms) {
+		return;
+	}
+	critical_ms        = took_ms;
+	stats.critical_key = key;
+	stats.has_critical = true;
 }
 
 void PipelineCache::RequestBuild(const GraphicsPipelineKey& key, const Stages& stages) {

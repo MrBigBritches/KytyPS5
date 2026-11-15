@@ -98,6 +98,35 @@
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  // The critical key is looked for only with the first-run report on, since only the report reads it.
+  // The same resolve of one key, whose fake build sleeps so its acquire waits measurably, long enough
+  // that a loaded parallel test run is unlikely to finish the build before the acquire, runs with the
+  // report on, the baseline that names that key as critical, and with it off, which must name none. A
+  // resolve that timed every key whatever the report says would name the key in both. The report flag
+  // is set after each rig, whose config load sets it, and put back before the checks.
+  void CheckCriticalKeyFollowsReport() {
+    constexpr const char *name = "ResolveCriticalKeyFollowsReport";
+    constexpr auto build_time = std::chrono::milliseconds(100);
+    for (const bool report_on : {true, false}) {
+      AsyncDrawRig rig(*this, true);
+      auto &cache = rig.Pipelines();
+      const auto keys = FakeKeys(1);
+      PipelineCacheTestAccess::PostFakeBuild(cache, keys[0], [build_time] { std::this_thread::sleep_for(build_time); });
+      const bool report_was = Common::FirstRunReport::Detail::g_report_enabled.exchange(report_on);
+      PipelineCache::DeferredAcquireStats stats;
+      (void)cache.AcquireDeferredPipelines(keys, false, stats);
+      Common::FirstRunReport::Detail::g_report_enabled = report_was;
+      PipelineCacheTestAccess::ForgetFakePipeline(cache, keys[0]);
+      if (report_on) {
+        Require(name, "report on", stats.has_critical && stats.critical_key == keys[0],
+                "the resolve with the report on did not name its only waited key as critical");
+      } else {
+        Require(name, "report off", !stats.has_critical, "the resolve with the report off looked for a critical key");
+      }
+    }
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   // The scope is held while the builds are waited for and never again. Fake builds first wait for a
   // scope to exist, so the state they see is the resolve's. One scope for several keys counts as one
   // hold of a thread that was parked in it. Scopes are counted, since a hold is only counted when a
@@ -309,6 +338,7 @@
     CheckResolveTriggerNames();
     CheckParallelResolveWait();
     CheckResolveDistinctKeys();
+    CheckCriticalKeyFollowsReport();
     CheckResolveStallScope();
     CheckResolveRecordsOutsideStall();
     CheckResolveReport();

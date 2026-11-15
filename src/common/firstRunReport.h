@@ -12,6 +12,7 @@
 #include <filesystem>
 #include <functional>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <span>
@@ -187,7 +188,36 @@ struct DeferredResolve {
 	uint64_t    window_hold_count_change = 0;
 	double      held_ms           = 0.0;
 	double      window_held_ms    = 0.0;
+	/// The vertex and pixel stage ids of the critical key, which name the shaders a stalled resolve
+	/// waited on. Set only when has_critical says the resolve had a critical key.
+	bool        has_critical      = false;
+	uint64_t    critical_vs       = 0;
+	uint64_t    critical_ps       = 0;
+	/// The skip verdict of each hole this resolve recorded, counted per verdict in the order first met.
+	/// A verdict is the S2 rule that refused the hole's skip, or one of the HOLE_VERDICT names. The
+	/// critical key is the one with a build whose own acquire took longest, and the critical refusal
+	/// is the verdict of the first hole of that key, empty when unknown.
+	std::vector<std::pair<std::string, uint32_t>> refused;
+	std::string                                   critical_refusal;
 };
+
+/// A hole whose draw S2 allowed to skip but which was deferred, under the default policy B.
+inline constexpr std::string_view HOLE_VERDICT_ALLOWED = "allowed";
+/// A hole deferred with skips not in play, so the S2 rules were never asked.
+inline constexpr std::string_view HOLE_VERDICT_NOT_ASKED = "not_asked";
+/// A hole that reached the resolve without a verdict.
+inline constexpr std::string_view HOLE_VERDICT_UNKNOWN = "unknown";
+
+/// One hole of a resolve as AddHoleVerdicts counts it. `verdict` is a static name or null for none,
+/// and `critical` says the hole's key is the one the resolve waited on longest.
+struct HoleVerdict {
+	const char*        verdict  = nullptr;
+	bool               critical = false;
+};
+
+/// Counts each hole under its verdict in the row, a null one as HOLE_VERDICT_UNKNOWN, and takes the
+/// first critical hole's verdict as the row's critical refusal.
+void AddHoleVerdicts(DeferredResolve& row, std::span<const HoleVerdict> holes);
 
 /// One draw that --deferred-pipeline-draws could not defer and that then waited for its pipeline,
 /// either compiling it or waiting for a worker. A draw that an S2 skip took instead waited for
@@ -945,6 +975,12 @@ struct PrescanCacheReport {
 	PrescanRecordsReport              records;
 };
 
+/// Deferred draws one S2 rule refused, and their waits for their pipelines summed.
+struct DeferredRefusal {
+	uint32_t draws     = 0;
+	double   waited_ms = 0.0;
+};
+
 /// Figures worked out from the raw records, kept apart from JSON so tests can read them.
 struct Summary {
 	double                                                   blocked_graphics_ms = 0.0;
@@ -991,6 +1027,9 @@ struct Summary {
 	// it compares with skips.refused.*.blocked_ms.
 	uint32_t                                                 deferred_would_skip_draws = 0;
 	double                                                   deferred_would_skip_waited_ms = 0.0;
+	// With --async-pipelines, deferred draws the S2 rules refused, by the refusing rule, with the same
+	// wait as above. They show why a deferral could not have been a skip.
+	std::map<std::string, DeferredRefusal, std::less<>>      deferred_refused_skip;
 	// Warm-up compute builds the GPU thread ran itself while --pause-warm-up-for-draws held the
 	// queue. That is an upper bound on what the pause cost, since a worker that was busy might not
 	// have reached the build either. The second figure counts those that ran as long as a hold of
@@ -1088,6 +1127,8 @@ public:
 	void AddDeferredIneligibleWait(const IneligibleWait& wait);
 	/// Records a deferred draw that S2 would have skipped, and how long it waited for its pipeline.
 	void AddDeferredWouldSkip(double waited_ms);
+	/// Records a deferred draw that S2 refused under `reason`, and how long it waited for its pipeline.
+	void AddDeferredRefusedSkip(std::string_view reason, double waited_ms);
 	/// Records a warm-up compute build that ran inline while the warm-up queue was held, and whether
 	/// it ran long enough to hold guest audio.
 	void AddDeferredWarmInline(bool over_hold_threshold);
@@ -1259,6 +1300,7 @@ private:
 	std::vector<std::pair<std::string, double>>   m_deferred_ineligible_waited_ms;
 	uint32_t                                      m_deferred_would_skip_draws = 0;
 	double                                        m_deferred_would_skip_waited_ms = 0.0;
+	std::map<std::string, DeferredRefusal, std::less<>> m_deferred_refused_skip;
 	uint32_t                                      m_deferred_warm_inline = 0;
 	uint32_t                                      m_deferred_warm_inline_over = 0;
 	uint32_t                                      m_warm_inline_total = 0;
@@ -1575,6 +1617,13 @@ inline void AddDeferredIneligibleWait(const IneligibleWait& wait) {
 inline void AddDeferredWouldSkip(double waited_ms) {
 	if (Enabled()) {
 		Global().AddDeferredWouldSkip(waited_ms);
+	}
+}
+
+/// Records a deferred draw that S2 refused, by the refusing rule, and how long it waited.
+inline void AddDeferredRefusedSkip(std::string_view reason, double waited_ms) {
+	if (Enabled()) {
+		Global().AddDeferredRefusedSkip(reason, waited_ms);
 	}
 }
 
