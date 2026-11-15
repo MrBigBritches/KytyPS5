@@ -41,6 +41,9 @@ struct PipelineBuildQueueOptions {
 	/// and macOS threads that the driver creates from a worker inherit the lowered setting, and on
 	/// Apple Silicon the utility class may put the workers on efficiency cores.
 	bool low_priority = false;
+	/// With low_priority, one step lower still, Common::SystemLowestStep (experimental). The graphics
+	/// prescan's queues use it so they lose to the compute prescan's, which run at low_priority alone.
+	bool lowest_priority = false;
 };
 
 /// Runs jobs on a few worker threads in the order they were posted. It knows nothing about what a
@@ -159,6 +162,7 @@ private:
 	std::atomic<bool>           m_stopping {false};
 	// Set in the init list and only read by the workers, so it needs no lock.
 	const bool                  m_low_priority;
+	const bool                  m_lowest_priority;
 	// Declared last, so the workers join before the rest is destroyed.
 	std::vector<std::jthread>   m_workers;
 };

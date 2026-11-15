@@ -23,11 +23,11 @@ void LogPriorityFailure(const char* api, long code) {
 	}
 }
 
-// Lowers the priority of the calling thread through the shared helper. A refusal is logged once
-// and the caller carries on at its old priority.
-bool LowerCurrentThreadPriority() {
+// Lowers the priority of the calling thread through the shared helper, to the lowest step when asked.
+// A refusal is logged once and the caller carries on at its old priority.
+bool LowerCurrentThreadPriority(bool lowest) {
 	Common::PriorityFailure failure;
-	if (Common::LowerCurrentThreadPriority(&failure)) {
+	if (lowest ? Common::LowerCurrentThreadPriorityToLowest(&failure) : Common::LowerCurrentThreadPriority(&failure)) {
 		return true;
 	}
 	// A platform without priority support names no call, and nothing was logged for it before.
@@ -47,7 +47,7 @@ uint32_t PipelineBuildWorkerCount(uint32_t worker_cap) {
 }
 
 PipelineBuildQueue::PipelineBuildQueue(uint32_t worker_count, PipelineBuildQueueOptions options)
-    : m_low_priority(options.low_priority) {
+    : m_low_priority(options.low_priority), m_lowest_priority(options.low_priority && options.lowest_priority) {
 	m_workers.reserve(worker_count);
 	for (uint32_t index = 0; index < worker_count; index++) {
 		m_workers.emplace_back([this](std::stop_token stop) { WorkerLoop(stop); });
@@ -109,7 +109,7 @@ void PipelineBuildQueue::WorkerLoop(std::stop_token stop) {
 	KYTY_PROFILER_THREAD("PipelineBuild");
 	// A refused hint is logged inside and must not stop the worker.
 	if (m_low_priority) {
-		LowerCurrentThreadPriority();
+		LowerCurrentThreadPriority(m_lowest_priority);
 	}
 	std::unique_lock lock(m_mutex);
 	while (!stop.stop_requested()) {
