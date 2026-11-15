@@ -2,6 +2,7 @@
 #define GRAPHICS_GUEST_GPU_COMMAND_PROCESSOR_COMMAND_PROCESSOR_H
 
 #include "common/assert.h"
+#include "graphics/guest_gpu/command_processor/guestRegisterFile.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pssr.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -72,6 +73,8 @@ public:
 	HW::Context&    GetCtx() { return m_ctx; }
 	HW::UserConfig& GetUcfg() { return m_ucfg; }
 	HW::Shader&     GetShCtx() { return m_sh_ctx; }
+	/// A view of the register state the register tables write.
+	GuestRegisterFile Registers() { return {m_ctx, m_ucfg, m_sh_ctx, m_index_type_and_size}; }
 
 	void SetIndexType(uint32_t index_type_and_size);
 	void SetIndexBaseAddress(uint64_t index_base_addr);

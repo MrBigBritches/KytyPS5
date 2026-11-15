@@ -20,7 +20,7 @@
 
 #define KYTY_HW_SH_PARSER(f) uint32_t f(KYTY_HW_SH_PARSER_ARGS)
 
-#define KYTY_HW_REG_ARGS CommandProcessor &cp, [[maybe_unused]] uint32_t cmd_offset, uint32_t value
+#define KYTY_HW_REG_ARGS GuestRegisterFile cp, [[maybe_unused]] uint32_t cmd_offset, uint32_t value
 
 #define KYTY_CP_OP_PARSER_ARGS                                                                     \
 	[[maybe_unused]] CommandProcessor &cp, [[maybe_unused]] uint32_t cmd_id,                       \
@@ -39,6 +39,9 @@ constexpr uint32_t NormalizeRegisterOffset(uint32_t raw_offset) {
 }
 
 } // namespace
+
+// Defined here, where the command processor is complete, so the view's header needs only its name.
+GuestRegisterFile::GuestRegisterFile(CommandProcessor& cp): GuestRegisterFile(cp.Registers()) {}
 
 static HW::BlendControl DecodeBlendControl(uint32_t value) {
 	HW::BlendControl r {};
@@ -172,7 +175,7 @@ static HW::AaConfig ParseAaConfig(uint32_t value) {
 	return r;
 }
 
-static void HwCtxSetDepthBoundsRegister(CommandProcessor& cp, uint32_t cmd_offset, uint32_t value) {
+static void HwCtxSetDepthBoundsRegister(GuestRegisterFile cp, uint32_t cmd_offset, uint32_t value) {
 	auto& ctx    = cp.GetCtx();
 	auto  fvalue = *reinterpret_cast<const float*>(&value);
 
@@ -182,7 +185,7 @@ static void HwCtxSetDepthBoundsRegister(CommandProcessor& cp, uint32_t cmd_offse
 	}
 }
 
-static void HwCtxSetDepthMetadataRegister(CommandProcessor& cp, uint32_t, uint32_t value) {
+static void HwCtxSetDepthMetadataRegister(GuestRegisterFile cp, uint32_t, uint32_t value) {
 	HW::DepthRenderOverride control;
 	control.force_z_valid       = (value & 0x20000000u) != 0;
 	control.force_z_dirty       = (value & 0x08000000u) != 0;
@@ -192,9 +195,9 @@ static void HwCtxSetDepthMetadataRegister(CommandProcessor& cp, uint32_t, uint32
 }
 
 // Accept registers the host does not read.
-static void IgnoreRegister(CommandProcessor&, uint32_t, uint32_t) {}
+static void IgnoreRegister(GuestRegisterFile, uint32_t, uint32_t) {}
 
-static void HwCtxSetDepthShadingRateEncodingRegister(CommandProcessor& cp, uint32_t value) {
+static void HwCtxSetDepthShadingRateEncodingRegister(GuestRegisterFile cp, uint32_t value) {
 	const auto shading_rate_encoding =
 	    KYTY_PM4_GET(value, DB_SHADING_RATE_ENCODING, SHADING_RATE_ENCODING);
 	EXIT_NOT_IMPLEMENTED(shading_rate_encoding > 2u);
@@ -224,7 +227,7 @@ static int ParseScissorCoord15(uint32_t value) {
 	return static_cast<int16_t>(static_cast<uint16_t>(value & 0x7fffu));
 }
 
-static void HwCtxSetClipRectRegister(CommandProcessor& cp, uint32_t cmd_offset, uint32_t value) {
+static void HwCtxSetClipRectRegister(GuestRegisterFile cp, uint32_t cmd_offset, uint32_t value) {
 	auto& ctx = cp.GetCtx();
 	if (cmd_offset == Pm4::PA_SC_CLIPRECT_RULE) {
 		ctx.SetClipRectRule(static_cast<uint16_t>(value & 0xffffu));
@@ -244,7 +247,7 @@ static void HwCtxSetClipRectRegister(CommandProcessor& cp, uint32_t cmd_offset, 
 	}
 }
 
-static void HwCtxSetPolyOffsetRegister(CommandProcessor& cp, uint32_t cmd_offset, uint32_t value) {
+static void HwCtxSetPolyOffsetRegister(GuestRegisterFile cp, uint32_t cmd_offset, uint32_t value) {
 	HW::PolyOffset offset = cp.GetCtx().GetPolyOffset();
 
 	switch (cmd_offset) {
@@ -274,7 +277,7 @@ static void HwCtxSetPolyOffsetRegister(CommandProcessor& cp, uint32_t cmd_offset
 	cp.GetCtx().SetPolyOffset(offset);
 }
 
-static void HwShSetCsRegister(CommandProcessor& cp, uint32_t cmd_offset, uint32_t value) {
+static void HwShSetCsRegister(GuestRegisterFile cp, uint32_t cmd_offset, uint32_t value) {
 	auto cs_regs = cp.GetShCtx().GetCs().cs_regs;
 
 	if (!DecodeCsRegister(cs_regs, cmd_offset, value)) {
@@ -352,7 +355,7 @@ static bool HwShIsUserAccumulatorRange(uint32_t first, uint32_t count, uint32_t 
 	return first >= base && first - base < 4u && count <= 4u - (first - base);
 }
 
-static void HwShIgnoreUserAccumulatorRegister(CommandProcessor&, uint32_t, uint32_t value) {
+static void HwShIgnoreUserAccumulatorRegister(GuestRegisterFile, uint32_t, uint32_t value) {
 	EXIT_NOT_IMPLEMENTED((value & ~0x7fu) != 0);
 }
 
@@ -969,7 +972,7 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 			EXIT("unknown cx reg at %05" PRIx32 ": 0x%" PRIx32 "\n", num_dw - dw, cmd_offset);
 		}
 
-		pfunc(cp, cmd_offset, value);
+		pfunc(cp.Registers(), cmd_offset, value);
 	}
 
 	return KYTY_PM4_LEN(cmd_id) - 1u;
@@ -1022,7 +1025,7 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 			EXIT("unknown sh reg at %05" PRIx32 ": 0x%" PRIx32 "\n", num_dw - dw, cmd_offset);
 		}
 
-		pfunc(cp, cmd_offset, value);
+		pfunc(cp.Registers(), cmd_offset, value);
 	}
 
 	return KYTY_PM4_LEN(cmd_id) - 1u;
@@ -1068,7 +1071,7 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 			}
 			EXIT("unknown uc reg at %05" PRIx32 ": 0x%" PRIx32 "\n", num_dw - dw, cmd_offset);
 		}
-		pfunc(cp, cmd_offset, value);
+		pfunc(cp.Registers(), cmd_offset, value);
 	}
 
 	return KYTY_PM4_LEN(cmd_id) - 1u;
@@ -1162,7 +1165,7 @@ static uint32_t SetRegisters(CommandProcessor& cp, const Table& table, uint32_t 
 			     "\n\tcmd_offset = %08" PRIx32 "\n",
 			     position, cmd_id, offset);
 		}
-		table[offset](cp, offset, values[i]);
+		table[offset](cp.Registers(), offset, values[i]);
 	}
 	return num_values + 1u;
 }

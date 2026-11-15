@@ -1,6 +1,7 @@
 #ifndef GRAPHICS_GUEST_GPU_COMMAND_PROCESSOR_PM4_DISPATCH_H
 #define GRAPHICS_GUEST_GPU_COMMAND_PROCESSOR_PM4_DISPATCH_H
 
+#include "graphics/guest_gpu/command_processor/guestRegisterFile.h"
 #include "graphics/guest_gpu/pm4.h"
 
 #include <array>
@@ -10,11 +11,14 @@ namespace Libs::Graphics {
 
 class CommandProcessor;
 
+// The register tables take a GuestRegisterFile, not the command processor, so the prescan's scanner
+// can decode registers into a shadow with the very same entries.
+
 using hw_sh_parser_func_t = uint32_t (*)(CommandProcessor&, uint32_t, uint32_t, const uint32_t*,
                                          uint32_t);
 using cp_op_parser_func_t = uint32_t (*)(CommandProcessor&, uint32_t, const uint32_t*, uint32_t,
                                          uint32_t);
-using hw_reg_func_t       = void (*)(CommandProcessor&, uint32_t, uint32_t);
+using hw_reg_func_t       = void (*)(GuestRegisterFile, uint32_t, uint32_t);
 
 extern const std::array<hw_reg_func_t, Pm4::CX_NUM>       g_hw_ctx_indirect_func;
 extern const std::array<hw_sh_parser_func_t, Pm4::SH_NUM> g_hw_sh_func;
