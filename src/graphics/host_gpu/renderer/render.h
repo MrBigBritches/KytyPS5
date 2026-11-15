@@ -230,9 +230,11 @@ private:
 	            PipelineCache::DeferredDraw* deferred = nullptr);
 	/// Turns a prepared draw that waits for its pipeline into a hole in the scheduler's command
 	/// stream, after applying any clear it consumed. Nothing fetched from the command buffer
-	/// before the call may be used after it. `skip_verdict` goes with the hole for the report.
+	/// before the call may be used after it. `skip_verdict` and `skip_targets`, the refusing targets or
+	/// null, go with the hole for the report.
 	void CreateDrawHole(CommandBuffer& buffer, DrawView& view, const GraphicsPipelineKey& key,
-	                    const char* skip_verdict);
+	                    const char* skip_verdict,
+	                    std::shared_ptr<const Common::FirstRunReport::SkipTargets> skip_targets = nullptr);
 	/// Resolves the bindings of every stage the draw runs and lists them in the view.
 	void PrepareDrawBindings(DrawRenderState& state, DrawView& view);
 	/// Records the commands a draw needs at the moment it is met, which are the image transitions

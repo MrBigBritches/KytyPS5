@@ -1300,11 +1300,12 @@
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
-  // The resolve row of one hole made through CreateDrawHole of a deferred draw, while its build is
-  // held so its key is the one the resolve waits on. Nothing when the draw was not deferred or the
-  // resolve added no single row. `key` receives the hole's pipeline key.
+  // The resolve row of one hole made through CreateDrawHole of a deferred draw, with the refusing
+  // targets given, while its build is held so its key is the one the resolve waits on. Nothing when the
+  // draw was not deferred or the resolve added no single row. `key` receives the hole's pipeline key.
   std::optional<Common::FirstRunReport::DeferredResolve>
-  ResolveRowOfHole(GraphicsPipelineKey *key = nullptr) {
+  ResolveRowOfHole(std::shared_ptr<const Common::FirstRunReport::SkipTargets> targets,
+                   GraphicsPipelineKey *key = nullptr) {
     PipelineCacheTestAccess::BuildHold hold;
     AsyncDrawRig rig(*this, false, false, false, false, true);
     auto &scheduler = rig.Scheduler();
@@ -1321,7 +1322,8 @@
       if (key != nullptr) {
         *key = deferred.key;
       }
-      RenderExecutorTestAccess::CreateDrawHole(executor, scheduler.Current(), view, deferred.key, "color_history");
+      RenderExecutorTestAccess::CreateDrawHole(executor, scheduler.Current(), view, deferred.key, "color_history",
+                                               std::move(targets));
     }
     RenderExecutorTestAccess::ResetBindings(executor);
     scheduler.Flush();
@@ -1332,26 +1334,32 @@
     return rows[0];
   }
 
-  // A hole made through CreateDrawHole with a verdict brings it to its resolve row, where its key is
-  // the critical one, as the row's critical refusal. The rig asks no skip rules, so the cache alone
-  // would give not_asked, and only the verdict the hole was made with can name color_history. The row
-  // also names the critical key's vertex and pixel stage ids. They differ and are not zero, so ids
-  // taken from another stage slot, swapped, or left at zero fail.
-  void CheckHoleVerdictReachesResolve() {
-    constexpr const char *name = "HoleVerdictReachesResolve";
+  // A hole made through CreateDrawHole with refusing targets brings them to its resolve row, where its
+  // key is the critical one, as the row's critical targets. The same hole made without targets, the
+  // baseline, gives a row with the same critical refusal and no targets, so they come from the hole.
+  // The row also names the critical key's vertex and pixel stage ids. They differ and are not zero,
+  // so ids taken from another stage slot, swapped, or left at zero fail.
+  void CheckHoleTargetsReachResolve() {
+    constexpr const char *name = "HoleTargetsReachResolve";
+    constexpr uint32_t marked_slot = 3;
+    auto targets = std::make_shared<Common::FirstRunReport::SkipTargets>();
+    targets->color_slot = marked_slot;
     GraphicsPipelineKey key {};
-    const auto row = ResolveRowOfHole(&key);
-    Require(name, "verdict",
-            row && row->critical_refusal == "color_history" &&
-                row->refused == std::vector<std::pair<std::string, uint32_t>>{{"color_history", 1}},
-            "the hole's verdict did not reach its resolve row as its count and critical refusal");
+    const auto kept = ResolveRowOfHole(targets, &key);
+    Require(name, "kept",
+            kept && kept->critical_refusal == "color_history" && kept->critical_targets &&
+                kept->critical_targets->color_slot == marked_slot,
+            "the hole's refusing targets did not reach its resolve row");
     const uint64_t vertex_id = key.stage_ids[VERTEX_STAGE_INDEX];
     const uint64_t pixel_id  = key.stage_ids[PIXEL_STAGE_INDEX];
     Require(name, "distinct stage ids", vertex_id != 0 && pixel_id != 0 && vertex_id != pixel_id,
             "the hole's key cannot tell its vertex and pixel ids apart");
     Require(name, "critical stage ids",
-            row && row->has_critical && row->critical_vs == vertex_id && row->critical_ps == pixel_id,
+            kept && kept->has_critical && kept->critical_vs == vertex_id && kept->critical_ps == pixel_id,
             "the resolve row did not name the critical key's vertex and pixel stage ids");
+    const auto bare = ResolveRowOfHole(nullptr);
+    Require(name, "bare", bare && bare->critical_refusal == "color_history" && !bare->critical_targets,
+            "a hole made without targets gave its resolve row some");
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
@@ -1921,7 +1929,7 @@
     CheckDeferredNonPush();
     CheckDeferredNonPushPoolRetire();
     CheckDeferredHoleCap();
-    CheckHoleVerdictReachesResolve();
+    CheckHoleTargetsReachResolve();
     CheckDeferredShutdownResolve();
     CheckDeferredStreamWrap();
     CheckDeferredWarmPause();

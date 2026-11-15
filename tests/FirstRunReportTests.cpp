@@ -374,6 +374,72 @@ void TestResolveRefusals() {
 	      "the critical key's stage ids were lost, swapped, or written for a resolve without one");
 }
 
+// Refusing targets as a test sets them, a colour and a depth target that differ in every field the
+// report writes, so a writer that swapped the two, or dropped one field, is told apart. `marker` goes
+// in the colour draw count so targets of different holes differ too.
+Common::FirstRunReport::SkipTargets TestSkipTargets(uint32_t marker) {
+	Common::FirstRunReport::SkipTargets targets;
+	targets.color      = {.width = 1920, .height = 1080, .layers = 1, .levels = 1, .format = "R16G16B16A16Sfloat",
+	                      .view = "whole", .history = "image", .draws_this_frame = marker, .draws_last_frame = 8,
+	                      .cleared_this_frame = false, .cleared_last_frame = false, .latest_attached_ago = 0,
+	                      .previous_attached_ago = 1};
+	targets.depth      = {.width = 960, .height = 540, .layers = 6, .levels = 2, .format = "D32Sfloat",
+	                      .view = "layer", .history = "range", .draws_this_frame = 12, .draws_last_frame = 11,
+	                      .cleared_this_frame = true, .cleared_last_frame = true, .latest_attached_ago = 3,
+	                      .previous_attached_ago = 4};
+	targets.color_slot = 2;
+	return targets;
+}
+
+// A resolve row takes the refusing targets of its first critical hole, the one its critical refusal
+// came from. A non-critical hole with targets comes first, so a row that took any hole's targets
+// fails, and a second critical hole with other targets shows the first is taken. The same holes
+// without targets, the baseline, give a row with none, whose JSON has no target objects. The JSON of
+// the row with targets writes each field under the colour or depth object it belongs to.
+void TestResolveRefusalTargets() {
+	using Common::FirstRunReport::DeferredResolve;
+	using Common::FirstRunReport::HoleVerdict;
+	const auto non_critical = TestSkipTargets(1);
+	const auto first        = TestSkipTargets(7);
+	const auto second       = TestSkipTargets(5);
+	const std::vector<HoleVerdict> holes {{"color_history", false, &non_critical},
+	                                      {"color_history", true, &first},
+	                                      {"color_history", true, &second}};
+	DeferredResolve row {.trigger = "submit", .holes = 3};
+	Common::FirstRunReport::AddHoleVerdicts(row, holes);
+	Check(row.critical_targets.has_value() && row.critical_targets->color.draws_this_frame == 7,
+	      "the row did not take the targets of its first critical hole");
+	std::vector<HoleVerdict> bare = holes;
+	for (auto& hole: bare) {
+		hole.targets = nullptr;
+	}
+	DeferredResolve plain {.trigger = "submit", .holes = 3};
+	Common::FirstRunReport::AddHoleVerdicts(plain, bare);
+	Check(!plain.critical_targets.has_value() && plain.critical_refusal == "color_history",
+	      "a row whose holes kept no targets had some, or lost its critical refusal");
+
+	auto report = std::make_unique<Report>();
+	report->AddDeferredResolve(row);
+	report->AddDeferredResolve(plain);
+	const auto rows = nlohmann::json::parse(report->ToJson({}, 0, 1.0, 0.0, {}))["deferred_draws"]["resolves"];
+	Check(!rows[1].contains("critical_color_target") && !rows[1].contains("critical_depth_target"),
+	      "a row without targets wrote target objects");
+	const auto& color = rows[0]["critical_color_target"];
+	const auto& depth = rows[0]["critical_depth_target"];
+	Check(color["slot"] == 2 && color["width"] == 1920 && color["height"] == 1080 && color["layers"] == 1 &&
+	          color["levels"] == 1 && color["format"] == "R16G16B16A16Sfloat" && color["view"] == "whole" &&
+	          color["history"] == "image" && color["draws_this_frame"] == 7 && color["draws_last_frame"] == 8 &&
+	          color["cleared_this_frame"] == false && color["cleared_last_frame"] == false &&
+	          color["latest_attached_ago"] == 0 && color["previous_attached_ago"] == 1,
+	      "the colour target object lost or swapped a field");
+	Check(!depth.contains("slot") && depth["width"] == 960 && depth["height"] == 540 && depth["layers"] == 6 &&
+	          depth["levels"] == 2 && depth["format"] == "D32Sfloat" && depth["view"] == "layer" &&
+	          depth["history"] == "range" && depth["draws_this_frame"] == 12 && depth["draws_last_frame"] == 11 &&
+	          depth["cleared_this_frame"] == true && depth["cleared_last_frame"] == true &&
+	          depth["latest_attached_ago"] == 3 && depth["previous_attached_ago"] == 4,
+	      "the depth target object lost or swapped a field");
+}
+
 // Deferred draws the S2 rules refused are kept per rule with their waits. An empty report writes an
 // empty object, the baseline. Two rules with distinct counts and waits show that each draw lands under
 // its own rule and adds its own wait, and the would-skip figures stay at 0, so the refusals are not
@@ -2828,6 +2894,7 @@ int main() {
   TestDeferredDrawsSection();
   TestDeferredRefusedSkip();
   TestResolveRefusals();
+  TestResolveRefusalTargets();
   TestViewHistorySkips();
   TestWarmTakeRows();
   TestIneligibleWaits();

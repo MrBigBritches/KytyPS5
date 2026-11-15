@@ -1111,8 +1111,9 @@ struct RenderExecutorTestAccess {
 
   // Makes a hole of a draw PrepareAutoDraw deferred, as ExecutePreparedDraw does.
   static void CreateDrawHole(RenderExecutor &executor, CommandBuffer &command, DrawView &view,
-                             const GraphicsPipelineKey &key, const char *verdict) {
-    executor.CreateDrawHole(command, view, key, verdict);
+                             const GraphicsPipelineKey &key, const char *verdict,
+                             std::shared_ptr<const Common::FirstRunReport::SkipTargets> targets) {
+    executor.CreateDrawHole(command, view, key, verdict, std::move(targets));
   }
 
   static bool ResolveColorTargets(RenderExecutor &executor, CommandBuffer &buffer) {
@@ -20671,9 +20672,9 @@ public:
   };
 
   // Plays the frames on fresh targets and asks whether one more draw in the last frame may skip.
-  // That draw is asked about and not noted, as in the renderer.
+  // That draw is asked about and not noted, as in the renderer. Its state goes to `asked` when given.
   SkipRefusal GateRefusal(GateRig &rig, const GateScript &frames, const GateView &view = {},
-                          bool depth_only = false) {
+                          bool depth_only = false, DrawRenderState *asked = nullptr) {
     const auto targets = MakeGateTargets(rig.Cache(), rig.next_case++, view);
     DrawRenderState state{};
     for (size_t index = 0; index < frames.size(); index++) {
@@ -20694,6 +20695,7 @@ public:
       }
       if (index + 1 < frames.size()) rig.Cache().RunGarbageCollector();
     }
+    if (asked != nullptr) *asked = state;
     return ExplainSkipRefusal(rig.Cache(), state, depth_only);
   }
 
@@ -20870,6 +20872,118 @@ public:
       }
       return names.size() == SKIP_REFUSAL_COUNT;
     }(), "two refusal reasons share a name, so a report could not tell them apart");
+  }
+
+  // What the report keeps of a target, plays the frames, asks about the draw and describes its refusal
+  // with the report on or off.
+  std::pair<SkipRefusal, std::shared_ptr<const Common::FirstRunReport::SkipTargets>>
+  GateRefusalTargets(GateRig &rig, const GateScript &frames, bool report_on) {
+    DrawRenderState state{};
+    (void)GateRefusal(rig, frames, {}, false, &state);
+    uint32_t refusing_color = 0;
+    const auto refusal = ExplainSkipRefusal(rig.Cache(), state, false, &refusing_color);
+    Common::FirstRunReport::Configure(report_on, false);
+    auto targets = DescribeSkipRefusal(rig.Cache(), state, refusal, refusing_color);
+    Common::FirstRunReport::Configure(false, false);
+    return {refusal, std::move(targets)};
+  }
+
+  // A colour history refusal keeps the facts of its colour target and of the depth target. The colour
+  // target had too few draws this frame and is never register cleared, while the depth target had
+  // enough and was cleared in both frames, and the two formats differ, so facts taken from the depth
+  // target for the colour one, or the reverse, fail. The same refused draw with the report off, and a
+  // draw that is allowed with it on, keep nothing, the baselines for the report switch and the rule.
+  void CheckAsyncGateRefusalTargets(GateRig &rig) {
+    constexpr const char *name = "AsyncGateRefusalTargets";
+    const GateFrame good;
+    const uint32_t few = MIN_DRAWS_FOR_SKIP - 1;
+    const GateScript refused{good, GateFrame{.color_draws = few}};
+    const auto [refusal, targets] = GateRefusalTargets(rig, refused, true);
+    Require(name, "kept", refusal == SkipRefusal::ColorHistory && targets != nullptr,
+            "a colour history refusal with the report on kept no targets");
+    const auto &color = targets->color;
+    const auto &depth = targets->depth;
+    Require(name, "colour",
+            color.format == vk::to_string(vk::Format::eR32G32B32A32Sfloat) && color.draws_this_frame == few &&
+                color.draws_last_frame == MIN_DRAWS_FOR_SKIP && !color.cleared_this_frame &&
+                !color.cleared_last_frame && color.view == "whole" && color.history == "image" &&
+                color.latest_attached_ago == 0 && color.previous_attached_ago == 1 &&
+                color.width == GATE_TARGET_EXTENT && color.layers == 1 && color.levels == 1 &&
+                targets->color_slot == 0,
+            "the colour target's facts were not the refusing colour target's");
+    Require(name, "depth",
+            depth.format == vk::to_string(vk::Format::eD32Sfloat) && depth.draws_this_frame == MIN_DRAWS_FOR_SKIP &&
+                depth.draws_last_frame == MIN_DRAWS_FOR_SKIP && depth.cleared_this_frame && depth.cleared_last_frame &&
+                depth.view == "whole" && depth.history == "image",
+            "the depth target's facts were not the depth target's");
+    Require(name, "report off", GateRefusalTargets(rig, refused, false).second == nullptr,
+            "targets were kept with the report off");
+    const auto allowed = GateRefusalTargets(rig, {good, good}, true);
+    Require(name, "allowed", allowed.first == SkipRefusal::None && allowed.second == nullptr,
+            "targets were kept for a draw the rule allowed");
+  }
+
+  // What GateTwoColourRefusal found.
+  struct TwoColourRefusal {
+    SkipRefusal refusal = SkipRefusal::None;
+    uint32_t index = 0;
+    std::shared_ptr<const Common::FirstRunReport::SkipTargets> targets;
+  };
+
+  // A draw into a depth target and two colour targets in slots 0 and 1, every target of a fresh gate
+  // case and drawn and cleared in two frames, except the colour target at `short_index`, which has one
+  // draw too few in the last frame. Asks about one more draw into all three and describes its refusal
+  // with the report on.
+  TwoColourRefusal GateTwoColourRefusal(GateRig &rig, uint32_t short_index) {
+    const auto first = MakeGateTargets(rig.Cache(), rig.next_case++);
+    const auto second = MakeGateTargets(rig.Cache(), rig.next_case++);
+    const std::array colors{first.color, second.color};
+    const uint32_t few = MIN_DRAWS_FOR_SKIP - 1;
+    const auto state_of = [&](uint32_t frame, uint32_t draw) {
+      DrawRenderState state{};
+      state.vertex_info[0].stage = {&rig.other_module, &rig.other_resources};
+      state.depth_info = first.depth;
+      state.depth_info.depth_clear_enable = true;
+      for (uint32_t slot = 0; slot < colors.size(); slot++) {
+        if (frame == 1 && slot == short_index && draw >= few) continue;
+        state.color_info[state.color_count] = colors[slot];
+        state.color_info[state.color_count].target_slot = slot;
+        state.color_count++;
+      }
+      return state;
+    };
+    for (uint32_t frame = 0; frame < 2; frame++) {
+      for (uint32_t draw = 0; draw < MIN_DRAWS_FOR_SKIP; draw++) NoteDrawTargets(rig.Cache(), state_of(frame, draw));
+      if (frame == 0) rig.Cache().RunGarbageCollector();
+    }
+    // Frame 0 notes every target, so this is the draw into all three.
+    const auto asked = state_of(0, 0);
+    TwoColourRefusal result;
+    result.refusal = ExplainSkipRefusal(rig.Cache(), asked, false, &result.index);
+    Common::FirstRunReport::Configure(true, false);
+    result.targets = DescribeSkipRefusal(rig.Cache(), asked, result.refusal, result.index);
+    Common::FirstRunReport::Configure(false, false);
+    return result;
+  }
+
+  // The refusing colour target is the one described. Only the second of two colour targets has too
+  // few draws, so the index, the slot and the facts are its own, the second's slot 1 with one draw too
+  // few. The baseline differs only in which target is short, the first, and gives index and slot 0, so
+  // a description that always took the first target, or an index never written, fails one of them.
+  void CheckAsyncGateRefusingColour(GateRig &rig) {
+    constexpr const char *name = "AsyncGateRefusingColour";
+    const uint32_t few = MIN_DRAWS_FOR_SKIP - 1;
+    const auto second = GateTwoColourRefusal(rig, 1);
+    Require(name, "second refuses",
+            second.refusal == SkipRefusal::ColorHistory && second.index == 1 && second.targets != nullptr &&
+                second.targets->color_slot == 1 && second.targets->color.draws_this_frame == few &&
+                second.targets->color.draws_last_frame == MIN_DRAWS_FOR_SKIP,
+            "the second colour target refused, but another was named or described");
+    const auto first = GateTwoColourRefusal(rig, 0);
+    Require(name, "first refuses",
+            first.refusal == SkipRefusal::ColorHistory && first.index == 0 && first.targets != nullptr &&
+                first.targets->color_slot == 0 && first.targets->color.draws_this_frame == few,
+            "the first colour target refused, but another was named or described");
   }
 
   // Stages that write beyond the targets are never skipped, however steady the targets are.
@@ -21133,6 +21247,8 @@ public:
     CheckAsyncGateViews(rig);
     CheckAsyncGateLayers(rig);
     CheckAsyncGateReasons(rig);
+    CheckAsyncGateRefusalTargets(rig);
+    CheckAsyncGateRefusingColour(rig);
     CheckAsyncGateWriters(rig);
     CheckAsyncGateViewHistory(rig);
     std::printf("[gpu]     %-32s ok\n", "AsyncGate");
@@ -62045,7 +62161,10 @@ struct ProbePolicy final : PipelineSkipPolicy {
     return skip_rule_asks != 0 && !skip_rules_allow ? "probe_rule" : nullptr;
   }
   const char *DeferBlocker() const override { return blocker; }
+  // Given whatever was asked, so only the cache's own conditions decide whether a hole carries them.
+  std::shared_ptr<const Common::FirstRunReport::SkipTargets> RefusedTargets() const override { return targets; }
   mutable uint32_t skip_rule_asks = 0;
+  std::shared_ptr<const Common::FirstRunReport::SkipTargets> targets;
 };
 
 // The three answers for a draw that misses its pipeline, asked of the cache directly. A hole is only
@@ -62134,7 +62253,10 @@ void CheckDeferredPolicy(VulkanHarness &vulkan) {
 // flag alone skips too, against a baseline with neither that defers without asking the rules. Each
 // deferred draw is resolved, and the report then counts it as one S2 would have skipped or, with
 // the async flag, under the rule that refused it. Without the async flag a refusing policy is never
-// asked, so nothing is counted, which shows the counter follows the flag.
+// asked, so nothing is counted, which shows the counter follows the flag. The policy offers refusing
+// targets in every case, and only a draw deferred under the policy's own refusal carries them. The
+// allowed and not asked cases, which differ from those in the rules' answer and the async flag, carry
+// none.
 void CheckPreferSkip(VulkanHarness &vulkan) {
   constexpr const char *name = "PreferSkip";
   struct Case {
@@ -62162,6 +62284,7 @@ void CheckPreferSkip(VulkanHarness &vulkan) {
       const auto state = rig.State(vk::PrimitiveTopology::eTriangleList);
       ProbePolicy policy;
       policy.skip_rules_allow = test.skip_rules_allow;
+      policy.targets = std::make_shared<Common::FirstRunReport::SkipTargets>();
       PipelineCache::DeferredDraw deferred;
       Common::FirstRunReport::Global().Reset();
       const auto *pipeline = rig.cache.AcquireGraphicsPipeline(rig.command, state, &policy, &deferred);
@@ -62176,6 +62299,9 @@ void CheckPreferSkip(VulkanHarness &vulkan) {
                                       : deferred.skip_verdict != nullptr &&
                                             std::strcmp(deferred.skip_verdict, test.verdict) == 0,
               "the deferred draw carried another skip verdict than expected");
+      const bool refused_here = test.verdict != nullptr && std::strcmp(test.verdict, "probe_rule") == 0;
+      Require(name, test.label, deferred.skip_targets == (refused_here ? policy.targets : nullptr),
+              "the deferred draw carried refusing targets that do not explain its verdict, or lost them");
       if (deferred.active) {
         PipelineCache::DeferredAcquireStats stats;
         (void)rig.cache.AcquireDeferredPipelines(std::span(&deferred.key, 1), false, stats);

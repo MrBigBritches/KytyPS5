@@ -168,6 +168,37 @@ struct Refusal {
 	double      blocked_ms = 0.0;
 };
 
+/// One render target of a draw the skip rule refused for its colour history, kept for the report
+/// (diagnostic). The size, layers, levels and format are the image's, and `view` says whether the draw
+/// viewed it whole, as a layer, as a mip or outside it. The draw counts and clears come from the
+/// history the rule judged, the image's own for a whole view and its range's for a partial one, which
+/// `history` names as image, range or none. FrameHistory keeps only the last two frames that had a
+/// draw, so the frame the target was first attached cannot be told. latest_attached_ago and
+/// previous_attached_ago say how many frames ago those two were, -1 when the frame is not known.
+struct SkipTargetFacts {
+	uint32_t    width                 = 0;
+	uint32_t    height                = 0;
+	uint32_t    layers                = 0;
+	uint32_t    levels                = 0;
+	std::string format;
+	std::string view;
+	std::string history;
+	uint32_t    draws_this_frame      = 0;
+	uint32_t    draws_last_frame      = 0;
+	bool        cleared_this_frame    = false;
+	bool        cleared_last_frame    = false;
+	int64_t     latest_attached_ago   = -1;
+	int64_t     previous_attached_ago = -1;
+};
+
+/// The colour target that refused a draw for its colour history, and the draw's depth target, so the
+/// two can be compared. color_slot is the refusing target's hardware slot.
+struct SkipTargets {
+	SkipTargetFacts color;
+	SkipTargetFacts depth;
+	uint32_t        color_slot = 0;
+};
+
 /// One resolve of the draws deferred by --deferred-pipeline-draws. All times are in ms.
 /// pre_resolve_ms runs from the first hole to the start of the resolve, resolve_wait_ms is the wait
 /// for the builds, record_ms the recording of the holes and save_ms the driver cache save inside the
@@ -205,6 +236,9 @@ struct DeferredResolve {
 	/// is the verdict of the first hole of that key, empty when unknown.
 	std::vector<std::pair<std::string, uint32_t>> refused;
 	std::string                                   critical_refusal;
+	/// The targets of the hole the critical refusal came from, when that hole kept them, which is only
+	/// a color_history refusal with the report on.
+	std::optional<SkipTargets> critical_targets;
 };
 
 /// A hole whose draw S2 allowed to skip but which was deferred, under the default policy B.
@@ -215,14 +249,16 @@ inline constexpr std::string_view HOLE_VERDICT_NOT_ASKED = "not_asked";
 inline constexpr std::string_view HOLE_VERDICT_UNKNOWN = "unknown";
 
 /// One hole of a resolve as AddHoleVerdicts counts it. `verdict` is a static name or null for none,
-/// and `critical` says the hole's key is the one the resolve waited on longest.
+/// `critical` says the hole's key is the one the resolve waited on longest, and `targets` are the
+/// refusing targets the hole kept, or null.
 struct HoleVerdict {
 	const char*        verdict  = nullptr;
 	bool               critical = false;
+	const SkipTargets* targets  = nullptr;
 };
 
 /// Counts each hole under its verdict in the row, a null one as HOLE_VERDICT_UNKNOWN, and takes the
-/// first critical hole's verdict as the row's critical refusal.
+/// first critical hole's verdict as the row's critical refusal, and its targets when it kept any.
 void AddHoleVerdicts(DeferredResolve& row, std::span<const HoleVerdict> holes);
 
 /// One draw that --deferred-pipeline-draws could not defer and that then waited for its pipeline,

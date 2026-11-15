@@ -135,16 +135,19 @@ public:
 	// The view must come from a draw prepared without early vertex buffer binds, since the commands
 	// of the hole's buffer have to bind them. Its bindings and dynamic state are copied.
 	// `skip_verdict` is what the S2 rules said of the draw, a static name kept for the report, or null.
-	DrawHole(const DrawView& view, const GraphicsPipelineKey& key, const char* skip_verdict = nullptr);
+	// `skip_targets` are the targets that refused it, kept for the report, or null.
+	DrawHole(const DrawView& view, const GraphicsPipelineKey& key, const char* skip_verdict = nullptr,
+	         std::shared_ptr<const Common::FirstRunReport::SkipTargets> skip_targets = nullptr);
 	KYTY_CLASS_NO_COPY(DrawHole);
 
 	/// The key of the pipeline the draw waits for.
 	[[nodiscard]] const GraphicsPipelineKey& Key() const noexcept { return m_key; }
 	/// What the S2 rules said of the draw when it was deferred, or null when nothing was kept.
 	[[nodiscard]] const char* SkipVerdict() const noexcept { return m_skip_verdict; }
-	/// The hole as the report counts it. `critical` says its key is the one the resolve waited on.
+	/// The hole as the report counts it, its verdict and refusing targets together, so a resolve row
+	/// cannot take one without the other. `critical` says its key is the one the resolve waited on.
 	[[nodiscard]] Common::FirstRunReport::HoleVerdict Verdict(bool critical) const noexcept {
-		return {.verdict = m_skip_verdict, .critical = critical};
+		return {.verdict = m_skip_verdict, .critical = critical, .targets = m_skip_targets.get()};
 	}
 	/// The draw to record, over this hole's own copies.
 	[[nodiscard]] const DrawView& View() const noexcept { return m_view; }
@@ -152,6 +155,7 @@ public:
 private:
 	GraphicsPipelineKey                              m_key;
 	const char*                                      m_skip_verdict = nullptr;
+	std::shared_ptr<const Common::FirstRunReport::SkipTargets> m_skip_targets;
 	DrawView                                         m_view;
 	std::array<PreparedBindings, MaxBindingStages>   m_bindings;
 	DynamicState                                     m_dynamic_state;

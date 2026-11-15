@@ -1071,7 +1071,32 @@
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  // A hole counts for the report with its verdict and the refusing targets it was made with, as one,
+  // so a resolve row reads both from the same hole. A hole made without targets, the baseline, gives
+  // none, so the targets come from the hole and not from the verdict or the critical flag.
+  void CheckHoleVerdictTargets() {
+    constexpr const char *name = "HoleVerdictTargets";
+    AsyncDrawRig rig(*this, false);
+    CommandSchedulerTestAccess::AllowThisThread(rig.Scheduler());
+    rig.PaintSentinels();
+    const auto source = PrepareHoleSource(rig);
+    const auto targets = std::make_shared<Common::FirstRunReport::SkipTargets>();
+    const DrawHole kept(source.view, source.key, "color_history", targets);
+    const DrawHole bare(source.view, source.key, "color_history");
+    const auto with = kept.Verdict(true);
+    const auto without = bare.Verdict(true);
+    Require(name, "kept", with.targets == targets.get() && with.critical && with.verdict != nullptr &&
+                              std::strcmp(with.verdict, "color_history") == 0,
+            "the hole's verdict lost its targets, its critical flag or its rule");
+    Require(name, "bare", without.targets == nullptr && without.critical,
+            "a hole made without targets counted with some");
+    RenderExecutorTestAccess::ResetBindings(rig.context->GetRenderExecutor());
+    rig.Scheduler().Flush();
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckDeferredHoles() {
+    CheckHoleVerdictTargets();
     CheckHoleClearsStripped();
     CheckHoleBookkeeping();
     CheckHoleEmptySegments();

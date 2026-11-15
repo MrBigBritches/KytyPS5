@@ -3,7 +3,12 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <utility>
+
+namespace Common::FirstRunReport {
+struct SkipTargets;
+} // namespace Common::FirstRunReport
 
 namespace Libs::Graphics {
 
@@ -73,9 +78,17 @@ inline constexpr size_t SKIP_REFUSAL_COUNT = static_cast<size_t>(SkipRefusal::Co
 /// The name a report gives a refusal.
 [[nodiscard]] const char* SkipRefusalName(SkipRefusal refusal);
 
-/// Applies the rule above and says which part refused the draw.
+/// Applies the rule above and says which part refused the draw. For a ColorHistory refusal the index
+/// of the refusing colour target in the draw's colour targets goes to `refusing_color` when given.
 [[nodiscard]] SkipRefusal ExplainSkipRefusal(TextureCache& cache, const DrawRenderState& state,
-                                             bool depth_only);
+                                             bool depth_only, uint32_t* refusing_color = nullptr);
+
+/// For the first-run report, the facts of the colour target that refused a draw for its colour
+/// history and of the draw's depth target, see TextureCache::DescribeSkipTarget. Null for any other
+/// refusal and with the report off, so a run without the report pays nothing.
+/// @param refusing_color the index ExplainSkipRefusal gave for the refusal.
+[[nodiscard]] std::shared_ptr<const Common::FirstRunReport::SkipTargets>
+DescribeSkipRefusal(TextureCache& cache, const DrawRenderState& state, SkipRefusal refusal, uint32_t refusing_color);
 
 /// Whether ExplainSkipRefusal finds no reason to refuse.
 [[nodiscard]] bool DrawMaySkipPipeline(TextureCache& cache, const DrawRenderState& state,

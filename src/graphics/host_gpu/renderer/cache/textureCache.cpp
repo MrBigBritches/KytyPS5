@@ -1963,6 +1963,45 @@ TextureCache::RebuildVerdict JudgeHistories(const FrameHistory& attached, const 
 	return RebuildVerdict::Rebuilt;
 }
 
+// How many frames before `tick` a noted frame was, or -1 when the history does not know it.
+int64_t FramesAgo(uint64_t frame, uint64_t tick) {
+	return frame == FrameHistory::Never || frame > tick ? -1 : static_cast<int64_t>(tick - frame);
+}
+
+// The events a history noted in `frame`, 0 when it noted none or no longer remembers the frame.
+uint32_t EventsIn(const FrameHistory& history, uint64_t frame) {
+	if (frame == FrameHistory::Never) {
+		return 0;
+	}
+	if (history.latest == frame) {
+		return history.latest_count;
+	}
+	return history.previous == frame ? history.previous_count : 0;
+}
+
+// The report's name of how a view relates to its image.
+const char* ViewScopeName(ViewRangeScope scope) {
+	switch (scope) {
+		case ViewRangeScope::Whole: return "whole";
+		case ViewRangeScope::Layer: return "layer";
+		case ViewRangeScope::Mip: return "mip";
+		case ViewRangeScope::Outside: return "outside";
+	}
+	return "outside";
+}
+
+// Fills the draw and clear facts of one pair of histories at `tick`.
+void DescribeHistories(const FrameHistory& attached, const FrameHistory& cleared, uint64_t tick,
+                       Common::FirstRunReport::SkipTargetFacts& facts) {
+	const uint64_t before         = tick > 0 ? tick - 1 : FrameHistory::Never;
+	facts.draws_this_frame        = EventsIn(attached, tick);
+	facts.draws_last_frame        = EventsIn(attached, before);
+	facts.cleared_this_frame      = cleared.HappenedIn(tick);
+	facts.cleared_last_frame      = cleared.HappenedIn(before);
+	facts.latest_attached_ago     = FramesAgo(attached.latest, tick);
+	facts.previous_attached_ago   = FramesAgo(attached.previous, tick);
+}
+
 } // namespace
 
 bool ViewHistoryEnabled() {
@@ -2027,6 +2066,30 @@ TextureCache::RebuildVerdict TextureCache::JudgeRebuiltEveryFrame(ImageId id,
 	}
 	return JudgeHistories(image.attached_frames, image.cleared_frames, image.htile_cleared_frames, m_gc_tick,
 	                      needs_clear, min_draws);
+}
+
+// Picks the history the same way JudgeRebuiltEveryFrame does, so the facts are those the rule saw.
+Common::FirstRunReport::SkipTargetFacts TextureCache::DescribeSkipTarget(ImageId id, const ImageViewInfo& view) {
+	std::scoped_lock lock {m_lock};
+	const auto&      image     = m_slot_images[id];
+	const auto&      resources = image.info.resources;
+	Common::FirstRunReport::SkipTargetFacts facts;
+	facts.width  = image.info.extent.width;
+	facts.height = image.info.extent.height;
+	facts.layers = resources.layers;
+	facts.levels = resources.levels;
+	facts.format = vk::to_string(image.info.pixel_format);
+	facts.view   = ViewScopeName(ClassifyViewRange(resources.levels, resources.layers, view));
+	if (ViewIsWholeImage(image, view)) {
+		facts.history = "image";
+		DescribeHistories(image.attached_frames, image.cleared_frames, m_gc_tick, facts);
+	} else if (const auto* range = ViewHistoryEnabled() ? FindViewHistory(image, view) : nullptr) {
+		facts.history = "range";
+		DescribeHistories(range->attached_frames, range->cleared_frames, m_gc_tick, facts);
+	} else {
+		facts.history = "none";
+	}
+	return facts;
 }
 
 bool TextureCache::NoteSkippedTarget(ImageId id, bool depth) {

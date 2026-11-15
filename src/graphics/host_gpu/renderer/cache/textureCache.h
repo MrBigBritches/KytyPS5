@@ -21,6 +21,10 @@
 #include <unordered_set>
 #include <vector>
 
+namespace Common::FirstRunReport {
+struct SkipTargetFacts;
+} // namespace Common::FirstRunReport
+
 namespace Libs::Graphics {
 
 struct GraphicContext;
@@ -118,6 +122,10 @@ public:
 	/// only when that range has none.
 	[[nodiscard]] RebuildVerdict JudgeRebuiltEveryFrame(ImageId id, const ImageViewInfo& view,
 	                                                    bool needs_clear, uint32_t min_draws);
+	/// What the first-run report keeps of a target the skip rule refused a draw for. That is the image's
+	/// size, layers, levels and format, how the view relates to it, and the draws and clears of this
+	/// frame and the one before in the same history JudgeRebuiltEveryFrame reads. It judges nothing.
+	[[nodiscard]] Common::FirstRunReport::SkipTargetFacts DescribeSkipTarget(ImageId id, const ImageViewInfo& view);
 	/// Notes that a draw into the image was skipped, as a depth target when `depth`. Returns true
 	/// when a resident image heap references the image, which then gets no mark. The heap resolves
 	/// its own bindings out of reach of TakeSkippedDraws, and it could select the image, so the

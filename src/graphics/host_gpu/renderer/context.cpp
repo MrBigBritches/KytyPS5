@@ -86,9 +86,10 @@ bool RenderStateClears(const RenderState& state) {
 	return state.depth_stencil_attachment.depth_clear || state.depth_stencil_attachment.stencil_clear;
 }
 
-// Copies the view's bindings and dynamic state, and keeps the skip verdict for the report.
-DrawHole::DrawHole(const DrawView& view, const GraphicsPipelineKey& key, const char* skip_verdict)
-    : m_key(key), m_skip_verdict(skip_verdict), m_view(view),
+// Copies the view's bindings and dynamic state, and keeps the skip verdict and targets for the report.
+DrawHole::DrawHole(const DrawView& view, const GraphicsPipelineKey& key, const char* skip_verdict,
+                   std::shared_ptr<const Common::FirstRunReport::SkipTargets> skip_targets)
+    : m_key(key), m_skip_verdict(skip_verdict), m_skip_targets(std::move(skip_targets)), m_view(view),
       m_dynamic_state(*view.dynamic_state) {
 	EXIT_IF(view.vertex_buffers_bound);
 	EXIT_IF(view.stage_count > MaxBindingStages);

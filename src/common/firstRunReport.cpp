@@ -458,6 +458,10 @@ void AddHoleVerdicts(DeferredResolve& row, std::span<const HoleVerdict> holes) {
 		found->second++;
 		if (hole.critical && row.critical_refusal.empty()) {
 			row.critical_refusal = std::string(name);
+			// From the same hole as the refusal, so the targets always explain the named rule.
+			if (hole.targets != nullptr) {
+				row.critical_targets = *hole.targets;
+			}
 		}
 	}
 }
@@ -996,8 +1000,25 @@ nlohmann::json ResolveRefusedToJson(const std::vector<std::pair<std::string, uin
 	return result;
 }
 
-// Adds a resolve row's skip verdicts, its critical key's stage ids when it had one, and its critical
-// refusal.
+// Writes one refusing target of a resolve row, as SkipTargetFacts describes it.
+nlohmann::json SkipTargetToJson(const SkipTargetFacts& facts) {
+	return {{"width", facts.width},
+	        {"height", facts.height},
+	        {"layers", facts.layers},
+	        {"levels", facts.levels},
+	        {"format", facts.format},
+	        {"view", facts.view},
+	        {"history", facts.history},
+	        {"draws_this_frame", facts.draws_this_frame},
+	        {"draws_last_frame", facts.draws_last_frame},
+	        {"cleared_this_frame", facts.cleared_this_frame},
+	        {"cleared_last_frame", facts.cleared_last_frame},
+	        {"latest_attached_ago", facts.latest_attached_ago},
+	        {"previous_attached_ago", facts.previous_attached_ago}};
+}
+
+// Adds a resolve row's skip verdicts, its critical key's stage ids when it had one, its critical
+// refusal and that hole's targets when it kept any.
 void AddVerdictFields(nlohmann::json& row, const DeferredResolve& resolve) {
 	if (resolve.has_critical) {
 		row["critical_vs"] = Hex(resolve.critical_vs);
@@ -1005,6 +1026,13 @@ void AddVerdictFields(nlohmann::json& row, const DeferredResolve& resolve) {
 	}
 	row["refused"]          = ResolveRefusedToJson(resolve.refused);
 	row["critical_refusal"] = resolve.critical_refusal.empty() ? "none" : resolve.critical_refusal;
+	// Only a row whose critical hole kept its targets has them, so other rows read as they did.
+	if (resolve.critical_targets) {
+		auto color    = SkipTargetToJson(resolve.critical_targets->color);
+		color["slot"] = resolve.critical_targets->color_slot;
+		row["critical_color_target"] = std::move(color);
+		row["critical_depth_target"] = SkipTargetToJson(resolve.critical_targets->depth);
+	}
 }
 
 // Writes the deferred-draw figures, which are empty or zero unless --deferred-pipeline-draws ran.

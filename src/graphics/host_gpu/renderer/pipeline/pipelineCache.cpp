@@ -1374,6 +1374,16 @@ const char* PipelineCache::NoteDeferredSkipVerdict(const std::shared_ptr<Graphic
 	return Common::FirstRunReport::HOLE_VERDICT_NOT_ASKED.data();
 }
 
+// The policy's refusing targets, only where NoteDeferredSkipVerdict takes the policy's own refusal as
+// the verdict, so a hole never carries targets that explain another verdict.
+static std::shared_ptr<const Common::FirstRunReport::SkipTargets> RefusedTargetsOf(const PipelineSkipPolicy* policy,
+                                                                                   bool may_skip) {
+	if (may_skip || !Config::AsyncPipelinesEnabled() || policy == nullptr) {
+		return nullptr;
+	}
+	return policy->RefusedTargets();
+}
+
 void PipelineCache::ReportDeferredWouldSkip() {
 	for (const auto& noted: m_would_skip) {
 		// The build reports its readiness as a time since it was requested, which a draw met after
@@ -1453,6 +1463,7 @@ PipelineCache::Pipeline* PipelineCache::AcquireBuiltPipeline(const GraphicsPipel
 		// A draw that S2 would have dropped is deferred instead, which costs it a wait, and one S2
 		// refused had no other way.
 		deferred->skip_verdict = NoteDeferredSkipVerdict(pending->second.build, policy, may_skip);
+		deferred->skip_targets = RefusedTargetsOf(policy, may_skip);
 		return nullptr;
 	}
 	if (fate == DrawFate::Skip) {

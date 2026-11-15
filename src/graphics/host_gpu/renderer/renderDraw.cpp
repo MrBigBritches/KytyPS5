@@ -549,7 +549,8 @@ static void NoteViewHistoryVerdict(TextureCache& cache, const DrawRenderState& s
 	}
 }
 
-SkipRefusal ExplainSkipRefusal(TextureCache& cache, const DrawRenderState& state, bool depth_only) {
+SkipRefusal ExplainSkipRefusal(TextureCache& cache, const DrawRenderState& state, bool depth_only,
+                               uint32_t* refusing_color) {
 	// A color-only pass shows no sign of being rebuilt, because a color clear is applied by the GPU
 	// and the CPU never sees it. It waits for the pipeline. In depth-only mode so does every draw
 	// that has a color target.
@@ -568,19 +569,36 @@ SkipRefusal ExplainSkipRefusal(TextureCache& cache, const DrawRenderState& state
 	if (const auto refusal = DepthRefusal(verdict); refusal != SkipRefusal::None) {
 		return refusal;
 	}
-	const std::span colors {state.color_info, state.color_count};
-	for (const auto& color: colors) {
-		const auto judged = cache.JudgeRebuiltEveryFrame(color.image_id, color.desc.view_info,
-		                                                 false, MIN_DRAWS_FOR_SKIP);
+	for (uint32_t index = 0; index < state.color_count; index++) {
+		const auto& color  = state.color_info[index];
+		const auto  judged = cache.JudgeRebuiltEveryFrame(color.image_id, color.desc.view_info,
+		                                                  false, MIN_DRAWS_FOR_SKIP);
 		if (judged == TextureCache::RebuildVerdict::PartialView) {
 			return SkipRefusal::PartialView;
 		}
 		if (judged != TextureCache::RebuildVerdict::Rebuilt) {
+			if (refusing_color != nullptr) {
+				*refusing_color = index;
+			}
 			return SkipRefusal::ColorHistory;
 		}
 	}
 	NoteViewHistoryVerdict(cache, state);
 	return SkipRefusal::None;
+}
+
+std::shared_ptr<const Common::FirstRunReport::SkipTargets>
+DescribeSkipRefusal(TextureCache& cache, const DrawRenderState& state, SkipRefusal refusal, uint32_t refusing_color) {
+	if (refusal != SkipRefusal::ColorHistory || !Common::FirstRunReport::Enabled() ||
+	    refusing_color >= state.color_count) {
+		return nullptr;
+	}
+	auto        targets = std::make_shared<Common::FirstRunReport::SkipTargets>();
+	const auto& color   = state.color_info[refusing_color];
+	targets->color      = cache.DescribeSkipTarget(color.image_id, color.desc.view_info);
+	targets->color_slot = color.target_slot;
+	targets->depth      = cache.DescribeSkipTarget(state.depth_info.image_id, state.depth_info.desc.view_info);
+	return targets;
 }
 
 bool DrawMaySkipPipeline(TextureCache& cache, const DrawRenderState& state, bool depth_only) {
@@ -618,7 +636,8 @@ public:
 		if (!Config::AsyncPipelinesEnabled()) {
 			return false;
 		}
-		m_refusal = ExplainSkipRefusal(m_cache, m_state, m_depth_only);
+		m_refusing_color = 0;
+		m_refusal        = ExplainSkipRefusal(m_cache, m_state, m_depth_only, &m_refusing_color);
 		return m_refusal == SkipRefusal::None;
 	}
 
@@ -656,6 +675,15 @@ public:
 		return m_refusal == SkipRefusal::None ? nullptr : SkipRefusalName(m_refusal);
 	}
 
+	/// The targets that refused the draw at the last question, for the report, or null. Described only
+	/// here, when the draw becomes a hole, so a refused draw that blocks or skips does no lock or string
+	/// work. The cache asks within the same AcquireGraphicsPipeline call on the same thread, and the
+	/// histories change only when a draw's targets are noted after that call or when the garbage
+	/// collector ticks at a flip, so they are those the question judged.
+	[[nodiscard]] std::shared_ptr<const Common::FirstRunReport::SkipTargets> RefusedTargets() const override {
+		return DescribeSkipRefusal(m_cache, m_state, m_refusal, m_refusing_color);
+	}
+
 private:
 	RenderContext&         m_context;
 	TextureCache&          m_cache;
@@ -663,6 +691,7 @@ private:
 	bool                   m_depth_only;
 	DeferFacts             m_facts;
 	mutable SkipRefusal    m_refusal = SkipRefusal::None;
+	mutable uint32_t       m_refusing_color = 0;
 };
 
 } // namespace
@@ -1655,7 +1684,8 @@ void RenderExecutor::RecordBlockingDraw(CommandBuffer& buffer, const DrawView& v
 // The caller must not use a command buffer it fetched before this call, since the scheduler ends
 // it here and starts another.
 void RenderExecutor::CreateDrawHole(CommandBuffer& buffer, DrawView& view,
-                                    const GraphicsPipelineKey& key, const char* skip_verdict) {
+                                    const GraphicsPipelineKey& key, const char* skip_verdict,
+                                    std::shared_ptr<const Common::FirstRunReport::SkipTargets> skip_targets) {
 	if (RenderStateClears(view.rendering)) {
 		// The clear was consumed from the registers when the draw was met, so it is applied here, in
 		// the pass before the hole. The hole's own pass loads, as it would after any earlier pass.
@@ -1666,7 +1696,7 @@ void RenderExecutor::CreateDrawHole(CommandBuffer& buffer, DrawView& view,
 	auto& scheduler = m_context.GetCommandScheduler();
 	// Counted where the draw is met, since the hole is recorded later and the cadence counts now.
 	scheduler.NoteRecordedWork();
-	scheduler.SplitForHole(std::make_unique<DrawHole>(view, key, skip_verdict));
+	scheduler.SplitForHole(std::make_unique<DrawHole>(view, key, skip_verdict, std::move(skip_targets)));
 }
 
 // Records one prepared draw. Resources are prepared and the targets acquired for every draw. With
@@ -1685,7 +1715,7 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	const auto* pipeline = PrepareDraw(buffer, draw, state, emit, index_source, true, view,
 	                                   Config::DeferredPipelineDrawsEnabled() ? &deferred : nullptr);
 	if (deferred.active) {
-		CreateDrawHole(buffer, view, deferred.key, deferred.skip_verdict);
+		CreateDrawHole(buffer, view, deferred.key, deferred.skip_verdict, std::move(deferred.skip_targets));
 		return;
 	}
 	if (pipeline != nullptr) {

@@ -338,6 +338,11 @@ public:
 	// The name of the rule that refused the draw at the last MaySkip, or null if it did not. A
 	// draw that missed its pipeline and was refused is counted under that name.
 	[[nodiscard]] virtual const char* Refusal() const { return nullptr; }
+	// The targets that refused the draw at the last MaySkip, kept for the first-run report, or null.
+	// Only a colour history refusal with the report on keeps them.
+	[[nodiscard]] virtual std::shared_ptr<const Common::FirstRunReport::SkipTargets> RefusedTargets() const {
+		return nullptr;
+	}
 	// The name of what stops the draw itself from being deferred, or null when nothing does. It
 	// covers the draw's own state, and the pipeline cache adds what its shaders need. A policy that
 	// does not override it never defers.
@@ -399,6 +404,8 @@ public:
 		// For the report, what the S2 rules said of the draw, the refusing rule's name or one of the
 		// first-run report's HOLE_VERDICT names. A static string, set with `active`.
 		const char*         skip_verdict = nullptr;
+		// The policy's refusing targets when skip_verdict is its refusal, or null.
+		std::shared_ptr<const Common::FirstRunReport::SkipTargets> skip_targets;
 	};
 	// Like GetGraphicsPipeline, but returns null instead of waiting when a background build has
 	// not finished and the draw may go without. Without a policy, or when builds are not in the
