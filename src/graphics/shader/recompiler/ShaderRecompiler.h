@@ -72,6 +72,14 @@ struct ShaderSource {
 };
 
 [[nodiscard]] const char* StageName(ShaderType stage);
+// Whether a formatted embedded vertex fetch of `component_count` components can read every component
+// from the buffer resource's format and destination selects. The translator EXITs where it cannot,
+// through RequireEmbeddedFetchFormat, and the graphics prescan rejects a draw on it first.
+[[nodiscard]] bool EmbeddedFetchFormatValid(const ShaderBufferResource& resource, uint32_t component_count);
+// EXITs as the translator does when EmbeddedFetchFormatValid is false.
+void RequireEmbeddedFetchFormat(const ShaderBufferResource& resource, uint32_t component_count,
+                                uint32_t attribute, uint32_t pc);
+
 [[nodiscard]] ShaderSource PrepareShaderSource(std::span<const uint32_t> code,
 	                                           const CompileOptions& options);
 const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtRuntime& runtime);

@@ -215,6 +215,19 @@ vk::Format NarrowInputFormat(vk::Format format, uint32_t used_components) {
 	}
 }
 
+// The raw formats InputFormat maps by hand, which VulkanFormat does not know.
+constexpr uint32_t RAW_FORMAT_16_16_SINT = 113;
+constexpr uint32_t RAW_FORMAT_121       = 121;
+
+// Whether InputFormat has a host format for the attribute, which it EXITs without.
+bool InputFormatKnown(const ShaderBufferResource& resource) {
+	if (resource.RawFormat() == RAW_FORMAT_16_16_SINT || resource.RawFormat() == RAW_FORMAT_121) {
+		return true;
+	}
+	return VulkanFormat(resource.Format()) != vk::Format::eUndefined &&
+	       ShaderRecompiler::Format::GetFormatInfo(resource.Format()).component_count != 0;
+}
+
 vk::Format InputFormat(const ShaderBufferResource& resource, uint32_t used_components) {
 	switch (resource.RawFormat()) {
 		// Temporary: invalid PS5 buffer format 113 (VertexAttribFormat::k16_16SInt).
@@ -222,12 +235,10 @@ vk::Format InputFormat(const ShaderBufferResource& resource, uint32_t used_compo
 		case 121: return vk::Format::eR16G16Sfloat;
 		default: break;
 	}
-	const auto format = VulkanFormat(resource.Format());
-	if (format == vk::Format::eUndefined ||
-	    ShaderRecompiler::Format::GetFormatInfo(resource.Format()).component_count == 0) {
+	if (!InputFormatKnown(resource)) {
 		EXIT("unknown vertex format: fmt = %u\n", resource.RawFormat());
 	}
-	return NarrowInputFormat(format, used_components);
+	return NarrowInputFormat(VulkanFormat(resource.Format()), used_components);
 }
 
 // The host format of each vertex input attribute, narrowed to the components the stage reads.

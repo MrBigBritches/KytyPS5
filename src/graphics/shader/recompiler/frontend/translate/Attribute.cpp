@@ -1,5 +1,6 @@
 #include "common/assert.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
+#include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
 
 #include <algorithm>
@@ -49,6 +50,9 @@ void Translator::TranslateEmbeddedFetch(const Decoder::Instruction& inst, uint32
                                         uint32_t component_count,
                                         const ShaderBufferResource& resource) {
 	const auto format = Format::GetFormatInfo(resource.Format());
+	if (inst.formatted && !inst.typed) {
+		RequireEmbeddedFetchFormat(resource, component_count, attribute, inst.pc);
+	}
 	for (uint32_t component = 0; component < component_count; component++) {
 		auto source = Format::FormattedSource {Format::FormattedSourceKind::Memory, component};
 		if (inst.formatted && !inst.typed) {
@@ -122,3 +126,25 @@ void Translator::EmitInterpolation(const Decoder::Instruction& inst) {
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Frontend
+
+namespace Libs::Graphics::ShaderRecompiler {
+
+bool EmbeddedFetchFormatValid(const ShaderBufferResource& resource, uint32_t component_count) {
+	const auto format = Format::GetFormatInfo(resource.Format());
+	for (uint32_t component = 0; component < component_count; component++) {
+		const auto source = Format::ResolveFormattedSource(format, GetDstSel(resource.DstSelXYZW(), component));
+		if (source.kind == Format::FormattedSourceKind::Invalid) {
+			return false;
+		}
+	}
+	return true;
+}
+
+void RequireEmbeddedFetchFormat(const ShaderBufferResource& resource, uint32_t component_count,
+                                uint32_t attribute, uint32_t pc) {
+	if (!EmbeddedFetchFormatValid(resource, component_count)) {
+		EXIT("invalid formatted vertex input %u at pc 0x%08x", attribute, pc);
+	}
+}
+
+} // namespace Libs::Graphics::ShaderRecompiler

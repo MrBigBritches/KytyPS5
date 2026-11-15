@@ -353,6 +353,17 @@ struct ShaderMapSnapshot {
 	uint32_t scratch_size_dwords = 0;
 	/// The hash ShaderMapUserData computed over the program bytes.
 	uint64_t hash = 0;
+	/// The binary type, which tells the graphics prescan whether a vertex program runs as a mesh shader.
+	Prospero::ShaderBinaryType type {};
+	/// Where the input semantics are in guest memory, and how many there are. The address is only a
+	/// value, which a caller off the GPU thread reads through a reader that cannot fault.
+	uint64_t input_semantics_address = 0;
+	uint32_t num_input_semantics     = 0;
+	/// The user registers that hold the vertex attribute and buffer table pointers, -1 for none, and
+	/// whether the vertex metadata was refused when the shader was mapped, which the GPU thread EXITs on.
+	int  vertex_attrib_reg = -1;
+	int  vertex_buffer_reg = -1;
+	bool vertex_error      = false;
 };
 
 /// Copies the entry of a mapped shader by value, under the map's lock. Unlike the lookup the GPU

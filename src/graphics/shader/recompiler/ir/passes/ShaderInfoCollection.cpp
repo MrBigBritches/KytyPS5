@@ -351,10 +351,8 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 				collect_element(memory.resource);
 				for (const auto child: info.buffers[memory.resource].indirect_resources)
 					collect_element(child);
-				if ((info.buffers[memory.resource].packed_stride & (1u << 20u)) != 0u) {
-					if (program.stage != ShaderType::Compute) {
-						return Fail("buffer ADD_TID is only valid for compute shaders");
-					}
+				if ((info.buffers[memory.resource].packed_stride & BUFFER_ADD_TID_STRIDE_BIT) != 0u) {
+					RequireBufferAddTidSupported(program.stage, info.buffers[memory.resource].packed_stride);
 					info.subgroup_local_invocation_id = true;
 				}
 			}
@@ -633,6 +631,12 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 		AddBuiltinInput(info, inputs.builtins[i]);
 	}
 	program.shader_info_complete = true;
+}
+
+void RequireBufferAddTidSupported(ShaderType stage, uint32_t packed_stride) {
+	if (BufferAddTidUnsupported(stage, packed_stride)) {
+		Fail("buffer ADD_TID is only valid for compute shaders");
+	}
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR
