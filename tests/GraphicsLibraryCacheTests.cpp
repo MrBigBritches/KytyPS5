@@ -13,6 +13,7 @@
 #include <future>
 #include <mutex>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -500,7 +501,7 @@ GraphicsLibraryCache::PriorityHooks LoggingHooks(BoostLog& log) {
 		        log.boosts++;
 		        return true;
 	        },
-	        .lower = [&log] { log.lowers++; }};
+	        .restore = [&log](int) { log.lowers++; }};
 }
 
 // Runs a prebuild held on a promise and an ordinary request of the same key, and releases the prebuild
@@ -833,8 +834,11 @@ struct DropBackLevels {
 // Runs one prebuild with the cache's own priority hooks, on a thread that first lowers itself as the
 // graphics prescan's library workers do, and one request that waits on it. The waiter blocks draws
 // when `blocking` and lowers itself one ordinary step first when `waiter_lowered`. The build is held
-// until the boost is counted, so `during` is read while the thread runs boosted.
-DropBackLevels RunRealBoost(bool blocking, bool waiter_lowered) {
+// until the boost is counted, so `during` is read while the thread runs boosted. `lower_builder` is how
+// the prebuild's thread lowers itself, the lowest step by default as the prescan's workers do.
+using LowerStep = bool (*)(Common::PriorityFailure*);
+DropBackLevels RunRealBoost(bool blocking, bool waiter_lowered,
+                            LowerStep lower_builder = &Common::LowerCurrentThreadPriorityToLowest) {
 	constexpr uint64_t kKey = 50;
 	FakeDriver         driver;
 	auto               cache = MakeCache(driver);
@@ -843,7 +847,7 @@ DropBackLevels RunRealBoost(bool blocking, bool waiter_lowered) {
 	auto               released = release.get_future().share();
 	std::atomic<bool>  started {false};
 	std::thread        prebuild([&] {
-		(void)Common::LowerCurrentThreadPriorityToLowest();
+		(void)lower_builder(nullptr);
 		levels.lowered = Common::CurrentThreadSystemPriority();
 		(void)cache.GetOrBuildPrebuilt(PrebuiltKey(kKey), [&] {
 			started = true;
@@ -890,6 +894,23 @@ void TestBoostDropsBackToTheLoweredLevel() {
 		Check(levels.after == levels.lowered, "a boosted prebuild did not drop back to the level it was lowered to");
 	}
 	std::printf("GraphicsLibraryCacheTests: boost drop-back ok\n");
+}
+
+// A boosted prebuild whose thread runs one ordinary step lowered, not at the lowest step, drops back to
+// that step. The baseline is the same run with the lowest-step builder, which drops back to lowest, so
+// the two runs differ only in the builder's level. A drop that always takes the lowest step passes the
+// baseline and lands at lowest here. Each run also checks that the boost moved the thread, so a thread
+// that never left its level cannot pass. Windows only, for the reasons TestBoostDropsBackToTheLoweredLevel gives.
+void TestBoostRestoresTheBuilderLevel() {
+	const auto baseline = RunRealBoost(false, false);
+	Check(baseline.lowered == THREAD_PRIORITY_LOWEST && baseline.during != baseline.lowered &&
+	          baseline.after == THREAD_PRIORITY_LOWEST,
+	      "the lowest-step baseline did not boost and drop back to lowest");
+	const auto lowered = RunRealBoost(false, false, &Common::LowerCurrentThreadPriority);
+	Check(lowered.lowered == THREAD_PRIORITY_BELOW_NORMAL && lowered.during != lowered.lowered,
+	      "the below-normal builder was not boosted");
+	Check(lowered.after == lowered.lowered, "a boosted prebuild did not drop back to its below-normal level");
+	std::printf("GraphicsLibraryCacheTests: boost restores the builder level ok\n");
 }
 #endif
 
@@ -944,6 +965,110 @@ void TestBoostGivesBackItsSlotAndTag() {
 	std::printf("GraphicsLibraryCacheTests: boost gives back its slot and tag ok\n");
 }
 
+// What one round of TestThrowingPrebuildDropsBack saw.
+struct ThrowingRound {
+	bool threw      = false;
+	bool tag_raised = false;
+};
+
+// Runs one prebuild of `key` that is held until a waiting request has boosted it and then throws, as a
+// build that fails partway would. The prebuild's thread catches the throw, as a prescan worker's job
+// loop would, and the waiter, still in the entry's once flag, is handed the flag and builds the library
+// itself. The round waits for the boost and for the underrun tag it notes, one above `tag_start`.
+ThrowingRound RunThrowingBoostedPrebuild(GraphicsLibraryCache& cache, FakeDriver& driver, const FragmentKey& key,
+                                         uint64_t boosts_before, uint32_t tag_start) {
+	ThrowingRound      round;
+	std::promise<void> release;
+	auto               released = release.get_future().share();
+	std::atomic<bool>  started {false};
+	std::thread        prebuild([&] {
+		try {
+			(void)cache.GetOrBuildPrebuilt(key, [&]() -> LibraryHandles {
+				started = true;
+				released.wait();
+				throw std::runtime_error("the prebuild failed partway");
+			});
+		} catch (const std::runtime_error&) {
+			round.threw = true;
+		}
+	});
+	Check(WaitFor(started), "the throwing prebuild never started");
+	std::thread request([&] { (void)cache.GetOrBuild(key, [&] { return driver.Build(LibraryPart::Fragment); }); });
+	const auto boosted = [&] {
+		return cache.PrebuiltCounts().boosts == boosts_before + 1 &&
+		       Common::FirstRunReport::PrescanGraphicsBoosted() == tag_start + 1;
+	};
+	const auto deadline = std::chrono::steady_clock::now() + kStuck;
+	while (!boosted() && std::chrono::steady_clock::now() < deadline) {
+		std::this_thread::yield();
+	}
+	round.tag_raised = boosted();
+	release.set_value();
+	prebuild.join();
+	request.join();
+	return round;
+}
+
+// A prebuild whose build throws after a waiting request boosted it still drops back and gives back its
+// boost slot and its underrun tag. One more round than MAX_CONCURRENT_BOOSTS runs, each over before the
+// next starts, so a slot a throw kept makes the cap refuse the last round's boost, and a kept tag stays
+// raised. TestBoostGivesBackItsSlotAndTag is the baseline, the same rounds with builds that return, so
+// only the throw is new here. Each round also checks that the tag rose while boosted, so a tag never
+// noted cannot pass as one given back. The waiters build each library, which is what the once flag
+// does after a throw with or without the boost.
+// A throwing std::call_once must hand the flag to a waiter, which libstdc++ does not do on every
+// target (GCC PR66146). x86_64 glibc is expected to be fine, and the first Linux CI run is the
+// evidence. A hang there ends at the test's ctest TIMEOUT.
+void TestThrowingPrebuildDropsBack() {
+	constexpr uint64_t kFirstKey = 70;
+	constexpr uint64_t kRounds   = MAX_CONCURRENT_BOOSTS + 1;
+	FakeDriver         driver;
+	auto               cache = MakeCache(driver);
+	BoostLog           log;
+	cache.SetPriorityHooksForTest(LoggingHooks(log));
+	const uint32_t tag_before        = Common::FirstRunReport::PrescanGraphicsBoosted();
+	bool           every_round_threw = true;
+	bool           every_tag_raised  = true;
+	for (uint64_t index = 0; index < kRounds; ++index) {
+		const auto round = RunThrowingBoostedPrebuild(cache, driver, PrebuiltKey(kFirstKey + index), index,
+		                                              Common::FirstRunReport::PrescanGraphicsBoosted());
+		every_round_threw = every_round_threw && round.threw;
+		every_tag_raised  = every_tag_raised && round.tag_raised;
+	}
+	const auto counts = cache.PrebuiltCounts();
+	Check(every_round_threw && every_tag_raised && counts.boosts == kRounds,
+	      "a throwing prebuild was not boosted with its tag raised, or its throw never reached its thread");
+	Check(log.lowers == kRounds && counts.boosts_refused_cap == 0,
+	      "a throwing prebuild did not drop back or kept its boost slot");
+	Check(Common::FirstRunReport::PrescanGraphicsBoosted() == tag_before, "a throwing prebuild kept its boosted tag");
+	Check(driver.Builds(LibraryPart::Fragment) == kRounds && cache.Counts(LibraryPart::Fragment).built == kRounds,
+	      "a waiter did not build the library after the prebuild it waited on threw");
+	std::printf("GraphicsLibraryCacheTests: throwing prebuild drops back ok\n");
+}
+
+// Hooks with no restore still finish a boosted prebuild, rather than end the process by calling an
+// empty function from the drop-back guard's destructor, and the drop still gives back the tag. The
+// baseline is TestWaitingRequestBoostsPrebuild, the same run with LoggingHooks, which drops back once.
+// Here nothing is called to drop back, and the tag coming back shows the rest of the drop still ran. The
+// boost is checked as well, since a run that never boosted would never reach the drop at all.
+void TestBoostWithoutRestoreHookFinishes() {
+	FakeDriver driver;
+	auto       cache = MakeCache(driver);
+	BoostLog   log;
+	auto       hooks = LoggingHooks(log);
+	hooks.restore    = nullptr;
+	cache.SetPriorityHooksForTest(hooks);
+	const uint32_t tag_before = Common::FirstRunReport::PrescanGraphicsBoosted();
+	// stderr is unbuffered, so if the drop-back ends the process this line still names the test.
+	std::fputs("GraphicsLibraryCacheTests: boost without a restore hook\n", stderr);
+	RunPrebuildAndRequest(cache, driver, log, true);
+	Check(log.boosts == 1 && cache.PrebuiltCounts().boosts == 1, "the waiting request did not boost the prebuild");
+	Check(Common::FirstRunReport::PrescanGraphicsBoosted() == tag_before,
+	      "a prebuild boosted under hooks with no restore did not finish its drop-back");
+	Check(driver.Builds(LibraryPart::Fragment) == 1, "the waiting request built its own copy");
+	std::printf("GraphicsLibraryCacheTests: boost without a restore hook finishes ok\n");
+}
+
 } // namespace
 
 int main() {
@@ -966,8 +1091,11 @@ int main() {
 	TestPrebuildCountsAsBuilt();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	TestBoostDropsBackToTheLoweredLevel();
+	TestBoostRestoresTheBuilderLevel();
 #endif
 	TestBoostGivesBackItsSlotAndTag();
+	TestThrowingPrebuildDropsBack();
+	TestBoostWithoutRestoreHookFinishes();
 	std::printf("GraphicsLibraryCacheTests: ok\n");
 	return 0;
 }

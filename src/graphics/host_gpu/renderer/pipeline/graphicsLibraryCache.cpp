@@ -16,13 +16,22 @@ Common::FirstRunReport::LibraryKind ReportKind(LibraryPart part) {
 	return static_cast<Common::FirstRunReport::LibraryKind>(part);
 }
 
+// The default restore hook. Puts a boosted prebuild's thread back to the level it read before the
+// build. When that level could not be read, or the system refused it, the thread takes the lowest
+// step instead, which is where the prescan's library workers run, so a boost never outlives its prebuild.
+void RestoreOrLowest(int builder_priority) {
+	if (!Common::SetCurrentThreadSystemPriority(builder_priority)) {
+		(void)Common::LowerCurrentThreadPriorityToLowest();
+	}
+}
+
 } // namespace
 
 GraphicsLibraryCache::GraphicsLibraryCache(DestroyFunction destroy)
     : m_destroy(std::move(destroy)),
       m_priority {.current_thread   = &Common::CurrentThreadSystemId,
                   .boost            = &Common::BoostThreadToNormal,
-                  .lower            = [] { (void)Common::LowerCurrentThreadPriorityToLowest(); },
+                  .restore          = &RestoreOrLowest,
                   .current_priority = &Common::CurrentThreadSystemPriority,
                   .boost_to         = &Common::BoostThreadToPriority} {}
 
@@ -70,8 +79,9 @@ void GraphicsLibraryCache::RaiseMaxCount(std::atomic<uint64_t>& maximum, uint64_
 
 // Runs on the prebuild's thread after its build. A boost still being asked for is waited out, which
 // is one system call, so the thread never finishes between a request's check and its boost and then
-// keeps normal priority for the rest of its jobs.
-void GraphicsLibraryCache::FinishPrebuildBoost(Entry& entry) {
+// keeps normal priority for the rest of its jobs. It runs from PrebuildBoostGuard, so it also runs when
+// the build throws.
+void GraphicsLibraryCache::FinishPrebuildBoost(Entry& entry, int builder_priority) {
 	uint8_t state = entry.boost_state.load(std::memory_order_acquire);
 	while (true) {
 		if (state == BOOST_BOOSTING) {
@@ -84,7 +94,11 @@ void GraphicsLibraryCache::FinishPrebuildBoost(Entry& entry) {
 		}
 	}
 	if (state == BOOST_BOOSTED) {
-		m_priority.lower();
+		// Optional like current_priority. This runs in PrebuildBoostGuard's destructor, where calling
+		// an empty std::function would throw and end the process.
+		if (m_priority.restore) {
+			m_priority.restore(builder_priority);
+		}
 		m_active_boosts.fetch_sub(1, std::memory_order_acq_rel);
 		Common::FirstRunReport::NotePrescanGraphicsBoosted(false);
 	}

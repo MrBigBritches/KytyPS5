@@ -19,6 +19,7 @@
 #include "common/common.h"
 #include "common/firstRunReport.h"
 #include "common/gpuStall.h"
+#include "common/threadPriority.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineParts.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
@@ -148,15 +149,18 @@ public:
 	[[nodiscard]] PrebuiltLibraryCounts PrebuiltCounts(LibraryPart part = LibraryPart::Fragment) const;
 
 	// How a request raises a prebuild's thread and how the thread drops back. The defaults are the
-	// system's, Common::CurrentThreadSystemId, BoostThreadToNormal and LowerCurrentThreadPriorityToLowest,
-	// which is where the graphics prescan's library workers, the only prebuilders, run.
+	// system's, Common::CurrentThreadSystemId and BoostThreadToNormal. The prebuild reads its own level
+	// with current_priority before anyone can boost it, and restore puts it back there, which
+	// Common::SetCurrentThreadSystemPriority does by default, falling back to the lowest step when the
+	// level could not be read or set. Hooks without current_priority restore Common::UNREAD_THREAD_PRIORITY,
+	// and hooks without restore leave the thread where the boost put it.
 	// A waiter that blocks a draw, the GPU thread or a deferred build worker, raises the prebuild to
 	// its own priority, read by current_priority, through boost_to, which Common::BoostThreadToPriority
 	// does by default. Hooks without boost_to boost such a waiter as any other.
 	struct PriorityHooks {
 		std::function<uint64_t()>          current_thread;
 		std::function<bool(uint64_t)>      boost;
-		std::function<void()>              lower;
+		std::function<void(int)>           restore;
 		std::function<int()>               current_priority;
 		std::function<bool(uint64_t, int)> boost_to;
 	};
@@ -237,6 +241,10 @@ private:
 		bool   built = false;
 		std::call_once(entry->once, [&] {
 			built = true;
+			// Read before the prebuilt flag is set, since no request can boost the thread until then, so
+			// this is the level the prescan's worker chose and the one a boost drops back to.
+			const int builder_priority =
+			    m_priority.current_priority ? m_priority.current_priority() : Common::UNREAD_THREAD_PRIORITY;
 			// The builder is recorded and marked running before the prebuilt flag is set, so a request
 			// that sees the flag can boost it. Both are set before the build, so a request that waits
 			// on it can tell it waited for a prebuild.
@@ -244,10 +252,12 @@ private:
 			entry->boost_state.store(BOOST_RUNNING, std::memory_order_relaxed);
 			entry->prebuilt.store(true, std::memory_order_release);
 			NotePrebuiltStage(part, stage_id);
-			const auto start = std::chrono::steady_clock::now();
-			entry->handles   = build();
-			NoteBuilt(part, entry->handles.pipeline != nullptr, Common::FirstRunReport::ElapsedMs(start));
-			FinishPrebuildBoost(*entry);
+			{
+				const PrebuildBoostGuard guard {*this, *entry, builder_priority};
+				const auto               start = std::chrono::steady_clock::now();
+				entry->handles                 = build();
+				NoteBuilt(part, entry->handles.pipeline != nullptr, Common::FirstRunReport::ElapsedMs(start));
+			}
 			entry->done.store(true, std::memory_order_release);
 		});
 		auto& counters = Prebuilt(part);
@@ -311,8 +321,24 @@ private:
 	// that holds up a draw, raises it to its own priority past MAX_CONCURRENT_BOOSTS, and any other to
 	// normal priority within it.
 	void TryBoostPrebuild(Entry& entry, LibraryPart part, bool blocking);
-	// Ends a prebuild's boost window on its own thread, dropping it back if a request boosted it.
-	void FinishPrebuildBoost(Entry& entry);
+	// Ends a prebuild's boost window on its own thread, dropping it back to `builder_priority`, the level
+	// it read before the build, if a request boosted it.
+	void FinishPrebuildBoost(Entry& entry, int builder_priority);
+	// Ends a prebuild's boost window when its build is over, however it ends. A build that throws
+	// would otherwise skip the drop, leaving its thread raised and its boost slot and tag taken for
+	// good, so the cap would refuse every later boost.
+	class PrebuildBoostGuard {
+	public:
+		PrebuildBoostGuard(GraphicsLibraryCache& cache, Entry& entry, int builder_priority)
+		    : m_cache(cache), m_entry(entry), m_builder_priority(builder_priority) {}
+		~PrebuildBoostGuard() { m_cache.FinishPrebuildBoost(m_entry, m_builder_priority); }
+		KYTY_CLASS_NO_COPY(PrebuildBoostGuard);
+
+	private:
+		GraphicsLibraryCache& m_cache;
+		Entry&                m_entry;
+		int                   m_builder_priority;
+	};
 	static void RaiseMaxCount(std::atomic<uint64_t>& maximum, uint64_t value);
 	// Remembers a prebuilt pixel shader id, and counts an ordinary build of a fragment library for one
 	// that was prebuilt under another key.

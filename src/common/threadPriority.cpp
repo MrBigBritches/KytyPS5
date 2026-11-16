@@ -26,6 +26,22 @@ namespace {
 [[maybe_unused]] constexpr int LOW_PRIORITY_NICE = 5;
 // The largest nice value Linux accepts.
 [[maybe_unused]] constexpr int MAX_NICE = 19;
+
+#if !defined(__APPLE__) && KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+// The nice value the process runs at, which is normal priority for its threads. A process started
+// under nice runs every thread there, so nice 0 would be a raise it may not be allowed, and above
+// its own threads. It is read once, on whichever thread boosts first, and it is the main thread's
+// nice value, since PRIO_PROCESS with the process id names the thread whose id that is. 0 if even
+// that read fails.
+int ProcessBaseNice() {
+	static const int base = [] {
+		errno          = 0;
+		const int nice = getpriority(PRIO_PROCESS, static_cast<id_t>(getpid()));
+		return (nice == -1 && errno != 0) ? 0 : nice;
+	}();
+	return base;
+}
+#endif
 } // namespace
 
 std::optional<PriorityFailure> SystemLowerStep() {
@@ -96,11 +112,35 @@ int CurrentThreadSystemPriority() {
 #if defined(__APPLE__)
 	return 0;
 #elif KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// A failed read already returns the sentinel, since the two are the same value.
+	static_assert(THREAD_PRIORITY_ERROR_RETURN == UNREAD_THREAD_PRIORITY);
 	return GetThreadPriority(GetCurrentThread());
 #elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
-	return getpriority(PRIO_PROCESS, static_cast<id_t>(syscall(SYS_gettid)));
+	// -1 is a valid nice value, so only errno says whether the read failed.
+	errno             = 0;
+	const int  nice   = getpriority(PRIO_PROCESS, static_cast<id_t>(syscall(SYS_gettid)));
+	const bool failed = nice == -1 && errno != 0;
+	return failed ? UNREAD_THREAD_PRIORITY : nice;
 #else
 	return 0;
+#endif
+}
+
+// The sentinel is refused before the system sees it, since Linux would clamp it to nice 19 and
+// accept, which would leave the thread far lower than any level it ever had.
+bool SetCurrentThreadSystemPriority(int priority) {
+	if (priority == UNREAD_THREAD_PRIORITY) {
+		return false;
+	}
+#if defined(__APPLE__)
+	return false;
+#elif KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	return SetThreadPriority(GetCurrentThread(), priority) != 0;
+#elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+	// The nice value belongs to the thread id, so this leaves the rest of the process alone.
+	return setpriority(PRIO_PROCESS, static_cast<id_t>(syscall(SYS_gettid)), priority) == 0;
+#else
+	return false;
 #endif
 }
 
@@ -131,7 +171,9 @@ uint64_t CurrentThreadSystemId() {
 #endif
 }
 
-// macOS has no call that sets another thread's QoS class, so the boost is a no-op there.
+// macOS has no call that sets another thread's QoS class, so the boost is a no-op there. On Linux it
+// goes through BoostThreadToPriority, which compares before it sets, so a thread already above the
+// process's nice value is never pulled down to it.
 bool BoostThreadToNormal(uint64_t thread_id) {
 	if (thread_id == 0) {
 		return false;
@@ -147,7 +189,7 @@ bool BoostThreadToNormal(uint64_t thread_id) {
 	CloseHandle(thread);
 	return raised;
 #elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
-	return setpriority(PRIO_PROCESS, static_cast<id_t>(thread_id), 0) == 0;
+	return BoostThreadToPriority(thread_id, ProcessBaseNice());
 #else
 	return false;
 #endif

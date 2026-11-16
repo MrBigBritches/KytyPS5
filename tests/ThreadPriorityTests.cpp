@@ -203,6 +203,39 @@ void TestLowestStepGoesOneFurther() {
 	OnNewThread([] { CHECK(!Common::SystemLowestStep().has_value()); });
 }
 
+// SetCurrentThreadSystemPriority puts the calling thread at a level CurrentThreadSystemPriority read on
+// another thread, here one ordinary step lowered, which needs no privileges on Windows or Linux. The
+// baseline is the same thread before the call, at the ordinary level, so a setter that reports success
+// without asking the system leaves the thread there and fails. The read's failure value is refused and
+// moves nothing. macOS has nothing to set, so there it only refuses.
+void TestSetPriorityRoundTrip() {
+#if defined(__APPLE__)
+	OnNewThread([] { CHECK(!Common::SetCurrentThreadSystemPriority(0)); });
+#else
+	int lowered = -1;
+	OnNewThread([&] {
+		CHECK(Common::LowerCurrentThreadPriority());
+		lowered = Common::CurrentThreadSystemPriority();
+	});
+	int  before       = -1;
+	int  after        = -1;
+	int  after_unread = -1;
+	bool set          = false;
+	bool set_unread   = true;
+	OnNewThread([&] {
+		before       = Common::CurrentThreadSystemPriority();
+		set          = Common::SetCurrentThreadSystemPriority(lowered);
+		after        = CurrentThreadPriority();
+		set_unread   = Common::SetCurrentThreadSystemPriority(Common::UNREAD_THREAD_PRIORITY);
+		after_unread = CurrentThreadPriority();
+	});
+	// The read on the lowered thread must differ from the ordinary one, or the round trip proves nothing.
+	CHECK(lowered == LoweredPriority(before) && lowered != before);
+	CHECK(set && after == lowered);
+	CHECK(!set_unread && after_unread == lowered);
+#endif
+}
+
 #if defined(__APPLE__)
 // macOS has no system thread id to hand over and no way to set another thread's QoS class, so both
 // boosts refuse and do nothing.
@@ -355,6 +388,28 @@ void TestBoostToNormal() {
 	}
 	CHECK(ThreadPriorityOf(worker.Id()) == NORMAL_PRIORITY);
 }
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+// On Linux BoostThreadToNormal aims at the process's own nice value and only raises. The main thread,
+// whose id is the process id, runs at exactly that value, so boosting it moves nothing and reports no
+// raise, where a boost that sets the value regardless reports one. A thread above that value, which
+// only a privileged process can make, stays above, and the check is skipped when the system refuses.
+void TestLinuxBoostNeverLowers() {
+	constexpr int MIN_NICE = -20;
+	const int     base     = CurrentThreadPriority();
+	CHECK(!Common::BoostThreadToNormal(Common::CurrentThreadSystemId()));
+	CHECK(CurrentThreadPriority() == base);
+	OnNewThread([base] {
+		const auto self = static_cast<id_t>(syscall(SYS_gettid));
+		if (base == MIN_NICE || setpriority(PRIO_PROCESS, self, base - 1) != 0) {
+			std::puts("Skipping the above-base boost check, the system refused to raise the thread");
+			return;
+		}
+		CHECK(!Common::BoostThreadToNormal(Common::CurrentThreadSystemId()));
+		CHECK(CurrentThreadPriority() == base - 1);
+	});
+}
+#endif
 #endif
 
 } // namespace
@@ -363,11 +418,15 @@ int main() {
 	TestLowersTheCallingThread();
 	TestRefusalIsReported();
 	TestLowestStepGoesOneFurther();
+	TestSetPriorityRoundTrip();
 #if defined(__APPLE__)
 	TestBoostsDoNothingOnMacOS();
 #else
 	TestBoostToPriorityRaisesAndTheThreadDropsBack();
 	TestBoostToNormal();
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+	TestLinuxBoostNeverLowers();
+#endif
 #endif
 	std::printf("ThreadPriorityTests: ok\n");
 	return 0;
