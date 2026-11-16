@@ -705,6 +705,16 @@ private:
 	                     std::chrono::steady_clock::time_point start);
 	void RunPreRasterPrebuild(uint64_t id, const std::vector<uint32_t>& spirv,
 	                          const ShaderRecompiler::IR::CompiledShaderInfo& info, const ScannedDraw& draw);
+	// Whether a library prebuild could do anything, which needs library mode on and the library cache.
+	// Read at each post, so a job that could only be skipped never takes a queue place. Worker.
+	[[nodiscard]] bool GraphicsPrebuildsPossible() const noexcept;
+	// Queue a posted module's fragment library job, or count it not queued with the libraries off. Worker.
+	void QueueFragmentPrebuild(uint64_t id, std::vector<uint32_t>&& spirv, ShaderRecompiler::IR::CompiledShaderInfo&& info,
+	                           bool alpha_to_coverage);
+	// Claim a posted vertex module's pre-rasterization library key and queue its job, or count it not
+	// queued with the libraries off before any claim. Worker.
+	void QueuePreRasterPrebuild(const ScannedDraw& draw, uint64_t id, std::vector<uint32_t>&& spirv,
+	                            ShaderRecompiler::IR::CompiledShaderInfo&& info);
 	// Builds the fragment library of a module the worker posted. Library worker.
 	void RunFragmentPrebuild(uint64_t id, const std::vector<uint32_t>& spirv,
 	                         const ShaderRecompiler::IR::CompiledShaderInfo& info, bool alpha_to_coverage);

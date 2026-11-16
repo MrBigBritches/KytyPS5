@@ -161,6 +161,8 @@ struct GraphicsVertexCounters {
 	std::atomic<uint64_t> prebuild_provoking_unsupported {0};
 	/// Pre-rasterization prebuilds not queued, since one of the same key was built or queued already.
 	std::atomic<uint64_t> prebuild_deduped_late {0};
+	/// Pre-rasterization prebuilds not queued, since the device does not build pipelines from libraries.
+	std::atomic<uint64_t> prebuild_not_queued_libraries_off {0};
 };
 
 /// How long a throttle signal holds the graphics prescan at GRAPHICS_PRESCAN_REDUCED_RUNNING_JOBS, and
@@ -243,6 +245,8 @@ struct GraphicsPrescanCounters {
 	std::atomic<uint64_t> prebuild_in_scope {0};
 	std::atomic<uint64_t> prebuild_in_hold {0};
 	std::array<std::atomic<uint64_t>, static_cast<size_t>(GraphicsPrebuildSkip::Count)> prebuild_skipped {};
+	/// Fragment prebuilds not queued, since the device does not build pipelines from libraries.
+	std::atomic<uint64_t> prebuild_not_queued_libraries_off {0};
 };
 
 /// How many workers translate pixel and vertex shaders, and how many build their fragment and

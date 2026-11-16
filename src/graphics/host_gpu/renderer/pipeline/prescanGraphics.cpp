@@ -676,6 +676,7 @@ VertexGroups(const GraphicsVertexCounters& counts, const PrebuiltLibraryCounts& 
 	                  {"prebuild_in_hold", number(counts.prebuild_in_hold)},
 	                  {"provoking_unsupported", number(counts.prebuild_provoking_unsupported)},
 	                  {"deduped_late", number(counts.prebuild_deduped_late)},
+	                  {"not_queued_libraries_off", number(counts.prebuild_not_queued_libraries_off)},
 	                  {"first_hits", static_cast<double>(pre_raster.first_hits)},
 	                  {"waits", static_cast<double>(pre_raster.waits)},
 	                  {"wait_ms", pre_raster.wait_ms},
@@ -1325,12 +1326,31 @@ void PipelineCache::RunGraphicsPrescanJob(const ScannedDraw& draw, Clock::time_p
 		std::scoped_lock lock(state.ps_bindings_mutex);
 		state.ps_bindings.insert_or_assign(draw.key_hash, ps_bindings);
 	}
-	(void)PostBounded(state.libraries, state.libraries_bound, PipelineBuildQueue::Lane::Front,
-	                  [this, id = build.id, spirv = std::move(build.spirv), info = std::move(build.info),
-	                   a2c = draw.alpha_to_coverage] { RunFragmentPrebuild(id, spirv, info, a2c); });
+	QueueFragmentPrebuild(build.id, std::move(build.spirv), std::move(build.info), draw.alpha_to_coverage);
 	if (chain_vertex) {
 		PostVertexJob(draw, ps_bindings);
 	}
+}
+
+// Read live like the checks in the jobs, so the post and the job never disagree. Library mode is fixed
+// when the device is made, so this costs nothing. The jobs check again when they run, as a backstop.
+bool PipelineCache::GraphicsPrebuildsPossible() const noexcept {
+	return m_graphics.graphics_pipeline_library_enabled && m_libraries != nullptr;
+}
+
+// Without libraries the job could only count a libraries_off skip, after taking a queue place and a
+// running slot, so it is counted not queued here instead.
+void PipelineCache::QueueFragmentPrebuild(uint64_t id, std::vector<uint32_t>&& spirv,
+                                          ShaderRecompiler::IR::CompiledShaderInfo&& info, bool alpha_to_coverage) {
+	auto& state = *m_graphics_prescan;
+	if (!GraphicsPrebuildsPossible()) {
+		state.counters.prebuild_not_queued_libraries_off.fetch_add(1, std::memory_order_relaxed);
+		return;
+	}
+	(void)PostBounded(state.libraries, state.libraries_bound, PipelineBuildQueue::Lane::Front,
+	                  [this, id, spirv = std::move(spirv), info = std::move(info), alpha_to_coverage] {
+		                  RunFragmentPrebuild(id, spirv, info, alpha_to_coverage);
+	                  });
 }
 
 // The vertex shader's half of a job, after the pixel shader posted. It is skipped for indirect draws
@@ -1419,15 +1439,26 @@ void PipelineCache::PostVertexBuild(const ScannedDraw& draw, const GraphicsStage
 	counts.posted.fetch_add(1, std::memory_order_relaxed);
 	NoteJobSighting(state.sightings.get(), SightingStage::Vertex, draw.vs_program_address, "posted", SightingKind::Posted);
 	counts.translate_us.fetch_add(WholeMicros(Clock::now() - start), std::memory_order_relaxed);
-	// A library of the same key built or queued already is not queued again, before any module or
-	// layout is made for it.
+	QueuePreRasterPrebuild(draw, build.id, std::move(build.spirv), std::move(build.info));
+}
+
+// The libraries are checked before the claim, so a dropped job leaves its key unclaimed. A library of
+// the same key built or queued already is not queued again, before any module or layout is made for it.
+void PipelineCache::QueuePreRasterPrebuild(const ScannedDraw& draw, uint64_t id, std::vector<uint32_t>&& spirv,
+                                           ShaderRecompiler::IR::CompiledShaderInfo&& info) {
+	auto& state  = *m_graphics_prescan;
+	auto& counts = state.counters.vertex;
+	if (!GraphicsPrebuildsPossible()) {
+		counts.prebuild_not_queued_libraries_off.fetch_add(1, std::memory_order_relaxed);
+		return;
+	}
 	constexpr uint64_t pre_raster_domain = 0x5052455241535445ull;
-	if (!state.dedupe.Claim(PartKeyHash<PreRasterKey> {}(ScannedPreRasterKey(build.id, draw)) ^ pre_raster_domain)) {
+	if (!state.dedupe.Claim(PartKeyHash<PreRasterKey> {}(ScannedPreRasterKey(id, draw)) ^ pre_raster_domain)) {
 		counts.prebuild_deduped_late.fetch_add(1, std::memory_order_relaxed);
 		return;
 	}
 	(void)PostBounded(state.libraries, state.libraries_bound, PipelineBuildQueue::Lane::Back,
-	                  [this, id = build.id, spirv = std::move(build.spirv), compiled = std::move(build.info), draw] {
+	                  [this, id, spirv = std::move(spirv), compiled = std::move(info), draw] {
 		                  RunPreRasterPrebuild(id, spirv, compiled, draw);
 	                  });
 }
@@ -1696,6 +1727,7 @@ Common::FirstRunReport::PrescanGraphicsReport PipelineCache::BuildGraphicsPresca
 	                       {"prebuild_ms", ToMs(counters.prebuild_us)},
 	                       {"prebuild_in_scope", Count(counters.prebuild_in_scope)},
 	                       {"prebuild_in_hold", Count(counters.prebuild_in_hold)},
+	                       {"not_queued_libraries_off", Count(counters.prebuild_not_queued_libraries_off)},
 	                       {"first_hits", static_cast<double>(prebuilt.first_hits)},
 	                       {"waits", static_cast<double>(prebuilt.waits)},
 	                       {"wait_ms", prebuilt.wait_ms},

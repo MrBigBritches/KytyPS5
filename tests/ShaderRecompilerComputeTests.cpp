@@ -1277,6 +1277,13 @@ struct PipelineCacheTestAccess {
   // The lock a graphics prescan worker posts its module under. A test that takes it keeps the worker
   // inside its job until the test lets go.
   static std::mutex &GenerationMutex(PipelineCache &cache) { return cache.m_generation->mutex; }
+  // The graphics prescan's library queue. A test pauses it so a library job queued there stays waiting
+  // where GraphicsLibraryPending can see it.
+  static PipelineBuildQueue &GraphicsLibraryQueue(PipelineCache &cache) { return cache.m_graphics_prescan->libraries; }
+  // The library jobs queued and not started yet, both lanes together.
+  static uint32_t GraphicsLibraryPending(const PipelineCache &cache) {
+    return cache.m_graphics_prescan->libraries_bound.pending.load();
+  }
   // One figure of the cache's part of the prescan_graphics block, or -1 when there is none.
   static double GraphicsPrescanFigure(const PipelineCache &cache, std::string_view group,
                                       std::string_view name) {
@@ -22913,10 +22920,88 @@ public:
     CheckGraphicsPrescanLongHolds(fixture);
     CheckGraphicsPrescanSightingNotes(fixture, sink, base, rsrc2);
     CheckGraphicsPrescanAgoClamp(fixture, base);
+    CheckGraphicsPrescanLibrariesOff(fixture, sink, base, rsrc2);
     fixture.scheduler.Finish();
     UnmapCadenceMemory(fixture.context, memory);
     SelectCadenceShader(fixture.processor, fixture.empty_shader, 0);
     std::printf("[gpu]     %-32s ok\n", GraphicsPrescanTestName);
+  }
+
+  // Offers a pair's draw with the library queue paused, so a library job queued by mistake stays
+  // waiting instead of running, and waits for its pixel and vertex jobs and then for no graphics job to
+  // run. Each translate job holds its running scope until its library post has returned, so by then
+  // every post is done and every not queued count is final. The report is on meanwhile, since a
+  // running scope counts only then. Returns whether all that happened and how many library jobs were
+  // left waiting in the queue past those already there.
+  static std::pair<bool, int64_t> OfferWithLibrariesPaused(PipelineCache &cache, const GraphicsDrawSink &sink,
+                                                           const ScannedDraw &draw) {
+    constexpr std::chrono::milliseconds idle_limit{30000};
+    auto &queue = PipelineCacheTestAccess::GraphicsLibraryQueue(cache);
+    const double pixel_jobs = GraphicsJobsDone(cache, false) + 1;
+    const double vertex_jobs = GraphicsJobsDone(cache, true) + 1;
+    queue.Pause(PipelineBuildQueue::Clock::now() + PipelineBuildQueue::MAX_PAUSE);
+    const int64_t pending = PipelineCacheTestAccess::GraphicsLibraryPending(cache);
+    Common::FirstRunReport::Configure(true, false);
+    sink(std::span<const ScannedDraw>(&draw, 1));
+    const bool ended = WaitForGraphicsJobs(cache, false, pixel_jobs) && WaitForGraphicsJobs(cache, true, vertex_jobs) &&
+                       WaitForGraphicsRunning(0, idle_limit);
+    Common::FirstRunReport::Configure(false, false);
+    // Read before the resume, which would let a waiting job start and leave the count.
+    const int64_t pending_added = PipelineCacheTestAccess::GraphicsLibraryPending(cache) - pending;
+    queue.Resume();
+    return {ended, pending_added};
+  }
+
+  // With the libraries off, which this rig's runtime context keeps, a fresh pair offered with its vertex
+  // half posts both modules but queues neither library job. Each is counted not queued in its own group,
+  // no job is left waiting in the paused library queue, and none runs to count a libraries_off skip.
+  // The not queued counts' only writers are the two checks at post time, and the libraries-on cases
+  // CheckFragmentPrebuild and CheckPreRasterPrebuild show they stay put when the libraries are on. A
+  // job queued anyway, counted or not, stays waiting, and a drop left uncounted leaves its count put.
+  void CheckGraphicsPrescanLibrariesOff(CadenceFixture &fixture, const GraphicsDrawSink &sink, uintptr_t base,
+                                        const HW::PsShaderResource2 &rsrc2) {
+    // Past the job sightings' last vertex shader at 0x5c00, with its vertex shader at 0x6600, which
+    // is past the short pixel shader at 0x6000.
+    constexpr uint64_t pair_offset = 0x5e00;
+    constexpr u32 pair_marker = 15;
+    constexpr u32 one_bits = 0x3f800000u;
+    auto &cache = fixture.context.GetPipelineCache();
+    auto &shaders = fixture.processor.GetShCtx();
+    const auto figure = [&](const char *group, const char *row) {
+      return PipelineCacheTestAccess::GraphicsPrescanFigure(cache, group, row);
+    };
+    Require(GraphicsPrescanTestName, "libraries off rig", !m_runtime_context.graphics_pipeline_library_enabled,
+            "the adoption rig had the libraries on, so this case would prove nothing");
+    // The marked vertex shader reads user register 0, set as CheckGraphicsPrescanVertexJob sets it.
+    const auto vertex_regs = shaders.GetVs();
+    auto one_user_sgpr = vertex_regs.gs_regs.rsrc2;
+    one_user_sgpr.user_sgpr = 1;
+    shaders.SetGsShaderResource2(one_user_sgpr);
+    shaders.SetGsUserSgpr(0, one_bits);
+    shaders.SetPsShaderResource2(rsrc2);
+    std::array<double, 2> not_queued{};
+    std::array<double, 2> skipped_off{};
+    constexpr std::array<const char *, 2> groups{"libraries", "pre_raster"};
+    for (size_t group = 0; group < groups.size(); group++) {
+      not_queued[group] = figure(groups[group], "not_queued_libraries_off");
+      skipped_off[group] = figure(groups[group], "skipped_libraries_off");
+    }
+    const double vertex_posted = figure("vs_modules", "posted");
+    const auto draw = PlacePairDraw(fixture, base + pair_offset, pair_marker, true);
+    const auto [ended, pending_added] = OfferWithLibrariesPaused(cache, sink, draw);
+    shaders.SetGsShaderResource2(vertex_regs.gs_regs.rsrc2);
+    shaders.SetGsUserSgpr(0, vertex_regs.gs_user_sgpr.value[0]);
+    shaders.SetEsShaderBase(vertex_regs.es_regs.data_addr);
+    Require(GraphicsPrescanTestName, "libraries off jobs", ended && figure("vs_modules", "posted") == vertex_posted + 1,
+            "the pair's jobs never ended, or its vertex module was not posted");
+    Require(GraphicsPrescanTestName, "libraries off queue", pending_added == 0,
+            "a library job with the libraries off was queued");
+    for (size_t group = 0; group < groups.size(); group++) {
+      Require(GraphicsPrescanTestName, groups[group],
+              figure(groups[group], "not_queued_libraries_off") == not_queued[group] + 1 &&
+                  figure(groups[group], "skipped_libraries_off") == skipped_off[group],
+              "a library job with the libraries off was queued, or dropped without being counted not queued");
+    }
   }
 
   // An id_differs miss is put down to the push start when the prescan's module has the GPU's
@@ -23351,7 +23436,8 @@ public:
                                              Prospero::ShaderBinaryType::kPs, nullptr));
     const auto draw = ScannedDrawOf(fixture.processor, base + held_offset);
     const double jobs = GraphicsJobsDone(cache, false) + 1;
-    // The posted module queues one fragment library job, which counts while it runs too.
+    // The posted module queues one fragment library job, which counts while it runs too. With the
+    // libraries off it is counted not queued instead, which ends it as well.
     const double library_jobs = LibraryJobsDone(cache, "libraries") + 1;
     auto report = std::make_unique<Common::FirstRunReport::Report>();
     Common::FirstRunReport::Configure(true, false);
@@ -23596,13 +23682,14 @@ public:
   static constexpr const char *GraphicsPrebuildTestName = "GraphicsPrescanPrebuild";
 
   // The library jobs of one report group that ended, built or skipped. A pre-raster library whose key
-  // an earlier job claimed never becomes a job, so its late dedupe counts as ended too. A figure the
-  // group does not have reads as -1 and adds nothing.
+  // an earlier job claimed never becomes a job, nor does any library with the libraries off, so a late
+  // dedupe and a not queued count as ended too. A figure the group does not have reads as -1 and adds
+  // nothing.
   static double LibraryJobsDone(const PipelineCache &cache, const char *group) {
     double done = 0.0;
-    for (const char *name : {"prebuilt", "provoking_unsupported", "deduped_late", "skipped_libraries_off",
-                             "skipped_no_heap_layout", "skipped_no_split_module", "skipped_layout_limits",
-                             "skipped_already_there"}) {
+    for (const char *name : {"prebuilt", "provoking_unsupported", "deduped_late", "not_queued_libraries_off",
+                             "skipped_libraries_off", "skipped_no_heap_layout", "skipped_no_split_module",
+                             "skipped_layout_limits", "skipped_already_there"}) {
       done += std::max(0.0, PipelineCacheTestAccess::GraphicsPrescanFigure(cache, group, name));
     }
     return done;
@@ -23865,14 +23952,18 @@ public:
     const double prebuilt = figure("prebuilt");
     const double first_hits = figure("first_hits");
     const double key_differs = figure("key_differs");
+    const double not_queued = figure("not_queued_libraries_off");
     shaders.SetPsShaderResource2(rsrc2);
     shaders.SetPsShaderBase(PlaceGuestShader(base + offered_offset, UserRedPixelShader(offered_green),
                                              Prospero::ShaderBinaryType::kPs, nullptr));
     Require(name, "fragment jobs",
             OfferAndWaitForLibraries(fixture, sink, ScannedDrawOf(fixture.processor, base + offered_offset), false),
             "the offered pixel shader's jobs never ended");
-    Require(name, "fragment prebuilt", figure("prebuilt") == prebuilt + 1,
-            "the offered pixel shader's fragment library was not built");
+    // The baseline of CheckGraphicsPrescanLibrariesOff, where the same offer with the libraries off is
+    // counted not queued instead of built.
+    Require(name, "fragment prebuilt",
+            figure("prebuilt") == prebuilt + 1 && figure("not_queued_libraries_off") == not_queued,
+            "the offered pixel shader's fragment library was not built, or was counted not queued");
     (void)DrawAndReadTarget(fixture);
     Require(name, "fragment first hit", figure("first_hits") == first_hits + 1 && figure("key_differs") == key_differs,
             "the draw did not find the prebuilt fragment library under its own key");
@@ -23917,13 +24008,16 @@ public:
     const double prebuilt = figure("prebuilt");
     const double first_hits = figure("first_hits");
     const double key_differs = figure("key_differs");
+    const double not_queued = figure("not_queued_libraries_off");
     place_pair(base + offered_offset, offered_marker);
     const auto draw = ScannedVertexDrawOf(fixture.processor, base + offered_offset,
                                           base + offered_offset + vertex_offset, true);
     Require(name, "pre-raster jobs", OfferAndWaitForLibraries(fixture, sink, draw, true),
             "the offered pair's jobs never ended");
-    Require(name, "pre-raster prebuilt", figure("prebuilt") == prebuilt + 1,
-            "the offered vertex shader's pre-rasterization library was not built");
+    // The pre_raster baseline of CheckGraphicsPrescanLibrariesOff, as in CheckFragmentPrebuild.
+    Require(name, "pre-raster prebuilt",
+            figure("prebuilt") == prebuilt + 1 && figure("not_queued_libraries_off") == not_queued,
+            "the offered vertex shader's pre-rasterization library was not built, or was counted not queued");
     (void)DrawAndReadTarget(fixture);
     Require(name, "pre-raster first hit", figure("first_hits") == first_hits + 1 && figure("key_differs") == key_differs,
             "the draw did not find the prebuilt pre-rasterization library under its own key");
