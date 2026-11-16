@@ -1216,6 +1216,11 @@ if(BUILD_TESTING)
 	add_test(NAME submit_scan COMMAND $<TARGET_FILE:submit_scan_tests>)
 	add_test(NAME pixel_inputs COMMAND $<TARGET_FILE:pixel_inputs_tests>)
 	add_test(NAME graphics_scan COMMAND $<TARGET_FILE:graphics_scan_tests>)
+	# The worker's guards in front of compile EXITs, alone, so a guard removed fails this test by EXIT.
+	add_test(NAME graphics_prescan_guards COMMAND $<TARGET_FILE:graphics_scan_tests> --guards-only)
+	# EXIT outside a reject scope must still end the process, so this passes only when it fails.
+	add_test(NAME graphics_prescan_exit_outside_scope COMMAND $<TARGET_FILE:graphics_scan_tests> --exit-outside-scope)
+	set_tests_properties(graphics_prescan_exit_outside_scope PROPERTIES WILL_FAIL TRUE)
 	add_test(NAME scan_differential COMMAND $<TARGET_FILE:scan_differential_tests>)
 	add_test(NAME prescan COMMAND $<TARGET_FILE:prescan_tests>)
 	# The whole test runs in about a second, so a ring that loses track of an item and leaves the

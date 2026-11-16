@@ -19,6 +19,7 @@
 #include "graphics/host_gpu/renderer/pipeline/generationState.h"
 #include "graphics/host_gpu/renderer/pipeline/graphicsLibraryCache.h"
 #include "graphics/host_gpu/renderer/pipeline/pixelInputs.h"
+#include "graphics/host_gpu/renderer/pipeline/prescanGraphics.h"
 #include "graphics/host_gpu/renderer/pipeline/prescanPreparer.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -241,6 +242,19 @@ vk::Format InputFormat(const ShaderBufferResource& resource, uint32_t used_compo
 	return NarrowInputFormat(VulkanFormat(resource.Format()), used_components);
 }
 
+// Whether VertexInputFormats can run on the info without EXIT, which it does on an attribute that is
+// not one to four registers wide or whose format has no host format.
+bool VertexInputsSupported(const ShaderVertexInputInfo& input_info) {
+	constexpr int max_registers = 4;
+	for (int index = 0; index < input_info.resources_num; index++) {
+		const auto registers_num = input_info.resources_dst[index].registers_num;
+		if (registers_num < 1 || registers_num > max_registers || !InputFormatKnown(input_info.resources[index])) {
+			return false;
+		}
+	}
+	return true;
+}
+
 // The host format of each vertex input attribute, narrowed to the components the stage reads.
 std::vector<vk::Format> VertexInputFormats(const ShaderVertexInputInfo&                    input_info,
                                            const ShaderRecompiler::IR::CompiledShaderInfo& program) {
@@ -309,6 +323,21 @@ void LogHostFloatMinMaxVerdict(HostFloatMinMaxVerdict verdict) {
 }
 
 } // namespace
+
+// The graphics prescan's worker uses the GPU thread's own two, so its vertex records and its
+// pre-rasterization keys are made the same way.
+std::vector<vk::Format> PrescanVertexInputFormats(const ShaderVertexInputInfo&                    input_info,
+                                                  const ShaderRecompiler::IR::CompiledShaderInfo& program) {
+	return VertexInputFormats(input_info, program);
+}
+
+bool PrescanVertexInputsSupported(const ShaderVertexInputInfo& input_info) {
+	return VertexInputsSupported(input_info);
+}
+
+vk::PolygonMode PrescanPolygonMode(const HW::ModeControl& mode, bool cull_front, bool cull_back) {
+	return ResolvePolygonMode(mode, cull_front, cull_back);
+}
 
 uint32_t HostComputeSubgroupSize(const GraphicContext& graphics) {
 	return graphics.SupportsComputeWave64() ? 64u : 32u;

@@ -8,6 +8,7 @@
 #include "common/firstRunReport.h"
 #include "common/gpuStall.h"
 #include "common/uniqueFunction.h"
+#include "graphics/guest_gpu/command_processor/submitScan.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptorSetLayoutCache.h"

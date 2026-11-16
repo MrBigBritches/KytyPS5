@@ -107,6 +107,17 @@ struct HoldRecord {
 	HoldCause cause   = HoldCause::Other;
 };
 
+/// When the last signal to throttle background work came, on the steady clock in nanoseconds since its
+/// epoch (the report's NowNs clock), or 0 before any. A hold of guest audio starting is one, and
+/// NoteAudioLowWater another. One relaxed load, so the graphics prescan's slots may read it often.
+[[nodiscard]] int64_t LastThrottleSignalNs() noexcept;
+
+/// Signals that a blocking guest audio submit found the host queue under its low-water mark, and
+/// counts it. The mark is the smaller of two periods and the queue floor less half a period, which is
+/// 1.5 periods on a 1024-sample port at the 40 ms target and 2 periods on 256- and 512-sample ports.
+void NoteAudioLowWater() noexcept;
+[[nodiscard]] uint64_t AudioLowWaterCount() noexcept;
+
 /// How many holds are kept one by one. Past it they are only counted in overflow, and the exact
 /// percentiles then cover the first holds only.
 inline constexpr size_t HOLD_RECORD_CAPACITY = 4096;

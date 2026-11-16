@@ -363,6 +363,56 @@ void TestHeldCausesSumToTotal() {
   }
 }
 
+// The steady clock in nanoseconds since its epoch, the clock LastThrottleSignalNs is kept on.
+int64_t SteadyNowNs() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count();
+}
+
+// A hold of guest audio that starts is a throttle signal, read while the waiter is still parked, so
+// the signal comes from the hold's start and not its end. The baseline parks a waiter under the same
+// Scope with a threshold no test reaches, so nothing holds and the signal stays where it was. A hold
+// is not an audio low-water signal, so it leaves that count alone.
+void TestHoldStartSignalsThrottle() {
+  const auto before_baseline = Common::GpuStall::LastThrottleSignalNs();
+  Common::GpuStall::Configure(true, kNeverReached);
+  {
+    Common::GpuStall::Scope scope(kAnyCause);
+    std::thread waiter([] { Common::GpuStall::WaitWhileStalled(); });
+    waiter.join();
+  }
+  Common::GpuStall::Configure(false);
+  Check(Common::GpuStall::LastThrottleSignalNs() == before_baseline, "a Scope that never held signalled the throttle");
+
+  // The steady clock ticks far finer than this, so a hold that starts after it is later than any
+  // signal before.
+  std::this_thread::sleep_for(milliseconds(1));
+  const auto low_water_before = Common::GpuStall::AudioLowWaterCount();
+  Common::GpuStall::Configure(true, milliseconds(0));
+  auto scope = std::make_unique<Common::GpuStall::Scope>(kAnyCause);
+  const auto before_hold = SteadyNowNs();
+  auto waiters = StartParkedWaiters(1);
+  const auto during_hold = Common::GpuStall::LastThrottleSignalNs();
+  const auto parked = SteadyNowNs();
+  scope.reset();
+  for (auto &waiter : waiters) waiter.join();
+  Common::GpuStall::Configure(false);
+  Check(during_hold >= before_hold && during_hold <= parked, "a hold that started did not signal the throttle");
+  Check(Common::GpuStall::AudioLowWaterCount() == low_water_before, "a hold counted as an audio low-water signal");
+}
+
+// An audio low-water signal counts one and moves the throttle time to now. The hold above is the
+// baseline that moves the throttle time without counting, so the count comes from this call alone.
+void TestAudioLowWaterSignals() {
+  std::this_thread::sleep_for(milliseconds(1));
+  const auto count_before = Common::GpuStall::AudioLowWaterCount();
+  const auto before       = SteadyNowNs();
+  Common::GpuStall::NoteAudioLowWater();
+  const auto after  = SteadyNowNs();
+  const auto signal = Common::GpuStall::LastThrottleSignalNs();
+  Check(Common::GpuStall::AudioLowWaterCount() == count_before + 1, "a low-water signal was not counted once");
+  Check(signal >= before && signal <= after, "a low-water signal did not move the throttle time to now");
+}
+
 // The exact percentiles are nearest rank over the sorted holds. Ten holds of 10 to 100 ms give p50 of
 // 50 and p95 of 100, where a rank that rounds down gives 90 for p95. Nineteen holds of 300 ms and one
 // of 600 ms give an exact p95 of 300, which the buckets, with a bound of 500, could not show.
@@ -424,6 +474,8 @@ int main() {
   TestOverlapChargesTheOldestScope();
   TestReclassifyBeforeTheScopeEnds();
   TestHeldCausesSumToTotal();
+  TestHoldStartSignalsThrottle();
+  TestAudioLowWaterSignals();
   TestHoldHistogramPercentiles();
   TestExactPercentiles();
   std::puts("GpuStallTests: all cases passed");

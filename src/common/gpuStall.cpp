@@ -65,6 +65,14 @@ std::array<std::atomic<int64_t>, HOLD_RECORD_CAPACITY>  g_record_end_ns {};
 std::array<std::atomic<uint8_t>, HOLD_RECORD_CAPACITY>  g_record_cause {};
 std::atomic<size_t>                                     g_record_next {0};
 std::atomic<uint64_t>                                   g_record_overflow {0};
+// The last throttle signal on the steady clock in nanoseconds, and the audio low-water signals.
+std::atomic<int64_t>                                    g_last_throttle_signal_ns {0};
+std::atomic<uint64_t>                                   g_audio_low_water {0};
+
+// Nanoseconds since the steady clock's epoch, the report's NowNs clock, for the throttle signals.
+int64_t SteadyNowNs() {
+	return std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count();
+}
 
 constexpr double NS_PER_MS = 1e6;
 
@@ -311,6 +319,7 @@ bool HoldWhileStalled() {
 				if (!state.first_hold.has_value()) {
 					state.first_hold = hold_start;
 					g_hold_in_progress.store(true, std::memory_order_relaxed);
+					g_last_throttle_signal_ns.store(SteadyNowNs(), std::memory_order_relaxed);
 					// The stall is past the threshold, so the oldest Scope is the one that crossed it.
 					state.hold_scope_id = state.tracker.OldestId().value_or(0);
 				}
@@ -403,6 +412,19 @@ std::vector<HoldRecord> HoldRecords() {
 		}
 	}
 	return records;
+}
+
+int64_t LastThrottleSignalNs() noexcept {
+	return g_last_throttle_signal_ns.load(std::memory_order_relaxed);
+}
+
+void NoteAudioLowWater() noexcept {
+	g_audio_low_water.fetch_add(1, std::memory_order_relaxed);
+	g_last_throttle_signal_ns.store(SteadyNowNs(), std::memory_order_relaxed);
+}
+
+uint64_t AudioLowWaterCount() noexcept {
+	return g_audio_low_water.load(std::memory_order_relaxed);
 }
 
 // Acquire pairs with the release in the Scope's constructor, so a Scope seen counted here is also
