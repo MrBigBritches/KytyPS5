@@ -246,12 +246,15 @@ void TestBoostsDoNothingOnMacOS() {
 	CHECK(!Common::BoostThreadToPriority(1, 0));
 }
 #else
-// What a thread raised by BoostThreadToNormal reports.
+// What a thread raised by BoostThreadToNormal reports. On Linux that is the process's own nice value,
+// read as BoostThreadToNormal reads it, so a runner started under nice still expects the right level.
+int NormalPriority() {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-constexpr int NORMAL_PRIORITY = THREAD_PRIORITY_NORMAL;
+	return THREAD_PRIORITY_NORMAL;
 #else
-constexpr int NORMAL_PRIORITY = 0;
+	return getpriority(PRIO_PROCESS, static_cast<id_t>(getpid()));
 #endif
+}
 
 // Another thread's priority read from outside it, in the units of CurrentThreadPriority.
 int ThreadPriorityOf(uint64_t thread_id) {
@@ -375,18 +378,19 @@ void TestBoostToPriorityRaisesAndTheThreadDropsBack() {
 // BoostThreadToNormal raises a lowered thread to normal priority. The baseline is the same thread
 // before the call. Thread id 0 names no thread, and both boosts refuse it.
 void TestBoostToNormal() {
+	const int normal = NormalPriority();
 	CHECK(!Common::BoostThreadToNormal(0));
-	CHECK(!Common::BoostThreadToPriority(0, NORMAL_PRIORITY));
+	CHECK(!Common::BoostThreadToPriority(0, normal));
 
 	LoweredThread worker;
 	const int     before = ThreadPriorityOf(worker.Id());
-	CHECK(before != NORMAL_PRIORITY);
+	CHECK(before != normal);
 	if (!Common::BoostThreadToNormal(worker.Id())) {
 		CHECK(ThreadPriorityOf(worker.Id()) == before);
 		CHECK(RefusedRaiseMaySkip());
 		return;
 	}
-	CHECK(ThreadPriorityOf(worker.Id()) == NORMAL_PRIORITY);
+	CHECK(ThreadPriorityOf(worker.Id()) == normal);
 }
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
