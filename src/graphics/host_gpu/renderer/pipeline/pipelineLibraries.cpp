@@ -221,6 +221,54 @@ bool ShouldUseLibraries(const GraphicContext& graphics, GraphicsLibraryCache* ca
 	return true;
 }
 
+// The fragment library reads only the multisample fields of the pipeline key, and the dynamic states
+// it owns do not depend on the key, so a key with those fields and the PS id set is enough. The
+// layout source has the same heap set, PS set and push stages a draw's split pipeline gives, and the
+// VS set is not the fragment library's to name, so it is null as in BuildFragmentLibrary.
+bool PrebuildFragmentLibrary(GraphicContext& graphics, GraphicsLibraryCache& cache,
+                             const PixelSplitLayout& layout, const ShaderModule& pixel,
+                             const FragmentKey& key, vk::PipelineCache driver_cache) {
+	if (graphics.image_heap_layout == nullptr || pixel.gpl_module == nullptr) {
+		return false;
+	}
+	GraphicsPipelineKey pipeline_key {};
+	pipeline_key.stage_ids[PIXEL_STAGE_INDEX]              = key.pixel_id;
+	pipeline_key.static_params.samples                     = key.samples;
+	pipeline_key.static_params.sample_shading_enable       = key.sample_shading_enable;
+	pipeline_key.static_params.alpha_to_coverage_enable    = key.alpha_to_coverage_enable;
+	std::array<const ShaderModule*, 4> stages {};
+	stages[PIXEL_STAGE_INDEX] = &pixel;
+	const LibraryLayoutSource source {nullptr, graphics.image_heap_layout, layout.pixel_set,
+	                                  layout.push_stages};
+	const LibraryRequest request {graphics, driver_cache, pipeline_key, stages};
+	return cache.GetOrBuildPrebuilt(key, [&] { return BuildFragmentLibrary(request, source); });
+}
+
+// The pre-rasterization library reads only the raster fields of the pipeline key, which PreRasterKey
+// holds, and its stages. The layout source has the VS set and push stages a draw's split pipeline
+// gives, and the PS set is not this library's to name, so it is null as in BuildPreRasterLibrary.
+bool PrebuildPreRasterLibrary(GraphicContext& graphics, GraphicsLibraryCache& cache, const VertexSplitLayout& layout,
+                              const ShaderModule& vertex, const PreRasterKey& key, vk::PipelineCache driver_cache) {
+	if (graphics.image_heap_layout == nullptr || vertex.module == nullptr) {
+		return false;
+	}
+	GraphicsPipelineKey pipeline_key {};
+	for (std::size_t index = 0; index < PRE_RASTER_STAGE_COUNT; index++) {
+		pipeline_key.stage_ids[index] = key.stage_ids[index];
+	}
+	auto& params                = pipeline_key.static_params;
+	params.negative_one_to_one  = key.negative_one_to_one;
+	params.depth_clip_enable    = key.depth_clip_enable;
+	params.provoking_vtx_last   = key.provoking_vtx_last;
+	params.polygon_mode         = key.polygon_mode;
+	params.patch_control_points = key.patch_control_points;
+	std::array<const ShaderModule*, 4> stages {};
+	stages[VERTEX_STAGE_INDEX] = &vertex;
+	const LibraryLayoutSource source {layout.vertex_set, graphics.image_heap_layout, nullptr, layout.push_stages};
+	const LibraryRequest      request {graphics, driver_cache, pipeline_key, stages};
+	return cache.GetOrBuildPrebuilt(key, [&] { return BuildPreRasterLibrary(request, source); });
+}
+
 bool CreatePipelineFromLibraries(GraphicContext& graphics, GraphicsLibraryCache& cache,
                                  PipelineCache::Pipeline& pipeline, const GraphicsPipelineKey& key,
                                  const std::array<const ShaderModule*, 4>& stages,

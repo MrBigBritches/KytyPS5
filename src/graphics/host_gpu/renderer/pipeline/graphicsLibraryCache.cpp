@@ -111,6 +111,50 @@ uint64_t GraphicsLibraryCache::Fallbacks(Common::FirstRunReport::FallbackKind re
 	return m_fallbacks[static_cast<std::size_t>(reason)].load();
 }
 
+// Every request that waited on a prebuild counts as a wait. The first request that found it finished
+// counts as its first hit, and a wait claims the entry too, so a later finished request is not taken
+// for a first hit.
+void GraphicsLibraryCache::NotePrebuiltUse(Entry& entry, LibraryPart part, bool waited, double waited_ms) {
+	if (waited) {
+		constexpr double US_PER_MS = 1000.0;
+		const auto       waited_us = static_cast<uint64_t>(waited_ms * US_PER_MS);
+		entry.prebuilt_claimed.store(true, std::memory_order_relaxed);
+		Prebuilt(part).waits.fetch_add(1, std::memory_order_relaxed);
+		Prebuilt(part).wait_us.fetch_add(waited_us, std::memory_order_relaxed);
+		uint64_t seen = Prebuilt(part).wait_max_us.load(std::memory_order_relaxed);
+		while (seen < waited_us &&
+		       !Prebuilt(part).wait_max_us.compare_exchange_weak(seen, waited_us, std::memory_order_relaxed)) {
+		}
+		return;
+	}
+	if (!entry.prebuilt_claimed.exchange(true, std::memory_order_relaxed)) {
+		Prebuilt(part).first_hits.fetch_add(1, std::memory_order_relaxed);
+	}
+}
+
+void GraphicsLibraryCache::NotePrebuiltStage(LibraryPart part, uint64_t stage_id) {
+	std::scoped_lock lock(m_prebuilt_pixels_mutex);
+	m_prebuilt_ids[static_cast<std::size_t>(part)].insert(stage_id);
+}
+
+void GraphicsLibraryCache::NoteBuiltHere(LibraryPart part, uint64_t stage_id) {
+	std::scoped_lock lock(m_prebuilt_pixels_mutex);
+	if (m_prebuilt_ids[static_cast<std::size_t>(part)].contains(stage_id)) {
+		Prebuilt(part).key_differs.fetch_add(1, std::memory_order_relaxed);
+	}
+}
+
+PrebuiltLibraryCounts GraphicsLibraryCache::PrebuiltCounts(LibraryPart part) const {
+	constexpr double MS_PER_US = 1e-3;
+	return {.built         = Prebuilt(part).built.load(std::memory_order_relaxed),
+	        .already_there = Prebuilt(part).already_there.load(std::memory_order_relaxed),
+	        .first_hits    = Prebuilt(part).first_hits.load(std::memory_order_relaxed),
+	        .waits         = Prebuilt(part).waits.load(std::memory_order_relaxed),
+	        .wait_ms       = static_cast<double>(Prebuilt(part).wait_us.load(std::memory_order_relaxed)) * MS_PER_US,
+	        .wait_max_ms = static_cast<double>(Prebuilt(part).wait_max_us.load(std::memory_order_relaxed)) * MS_PER_US,
+	        .key_differs = Prebuilt(part).key_differs.load(std::memory_order_relaxed)};
+}
+
 uint64_t TotalLinkedPipelines() {
 	return g_total_links.load();
 }

@@ -343,6 +343,36 @@ static void CreateSplitLayouts(GraphicContext& graphics, DescriptorSetLayoutCach
 	                     vk::Result::eSuccess);
 }
 
+// The PS set is planned exactly as for a split pipeline, which depends on the PS alone and the
+// device's push descriptor limit, and the PS bindings are judged alone, since a pipeline whose PS
+// alone is past the limits would stop the process whatever its VS.
+std::optional<PixelSplitLayout> PixelSplitSetLayout(const GraphicContext&     graphics,
+                                                    DescriptorSetLayoutCache& shared_layouts,
+                                                    const ShaderModule&       pixel) {
+	std::array<const ShaderModule*, 4> stages {};
+	stages[PIXEL_STAGE_INDEX] = &pixel;
+	const auto plan           = PlanSplitSets(graphics, stages);
+	if (!SplitLayoutLimitError(graphics.GetPhysicalDeviceProperties().limits, {}, plan.pixel).empty()) {
+		return std::nullopt;
+	}
+	return PixelSplitLayout {
+	    .pixel_set   = shared_layouts.GetOrCreate(plan.pixel, SetLayoutFlags(plan.pixel_push)),
+	    .push_stages = SPLIT_PUSH_STAGES};
+}
+
+// The VS set is planned exactly as for a split pipeline, from the VS bindings alone, with no flags.
+std::optional<VertexSplitLayout> VertexSplitSetLayout(const GraphicContext&     graphics,
+                                                      DescriptorSetLayoutCache& shared_layouts,
+                                                      const ShaderModule&       vertex) {
+	std::array<const ShaderModule*, 4> stages {};
+	stages[VERTEX_STAGE_INDEX] = &vertex;
+	const auto plan            = PlanSplitSets(graphics, stages);
+	if (!SplitLayoutLimitError(graphics.GetPhysicalDeviceProperties().limits, plan.vertex, {}).empty()) {
+		return std::nullopt;
+	}
+	return VertexSplitLayout {.vertex_set = shared_layouts.GetOrCreate(plan.vertex, {}), .push_stages = SPLIT_PUSH_STAGES};
+}
+
 // The create info of one stage, whose entry point is always main.
 static vk::PipelineShaderStageCreateInfo MakeStageInfo(vk::ShaderStageFlagBits stage,
                                                        vk::ShaderModule        module) {

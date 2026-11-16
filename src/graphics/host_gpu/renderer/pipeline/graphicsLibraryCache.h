@@ -28,7 +28,9 @@
 #include <cstdint>
 #include <functional>
 #include <mutex>
+#include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace Libs::Graphics {
 
@@ -60,6 +62,22 @@ struct LibraryCounts {
 	uint64_t hits         = 0;
 	uint64_t failed       = 0;
 	uint64_t refused_hits = 0;
+};
+
+// What became of the fragment libraries the graphics prescan built ahead (experimental). first_hits are
+// entries a later ordinary request found finished, counted once per entry, and waits are ordinary
+// requests that found the prebuild still running and waited for it in its once flag, which is how a
+// normal priority thread can end up waiting on a below normal prebuild. key_differs are ordinary
+// requests that built a fragment library themselves for a pixel shader that was prebuilt under
+// another key, such as a different sample count.
+struct PrebuiltLibraryCounts {
+	uint64_t built         = 0;
+	uint64_t already_there = 0;
+	uint64_t first_hits    = 0;
+	uint64_t waits         = 0;
+	double   wait_ms       = 0.0;
+	double   wait_max_ms   = 0.0;
+	uint64_t key_differs   = 0;
 };
 
 // Finds or builds libraries under per-entry once flags. A map lock guards only the lookup, and the
@@ -102,6 +120,21 @@ public:
 	[[nodiscard]] LibraryHandles GetOrBuild(const FragmentOutputKey& key, Build&& build) {
 		return Get(m_output, LibraryPart::Output, key, build);
 	}
+	// Builds the fragment library for the key ahead of any draw, for the graphics prescan
+	// (experimental), and marks its entry prebuilt so the first ordinary request that uses it is counted.
+	// Returns whether this call built it. An entry that is already there is left as it is.
+	template <class Build>
+	bool GetOrBuildPrebuilt(const FragmentKey& key, Build&& build) {
+		return Prebuild(m_fragment, LibraryPart::Fragment, key, key.pixel_id, build);
+	}
+	// The same for the pre-rasterization library of a vertex shader, named by its id.
+	template <class Build>
+	bool GetOrBuildPrebuilt(const PreRasterKey& key, Build&& build) {
+		return Prebuild(m_pre_raster, LibraryPart::PreRaster, key, key.stage_ids[0], build);
+	}
+	// What became of the prebuilt libraries of a part so far. Only fragment and pre-rasterization
+	// libraries are ever prebuilt.
+	[[nodiscard]] PrebuiltLibraryCounts PrebuiltCounts(LibraryPart part = LibraryPart::Fragment) const;
 
 	// How many libraries of a part the cache holds, failed ones included.
 	[[nodiscard]] std::size_t Size(LibraryPart part) const;
@@ -128,6 +161,20 @@ private:
 		LibraryHandles handles;
 		// Set when the build is over, so a request that finds it set did not wait for anyone.
 		std::atomic<bool> done {false};
+		// Set by a prebuild before it builds, and the first ordinary request after it claims the entry.
+		std::atomic<bool> prebuilt {false};
+		std::atomic<bool> prebuilt_claimed {false};
+	};
+
+	// The prebuilt counts, written by any thread.
+	struct PrebuiltCounters {
+		std::atomic<uint64_t> built {0};
+		std::atomic<uint64_t> already_there {0};
+		std::atomic<uint64_t> first_hits {0};
+		std::atomic<uint64_t> waits {0};
+		std::atomic<uint64_t> wait_us {0};
+		std::atomic<uint64_t> wait_max_us {0};
+		std::atomic<uint64_t> key_differs {0};
 	};
 
 	// One table of entries. Entries are never erased, so a reference to one stays valid while other
@@ -138,19 +185,43 @@ private:
 		std::unordered_map<Key, Entry, PartKeyHash<Key>>         entries;
 	};
 
+	// Builds a library ahead under the entry's once flag and marks it prebuilt. `stage_id` is the id of
+	// the shader the part is named by, which an ordinary build under another key is checked against.
+	template <class Key, class Build>
+	bool Prebuild(Table<Key>& table, LibraryPart part, const Key& key, uint64_t stage_id, Build& build) {
+		Entry* entry = FindEntry(table, key);
+		bool   built = false;
+		std::call_once(entry->once, [&] {
+			built = true;
+			entry->prebuilt.store(true, std::memory_order_release);
+			NotePrebuiltStage(part, stage_id);
+			const auto start = std::chrono::steady_clock::now();
+			entry->handles   = build();
+			NoteBuilt(part, entry->handles.pipeline != nullptr, Common::FirstRunReport::ElapsedMs(start));
+			entry->done.store(true, std::memory_order_release);
+		});
+		auto& counters = Prebuilt(part);
+		(built ? counters.built : counters.already_there).fetch_add(1, std::memory_order_relaxed);
+		return built;
+	}
+
+	// Finds or adds the entry for the key under the map lock.
+	template <class Key>
+	Entry* FindEntry(Table<Key>& table, const Key& key) {
+		std::scoped_lock lock(table.mutex);
+		return &table.entries.try_emplace(key).first->second;
+	}
+
 	// Finds the entry under the map lock and then builds it under the entry's once flag.
 	template <class Key, class Build>
 	LibraryHandles Get(Table<Key>& table, LibraryPart part, const Key& key, Build& build) {
-		Entry* entry = nullptr;
-		{
-			std::scoped_lock lock(table.mutex);
-			entry = &table.entries.try_emplace(key).first->second;
-		}
-		// Clocks are read only when the report is on, which is the only reader of the times.
+		Entry* entry = FindEntry(table, key);
+		// Clocks are read only when the report is on, or when the request may wait, since a wait on a
+		// prebuild is counted either way.
 		const bool timed      = Common::FirstRunReport::Enabled();
 		bool       built_here = false;
 		const bool finished   = entry->done.load(std::memory_order_acquire);
-		const bool waits      = timed && !finished;
+		const bool waits      = !finished;
 		const auto wait_start = waits ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
 		std::call_once(entry->once, [&] {
 			built_here       = true;
@@ -163,13 +234,31 @@ private:
 		if (!built_here) {
 			NoteHit(part, entry->handles.pipeline != nullptr);
 			// The call returned when the other thread's build finished, so the time since the start is wait.
-			if (waits) {
-				Common::FirstRunReport::LibraryPipelineScope::NoteWaited(
-				    Common::FirstRunReport::ElapsedMs(wait_start));
+			const double waited_ms = waits ? Common::FirstRunReport::ElapsedMs(wait_start) : 0.0;
+			if (waits && timed) {
+				Common::FirstRunReport::LibraryPipelineScope::NoteWaited(waited_ms);
 			}
+			// Read after the once flag, which orders it after the prebuild that set it.
+			if (entry->prebuilt.load(std::memory_order_acquire)) {
+				NotePrebuiltUse(*entry, part, waits, waited_ms);
+			}
+		} else if constexpr (std::is_same_v<Key, FragmentKey>) {
+			NoteBuiltHere(part, key.pixel_id);
+		} else if constexpr (std::is_same_v<Key, PreRasterKey>) {
+			NoteBuiltHere(part, key.stage_ids[0]);
 		}
 		return entry->handles;
 	}
+
+	// Counts an ordinary request answered by a prebuilt entry, as its first hit or as a wait on it.
+	void NotePrebuiltUse(Entry& entry, LibraryPart part, bool waited, double waited_ms);
+	// Remembers a prebuilt pixel shader id, and counts an ordinary build of a fragment library for one
+	// that was prebuilt under another key.
+	void NotePrebuiltStage(LibraryPart part, uint64_t stage_id);
+	void NoteBuiltHere(LibraryPart part, uint64_t stage_id);
+	// The prebuilt counters of a part.
+	[[nodiscard]] PrebuiltCounters& Prebuilt(LibraryPart part) { return m_prebuilt[static_cast<std::size_t>(part)]; }
+	[[nodiscard]] const PrebuiltCounters& Prebuilt(LibraryPart part) const { return m_prebuilt[static_cast<std::size_t>(part)]; }
 
 	// Count a builder that ran, and a request an entry answered, here and in the report.
 	void NoteBuilt(LibraryPart part, bool succeeded, double ms);
@@ -190,6 +279,11 @@ private:
 	std::atomic<uint64_t>                                    m_links {0};
 	std::atomic<uint64_t>                                    m_live_links {0};
 	std::array<std::atomic<uint64_t>, Common::FirstRunReport::FALLBACK_KIND_COUNT> m_fallbacks {};
+	std::array<PrebuiltCounters, LIBRARY_PART_COUNT>         m_prebuilt;
+	// The pixel shader ids that have a prebuilt fragment library. Read only when a request builds a
+	// fragment library itself, which is a pipeline build anyway.
+	mutable std::mutex                                       m_prebuilt_pixels_mutex;
+	std::array<std::unordered_set<uint64_t>, LIBRARY_PART_COUNT> m_prebuilt_ids;
 };
 
 // Whether a pipeline is to be linked from libraries. That needs a library cache, the library mode on,

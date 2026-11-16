@@ -69,6 +69,8 @@ struct GraphicContext;
 struct ShaderParams;
 class CommandBuffer;
 class GraphicsLibraryCache;
+struct FragmentKey;
+struct PreRasterKey;
 class PrescanPreparer;
 struct PrescanPreparerConfig;
 
@@ -1056,6 +1058,44 @@ inline constexpr uint32_t SPLIT_SET_COUNT  = 3;
 [[nodiscard]] std::string SplitLayoutLimitError(const vk::PhysicalDeviceLimits&                limits,
                                                 std::span<const vk::DescriptorSetLayoutBinding> vertex,
                                                 std::span<const vk::DescriptorSetLayoutBinding> pixel);
+
+// The PS half of a split layout, which is all a fragment shader library's layout names besides the
+// image heap. It is the same set layout handle any split pipeline with this PS gets from the shared
+// cache, so a library built from it matches one built for a draw.
+struct PixelSplitLayout {
+	vk::DescriptorSetLayout pixel_set = nullptr;
+	vk::ShaderStageFlags    push_stages;
+};
+// Gets the PS half of the split layout for a pixel shader module, the way CreateSplitLayouts does
+// for a pipeline. Returns nothing when the PS bindings alone are past the device limits, where the
+// layout code would EXIT for any pipeline with this PS.
+[[nodiscard]] std::optional<PixelSplitLayout> PixelSplitSetLayout(const GraphicContext&     graphics,
+                                                                  DescriptorSetLayoutCache& shared_layouts,
+                                                                  const ShaderModule&       pixel);
+
+// The VS half of a split layout, which a pre-rasterization library's layout names besides the image
+// heap, from the shared cache as CreateSplitLayouts gets it.
+struct VertexSplitLayout {
+	vk::DescriptorSetLayout vertex_set = nullptr;
+	vk::ShaderStageFlags    push_stages;
+};
+// Returns nothing when the VS bindings alone are past the device limits.
+[[nodiscard]] std::optional<VertexSplitLayout> VertexSplitSetLayout(const GraphicContext&     graphics,
+                                                                    DescriptorSetLayoutCache& shared_layouts,
+                                                                    const ShaderModule&       vertex);
+// Builds the pre-rasterization library of a vertex shader ahead of any draw, as
+// CreatePipelineFromLibraries makes it for a draw whose PreRasterKey is `key` (experimental). Returns
+// whether this call built it.
+bool PrebuildPreRasterLibrary(GraphicContext& graphics, GraphicsLibraryCache& cache, const VertexSplitLayout& layout,
+                              const ShaderModule& vertex, const PreRasterKey& key, vk::PipelineCache driver_cache);
+
+// Builds the fragment shader library of a pixel shader into the cache ahead of any draw, for the
+// graphics prescan (experimental). The library is made exactly as CreatePipelineFromLibraries makes it
+// for a draw whose FragmentKey is `key`, with the same layout sources, so the draw's request finds
+// it. The module's gpl_module must be set. Returns whether this call built it.
+bool PrebuildFragmentLibrary(GraphicContext& graphics, GraphicsLibraryCache& cache,
+                             const PixelSplitLayout& layout, const ShaderModule& pixel,
+                             const FragmentKey& key, vk::PipelineCache driver_cache);
 
 // Destroys what a pipeline owns, whichever layout it has. Handles that were never made are skipped.
 // The set layouts of a split pipeline are shared and belong to the DescriptorSetLayoutCache.

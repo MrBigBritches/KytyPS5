@@ -411,6 +411,204 @@ void TestLinkAndFallbackCounts() {
 	std::printf("GraphicsLibraryCacheTests: counts ok\n");
 }
 
+// A fragment key for the prebuilt tests, of a pixel shader id with a sample count.
+FragmentKey PrebuiltKey(uint64_t pixel_id, uint32_t samples = 1) {
+	FragmentKey key;
+	key.pixel_id = pixel_id;
+	key.samples  = samples;
+	return key;
+}
+
+// A prebuilt fragment library answers the first ordinary request for its key, which is counted once
+// as a first hit, and is not built again. The baseline is the same two requests after an ordinary
+// build, which count no first hit, so only the prebuild's mark makes the count.
+void TestPrebuiltFirstHit() {
+	FakeDriver driver;
+	auto       cache = MakeCache(driver);
+	const auto build = [&] { return driver.Build(LibraryPart::Fragment); };
+	Check(cache.GetOrBuildPrebuilt(PrebuiltKey(5), build), "the prebuild did not build");
+	Check(!cache.GetOrBuildPrebuilt(PrebuiltKey(5), build), "a second prebuild built again");
+	(void)cache.GetOrBuild(PrebuiltKey(5), build);
+	(void)cache.GetOrBuild(PrebuiltKey(5), build);
+	auto counts = cache.PrebuiltCounts();
+	Check(driver.Builds(LibraryPart::Fragment) == 1, "a prebuilt library was built again");
+	Check(counts.built == 1 && counts.already_there == 1 && counts.first_hits == 1 && counts.waits == 0,
+	      "the prebuilt library's first hit was not counted once");
+
+	FakeDriver plain_driver;
+	auto       plain = MakeCache(plain_driver);
+	const auto plain_build = [&] { return plain_driver.Build(LibraryPart::Fragment); };
+	(void)plain.GetOrBuild(PrebuiltKey(5), plain_build);
+	(void)plain.GetOrBuild(PrebuiltKey(5), plain_build);
+	counts = plain.PrebuiltCounts();
+	Check(counts.first_hits == 0 && counts.built == 0, "an ordinary library counted as prebuilt");
+	std::printf("GraphicsLibraryCacheTests: prebuilt first hit ok\n");
+}
+
+// An ordinary request that meets a prebuild still running waits for it in the entry's once flag, and
+// is counted as a wait with its time, not as a first hit. The prebuild is held on a promise until the
+// request has had time to arrive, and the request's own build never runs.
+void TestPrebuiltWaitIsCounted() {
+	FakeDriver         driver;
+	auto               cache = MakeCache(driver);
+	std::promise<void> release;
+	auto               released = release.get_future().share();
+	std::atomic<bool>  started {false};
+	std::thread prebuild([&] {
+		(void)cache.GetOrBuildPrebuilt(PrebuiltKey(9), [&] {
+			started = true;
+			released.wait();
+			return driver.Build(LibraryPart::Fragment);
+		});
+	});
+	const auto deadline = std::chrono::steady_clock::now() + kStuck;
+	while (!started && std::chrono::steady_clock::now() < deadline) {
+		std::this_thread::yield();
+	}
+	Check(started, "the prebuild never started");
+	std::thread request([&] { (void)cache.GetOrBuild(PrebuiltKey(9), [&] { return driver.Build(LibraryPart::Fragment); }); });
+	// Long enough for the request to reach the once flag on a loaded machine, so it really waits.
+	constexpr std::chrono::milliseconds kRequestArrival(100);
+	std::this_thread::sleep_for(kRequestArrival);
+	release.set_value();
+	prebuild.join();
+	request.join();
+	const auto counts = cache.PrebuiltCounts();
+	Check(driver.Builds(LibraryPart::Fragment) == 1, "the waiting request built the library itself");
+	Check(counts.waits == 1 && counts.first_hits == 0 && counts.wait_ms > 0.0 && counts.wait_max_ms > 0.0,
+	      "a request that waited on a prebuild was not counted as a wait");
+	std::printf("GraphicsLibraryCacheTests: prebuilt wait ok\n");
+}
+
+// A prebuilt pre-rasterization library answers the first ordinary request for its key, counted once
+// as a first hit of that part and not of the fragment part, and is not built again. The baseline is an
+// ordinary build of another vertex shader's key, which counts no first hit.
+void TestPreRasterPrebuiltFirstHit() {
+	FakeDriver   driver;
+	auto         cache = MakeCache(driver);
+	const auto   build = [&] { return driver.Build(LibraryPart::PreRaster); };
+	PreRasterKey prebuilt_key;
+	prebuilt_key.stage_ids[0] = 7;
+	PreRasterKey plain_key;
+	plain_key.stage_ids[0] = 8;
+	Check(cache.GetOrBuildPrebuilt(prebuilt_key, build), "the pre-raster prebuild did not build");
+	(void)cache.GetOrBuild(prebuilt_key, build);
+	(void)cache.GetOrBuild(prebuilt_key, build);
+	(void)cache.GetOrBuild(plain_key, build);
+	(void)cache.GetOrBuild(plain_key, build);
+	const auto counts = cache.PrebuiltCounts(LibraryPart::PreRaster);
+	Check(driver.Builds(LibraryPart::PreRaster) == 2, "a prebuilt pre-raster library was built again");
+	Check(counts.built == 1 && counts.first_hits == 1 && counts.waits == 0,
+	      "the prebuilt pre-raster library's first hit was not counted once");
+	Check(cache.PrebuiltCounts(LibraryPart::Fragment).first_hits == 0, "a pre-raster hit was counted as fragment");
+	std::printf("GraphicsLibraryCacheTests: pre-raster prebuilt first hit ok\n");
+}
+
+// An ordinary request that builds a fragment library for a prebuilt pixel shader under another key,
+// here another sample count, is counted. The baseline builds one for a pixel shader that was never
+// prebuilt, which counts nothing.
+void TestPrebuiltKeyDiffers() {
+	FakeDriver driver;
+	auto       cache = MakeCache(driver);
+	const auto build = [&] { return driver.Build(LibraryPart::Fragment); };
+	(void)cache.GetOrBuildPrebuilt(PrebuiltKey(5), build);
+	(void)cache.GetOrBuild(PrebuiltKey(6, 4), build);
+	Check(cache.PrebuiltCounts().key_differs == 0, "a pixel shader never prebuilt counted as differing");
+	(void)cache.GetOrBuild(PrebuiltKey(5, 4), build);
+	Check(cache.PrebuiltCounts().key_differs == 1, "a prebuilt pixel shader under another key was not counted");
+	std::printf("GraphicsLibraryCacheTests: prebuilt key differs ok\n");
+}
+
+// How long a held prebuild waits before it is let go, so an ordinary request started just before has
+// reached the entry's once flag even on a loaded machine.
+constexpr std::chrono::milliseconds kHeldPrebuildArrival(100);
+
+// Holds a prebuild of `key` until an ordinary request for the same key has had time to reach the
+// entry's once flag, so the request waits on the prebuild, then lets both finish.
+void WaitOnHeldPrebuild(GraphicsLibraryCache& cache, FakeDriver& driver, const FragmentKey& key) {
+	std::promise<void> release;
+	auto               released = release.get_future().share();
+	std::atomic<bool>  started {false};
+	std::thread prebuild([&] {
+		(void)cache.GetOrBuildPrebuilt(key, [&] {
+			started = true;
+			released.wait();
+			return driver.Build(LibraryPart::Fragment);
+		});
+	});
+	Check(WaitFor(started), "the held prebuild never started");
+	std::thread request([&] { (void)cache.GetOrBuild(key, [&] { return driver.Build(LibraryPart::Fragment); }); });
+	std::this_thread::sleep_for(kHeldPrebuildArrival);
+	release.set_value();
+	prebuild.join();
+	request.join();
+}
+
+// A request that waited on a prebuild claims its entry, so a later request that finds it finished is
+// not counted as a first hit. The baseline is the same later request on a prebuild nobody waited on,
+// which is counted as the first hit, so only the wait's claim keeps the count at zero.
+void TestWaitClaimsThePrebuilt() {
+	FakeDriver driver;
+	auto       cache = MakeCache(driver);
+	WaitOnHeldPrebuild(cache, driver, PrebuiltKey(21));
+	(void)cache.GetOrBuild(PrebuiltKey(21), [&] { return driver.Build(LibraryPart::Fragment); });
+	const auto counts = cache.PrebuiltCounts();
+	Check(counts.waits == 1 && counts.first_hits == 0, "a request after a wait on a prebuild counted as its first hit");
+
+	FakeDriver plain_driver;
+	auto       plain = MakeCache(plain_driver);
+	const auto plain_build = [&] { return plain_driver.Build(LibraryPart::Fragment); };
+	(void)plain.GetOrBuildPrebuilt(PrebuiltKey(21), plain_build);
+	(void)plain.GetOrBuild(PrebuiltKey(21), plain_build);
+	Check(plain.PrebuiltCounts().first_hits == 1, "a request on a prebuild nobody waited on was not its first hit");
+	std::printf("GraphicsLibraryCacheTests: wait claims the prebuilt ok\n");
+}
+
+// An ordinary request that builds a pre-rasterization library for a prebuilt vertex shader under
+// another key, here another polygon mode, is counted under that part. The baselines are a vertex
+// shader that was never prebuilt and a fragment library of a pixel shader that has the prebuilt
+// vertex shader's id, neither of which counts, so only the prebuilt shader's id within its own part
+// makes the count.
+void TestPreRasterKeyDiffers() {
+	constexpr uint64_t kPrebuiltVertex = 7;
+	constexpr uint64_t kOtherVertex    = 8;
+	FakeDriver         driver;
+	auto               cache        = MakeCache(driver);
+	const auto         raster_build = [&] { return driver.Build(LibraryPart::PreRaster); };
+	PreRasterKey       prebuilt_key;
+	prebuilt_key.stage_ids[0] = kPrebuiltVertex;
+	PreRasterKey other_mode   = prebuilt_key;
+	other_mode.polygon_mode   = vk::PolygonMode::eLine;
+	PreRasterKey other_vertex = other_mode;
+	other_vertex.stage_ids[0] = kOtherVertex;
+	(void)cache.GetOrBuildPrebuilt(prebuilt_key, raster_build);
+	(void)cache.GetOrBuild(other_vertex, raster_build);
+	(void)cache.GetOrBuild(PrebuiltKey(kPrebuiltVertex), [&] { return driver.Build(LibraryPart::Fragment); });
+	Check(cache.PrebuiltCounts(LibraryPart::PreRaster).key_differs == 0 &&
+	          cache.PrebuiltCounts(LibraryPart::Fragment).key_differs == 0,
+	      "a vertex shader never prebuilt, or a pixel shader with the same id, counted as differing");
+	(void)cache.GetOrBuild(other_mode, raster_build);
+	Check(cache.PrebuiltCounts(LibraryPart::PreRaster).key_differs == 1 &&
+	          cache.PrebuiltCounts(LibraryPart::Fragment).key_differs == 0,
+	      "a prebuilt vertex shader under another key was not counted as a pre-raster key differs");
+	std::printf("GraphicsLibraryCacheTests: pre-raster key differs ok\n");
+}
+
+// A prebuild is counted among the cache's built libraries like any build, so the library totals the
+// report takes from the cache include it, and the request it answers counts as a hit. The request
+// builds nothing itself, so only the prebuild can make the built count.
+void TestPrebuildCountsAsBuilt() {
+	FakeDriver driver;
+	auto       cache = MakeCache(driver);
+	const auto build = [&] { return driver.Build(LibraryPart::Fragment); };
+	(void)cache.GetOrBuildPrebuilt(PrebuiltKey(23), build);
+	(void)cache.GetOrBuild(PrebuiltKey(23), build);
+	const auto counts = cache.Counts(LibraryPart::Fragment);
+	Check(driver.Builds(LibraryPart::Fragment) == 1 && counts.built == 1 && counts.hits == 1,
+	      "a prebuild was not counted as a built library");
+	std::printf("GraphicsLibraryCacheTests: prebuild counts as built ok\n");
+}
+
 } // namespace
 
 int main() {
@@ -421,6 +619,13 @@ int main() {
 	TestRefusalIsKept();
 	TestDestroyOnce();
 	TestLinkAndFallbackCounts();
+	TestPrebuiltFirstHit();
+	TestPrebuiltWaitIsCounted();
+	TestPrebuiltKeyDiffers();
+	TestPreRasterPrebuiltFirstHit();
+	TestWaitClaimsThePrebuilt();
+	TestPreRasterKeyDiffers();
+	TestPrebuildCountsAsBuilt();
 	std::printf("GraphicsLibraryCacheTests: ok\n");
 	return 0;
 }
