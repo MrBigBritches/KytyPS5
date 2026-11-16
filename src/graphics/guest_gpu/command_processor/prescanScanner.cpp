@@ -182,6 +182,30 @@ Common::FirstRunReport::PrescanScannerReport PrescanReportOf(const PrescanScanne
 	return report;
 }
 
+Common::FirstRunReport::PrescanGraphicsReport PrescanGraphicsScanReportOf(const PrescanScannerStats& stats) {
+	const auto& graphics = stats.graphics;
+	const auto  number   = [](uint64_t value) { return static_cast<double>(value); };
+	return {{{"scanner",
+	          {{"draws", number(graphics.draws)},
+	           {"draws_offered", number(stats.draws_offered)},
+	           {"recorded", number(graphics.recorded)},
+	           {"cached", number(graphics.cached)},
+	           {"no_pixel_stage", number(graphics.no_pixel_stage)},
+	           {"ps_unwritten", number(graphics.ps_unwritten)},
+	           {"skipped_clip_planes", number(graphics.skipped_clip_planes)},
+	           {"skipped_rect_list", number(graphics.skipped_rect_list)},
+	           {"skipped_object_id", number(graphics.skipped_object_id)},
+	           {"skipped_tessellation", number(graphics.skipped_tessellation)},
+	           {"unsupported_inputs", number(graphics.unsupported_inputs)},
+	           {"unsupported_target_format", number(graphics.unsupported_target_format)},
+	           {"unsupported_packed_unorm", number(graphics.unsupported_packed_unorm)},
+	           {"registers_denied", number(graphics.registers_denied)},
+	           {"registers_unknown", number(graphics.registers_unknown)},
+	           {"context_state_imbalance", number(graphics.context_state_imbalance)},
+	           {"doubts", number(graphics.doubts)},
+	           {"register_lists_unreadable", number(graphics.register_lists_unreadable)}}}}};
+}
+
 bool ChunkedScanRead(const ScanMemoryReader& inner, uint64_t address, void* destination, uint64_t bytes,
                      const std::atomic<bool>* stop, ScanReadTiming* timing) {
 	auto* out = static_cast<uint8_t*>(destination);
@@ -258,6 +282,20 @@ uint64_t PrescanScanner::Push(ScanJob job, double copy_us) {
 
 void PrescanScanner::NoteBegan(uint32_t queue_id, uint64_t seq) {
 	m_queue.NoteBegan(queue_id, seq);
+}
+
+// Taken under the stop lock, which Start holds while it makes the thread, so the shadow is never swapped
+// under a running thread.
+void PrescanScanner::AttachGraphics(std::unique_ptr<GraphicsScan> graphics, GraphicsDrawSink sink) {
+	std::lock_guard lock(m_stop_mutex);
+	if (m_thread.joinable() || m_finished.load(std::memory_order_acquire)) {
+		throw std::logic_error("PrescanScanner's graphics shadow must be attached before Start");
+	}
+	if (graphics == nullptr) {
+		throw std::invalid_argument("PrescanScanner needs a graphics shadow to attach");
+	}
+	m_graphics      = std::move(graphics);
+	m_graphics_sink = std::move(sink);
 }
 
 void PrescanScanner::Start() {
@@ -359,6 +397,10 @@ void PrescanScanner::RunJob(const ScanJob& job) {
 	}
 	if (commands && lag > m_lag_bound) {
 		shadow.MarkUncertain();
+		// The list may have set graphics state too.
+		if (auto* graphics = GraphicsOf(job.queue_id)) {
+			graphics->MarkUncertain();
+		}
 		counts.lag_skipped = true;
 	} else {
 		if (commands) {
@@ -370,15 +412,40 @@ void PrescanScanner::RunJob(const ScanJob& job) {
 }
 
 // Walks the job into a local count, so the stats lock is not held during the walk, then offers what
-// it found. The dispatch storage is emptied first, since a walk appends to it.
+// it found. The dispatch storage is emptied first, since a walk appends to it. The graphics queue's
+// walk also drives the graphics shadow, when one is attached.
 void PrescanScanner::WalkAndOffer(const ScanJob& job, CsShadow& shadow, JobCounts& counts) {
 	m_dispatches.clear();
 	const auto start = Clock::now();
 	RunScanJob(m_scanner, job, job.queue_id != GRAPHICS_QUEUE_ID, shadow, m_dispatches, counts.scan, &m_cache,
-	           &m_scratch);
+	           &m_scratch, GraphicsOf(job.queue_id));
 	counts.scan_us = WholeUnits<std::chrono::microseconds>(Clock::now() - start);
 	counts.walked  = job.kind == ScanJob::Kind::Commands;
 	OfferDispatches(job.seq, counts);
+	OfferDraws(job.seq, counts);
+}
+
+// Hands the walk's draws to the sink with the job's number, and takes the shadow's counts into the
+// job's, so both are merged under the stats lock with the rest.
+void PrescanScanner::OfferDraws(uint64_t seq, JobCounts& counts) {
+	if (m_graphics == nullptr) {
+		return;
+	}
+	auto& draws = m_graphics->draws;
+	for (auto& draw: draws) {
+		draw.seq = seq;
+	}
+	if (m_graphics_sink && !draws.empty()) {
+		m_graphics_sink(std::span<const ScannedDraw>(draws));
+		counts.draws_offered = draws.size();
+	}
+	draws.clear();
+	counts.graphics = std::exchange(m_graphics->stats, GraphicsScanStats {});
+}
+
+// The graphics shadow walks the graphics queue only, which is the queue that draws.
+GraphicsScan* PrescanScanner::GraphicsOf(uint32_t queue_id) const {
+	return queue_id == GRAPHICS_QUEUE_ID ? m_graphics.get() : nullptr;
 }
 
 // Offers each dispatch and wakes the preparer once if any went into the ring, since a wake may enter
@@ -406,6 +473,8 @@ void PrescanScanner::Record(const JobCounts& counts) {
 	m_stats.offers_skipped += counts.skipped;
 	m_stats.offers_dropped += counts.dropped;
 	m_stats.wakes += counts.posted != 0 ? 1 : 0;
+	m_stats.graphics.Add(counts.graphics);
+	m_stats.draws_offered += counts.draws_offered;
 	if (counts.walked) {
 		m_stats.scan_us_max = std::max(m_stats.scan_us_max, counts.scan_us);
 		AddToHistogram(m_stats.scan_us_histogram, counts.scan_us);

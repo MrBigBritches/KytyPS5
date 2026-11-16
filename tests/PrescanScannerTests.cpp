@@ -19,10 +19,12 @@
 #include <cstring>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <new>
 #include <numeric>
 #include <optional>
 #include <stdexcept>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -887,6 +889,261 @@ void TestReportOfStatsPercentiles() {
 	CHECK(copy.p50 == 0 && copy.p90 == 0 && copy.p99 == 0 && copy.max == 0);
 }
 
+// What the scanner asked of a FakeGraphics, read by the test thread while the scanner thread writes.
+struct GraphicsCalls {
+	std::atomic<uint64_t> resets {0};
+	std::atomic<uint64_t> doubts {0};
+	std::atomic<uint64_t> draws_seen {0};
+};
+
+// A graphics shadow that only records the scanner's calls, so these tests need none of the register
+// tables. Every draw packet becomes one draw.
+class FakeGraphics final : public GraphicsScan {
+public:
+	explicit FakeGraphics(std::shared_ptr<GraphicsCalls> calls): m_calls(std::move(calls)) {}
+
+	void ApplyRegister(GraphicsRegisterSpace, uint32_t, uint32_t) override {}
+	[[nodiscard]] bool IsInternalDataPacket(uint32_t, const uint32_t*) const override { return false; }
+	void ApplyContextState(uint32_t) override {}
+	void Reset() override { m_calls->resets++; }
+	void MarkUncertain() override { m_calls->doubts++; }
+	void RecordDraw(uint32_t queue, bool /*indirect*/) override {
+		m_calls->draws_seen++;
+		ScannedDraw draw;
+		draw.queue = queue;
+		draws.push_back(draw);
+		stats.draws++;
+		stats.recorded++;
+	}
+	void SaveState() override {}
+	void RestoreState() override {}
+	void DropSavedState() override {}
+
+private:
+	std::shared_ptr<GraphicsCalls> m_calls;
+};
+
+// The draws a sink was given, as queue and job number.
+struct SinkLog {
+	std::mutex                                  mutex;
+	std::vector<std::pair<uint32_t, uint64_t>> draws;
+
+	[[nodiscard]] size_t Count() {
+		std::lock_guard lock(mutex);
+		return draws.size();
+	}
+};
+
+// A harness whose scanner walks the graphics queue with a FakeGraphics and hands draws to a SinkLog.
+struct GraphicsHarness {
+	std::shared_ptr<GraphicsCalls> calls = std::make_shared<GraphicsCalls>();
+	std::shared_ptr<SinkLog>       sink  = std::make_shared<SinkLog>();
+	Harness                        harness;
+
+	explicit GraphicsHarness(std::chrono::microseconds lag_bound = UNBOUNDED_LAG)
+	    : harness(NoMemory(), lag_bound) {
+		harness.scanner->AttachGraphics(std::make_unique<FakeGraphics>(calls),
+		                                [log = sink](std::span<const ScannedDraw> draws) {
+			                                std::lock_guard lock(log->mutex);
+			                                for (const auto& draw: draws) {
+				                                log->draws.emplace_back(draw.queue, draw.seq);
+			                                }
+		                                });
+	}
+};
+
+Stream DrawAuto() {
+	return {KYTY_PM4(3, Pm4::IT_DRAW_INDEX_AUTO, 0), 3u, 0u};
+}
+
+// A draw on the graphics queue reaches the sink with the queue and the job's number, and is counted.
+// The baseline is the same list on an async queue, whose walk has no graphics shadow, so nothing reaches
+// the sink and the shadow never sees the draw.
+void TestGraphicsDrawReachesSink() {
+	GraphicsHarness graphics;
+	graphics.harness.scanner->Start();
+	(void)graphics.harness.Submit(GRAPHICS_QUEUE, {FILLER_WORD});
+	const uint64_t seq = graphics.harness.Submit(GRAPHICS_QUEUE, DrawAuto());
+	CHECK(graphics.harness.WaitForJobs(2));
+	CHECK(graphics.sink->Count() == 1);
+	{
+		std::lock_guard lock(graphics.sink->mutex);
+		if (!graphics.sink->draws.empty()) {
+			CHECK(graphics.sink->draws[0].first == GRAPHICS_QUEUE && graphics.sink->draws[0].second == seq);
+		}
+	}
+	const auto stats = graphics.harness.scanner->Stats();
+	CHECK(stats.draws_offered == 1 && stats.graphics.draws == 1 && stats.graphics.recorded == 1);
+
+	GraphicsHarness async;
+	async.harness.scanner->Start();
+	(void)async.harness.Submit(ASYNC_QUEUE, DrawAuto());
+	CHECK(async.harness.WaitForJobs(1));
+	CHECK(async.sink->Count() == 0 && async.calls->draws_seen == 0);
+	CHECK(async.harness.scanner->Stats().draws_offered == 0);
+}
+
+// A reset marker for the graphics queue resets the graphics shadow, as it does the compute one. The
+// baseline is a marker for an async queue, which leaves the graphics shadow alone.
+void TestGraphicsResetOnMarker() {
+	GraphicsHarness graphics;
+	graphics.harness.scanner->Start();
+	(void)graphics.harness.Reset(GRAPHICS_QUEUE);
+	CHECK(graphics.harness.WaitForJobs(1));
+	CHECK(graphics.calls->resets == 1);
+
+	GraphicsHarness async;
+	async.harness.scanner->Start();
+	(void)async.harness.Reset(ASYNC_QUEUE);
+	CHECK(async.harness.WaitForJobs(1));
+	CHECK(async.calls->resets == 0);
+}
+
+// A graphics list older than the lag bound is not walked and puts the graphics shadow in doubt, since
+// it may have set state the scanner never saw. The baseline is the same list three quarters of the
+// bound old, which is walked and leaves no doubt.
+void TestGraphicsLagSkipMarksUncertain() {
+	GraphicsHarness stale(TEST_LAG_BOUND);
+	(void)stale.harness.Submit(GRAPHICS_QUEUE, DrawAuto(), 2 * TEST_LAG_BOUND);
+	stale.harness.scanner->Start();
+	CHECK(stale.harness.WaitForJobs(1));
+	CHECK(stale.harness.scanner->Stats().lag_skipped == 1);
+	CHECK(stale.calls->doubts == 1 && stale.calls->draws_seen == 0);
+
+	GraphicsHarness fresh(TEST_LAG_BOUND);
+	(void)fresh.harness.Submit(GRAPHICS_QUEUE, DrawAuto(), TEST_LAG_BOUND * 3 / 4);
+	fresh.harness.scanner->Start();
+	CHECK(fresh.harness.WaitForJobs(1));
+	CHECK(fresh.harness.scanner->Stats().lag_skipped == 0);
+	CHECK(fresh.calls->doubts == 0 && fresh.calls->draws_seen == 1);
+}
+
+// The graphics shadow can only be attached before the thread starts, since the thread owns it from then.
+void TestAttachGraphicsAfterStartRefused() {
+	Harness harness(NoMemory());
+	harness.scanner->Start();
+	bool refused = false;
+	try {
+		harness.scanner->AttachGraphics(std::make_unique<FakeGraphics>(std::make_shared<GraphicsCalls>()), {});
+	} catch (const std::logic_error&) {
+		refused = true;
+	}
+	CHECK(refused);
+}
+
+// The scanner's figure named `name` in a prescan_graphics part, or -1 when the part has no such figure
+// or more than one.
+double ScannerFigure(const Common::FirstRunReport::PrescanGraphicsReport& report, std::string_view name) {
+	if (report.groups.size() != 1 || report.groups[0].name != "scanner") {
+		return -1.0;
+	}
+	const auto& figures = report.groups[0].figures;
+	const auto  named   = [&](const auto& figure) { return figure.first == name; };
+	if (std::count_if(figures.begin(), figures.end(), named) != 1) {
+		return -1.0;
+	}
+	return std::find_if(figures.begin(), figures.end(), named)->second;
+}
+
+// The counts GraphicsStatFields names. A field added to GraphicsScanStats fails the assert, so it is
+// added to the list, and with it to the report and Add tests.
+constexpr size_t GRAPHICS_SCAN_COUNTS = 17;
+static_assert(sizeof(GraphicsScanStats) == GRAPHICS_SCAN_COUNTS * sizeof(uint64_t),
+              "GraphicsStatFields must name every count of GraphicsScanStats");
+
+// Every count of GraphicsScanStats, by its figure name in the scanner's report part.
+std::vector<std::pair<const char*, uint64_t*>> GraphicsStatFields(GraphicsScanStats& graphics) {
+	return {
+	    {"draws", &graphics.draws},
+	    {"recorded", &graphics.recorded},
+	    {"cached", &graphics.cached},
+	    {"no_pixel_stage", &graphics.no_pixel_stage},
+	    {"ps_unwritten", &graphics.ps_unwritten},
+	    {"skipped_clip_planes", &graphics.skipped_clip_planes},
+	    {"skipped_rect_list", &graphics.skipped_rect_list},
+	    {"skipped_object_id", &graphics.skipped_object_id},
+	    {"skipped_tessellation", &graphics.skipped_tessellation},
+	    {"unsupported_inputs", &graphics.unsupported_inputs},
+	    {"unsupported_target_format", &graphics.unsupported_target_format},
+	    {"unsupported_packed_unorm", &graphics.unsupported_packed_unorm},
+	    {"registers_denied", &graphics.registers_denied},
+	    {"registers_unknown", &graphics.registers_unknown},
+	    {"context_state_imbalance", &graphics.context_state_imbalance},
+	    {"doubts", &graphics.doubts},
+	    {"register_lists_unreadable", &graphics.register_lists_unreadable}};
+}
+
+// The scanner's part of the prescan_graphics block names every graphics count and the draws handed to
+// the sink, each once and from its own field. Every field gets a distinct value, so a figure read from
+// another field shows that field's value. The baseline is default stats, where every figure is 0, so
+// the values come from the fields. A figure left out or named twice reads -1 and fails both.
+void TestGraphicsScanReportOfCopiesEachCount() {
+	PrescanScannerStats stats;
+	auto                fields = GraphicsStatFields(stats.graphics);
+	fields.emplace_back("draws_offered", &stats.draws_offered);
+	const auto baseline = PrescanGraphicsScanReportOf(stats);
+	// 1 to 18, so no field shares a value with another or with the baseline's 0.
+	uint64_t distinct = 1;
+	for (const auto& [name, field]: fields) {
+		*field = distinct++;
+	}
+	const auto report = PrescanGraphicsScanReportOf(stats);
+	CHECK(report.groups.size() == 1 && report.groups[0].figures.size() == fields.size());
+	for (const auto& [name, field]: fields) {
+		CHECK(ScannerFigure(baseline, name) == 0.0);
+		CHECK(ScannerFigure(report, name) == static_cast<double>(*field));
+	}
+}
+
+// Add sums every count. The stats added to start at 100 in each field and the added stats hold 1 to 17,
+// so a field left out stays at 100 and one summed from another field is off by the difference. The
+// baseline adds default stats, which changes nothing.
+void TestGraphicsScanStatsAddEachCount() {
+	constexpr uint64_t start = 100;
+	GraphicsScanStats  sum;
+	GraphicsScanStats  added;
+	const auto         sum_fields   = GraphicsStatFields(sum);
+	const auto         added_fields = GraphicsStatFields(added);
+	CHECK(sum_fields.size() == GRAPHICS_SCAN_COUNTS);
+	for (const auto& [name, field]: sum_fields) {
+		*field = start;
+	}
+	sum.Add(GraphicsScanStats {});
+	for (const auto& [name, field]: sum_fields) {
+		CHECK(*field == start);
+	}
+	uint64_t distinct = 1;
+	for (const auto& [name, field]: added_fields) {
+		*field = distinct++;
+	}
+	sum.Add(added);
+	for (size_t index = 0; index < sum_fields.size(); index++) {
+		CHECK(*sum_fields[index].second == start + *added_fields[index].second);
+	}
+}
+
+// A job the queue marked in doubt, or whose list was cut, puts the graphics shadow in doubt as it does
+// the compute one. The baseline is the same empty job with neither mark, which leaves no doubt.
+void TestJobDoubtsReachGraphics() {
+	const auto doubts_after = [](bool shadow_uncertain, bool truncated) {
+		auto         calls = std::make_shared<GraphicsCalls>();
+		FakeGraphics graphics(calls);
+		ScanJob      job;
+		job.queue_id         = GRAPHICS_QUEUE;
+		job.shadow_uncertain = shadow_uncertain;
+		job.truncated        = truncated;
+		CsShadow                     shadow;
+		std::vector<ScannedDispatch> dispatches;
+		ScanStats                    stats;
+		ScanScratch                  scratch;
+		RunScanJob(SubmitScanner(NoMemory()), job, false, shadow, dispatches, stats, nullptr, &scratch, &graphics);
+		return calls->doubts.load();
+	};
+	CHECK(doubts_after(false, false) == 0);
+	CHECK(doubts_after(true, false) == 1);
+	CHECK(doubts_after(false, true) == 1);
+}
+
 } // namespace
 
 // Counts every allocation on the thread that makes it, for TestScannerNoAllocationAfterWarmup.
@@ -928,6 +1185,13 @@ int main() {
 	TestCrossQueueEvictionMarksUncertain();
 	TestReportOfStatsCopiesEachCount();
 	TestReportOfStatsPercentiles();
+	TestGraphicsDrawReachesSink();
+	TestGraphicsResetOnMarker();
+	TestGraphicsLagSkipMarksUncertain();
+	TestAttachGraphicsAfterStartRefused();
+	TestGraphicsScanReportOfCopiesEachCount();
+	TestGraphicsScanStatsAddEachCount();
+	TestJobDoubtsReachGraphics();
 	if (g_failures != 0) {
 		std::fprintf(stderr, "%d check(s) failed\n", g_failures);
 		return 1;

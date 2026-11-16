@@ -677,6 +677,9 @@ target_link_libraries(image_page_table_tests common fmt::fmt)
 target_include_directories(image_page_table_tests PRIVATE ${inc_headers})
 
 add_kyty_full_emulator_test(shader_recompiler_compute_tests "${KYTY_TESTS_DIR}/ShaderRecompilerComputeTests.cpp")
+# The graphics half of the submit-time walk. It decodes registers with the command processor's own
+# tables, which live with the processor, so unlike the compute walk's tests it links the emulator.
+add_kyty_full_emulator_test(graphics_scan_tests "${KYTY_TESTS_DIR}/GraphicsScanTests.cpp")
 # A light target. It links only the scan, the register decoder and the device-free key and sl00 code.
 add_executable(shader_store_scan_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ShaderStoreScanTests.cpp"
@@ -1212,6 +1215,7 @@ if(BUILD_TESTING)
 	add_test(NAME shader_store_scan COMMAND $<TARGET_FILE:shader_store_scan_tests>)
 	add_test(NAME submit_scan COMMAND $<TARGET_FILE:submit_scan_tests>)
 	add_test(NAME pixel_inputs COMMAND $<TARGET_FILE:pixel_inputs_tests>)
+	add_test(NAME graphics_scan COMMAND $<TARGET_FILE:graphics_scan_tests>)
 	add_test(NAME scan_differential COMMAND $<TARGET_FILE:scan_differential_tests>)
 	add_test(NAME prescan COMMAND $<TARGET_FILE:prescan_tests>)
 	# The whole test runs in about a second, so a ring that loses track of an item and leaves the
@@ -1401,6 +1405,7 @@ if(BUILD_TESTING)
 		shader_store_scan_tests
 		submit_scan_tests
 		pixel_inputs_tests
+		graphics_scan_tests
 		scan_differential_tests
 		prescan_tests
 		prescan_handoff_tests

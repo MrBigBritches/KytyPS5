@@ -3,6 +3,7 @@
 
 #include "graphics/guest_gpu/command_processor/scanScratch.h"
 #include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/shader/shader.h"
 
 #include <algorithm>
 #include <array>
@@ -296,6 +297,165 @@ struct ScanStats {
 	}
 };
 
+/// One draw the graphics walk found, with what building its pixel shader ahead needs. It is the seam
+/// between the scanner, which fills it from its shadow, and the GraphicsDrawSink, which translates the
+/// shader on a worker. The register state is exact as far as the shadow is. What only the shader map
+/// or guest memory can say is left for the worker, as each field notes.
+struct ScannedDraw {
+	/// The guest address of the pixel shader, which its shader map entry is keyed by.
+	uint64_t ps_program_address = 0;
+	/// The pixel stage registers and user data at the draw.
+	HW::PixelShaderInfo ps_regs;
+	/// The pixel input info, from ShaderGetStaticInputInfoPS and FinishPixelInputInfo on the shadow, as
+	/// GetGraphicsPrograms makes it. The scanner reads no shader map and no guest memory, so the worker
+	/// still sets scratch_size_dwords from ShaderTryGetMapped and custom_interpolation_mask from the
+	/// shader's input semantics through ShaderCustomInterpolationMask. The draw-time part assumes a
+	/// vertex stage that is not a mesh shader, which only rect lists would notice, and those are skipped.
+	ShaderPixelInputInfo ps_info;
+	/// A hash of the program address and the static key words of ps_info as the scanner has it. It is
+	/// what the walk's draw cache is keyed by, and stands for the program's key until the worker knows it.
+	uint64_t key_hash = 0;
+	/// The vertex stage's program address, SPI_SHADER_PGM_LO_ES and HI. With the program's binary type
+	/// from the shader map, VertexStageIsMesh says whether it is a mesh shader, which decides where the
+	/// pixel shader's push data starts.
+	uint64_t vs_program_address = 0;
+	/// VGT_SHADER_STAGES_EN, for VertexStageIsMesh.
+	uint32_t shader_stages = 0;
+	/// SPI_SHADER_PGM_RSRC2_GS LDS_SIZE, for VertexStageIsMesh.
+	uint32_t gs_lds_size = 0;
+	/// The vertex stage registers and user data at the draw, for building the vertex shader ahead. The
+	/// attribute and buffer tables they point at are read by the worker.
+	HW::VertexShaderInfo vs_regs;
+	/// PA_CL_VS_OUT_CNTL, which the vertex shader's key carries.
+	uint32_t pa_cl_vs_out_cntl = 0;
+	/// What the pre-rasterization library and the vertex shader's clip space read: the clip and mode
+	/// controls and viewport 0's scale and offset in x and y, which CLIP_DISABLE puts in the key.
+	HW::ClipControl clip_control;
+	HW::ModeControl mode_control;
+	std::array<float, 2> viewport_scale {};
+	std::array<float, 2> viewport_offset {};
+	/// Whether the draw came from an indirect packet, whose vertex shader key carries the packet's
+	/// offsets, which the prescan does not predict.
+	bool indirect = false;
+	/// PA_CL_CLIP_CNTL UCP_ENA as the GPU thread uses it, which is zero under CLIP_DISABLE. Active
+	/// planes move where the pixel shader's push data starts, see ScannedDrawPushCursor.
+	uint32_t user_clip_planes = 0;
+	/// Whether alpha to coverage is on, the a2c of the fragment library's key.
+	bool alpha_to_coverage = false;
+	/// The draw was let through by the walk's draw cache as a probe.
+	bool force_probe = false;
+	/// The queue the submission was made on, and the scanner's number of the job it was found in.
+	uint32_t queue = 0;
+	uint64_t seq   = 0;
+	/// The vertex half's key, apart from key_hash, which is the pixel half's: the vertex program's
+	/// address, the vertex stage's static registers and key_hash, whose pixel shader decides the
+	/// vertex shader's push start, without user data, table pointers or viewport values, which change
+	/// from draw to draw. 0 when the scanner keys no vertex half.
+	uint64_t vs_key_hash = 0;
+	/// Which halves the walk's caches had not seen, so the sink offers each half on its own.
+	bool offer_ps = true;
+	bool offer_vs = false;
+};
+
+/// What the graphics walk counted. Every field is added to, never reset, so a caller sums many walks.
+struct GraphicsScanStats {
+	/// Draw packets met.
+	uint64_t draws = 0;
+	/// Draws whose pixel shader does not run, see PixelStageActive.
+	uint64_t no_pixel_stage = 0;
+	/// Draws whose pixel shader address was not written since the shadow was last in doubt. They are
+	/// counted and not offered, since their program may be stale.
+	uint64_t ps_unwritten = 0;
+	/// Draws skipped because the prescan does not predict their key. User clip planes only where
+	/// GetGraphicsPrograms would EXIT on them, which is a vertex stage that writes clip or cull
+	/// distances, and rect lists, the object primitive id and tessellation.
+	uint64_t skipped_clip_planes   = 0;
+	uint64_t skipped_rect_list     = 0;
+	uint64_t skipped_object_id     = 0;
+	uint64_t skipped_tessellation  = 0;
+	/// Draws whose registers ShaderGetStaticInputInfoPS, TextureGetRenderTargetFormat or the packed
+	/// UNorm check would EXIT on.
+	uint64_t unsupported_inputs        = 0;
+	uint64_t unsupported_target_format = 0;
+	uint64_t unsupported_packed_unorm  = 0;
+	/// Draws the walk's draw cache skipped, and draws it offered.
+	uint64_t cached   = 0;
+	uint64_t recorded = 0;
+	/// Register writes left out because their decoder may EXIT, and writes to registers no table knows.
+	uint64_t registers_denied  = 0;
+	uint64_t registers_unknown = 0;
+	/// CONTEXT_STATE pushes over a saved context, and pops with none, which the processor EXITs on.
+	uint64_t context_state_imbalance = 0;
+	/// How many times the shadow was put in doubt.
+	uint64_t doubts = 0;
+	/// Context and uconfig register lists that could not be read.
+	uint64_t register_lists_unreadable = 0;
+
+	/// Adds another walk's counts to these.
+	void Add(const GraphicsScanStats& other) {
+		draws += other.draws;
+		no_pixel_stage += other.no_pixel_stage;
+		ps_unwritten += other.ps_unwritten;
+		skipped_clip_planes += other.skipped_clip_planes;
+		skipped_rect_list += other.skipped_rect_list;
+		skipped_object_id += other.skipped_object_id;
+		skipped_tessellation += other.skipped_tessellation;
+		unsupported_inputs += other.unsupported_inputs;
+		unsupported_target_format += other.unsupported_target_format;
+		unsupported_packed_unorm += other.unsupported_packed_unorm;
+		cached += other.cached;
+		recorded += other.recorded;
+		registers_denied += other.registers_denied;
+		registers_unknown += other.registers_unknown;
+		context_state_imbalance += other.context_state_imbalance;
+		doubts += other.doubts;
+		register_lists_unreadable += other.register_lists_unreadable;
+	}
+};
+
+/// Which register file a graphics register write goes to.
+enum class GraphicsRegisterSpace : uint8_t { Context, Shader, Uconfig };
+
+/// The graphics half of a walk, which the walk drives when it is given one. It is an interface so the
+/// walk's own file needs none of the register tables or the pixel key code, and the light tests that
+/// link only the walk still link. GraphicsScanShadow, in graphicsScanShadow.h, is the one real
+/// implementation. One shadow belongs to one queue and is used from one thread.
+class GraphicsScan {
+public:
+	virtual ~GraphicsScan() = default;
+
+	/// Writes one register, with the selector bits already stripped as the processor strips them.
+	virtual void ApplyRegister(GraphicsRegisterSpace space, uint32_t offset, uint32_t value) = 0;
+	/// Whether a SET_UCONFIG_REG packet is the library's internal data, which the processor skips.
+	[[nodiscard]] virtual bool IsInternalDataPacket(uint32_t header, const uint32_t* payload) const = 0;
+	/// Applies a CONTEXT_STATE operation, CLEAR_STATE being operation 0.
+	virtual void ApplyContextState(uint32_t operation) = 0;
+	/// Forgets every register, as the processor's reset does.
+	virtual void Reset() = 0;
+	/// Records that the shadow can no longer vouch for its state.
+	virtual void MarkUncertain() = 0;
+	/// Looks at the draw the shadow's state describes, and appends it to draws when it can be built ahead.
+	/// `indirect` says the draw came from an indirect packet.
+	virtual void RecordDraw(uint32_t queue, bool indirect) = 0;
+	/// Saves the state before a branch arm, puts it back after one, and forgets the saved copy. Saves
+	/// nest, and each is dropped once.
+	virtual void SaveState()      = 0;
+	virtual void RestoreState()   = 0;
+	virtual void DropSavedState() = 0;
+
+	/// The draws found since the caller last took them.
+	std::vector<ScannedDraw> draws;
+	/// What was counted since the caller last took the counts.
+	GraphicsScanStats stats;
+	/// Set by every write and reset, and cleared by the walk around a COND_EXEC region or a predicated
+	/// packet, so that one which wrote graphics state puts the shadow in doubt.
+	bool state_dirty = false;
+};
+
+/// Takes the draws one walk found, on the scanner thread. The span is only valid during the call.
+/// PipelineCache::GraphicsPrescanSink makes the one a real run uses.
+using GraphicsDrawSink = std::function<void(std::span<const ScannedDraw> draws)>;
+
 /// Walks a command list and reports the compute dispatches in it.
 class SubmitScanner {
 public:
@@ -324,6 +484,13 @@ public:
 	void Scan(std::span<const uint32_t> commands, uint32_t queue, bool async_queue, CsShadow& shadow,
 	          std::vector<ScannedDispatch>& dispatches, ScanStats& stats, ScanScratch& scratch,
 	          DispatchCache* cache = nullptr) const;
+
+	/// The same walk, which also drives `graphics` when it is not null. The graphics registers, context
+	/// state packets and draws then go to it, and the context and uconfig register lists are read too,
+	/// which the compute walk alone never reads. With null graphics this is the walk above.
+	void Scan(std::span<const uint32_t> commands, uint32_t queue, bool async_queue, CsShadow& shadow,
+	          std::vector<ScannedDispatch>& dispatches, ScanStats& stats, ScanScratch& scratch,
+	          DispatchCache* cache, GraphicsScan* graphics) const;
 
 	/// Changes how long each later walk may run. The prescan's scanner thread gives each job what is
 	/// left of its lag bound in place of the fixed cap. Only the thread that scans may call it, and

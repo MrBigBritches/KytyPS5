@@ -78,6 +78,14 @@ constexpr uint32_t PM4_OPCODE_SHIFT = 8;
 constexpr uint32_t PM4_OPCODE_MASK  = 0xffu;
 // A dispatch has three axes.
 constexpr uint32_t DISPATCH_AXES = 3;
+// SET_CONTEXT_REG_INDIRECT and SET_UCONFIG_REG_INDIRECT have the length of the SH one.
+constexpr uint32_t SET_REG_INDIRECT_LEN = SET_SH_REG_INDIRECT_LEN;
+// SET_UCONFIG_REG_INDEX keeps its offset in the low 28 bits, which the processor reads unnormalized.
+constexpr uint32_t UCONFIG_INDEX_OFFSET_MASK = 0x0fffffffu;
+// A CONTEXT_STATE packet needs its operation word.
+constexpr uint32_t CONTEXT_STATE_MIN_LEN = 2;
+// CLEAR_STATE is the context state operation that resets the context.
+constexpr uint32_t CONTEXT_STATE_CLEAR = 0;
 
 // How a walk of one buffer ended.
 enum class WalkEnd : uint8_t {
@@ -106,6 +114,8 @@ struct Walk {
 	VisitedSet&                   visited;
 	ScratchArena&                 scratch;
 	DispatchCache*                cache;
+	// The graphics half of the walk, or null when only compute is walked.
+	GraphicsScan* graphics = nullptr;
 	// How many buffers are being walked inside each other, chains included, which the level limit bounds.
 	uint32_t level = 0;
 	// The time the walk must end by, how many packets passed since the clock was read, and whether the
@@ -115,10 +125,29 @@ struct Walk {
 	bool                                  out_of_time         = false;
 };
 
-// Stops the walk vouching for the program and counts the cause.
+// Whether a cause of doubt is about compute state only. A region, a predicated packet or a revisit doubts
+// compute only when it wrote compute state, and the graphics walk judges its own writes there. An
+// unreadable register list doubts the state of the space it held, which its reader says.
+bool IsComputeOnlyCause(UncertainCause cause) {
+	return cause == UncertainCause::CondExecRegion || cause == UncertainCause::Predicated ||
+	       cause == UncertainCause::Revisited || cause == UncertainCause::UnreadableRegisterList;
+}
+
+// Puts the graphics shadow in doubt, when there is one.
+void NoteGraphicsUncertain(Walk& walk) {
+	if (walk.graphics != nullptr) {
+		walk.graphics->MarkUncertain();
+	}
+}
+
+// Stops the walk vouching for the program and counts the cause. A cause that may have hidden any write
+// puts the graphics shadow in doubt as well.
 void NoteUncertain(Walk& walk, UncertainCause cause) {
 	walk.stats.uncertain_cleared_by[static_cast<size_t>(cause)]++;
 	walk.shadow.MarkUncertain();
+	if (!IsComputeOnlyCause(cause)) {
+		NoteGraphicsUncertain(walk);
+	}
 }
 
 // Counts a cut caused by the dword budget. What the walk did not read may have set the program, so
@@ -292,6 +321,8 @@ bool ShouldSkipBuffer(Walk& walk, uint64_t address, uint32_t dword_count, uint32
 			walk.stats.ib_revisit_doubts++;
 			NoteUncertain(walk, UncertainCause::Revisited);
 		}
+		// The clean mark only covers compute state, so the skipped graphics writes leave it in doubt.
+		NoteGraphicsUncertain(walk);
 		return true;
 	}
 	return false;
@@ -358,9 +389,33 @@ WalkEnd FollowIndirectBuffer(Walk& walk, uint64_t address, uint32_t dword_count,
 	                          visit_key);
 }
 
-// Applies an indirect register list (SET_SH_REG_INDIRECT), which holds offset and value pairs in
-// guest memory that the walk reads in small chunks.
-void ApplyIndirectRegisters(Walk& walk, const uint32_t* payload) {
+// Applies one pair of an indirect register list. A shader register goes to the compute shadow and to
+// the graphics shadow, which each take the ones they know. Context and uconfig registers go to the
+// graphics shadow only, since a walk without one never reads their lists.
+void ApplyIndirectPair(Walk& walk, GraphicsRegisterSpace space, uint32_t reg, uint32_t value) {
+	if (space == GraphicsRegisterSpace::Shader) {
+		ApplyRegister(walk.shadow, reg, value);
+	}
+	if (walk.graphics != nullptr) {
+		walk.graphics->ApplyRegister(space, reg, value);
+	}
+}
+
+// Counts an indirect register list that could not be read and puts the state it held in doubt. A shader
+// list may have held compute registers, and a context or uconfig list only graphics ones.
+void NoteUnreadableRegisterList(Walk& walk, GraphicsRegisterSpace space) {
+	if (space == GraphicsRegisterSpace::Shader) {
+		walk.stats.register_list_unreadable++;
+		NoteUncertain(walk, UncertainCause::UnreadableRegisterList);
+	} else if (walk.graphics != nullptr) {
+		walk.graphics->stats.register_lists_unreadable++;
+	}
+	NoteGraphicsUncertain(walk);
+}
+
+// Applies an indirect register list (SET_SH_REG_INDIRECT and, with a graphics shadow, the context and
+// uconfig ones), which holds offset and value pairs in guest memory that the walk reads in small chunks.
+void ApplyIndirectRegisters(Walk& walk, const uint32_t* payload, GraphicsRegisterSpace space) {
 	const uint64_t address = (static_cast<uint64_t>(payload[1]) << ADDRESS_HIGH_SHIFT) |
 	                         (payload[0] & ADDRESS_ALIGN_MASK);
 	const uint32_t pairs = payload[3] & INDIRECT_PAIR_COUNT_MASK;
@@ -376,8 +431,7 @@ void ApplyIndirectRegisters(Walk& walk, const uint32_t* payload) {
 			return;
 		}
 		if (!walk.reader(address + uint64_t {done} * 8u, chunk.data(), uint64_t {count} * 8u)) {
-			walk.stats.register_list_unreadable++;
-			NoteUncertain(walk, UncertainCause::UnreadableRegisterList);
+			NoteUnreadableRegisterList(walk, space);
 			return;
 		}
 		walk.dwords_left -= count * 2u;
@@ -387,7 +441,7 @@ void ApplyIndirectRegisters(Walk& walk, const uint32_t* payload) {
 			if (raw == INDIRECT_PAIR_SENTINEL) {
 				continue;
 			}
-			ApplyRegister(walk.shadow, raw & ~REGISTER_SELECTOR_MASK, chunk[pair * 2u + 1u]);
+			ApplyIndirectPair(walk, space, raw & ~REGISTER_SELECTOR_MASK, chunk[pair * 2u + 1u]);
 		}
 		done += count;
 	}
@@ -416,11 +470,21 @@ BranchArms ReadBranchArms(const uint32_t* payload) {
 // only when the then arm did not. The tail then runs under a program the walk cannot vouch for.
 WalkEnd WalkBranchThenOrNothing(Walk& walk, const BranchArms& arms, uint32_t depth) {
 	const CsShadow before = walk.shadow;
-	const auto     end    = FollowIndirectBuffer(walk, arms.then_address, arms.then_dwords, depth, true);
+	if (walk.graphics != nullptr) {
+		walk.graphics->SaveState();
+	}
+	const auto end = FollowIndirectBuffer(walk, arms.then_address, arms.then_dwords, depth, true);
 	if (end == WalkEnd::Budget) {
+		if (walk.graphics != nullptr) {
+			walk.graphics->DropSavedState();
+		}
 		return end;
 	}
 	walk.shadow = before;
+	if (walk.graphics != nullptr) {
+		walk.graphics->RestoreState();
+		walk.graphics->DropSavedState();
+	}
 	NoteUncertain(walk, UncertainCause::Branch);
 	return WalkEnd::Finished;
 }
@@ -430,7 +494,16 @@ WalkEnd WalkBranchThenOrNothing(Walk& walk, const BranchArms& arms, uint32_t dep
 // arm starts from the state the branch met. The state after the branch is the then arm's.
 WalkEnd WalkBranchElseThenThen(Walk& walk, const BranchArms& arms, uint32_t depth) {
 	const CsShadow before = walk.shadow;
+	if (walk.graphics != nullptr) {
+		walk.graphics->SaveState();
+	}
 	const auto end = FollowIndirectBuffer(walk, arms.else_address, arms.else_dwords, depth, true);
+	if (walk.graphics != nullptr && end != WalkEnd::Budget) {
+		walk.graphics->RestoreState();
+	}
+	if (walk.graphics != nullptr) {
+		walk.graphics->DropSavedState();
+	}
 	if (end == WalkEnd::Budget) {
 		return end;
 	}
@@ -507,9 +580,88 @@ uint32_t PacketOpcode(uint32_t header) {
 	return (header >> PM4_OPCODE_SHIFT) & PM4_OPCODE_MASK;
 }
 
+// Writes the values of a SET_*_REG packet to consecutive graphics registers from `first`, as the
+// processor's SetRegisters does. The packet's length counts the header and the offset word.
+void ApplyGraphicsRegisters(Walk& walk, GraphicsRegisterSpace space, uint32_t first, uint32_t length,
+                            const uint32_t* values) {
+	for (uint32_t index = 0; index + 2u < length; ++index) {
+		walk.graphics->ApplyRegister(space, first + index, values[index]);
+	}
+}
+
+// Applies an IT_NOP that carries the reset or a CONTEXT_STATE operation, as CpOpNop dispatches them.
+void HandleGraphicsNop(Walk& walk, uint32_t header, uint32_t length, const uint32_t* payload) {
+	if ((header & ~PM4_PREDICATE_BIT) == DISPATCH_RESET_PACKET) {
+		walk.graphics->Reset();
+	} else if (KYTY_PM4_R(header) == Pm4::R_CONTEXT_STATE && length >= CONTEXT_STATE_MIN_LEN) {
+		walk.graphics->ApplyContextState(payload[0]);
+	}
+}
+
+// Applies a SET_UCONFIG_REG or SET_UCONFIG_REG_INDEX packet the way CpOpSetUconfigReg reads it, which
+// skips the library's internal data and reads the indexed form's offset unnormalized.
+void HandleUconfigPacket(Walk& walk, uint32_t header, uint32_t length, const uint32_t* payload) {
+	if (length < 3u || walk.graphics->IsInternalDataPacket(header, payload)) {
+		return;
+	}
+	const uint32_t offset = PacketOpcode(header) == Pm4::IT_SET_UCONFIG_REG_INDEX
+	                            ? payload[0] & UCONFIG_INDEX_OFFSET_MASK
+	                            : payload[0] & ~REGISTER_SELECTOR_MASK;
+	if (offset != Pm4::UC_NOP) {
+		ApplyGraphicsRegisters(walk, GraphicsRegisterSpace::Uconfig, offset, length, payload + 1);
+	}
+}
+
+// Applies what a packet does to graphics state, which the walk does only with a graphics shadow. Shader
+// register lists are read once by the compute case, which hands their pairs to both shadows.
+void HandleGraphicsPacket(Walk& walk, uint32_t header, uint32_t length, const uint32_t* payload) {
+	switch (PacketOpcode(header)) {
+		case Pm4::IT_NOP: HandleGraphicsNop(walk, header, length, payload); break;
+		case Pm4::IT_CLEAR_STATE: walk.graphics->ApplyContextState(CONTEXT_STATE_CLEAR); break;
+		case Pm4::IT_SET_CONTEXT_REG:
+			if (length >= 3u && (payload[0] & ~REGISTER_SELECTOR_MASK) != Pm4::CX_NOP) {
+				ApplyGraphicsRegisters(walk, GraphicsRegisterSpace::Context, payload[0] & ~REGISTER_SELECTOR_MASK,
+				                       length, payload + 1);
+			}
+			break;
+		case Pm4::IT_SET_SH_REG:
+			if (length >= 3u && payload[0] != Pm4::SH_NOP) {
+				ApplyGraphicsRegisters(walk, GraphicsRegisterSpace::Shader, payload[0], length, payload + 1);
+			}
+			break;
+		case Pm4::IT_SET_UCONFIG_REG:
+		case Pm4::IT_SET_UCONFIG_REG_INDEX: HandleUconfigPacket(walk, header, length, payload); break;
+		case Pm4::IT_SET_CONTEXT_REG_INDIRECT:
+			if (length == SET_REG_INDIRECT_LEN) {
+				ApplyIndirectRegisters(walk, payload, GraphicsRegisterSpace::Context);
+			}
+			break;
+		case Pm4::IT_SET_UCONFIG_REG_INDIRECT:
+			if (length == SET_REG_INDIRECT_LEN) {
+				ApplyIndirectRegisters(walk, payload, GraphicsRegisterSpace::Uconfig);
+			}
+			break;
+		// The draw opcodes of the processor's dispatch table, the indirect ones first.
+		case Pm4::IT_DRAW_INDIRECT:
+		case Pm4::IT_DRAW_INDEX_INDIRECT:
+		case Pm4::IT_DRAW_INDIRECT_MULTI:
+		case Pm4::IT_DRAW_INDEX_INDIRECT_MULTI:
+			walk.graphics->RecordDraw(walk.queue, true);
+			break;
+		case Pm4::IT_DRAW_INDEX_2:
+		case Pm4::IT_DRAW_INDEX_OFFSET_2:
+		case Pm4::IT_DISPATCH_DRAW_PREAMBLE:
+		case Pm4::IT_DRAW_INDEX_AUTO: walk.graphics->RecordDraw(walk.queue, false); break;
+		default: break;
+	}
+}
+
 // Applies one packet of a buffer. Returns Finished to go on with the next packet.
 WalkEnd HandlePacket(Walk& walk, uint32_t header, uint32_t length, const uint32_t* payload,
                      uint32_t depth) {
+	if (walk.graphics != nullptr) {
+		HandleGraphicsPacket(walk, header, length, payload);
+	}
 	switch (PacketOpcode(header)) {
 		case Pm4::IT_NOP:
 			if ((header & ~PM4_PREDICATE_BIT) == DISPATCH_RESET_PACKET) {
@@ -528,7 +680,7 @@ WalkEnd HandlePacket(Walk& walk, uint32_t header, uint32_t length, const uint32_
 			break;
 		case Pm4::IT_SET_SH_REG_INDIRECT:
 			if (length == SET_SH_REG_INDIRECT_LEN) {
-				ApplyIndirectRegisters(walk, payload);
+				ApplyIndirectRegisters(walk, payload, GraphicsRegisterSpace::Shader);
 			}
 			break;
 		case Pm4::IT_SET_BASE: ApplySetBase(walk.shadow, header, length, payload); break;
@@ -547,12 +699,35 @@ WalkEnd HandlePacket(Walk& walk, uint32_t header, uint32_t length, const uint32_
 // Applies a packet, and when the packet is predicated and wrote compute state, stops vouching for the
 // program, since the processor may have skipped the write. Only a write counts, so a predicated dispatch
 // or user data write leaves the program certain. The packet's own effects are applied first.
+// Clears the graphics shadow's dirty flag at the start of a span whose writes may be skipped, and
+// returns what it was, so that only writes inside the span are judged at its end.
+bool OpenGraphicsSpan(Walk& walk) {
+	if (walk.graphics == nullptr) {
+		return false;
+	}
+	return std::exchange(walk.graphics->state_dirty, false);
+}
+
+// Ends such a span. The graphics shadow is in doubt if the span wrote graphics state, and the flag the
+// span opened over is merged back.
+void CloseGraphicsSpan(Walk& walk, bool outer_dirty) {
+	if (walk.graphics == nullptr) {
+		return;
+	}
+	if (walk.graphics->state_dirty) {
+		walk.graphics->MarkUncertain();
+	}
+	walk.graphics->state_dirty = walk.graphics->state_dirty || outer_dirty;
+}
+
 WalkEnd RunPacket(Walk& walk, uint32_t header, uint32_t length, const uint32_t* payload,
                   uint32_t depth) {
 	const bool predicated  = (header & PM4_PREDICATE_BIT) != 0;
 	const bool outer_dirty = walk.shadow.key_state_dirty;
+	bool       outer_graphics_dirty = false;
 	if (predicated) {
 		walk.shadow.key_state_dirty = false;
+		outer_graphics_dirty        = OpenGraphicsSpan(walk);
 	}
 	const auto end = HandlePacket(walk, header, length, payload, depth);
 	if (predicated) {
@@ -560,15 +735,17 @@ WalkEnd RunPacket(Walk& walk, uint32_t header, uint32_t length, const uint32_t* 
 			NoteUncertain(walk, UncertainCause::Predicated);
 		}
 		walk.shadow.key_state_dirty = walk.shadow.key_state_dirty || outer_dirty;
+		CloseGraphicsSpan(walk, outer_graphics_dirty);
 	}
 	return end;
 }
 
-// The span a COND_EXEC may skip in the buffer being walked, as an end offset, with whether the shadow
-// was already dirty when the span opened, so that only writes inside the span are judged at its end.
+// The span a COND_EXEC may skip in the buffer being walked, as an end offset, with whether the shadows
+// were already dirty when the span opened, so that only writes inside the span are judged at its end.
 struct CondRegion {
-	size_t end         = 0;
-	bool   outer_dirty = false;
+	size_t end                  = 0;
+	bool   outer_dirty          = false;
+	bool   outer_graphics_dirty = false;
 };
 
 // Where the dwords a COND_EXEC may skip end, as an offset in the buffer being walked, or 0 when the
@@ -589,6 +766,7 @@ void OpenRegion(Walk& walk, CondRegion& region, size_t end) {
 	if (region.end == 0) {
 		region.outer_dirty          = walk.shadow.key_state_dirty;
 		walk.shadow.key_state_dirty = false;
+		region.outer_graphics_dirty = OpenGraphicsSpan(walk);
 	}
 	region.end = std::max(region.end, end);
 }
@@ -600,6 +778,7 @@ void CloseRegion(Walk& walk, CondRegion& region) {
 		NoteUncertain(walk, UncertainCause::CondExecRegion);
 	}
 	walk.shadow.key_state_dirty = walk.shadow.key_state_dirty || region.outer_dirty;
+	CloseGraphicsSpan(walk, region.outer_graphics_dirty);
 	region                      = {};
 }
 
@@ -705,7 +884,17 @@ void SubmitScanner::Scan(std::span<const uint32_t> commands, uint32_t queue, boo
 void SubmitScanner::Scan(std::span<const uint32_t> commands, uint32_t queue, bool async_queue,
                          CsShadow& shadow, std::vector<ScannedDispatch>& dispatches,
                          ScanStats& stats, ScanScratch& storage, DispatchCache* cache) const {
+	Scan(commands, queue, async_queue, shadow, dispatches, stats, storage, cache, nullptr);
+}
+
+void SubmitScanner::Scan(std::span<const uint32_t> commands, uint32_t queue, bool async_queue,
+                         CsShadow& shadow, std::vector<ScannedDispatch>& dispatches,
+                         ScanStats& stats, ScanScratch& storage, DispatchCache* cache,
+                         GraphicsScan* graphics) const {
 	stats.submissions++;
+	if (graphics != nullptr) {
+		graphics->state_dirty = false;
+	}
 	shadow.program_set_in_submission = false;
 	shadow.key_state_dirty           = false;
 	// The arena is the size of the budget, which is the most a walk reads into it.
@@ -725,7 +914,8 @@ void SubmitScanner::Scan(std::span<const uint32_t> commands, uint32_t queue, boo
 	           .dwords_left = m_limits.dword_budget - top_level,
 	           .visited     = visited,
 	           .scratch     = scratch,
-	           .cache       = cache};
+	           .cache       = cache,
+	           .graphics    = graphics};
 	const bool truncated = top_level < commands.size();
 	if (truncated) {
 		NoteBudgetCut(walk);

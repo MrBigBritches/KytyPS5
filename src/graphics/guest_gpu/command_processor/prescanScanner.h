@@ -10,6 +10,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <span>
 #include <thread>
@@ -25,6 +26,7 @@
 // Only named as a return type here, so the report's header stays out of every file that includes this.
 namespace Common::FirstRunReport {
 struct PrescanScannerReport;
+struct PrescanGraphicsReport;
 } // namespace Common::FirstRunReport
 
 namespace Libs::Graphics {
@@ -109,6 +111,10 @@ struct PrescanScannerStats {
 	PrescanHistogram push_us_histogram {};
 	/// The calls the walks made to the inner reader.
 	ScanReadTiming reads;
+	/// What the graphics walk counted, when a graphics shadow is attached.
+	GraphicsScanStats graphics;
+	/// Draws handed to the graphics sink.
+	uint64_t draws_offered = 0;
 };
 
 /// Walks this long or longer are counted apart in the report. It is a power of two, so the count is
@@ -119,6 +125,10 @@ inline constexpr uint64_t PRESCAN_LONG_WALK_US = 1024;
 /// percentiles. A bucket spans a factor of two, so each percentile is the top of the bucket its rank
 /// falls in, capped at the exact maximum, which makes it an upper bound.
 [[nodiscard]] Common::FirstRunReport::PrescanScannerReport PrescanReportOf(const PrescanScannerStats& stats);
+
+/// The scanner's part of the prescan_graphics block (experimental), the graphics walk's counts with the
+/// draws handed to the sink.
+[[nodiscard]] Common::FirstRunReport::PrescanGraphicsReport PrescanGraphicsScanReportOf(const PrescanScannerStats& stats);
 
 /// Runs the scanner thread and owns everything it uses. The hand-off belongs to the caller and must
 /// outlive this. Submitting threads call PrepareCommands or PrepareReset outside the order gate and
@@ -154,6 +164,16 @@ public:
 	/// Says that the GPU thread began the queue's job `seq`. Lock-free, and safe after Stop.
 	void NoteBegan(uint32_t queue_id, uint64_t seq);
 
+	/// Makes the thread also walk the graphics queue's state with `graphics`, and hand the draws each
+	/// walk finds to `sink`, for the graphics prescan (experimental). The thread owns the shadow from Start
+	/// on. It is reset by the graphics queue's reset markers and put in doubt where that queue's compute
+	/// shadow is. An empty sink drops the draws.
+	/// @throws std::logic_error when the thread was already started, std::invalid_argument when graphics
+	/// is null.
+	void AttachGraphics(std::unique_ptr<GraphicsScan> graphics, GraphicsDrawSink sink);
+	/// Whether a graphics shadow was attached. Set before Start or never, so any thread may ask after.
+	[[nodiscard]] bool HasGraphics() const noexcept { return m_graphics != nullptr; }
+
 	/// Starts the thread.
 	/// @throws std::logic_error when it was already started, or Stop was already called, since a stopped
 	/// queue would end the new thread at once.
@@ -186,6 +206,8 @@ private:
 		uint64_t  posted      = 0;
 		uint64_t  skipped     = 0;
 		uint64_t  dropped     = 0;
+		GraphicsScanStats graphics;
+		uint64_t          draws_offered = 0;
 	};
 
 	void ThreadMain() noexcept;
@@ -193,6 +215,8 @@ private:
 	void RunJob(const ScanJob& job);
 	void WalkAndOffer(const ScanJob& job, CsShadow& shadow, JobCounts& counts);
 	void OfferDispatches(uint64_t seq, JobCounts& counts);
+	void OfferDraws(uint64_t seq, JobCounts& counts);
+	[[nodiscard]] GraphicsScan* GraphicsOf(uint32_t queue_id) const;
 	void Record(const JobCounts& counts);
 	[[nodiscard]] std::chrono::microseconds WalkTimeFor(std::chrono::steady_clock::duration lag) const;
 	[[nodiscard]] CsShadow& ShadowOf(uint32_t queue_id);
@@ -213,6 +237,9 @@ private:
 	std::vector<ScannedDispatch>           m_dispatches;
 	ScanScratch                            m_scratch;
 	ScanReadTiming                         m_read_timing;
+	// The graphics queue's graphics shadow and where its draws go, both set before Start or never.
+	std::unique_ptr<GraphicsScan> m_graphics;
+	GraphicsDrawSink              m_graphics_sink;
 
 	// Push runs on the submitting threads, so its figures are atomics and never wait on the stats lock.
 	// They start a cache line of their own, so a submitter's Push does not fight the scanner thread over

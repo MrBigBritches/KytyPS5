@@ -465,24 +465,36 @@ private:
 /// shadow. A list is walked after the shadow takes the doubt the queue left it, and a list that was
 /// copied short leaves the shadow in doubt after the walk, since the part that was cut may have changed
 /// the program. A caller that keeps its own ScanScratch passes it, and the walk then uses it in place of
-/// the calling thread's own.
+/// the calling thread's own. A graphics shadow, when given, takes the same resets and doubts as the
+/// compute one, and needs the caller's scratch.
 inline void RunScanJob(const SubmitScanner& scanner, const ScanJob& job, bool async_queue, CsShadow& shadow,
                        std::vector<ScannedDispatch>& dispatches, ScanStats& stats,
-                       DispatchCache* cache = nullptr, ScanScratch* scratch = nullptr) {
+                       DispatchCache* cache = nullptr, ScanScratch* scratch = nullptr,
+                       GraphicsScan* graphics = nullptr) {
 	if (job.kind == ScanJob::Kind::Reset) {
 		shadow.Reset();
+		if (graphics != nullptr) {
+			graphics->Reset();
+		}
 		return;
 	}
 	if (job.shadow_uncertain) {
 		shadow.MarkUncertain();
+		if (graphics != nullptr) {
+			graphics->MarkUncertain();
+		}
 	}
 	if (scratch != nullptr) {
-		scanner.Scan(job.CommandSpan(), job.queue_id, async_queue, shadow, dispatches, stats, *scratch, cache);
+		scanner.Scan(job.CommandSpan(), job.queue_id, async_queue, shadow, dispatches, stats, *scratch, cache,
+		             graphics);
 	} else {
 		scanner.Scan(job.CommandSpan(), job.queue_id, async_queue, shadow, dispatches, stats, cache);
 	}
 	if (job.truncated) {
 		shadow.MarkUncertain();
+		if (graphics != nullptr) {
+			graphics->MarkUncertain();
+		}
 	}
 }
 
