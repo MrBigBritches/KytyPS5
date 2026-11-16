@@ -23143,6 +23143,292 @@ public:
             "a module the GPU thread compiled first was adopted, or not counted as a late duplicate");
   }
 
+  static constexpr const char *GraphicsPrebuildTestName = "GraphicsPrescanPrebuild";
+
+  // The library jobs of one report group that ended, built or skipped. A pre-raster library whose key
+  // an earlier job claimed never becomes a job, so its late dedupe counts as ended too. A figure the
+  // group does not have reads as -1 and adds nothing.
+  static double LibraryJobsDone(const PipelineCache &cache, const char *group) {
+    double done = 0.0;
+    for (const char *name : {"prebuilt", "provoking_unsupported", "deduped_late", "skipped_libraries_off",
+                             "skipped_no_heap_layout", "skipped_no_split_module", "skipped_layout_limits",
+                             "skipped_already_there"}) {
+      done += std::max(0.0, PipelineCacheTestAccess::GraphicsPrescanFigure(cache, group, name));
+    }
+    return done;
+  }
+
+  // Waits until `jobs` library jobs of the group ended in all.
+  static bool WaitForLibraryJobs(const PipelineCache &cache, const char *group, double jobs) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    while (std::chrono::steady_clock::now() < deadline) {
+      if (LibraryJobsDone(cache, group) >= jobs) {
+        return true;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    return false;
+  }
+
+  // Offers one draw and waits until its pixel job, its vertex job when it has a vertex half, the
+  // fragment library job and, with `pre_raster_job`, the pre-raster library job all ended. A draw is
+  // only drawn after this, so the GPU thread finds a prebuilt library finished, never building.
+  static bool OfferAndWaitForLibraries(CadenceFixture &fixture, const GraphicsDrawSink &sink,
+                                       const ScannedDraw &draw, bool pre_raster_job) {
+    auto &cache = fixture.context.GetPipelineCache();
+    const double pixel_jobs = GraphicsJobsDone(cache, false) + 1;
+    const double vertex_jobs = GraphicsJobsDone(cache, true) + (draw.offer_vs ? 1 : 0);
+    const double fragment_jobs = LibraryJobsDone(cache, "libraries") + 1;
+    const double pre_raster_jobs = LibraryJobsDone(cache, "pre_raster") + (pre_raster_job ? 1 : 0);
+    sink(std::span<const ScannedDraw>(&draw, 1));
+    return WaitForGraphicsJobs(cache, false, pixel_jobs) && WaitForGraphicsJobs(cache, true, vertex_jobs) &&
+           WaitForLibraryJobs(cache, "libraries", fragment_jobs) &&
+           WaitForLibraryJobs(cache, "pre_raster", pre_raster_jobs);
+  }
+
+  // A pixel shader whose red and green come from user registers s0 and s1, so its push data is two
+  // dwords, one more than UserRedPixelShader's.
+  static std::vector<u32> UserRedGreenPixelShader() {
+    constexpr u32 v_mov_b32 = 0x01;
+    constexpr u32 one_bits = 0x3f800000u;
+    std::vector<u32> code;
+    code.push_back(EncodeVop1(v_mov_b32, 0, 0));
+    code.push_back(EncodeVop1(v_mov_b32, 1, 1));
+    AppendVMovU32(&code, 2, 0);
+    AppendVMovLiteral(&code, 3, one_bits);
+    code.push_back(EncodeExp0(0, 0xf));
+    code.push_back(EncodeExp1(0, 1, 2, 3));
+    AppendEnd(&code);
+    return code;
+  }
+
+  // The library prebuilds end to end, on the device made with the library. Without it the first hits
+  // cannot happen, so the case is skipped and says so. The cases run on the GPU thread, like the
+  // adoption case, with the library mode on in the runtime context.
+  void CheckGraphicsPrescanPrebuild() {
+    if (!m_library_available) {
+      std::printf("[gpu]     %-32s skipped: the device has no graphics pipeline library\n",
+                  GraphicsPrebuildTestName);
+      return;
+    }
+    Config::Load({.printf_direction = Config::LogDirection::Silent});
+    SplitLayoutScope layout(*this, true);
+    RenderContext context(RuntimeContext());
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    context.GetGpu().SendCommandSync([&] {
+      CommandProcessor processor(context, 0);
+      processor.BufferInit();
+      CadenceFixture fixture{context, context.GetCommandScheduler(), processor};
+      CheckGraphicsPrebuildCases(fixture);
+    });
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    context.ShutdownGpu();
+    std::printf("[gpu]     %-32s ok\n", GraphicsPrebuildTestName);
+  }
+
+  // Sets up the target, the plain triangle vertex shader and one pixel user register at a half, then
+  // runs each prebuild case in guest memory of its own.
+  void CheckGraphicsPrebuildCases(CadenceFixture &fixture) {
+    constexpr u32 extent = 16;
+    constexpr uintptr_t base = 0x0000000207400000ull;
+    constexpr uint64_t vertex_offset = 0x1000;
+    constexpr u32 half_bits = 0x3f000000u;
+    static ShaderUserData vertex_user_data{};
+    CadenceMemory memory{base, CadenceMemorySize};
+    MapCadenceMemory(fixture.context, memory);
+    auto &cache = fixture.context.GetPipelineCache();
+    PipelineCacheTestAccess::EnableGeneration(cache);
+    const auto sink = cache.GraphicsPrescanSink();
+    SetupCadenceColorTarget(fixture.processor.GetCtx(), base + CadenceSecondRegion, extent);
+    fixture.processor.GetUcfg().SetPrimitiveType(Prospero::PrimitiveType::kTriList);
+    auto &shaders = fixture.processor.GetShCtx();
+    shaders.SetEsShaderBase(PlaceGuestShader(base + vertex_offset, CadenceTriangleVertexShader(),
+                                             Prospero::ShaderBinaryType::kGs, &vertex_user_data));
+    HW::PsShaderResource2 rsrc2{};
+    rsrc2.user_sgpr = 1;
+    shaders.SetPsUserSgpr(0, half_bits);
+    CheckFragmentPrebuild(fixture, sink, base, rsrc2);
+    CheckPreRasterPrebuild(fixture, sink, base, rsrc2);
+    CheckPreRasterDedupe(fixture, sink, base);
+    CheckPreRasterEligibility(fixture, sink, base, rsrc2);
+    fixture.scheduler.Finish();
+    UnmapCadenceMemory(fixture.context, memory);
+  }
+
+  // An offered pixel shader has its fragment library built on a library worker, and its draw's pipeline
+  // then finds it finished, which counts one first hit and no key that differs. The baseline is a pixel
+  // shader never offered, drawn the same way, which adds no first hit, so the hit is the prebuild's.
+  void CheckFragmentPrebuild(CadenceFixture &fixture, const GraphicsDrawSink &sink, uintptr_t base,
+                             const HW::PsShaderResource2 &rsrc2) {
+    constexpr const char *name = GraphicsPrebuildTestName;
+    constexpr uint64_t offered_offset = 0x8000;
+    constexpr uint64_t plain_offset = 0x9000;
+    constexpr u32 offered_green = 1;
+    constexpr u32 plain_green = 2;
+    auto &cache = fixture.context.GetPipelineCache();
+    auto &shaders = fixture.processor.GetShCtx();
+    const auto figure = [&](const char *row) {
+      return PipelineCacheTestAccess::GraphicsPrescanFigure(cache, "libraries", row);
+    };
+    const double prebuilt = figure("prebuilt");
+    const double first_hits = figure("first_hits");
+    const double key_differs = figure("key_differs");
+    shaders.SetPsShaderResource2(rsrc2);
+    shaders.SetPsShaderBase(PlaceGuestShader(base + offered_offset, UserRedPixelShader(offered_green),
+                                             Prospero::ShaderBinaryType::kPs, nullptr));
+    Require(name, "fragment jobs",
+            OfferAndWaitForLibraries(fixture, sink, ScannedDrawOf(fixture.processor, base + offered_offset), false),
+            "the offered pixel shader's jobs never ended");
+    Require(name, "fragment prebuilt", figure("prebuilt") == prebuilt + 1,
+            "the offered pixel shader's fragment library was not built");
+    (void)DrawAndReadTarget(fixture);
+    Require(name, "fragment first hit", figure("first_hits") == first_hits + 1 && figure("key_differs") == key_differs,
+            "the draw did not find the prebuilt fragment library under its own key");
+    shaders.SetPsShaderBase(PlaceGuestShader(base + plain_offset, UserRedPixelShader(plain_green),
+                                             Prospero::ShaderBinaryType::kPs, nullptr));
+    (void)DrawAndReadTarget(fixture);
+    Require(name, "fragment baseline", figure("first_hits") == first_hits + 1 && figure("key_differs") == key_differs,
+            "a pixel shader never offered counted a first hit or a key that differs");
+  }
+
+  // The same for the vertex half. A draw offered with it has its vertex job queue the pre-rasterization
+  // library, which the draw's pipeline finds finished. The baseline is a fresh pair never offered, drawn
+  // the same way, which adds no first hit. The marked vertex shaders scale x by user register 0, which
+  // is 1.0 here as in CheckGraphicsPrescanVertexJob.
+  void CheckPreRasterPrebuild(CadenceFixture &fixture, const GraphicsDrawSink &sink, uintptr_t base,
+                              const HW::PsShaderResource2 &rsrc2) {
+    constexpr const char *name = GraphicsPrebuildTestName;
+    constexpr uint64_t offered_offset = 0xa000;
+    constexpr uint64_t plain_offset = 0xb000;
+    constexpr uint64_t vertex_offset = 0x800;
+    constexpr u32 offered_marker = 3;
+    constexpr u32 plain_marker = 4;
+    constexpr u32 one_bits = 0x3f800000u;
+    static ShaderUserData vertex_user_data{};
+    auto &cache = fixture.context.GetPipelineCache();
+    auto &shaders = fixture.processor.GetShCtx();
+    const auto figure = [&](const char *row) {
+      return PipelineCacheTestAccess::GraphicsPrescanFigure(cache, "pre_raster", row);
+    };
+    const auto place_pair = [&](uint64_t address, u32 marker) {
+      shaders.SetPsShaderBase(PlaceGuestShader(address, UserRedPixelShader(marker), Prospero::ShaderBinaryType::kPs,
+                                               nullptr));
+      shaders.SetEsShaderBase(PlaceGuestShader(address + vertex_offset, MarkedTriangleVertexShader(marker),
+                                               Prospero::ShaderBinaryType::kGs, &vertex_user_data));
+    };
+    const auto vertex_regs = shaders.GetVs();
+    auto one_user_sgpr = vertex_regs.gs_regs.rsrc2;
+    one_user_sgpr.user_sgpr = 1;
+    shaders.SetGsShaderResource2(one_user_sgpr);
+    shaders.SetGsUserSgpr(0, one_bits);
+    shaders.SetPsShaderResource2(rsrc2);
+    const double prebuilt = figure("prebuilt");
+    const double first_hits = figure("first_hits");
+    const double key_differs = figure("key_differs");
+    place_pair(base + offered_offset, offered_marker);
+    const auto draw = ScannedVertexDrawOf(fixture.processor, base + offered_offset,
+                                          base + offered_offset + vertex_offset, true);
+    Require(name, "pre-raster jobs", OfferAndWaitForLibraries(fixture, sink, draw, true),
+            "the offered pair's jobs never ended");
+    Require(name, "pre-raster prebuilt", figure("prebuilt") == prebuilt + 1,
+            "the offered vertex shader's pre-rasterization library was not built");
+    (void)DrawAndReadTarget(fixture);
+    Require(name, "pre-raster first hit", figure("first_hits") == first_hits + 1 && figure("key_differs") == key_differs,
+            "the draw did not find the prebuilt pre-rasterization library under its own key");
+    place_pair(base + plain_offset, plain_marker);
+    (void)DrawAndReadTarget(fixture);
+    Require(name, "pre-raster baseline", figure("first_hits") == first_hits + 1 && figure("key_differs") == key_differs,
+            "a pair never offered counted a pre-rasterization first hit or a key that differs");
+    shaders.SetGsShaderResource2(vertex_regs.gs_regs.rsrc2);
+    shaders.SetGsUserSgpr(0, vertex_regs.gs_user_sgpr.value[0]);
+    shaders.SetEsShaderBase(vertex_regs.es_regs.data_addr);
+  }
+
+  // The pre-rasterization dedupe. A triangle vertex shader with no shader data has the same module id
+  // at every push start, so paired with pixel shaders of other push sizes its module is built again
+  // under another push cursor. The first pairing builds the library. A pairing with the same raster
+  // state then finds the library key claimed and stops as deduped_late without a job. The baseline,
+  // before it, differs from that pairing only in its clip space, so its key is new and built. The
+  // vertex shader is the plain triangle behind a dead move, new to the cache, since the earlier draws
+  // made the plain triangle's own library already.
+  void CheckPreRasterDedupe(CadenceFixture &fixture, const GraphicsDrawSink &sink, uintptr_t base) {
+    constexpr const char *name = GraphicsPrebuildTestName;
+    constexpr uint64_t vertex_offset = 0xc800;
+    constexpr uint64_t first_offset = 0xc000;
+    constexpr uint64_t baseline_offset = 0xd000;
+    constexpr uint64_t repeat_offset = 0xe000;
+    constexpr u32 first_green = 5;
+    constexpr u32 unused_vgpr = 7;
+    constexpr u32 vertex_marker = 9;
+    static ShaderUserData vertex_user_data{};
+    auto &cache = fixture.context.GetPipelineCache();
+    auto &shaders = fixture.processor.GetShCtx();
+    const auto figure = [&](const char *row) {
+      return PipelineCacheTestAccess::GraphicsPrescanFigure(cache, "pre_raster", row);
+    };
+    std::vector<u32> vertex;
+    AppendVMovU32(&vertex, unused_vgpr, vertex_marker);
+    const auto triangle = CadenceTriangleVertexShader();
+    vertex.insert(vertex.end(), triangle.begin(), triangle.end());
+    const auto plain_vertex = shaders.GetVs().es_regs.data_addr;
+    shaders.SetEsShaderBase(PlaceGuestShader(base + vertex_offset, vertex, Prospero::ShaderBinaryType::kGs,
+                                             &vertex_user_data));
+    // Each pairing has a pixel shader with `user_sgprs` registers of push data, so each vertex job has a
+    // push cursor of its own.
+    const auto offer = [&](uint64_t address, const std::vector<u32> &code, u32 user_sgprs, bool flip_clip_space) {
+      shaders.SetPsShaderBase(PlaceGuestShader(address, code, Prospero::ShaderBinaryType::kPs, nullptr));
+      HW::PsShaderResource2 rsrc2{};
+      rsrc2.user_sgpr = user_sgprs;
+      shaders.SetPsShaderResource2(rsrc2);
+      auto draw = ScannedVertexDrawOf(fixture.processor, address, address, true);
+      draw.clip_control.dx_clip_space = draw.clip_control.dx_clip_space != flip_clip_space;
+      return OfferAndWaitForLibraries(fixture, sink, draw, true);
+    };
+    const double prebuilt = figure("prebuilt");
+    const double deduped = figure("deduped_late");
+    Require(name, "dedupe first",
+            offer(base + first_offset, UserRedPixelShader(first_green), 1, false) &&
+                figure("prebuilt") == prebuilt + 1 && figure("deduped_late") == deduped,
+            "the first pairing's library was not built");
+    Require(name, "dedupe baseline",
+            offer(base + baseline_offset, CadenceColorPixelShader({0.75f, 0.5f, 0.25f, 1.0f}), 0, true) &&
+                figure("prebuilt") == prebuilt + 2 && figure("deduped_late") == deduped,
+            "a pairing whose library key was new was not built, or was deduped");
+    Require(name, "dedupe repeat",
+            offer(base + repeat_offset, UserRedGreenPixelShader(), 2, false) &&
+                figure("prebuilt") == prebuilt + 2 && figure("deduped_late") == deduped + 1,
+            "a pairing whose library key was claimed already was built again, or not counted deduped_late");
+    shaders.SetEsShaderBase(plain_vertex);
+  }
+
+  // A pre-rasterization library is only queued for a draw GplEligible would build from libraries. A
+  // merged vertex stage, a mesh draw, has its vertex job stop as vertex_mesh before any library key is
+  // made, so it queues no pre-raster job. The baseline is the first pairing of CheckPreRasterDedupe,
+  // which differs in the stage bit and the shaders and queued one.
+  void CheckPreRasterEligibility(CadenceFixture &fixture, const GraphicsDrawSink &sink, uintptr_t base,
+                                 const HW::PsShaderResource2 &rsrc2) {
+    constexpr const char *name = GraphicsPrebuildTestName;
+    constexpr uint64_t mesh_offset = 0xf000;
+    constexpr u32 mesh_green = 6;
+    constexpr u32 merged_stages = 0x20u;
+    auto &cache = fixture.context.GetPipelineCache();
+    auto &shaders = fixture.processor.GetShCtx();
+    shaders.SetPsShaderBase(PlaceGuestShader(base + mesh_offset, UserRedPixelShader(mesh_green),
+                                             Prospero::ShaderBinaryType::kPs, nullptr));
+    shaders.SetPsShaderResource2(rsrc2);
+    auto draw = ScannedVertexDrawOf(fixture.processor, base + mesh_offset, base + mesh_offset, true);
+    draw.shader_stages = merged_stages;
+    const double vertex_mesh = PipelineCacheTestAccess::GraphicsPrescanFigure(cache, "vs_skipped", "vertex_mesh");
+    const double pre_raster_jobs = LibraryJobsDone(cache, "pre_raster");
+    Require(name, "mesh jobs", OfferAndWaitForLibraries(fixture, sink, draw, false),
+            "the mesh draw's jobs never ended");
+    Require(name, "mesh skipped",
+            PipelineCacheTestAccess::GraphicsPrescanFigure(cache, "vs_skipped", "vertex_mesh") == vertex_mesh + 1 &&
+                LibraryJobsDone(cache, "pre_raster") == pre_raster_jobs,
+            "a mesh draw's vertex half was not skipped as vertex_mesh, or queued a pre-rasterization library");
+  }
+
   // The checks of T5, separate to keep each function short.
   void CheckCadenceRenderPassResults(const CadenceDraws &unsplit, const CadenceDraws &split,
                                      const std::array<float, 4> &first_color,
@@ -76676,6 +76962,7 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--split-layout-only") == 0) {
     VulkanHarness vulkan(false, true);
     vulkan.CheckSplitLayout();
+    vulkan.CheckGraphicsPrescanPrebuild();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--split-layout-sync-only") == 0) {
@@ -78176,6 +78463,7 @@ int main(int argc, char **argv) {
     // The split layout tests run on a device made with the library, apart from the one above.
     VulkanHarness library_vulkan(false, true);
     library_vulkan.CheckSplitLayout();
+    library_vulkan.CheckGraphicsPrescanPrebuild();
   }
   std::printf("ShaderRecompilerComputeTests: all cases passed\n");
   return 0;

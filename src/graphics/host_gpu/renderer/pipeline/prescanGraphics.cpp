@@ -10,8 +10,10 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/pipeline/generationState.h"
 #include "graphics/host_gpu/renderer/pipeline/graphicsLibraryCache.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineParts.h"
 #include "graphics/host_gpu/renderer/pipeline/prescanHeapProbe.h"
 #include "graphics/host_gpu/renderer/pipeline/prescanValidate.h"
+#include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/moduleId.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
@@ -633,6 +635,24 @@ Common::FirstRunReport::PrescanGraphicsReport::Group RejectedGroup(const Graphic
 	return group;
 }
 
+// Whether a stall scope or a hold of guest audio overlapped a prebuild, sampled as the compute
+// prescan's builds sample it, without the stall mutex.
+struct StallMarks {
+	bool     scope_active = false;
+	bool     hold_active  = false;
+	uint64_t scopes       = 0;
+	uint64_t holds        = 0;
+
+	static StallMarks Take() {
+		StallMarks marks;
+		marks.hold_active  = Common::GpuStall::HoldInProgress();
+		marks.holds        = Common::GpuStall::HoldCount();
+		marks.scopes       = Common::GpuStall::ScopeCount();
+		marks.scope_active = Common::GpuStall::AnyScopeActive();
+		return marks;
+	}
+};
+
 } // namespace
 
 // The count is taken with a compare and swap, so two jobs never both take the last slot. A job that
@@ -973,6 +993,20 @@ void AddClipState(const ScannedDraw& draw, std::array<uint32_t, 2> max_viewport,
 // Whether every attribute's buffer can be fetched by TranslateEmbeddedFetch without EXIT. A fetch reads
 // at most four components and which ones is only known after translation, so all four selectors are
 // judged. That rejects only a buffer with a reserved selector (2 or 3) on a component no fetch reads.
+// The pre-rasterization key of a vertex module for a draw, as FillStaticKey and MakePreRasterKey make
+// it for a draw with no tessellation and no rect list, which are both skipped.
+PreRasterKey ScannedPreRasterKey(uint64_t id, const ScannedDraw& draw) {
+	const auto&  clip = draw.clip_control;
+	const auto&  mode = draw.mode_control;
+	PreRasterKey key;
+	key.stage_ids[0]        = id;
+	key.negative_one_to_one = !clip.dx_clip_space;
+	key.depth_clip_enable   = clip.IsZClipEnabled();
+	key.provoking_vtx_last  = mode.provoking_vtx_last;
+	key.polygon_mode        = PrescanPolygonMode(mode, mode.cull_front, mode.cull_back);
+	return key;
+}
+
 bool EmbeddedFetchesValid(const ShaderVertexInputInfo& info) {
 	constexpr uint32_t max_fetch_components = 4;
 	for (int index = 0; index < info.resources_num; index++) {
@@ -1168,6 +1202,9 @@ void PipelineCache::RunGraphicsPrescanJob(const ScannedDraw& draw, Clock::time_p
 		std::scoped_lock lock(state.ps_bindings_mutex);
 		state.ps_bindings.insert_or_assign(draw.key_hash, ps_bindings);
 	}
+	(void)PostBounded(state.libraries, state.libraries_bound, PipelineBuildQueue::Lane::Front,
+	                  [this, id = build.id, spirv = std::move(build.spirv), info = std::move(build.info),
+	                   a2c = draw.alpha_to_coverage] { RunFragmentPrebuild(id, spirv, info, a2c); });
 	if (chain_vertex) {
 		PostVertexJob(draw, ps_bindings);
 	}
@@ -1262,6 +1299,62 @@ void PipelineCache::PostVertexBuild(const ScannedDraw& draw, const GraphicsStage
 	PostGraphicsPrescanModule(MakeRecord(source, build, formats), std::move(bytes));
 	counts.posted.fetch_add(1, std::memory_order_relaxed);
 	counts.translate_us.fetch_add(WholeMicros(Clock::now() - start), std::memory_order_relaxed);
+	// A library of the same key built or queued already is not queued again, before any module or
+	// layout is made for it.
+	constexpr uint64_t pre_raster_domain = 0x5052455241535445ull;
+	if (!state.dedupe.Claim(PartKeyHash<PreRasterKey> {}(ScannedPreRasterKey(build.id, draw)) ^ pre_raster_domain)) {
+		counts.prebuild_deduped_late.fetch_add(1, std::memory_order_relaxed);
+		return;
+	}
+	(void)PostBounded(state.libraries, state.libraries_bound, PipelineBuildQueue::Lane::Back,
+	                  [this, id = build.id, spirv = std::move(build.spirv), compiled = std::move(build.info), draw] {
+		                  RunPreRasterPrebuild(id, spirv, compiled, draw);
+	                  });
+}
+
+// The pre-rasterization key is made as FillStaticKey and MakePreRasterKey make it for a draw with no
+// tessellation and no rect list, which are both skipped. The vertex module here has no handle of its
+// own, since the library build uses only the plain module, made privately and destroyed after.
+void PipelineCache::RunPreRasterPrebuild(uint64_t id, const std::vector<uint32_t>& spirv,
+                                         const ShaderRecompiler::IR::CompiledShaderInfo& info, const ScannedDraw& draw) {
+	auto&      counts = m_graphics_prescan->counters.vertex;
+	const auto skip   = [&](GraphicsPrebuildSkip reason) {
+		counts.prebuild_skipped[static_cast<size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
+	};
+	const GraphicsJobSlot slot(m_graphics_prescan->running_jobs, m_graphics_prescan->counters, m_graphics_prescan->libraries);
+	const Common::FirstRunReport::PrescanGraphicsRunningScope running;
+	if (!m_graphics.graphics_pipeline_library_enabled || m_libraries == nullptr) {
+		return skip(GraphicsPrebuildSkip::LibrariesOff);
+	}
+	if (m_graphics.image_heap_layout == nullptr) {
+		return skip(GraphicsPrebuildSkip::NoHeapLayout);
+	}
+	if (draw.mode_control.provoking_vtx_last && !m_graphics.provoking_vertex_last_enabled) {
+		counts.prebuild_provoking_unsupported.fetch_add(1, std::memory_order_relaxed);
+		return;
+	}
+	ShaderModule vertex {.id = id, .module = CompileSPV(spirv, m_graphics.device), .info = info};
+	const auto   layout = VertexSplitSetLayout(m_graphics, m_set_layouts, vertex);
+	if (layout) {
+		const auto key    = ScannedPreRasterKey(id, draw);
+		const auto before = StallMarks::Take();
+		const auto begin  = Clock::now();
+		if (PrebuildPreRasterLibrary(m_graphics, *m_libraries, *layout, vertex, key, m_driver_cache)) {
+			const auto after = StallMarks::Take();
+			counts.prebuilt.fetch_add(1, std::memory_order_relaxed);
+			counts.prebuild_us.fetch_add(WholeMicros(Clock::now() - begin), std::memory_order_relaxed);
+			counts.prebuild_in_scope.fetch_add(
+			    before.scope_active || after.scope_active || after.scopes != before.scopes ? 1 : 0, std::memory_order_relaxed);
+			counts.prebuild_in_hold.fetch_add(
+			    before.hold_active || after.hold_active || after.holds != before.holds ? 1 : 0, std::memory_order_relaxed);
+			m_driver_cache_dirty.store(true, std::memory_order_relaxed);
+		} else {
+			skip(GraphicsPrebuildSkip::AlreadyThere);
+		}
+	} else {
+		skip(GraphicsPrebuildSkip::LayoutLimits);
+	}
+	m_graphics.device.destroyShaderModule(vertex.module, nullptr);
 }
 
 // Several translate workers post at once. That is safe: the intake always carries the plan, so its
@@ -1277,6 +1370,53 @@ void PipelineCache::PostGraphicsPrescanModule(DecodedModuleRecord&& record, std:
 		}
 		PushGenerated(std::move(*item));
 	}
+}
+
+// The library is keyed as a single-sample draw with this alpha to coverage would key it, see
+// FillStaticKey. The split module is private to this job and destroyed after, which Vulkan allows
+// once the library is made.
+void PipelineCache::RunFragmentPrebuild(uint64_t id, const std::vector<uint32_t>& spirv,
+                                        const ShaderRecompiler::IR::CompiledShaderInfo& info,
+                                        bool alpha_to_coverage) {
+	auto&      counters = m_graphics_prescan->counters;
+	const auto skip     = [&](GraphicsPrebuildSkip reason) {
+		counters.prebuild_skipped[static_cast<size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
+	};
+	const GraphicsJobSlot slot(m_graphics_prescan->running_jobs, counters, m_graphics_prescan->libraries);
+	const Common::FirstRunReport::PrescanGraphicsRunningScope running;
+	if (!m_graphics.graphics_pipeline_library_enabled || m_libraries == nullptr) {
+		return skip(GraphicsPrebuildSkip::LibrariesOff);
+	}
+	if (m_graphics.image_heap_layout == nullptr) {
+		return skip(GraphicsPrebuildSkip::NoHeapLayout);
+	}
+	ShaderModule pixel {.id = id, .gpl_module = CompileSplitPixelModule(m_graphics, ShaderType::Pixel, spirv),
+	                    .info = info};
+	if (pixel.gpl_module == nullptr) {
+		return skip(GraphicsPrebuildSkip::NoSplitModule);
+	}
+	const auto layout = PixelSplitSetLayout(m_graphics, m_set_layouts, pixel);
+	if (layout) {
+		const FragmentKey key {.pixel_id = id, .samples = 1, .alpha_to_coverage_enable = alpha_to_coverage};
+		const auto        before = StallMarks::Take();
+		const auto        start  = Clock::now();
+		const bool built = PrebuildFragmentLibrary(m_graphics, *m_libraries, *layout, pixel, key, m_driver_cache);
+		const auto after = StallMarks::Take();
+		if (built) {
+			counters.prebuilt.fetch_add(1, std::memory_order_relaxed);
+			counters.prebuild_us.fetch_add(WholeMicros(Clock::now() - start), std::memory_order_relaxed);
+			const bool in_scope = before.scope_active || after.scope_active || after.scopes != before.scopes;
+			const bool in_hold  = before.hold_active || after.hold_active || after.holds != before.holds;
+			counters.prebuild_in_scope.fetch_add(in_scope ? 1 : 0, std::memory_order_relaxed);
+			counters.prebuild_in_hold.fetch_add(in_hold ? 1 : 0, std::memory_order_relaxed);
+			m_driver_cache_dirty.store(true, std::memory_order_relaxed);
+		} else {
+			skip(GraphicsPrebuildSkip::AlreadyThere);
+		}
+	} else {
+		skip(GraphicsPrebuildSkip::LayoutLimits);
+	}
+	m_graphics.device.destroyShaderModule(pixel.gpl_module, nullptr);
 }
 
 // The set is the GPU thread's, so a lookup on another thread, such as a boot-time one, is left out.

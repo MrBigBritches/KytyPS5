@@ -698,6 +698,11 @@ private:
 	void RunVertexPrescan(const ScannedDraw& draw, const ShaderRecompiler::IR::Bindings& ps_bindings, uint32_t ps_cursor);
 	void PostVertexBuild(const ScannedDraw& draw, const GraphicsStageSource& source, const ShaderVertexInputInfo& info,
 	                     std::chrono::steady_clock::time_point start);
+	void RunPreRasterPrebuild(uint64_t id, const std::vector<uint32_t>& spirv,
+	                          const ShaderRecompiler::IR::CompiledShaderInfo& info, const ScannedDraw& draw);
+	// Builds the fragment library of a module the worker posted. Library worker.
+	void RunFragmentPrebuild(uint64_t id, const std::vector<uint32_t>& spirv,
+	                         const ShaderRecompiler::IR::CompiledShaderInfo& info, bool alpha_to_coverage);
 	// Makes the module of a graphics prescan record and hands it to the GPU thread, as
 	// PostPrescanModule does with the graphics intake. Worker.
 	void PostGraphicsPrescanModule(DecodedModuleRecord&& record, std::vector<uint8_t>&& record_bytes);
