@@ -176,6 +176,57 @@ void TestMaskedTargetLeavesStageInactive() {
 	CHECK(!outcome.active);
 }
 
+// The export mode a packed UNorm target must be written in.
+constexpr uint8_t PACKED_UNORM_EXPORT = 9;
+
+// The baseline with target 0 made an 11_11_10 UNorm target, the packed UNorm format, written whole in
+// the packed export mode and unblended, which the host can write.
+HW::Context PackedUnormContext() {
+	auto          context = BaselineContext();
+	HW::ColorInfo info    = context.GetRenderTarget(0).info;
+	info.format           = Prospero::ChannelLayout::k11_11_10;
+	info.channel_order    = Prospero::ChannelOrder::kStandard;
+	context.SetColorInfo(0, info);
+	context.SetTargetOutputMode(0, PACKED_UNORM_EXPORT);
+	HW::BlendControl blend = context.GetBlendControl(0);
+	blend.enable           = false;
+	context.SetBlendControl(0, blend);
+	return context;
+}
+
+// A packed UNorm target that is blended, or written in another export mode, is refused where the GPU
+// thread EXITs. The baseline is the same target unblended in the packed mode, which is accepted and
+// sets its packed mask, so the packed path is reached and each refusal comes from its one register.
+void TestPackedUnormIsRefused() {
+	const auto accepted = Run(PackedUnormContext());
+	CHECK(accepted.status == PixelInputStatus::Ok);
+	CHECK(accepted.info.target_packed_unorm_mask == 1u);
+
+	auto             blended = PackedUnormContext();
+	HW::BlendControl blend   = blended.GetBlendControl(0);
+	blend.enable             = true;
+	blended.SetBlendControl(0, blend);
+	CHECK(Run(blended).status == PixelInputStatus::UnsupportedPackedUnorm);
+
+	auto other_mode = PackedUnormContext();
+	other_mode.SetTargetOutputMode(0, FOUR_CHANNEL_EXPORT);
+	CHECK(Run(other_mode).status == PixelInputStatus::UnsupportedPackedUnorm);
+}
+
+// The EXITing mapping gives what the Try form gives for a target both accept. The baseline's reversed
+// channel order makes its mapping other than the identity, so a mapping left default does not match.
+void TestExitingMappingMatchesTry() {
+	const auto               context = BaselineContext();
+	const auto               written = PixelColorOutputMask(context);
+	PixelTargetExportMapping tried {};
+	CHECK(TryPixelTargetExportMapping(context, written, tried));
+	const auto exiting = PixelTargetExportMappingOf(context, written);
+	CHECK(!exiting[0].IsIdentity());
+	for (uint32_t slot = 0; slot < PIXEL_COLOR_TARGETS; slot++) {
+		CHECK(exiting[slot].packed == tried[slot].packed);
+	}
+}
+
 } // namespace
 
 int main() {
@@ -186,6 +237,8 @@ int main() {
 	TestRectListUnlessMesh();
 	TestUnsupportedTargetFormatIsRefused();
 	TestMaskedTargetLeavesStageInactive();
+	TestPackedUnormIsRefused();
+	TestExitingMappingMatchesTry();
 	if (g_failures != 0) {
 		std::fprintf(stderr, "%d check(s) failed\n", g_failures);
 		return 1;

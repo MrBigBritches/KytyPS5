@@ -836,6 +836,37 @@ void TestIndirectUconfigListApplies() {
 	CHECK(walk_with(Prospero::PrimitiveType::kTriList).draws.size() == 1);
 }
 
+// Target 0 as an 11_11_10 UNorm target, the packed UNorm format, with every channel on in both masks
+// and written in the packed export mode. CB_COLOR0_BASE holds the address from bit 8.
+constexpr uint64_t PACKED_TARGET_ADDRESS = 0x0000001000000000ull;
+constexpr uint32_t COLOR_BASE_SHIFT      = 8;
+constexpr uint32_t PACKED_TARGET_INFO =
+    static_cast<uint32_t>(Prospero::ChannelLayout::k11_11_10) << Pm4::CB_COLOR0_INFO_FORMAT_SHIFT;
+constexpr uint32_t TARGET0_CHANNELS    = 0xfu;
+constexpr uint32_t PACKED_UNORM_EXPORT = 9;
+constexpr uint32_t BLEND_ENABLE        = 1u << Pm4::CB_BLEND0_CONTROL_ENABLE_SHIFT;
+
+// A blended packed UNorm target, which GetGraphicsPrograms EXITs on, is counted and not offered. The
+// baseline is the same target unblended, which is offered with its packed mask set, so the walk reaches
+// the packed check and the refusal comes from the blend alone.
+void TestPackedUnormIsNotOffered() {
+	const auto walk_with = [](bool blended) {
+		Stream stream = PixelSetup();
+		Append(stream, SetContext(Pm4::CB_COLOR0_BASE, {static_cast<uint32_t>(PACKED_TARGET_ADDRESS >> COLOR_BASE_SHIFT)}));
+		Append(stream, SetContext(Pm4::CB_COLOR0_INFO, {PACKED_TARGET_INFO}));
+		Append(stream, SetContext(Pm4::CB_TARGET_MASK, {TARGET0_CHANNELS, TARGET0_CHANNELS}));
+		Append(stream, SetContext(Pm4::SPI_SHADER_COL_FORMAT, {PACKED_UNORM_EXPORT}));
+		Append(stream, SetContext(Pm4::CB_BLEND0_CONTROL, {blended ? BLEND_ENABLE : 0u}));
+		Append(stream, DrawAuto());
+		return Walk(stream);
+	};
+	const auto blended = walk_with(true);
+	CHECK(blended.draws.empty() && blended.stats.unsupported_packed_unorm == 1);
+	const auto plain = walk_with(false);
+	CHECK(plain.draws.size() == 1 && plain.stats.unsupported_packed_unorm == 0);
+	CHECK(!plain.draws.empty() && plain.draws[0].ps_info.target_packed_unorm_mask == 1u);
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -864,6 +895,7 @@ int main(int argc, char** argv) {
 	TestClearStateResetsContext();
 	TestPrimitiveTypeReachesClassChecks();
 	TestIndirectUconfigListApplies();
+	TestPackedUnormIsNotOffered();
 	if (g_failures != 0) {
 		std::fprintf(stderr, "%d check(s) failed\n", g_failures);
 		return 1;
