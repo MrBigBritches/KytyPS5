@@ -18,6 +18,9 @@ struct GuestGpuOptions {
 	/// Runs the submit-time compute prescan. It reads each command list as the game submits it and
 	/// builds the compute shaders it is about to run. Off by default.
 	bool prescan_compute_builds = false;
+	/// Also walks the graphics state of each submitted list and hands its draws to the pipeline cache's
+	/// graphics prescan sink (experimental). It needs prescan_compute_builds, whose scanner it rides on.
+	bool prescan_graphics_libraries = false;
 	/// Makes the prescan's transport. Empty means the Stream worker in a child process, which is what a
 	/// real run uses. Tests pass the in-process one.
 	StoreGen::PrescanTransportFactory prescan_transport;
@@ -33,8 +36,9 @@ struct GuestGpuOptions {
 	/// the scanner reaches it. GuestGpuTestAccess starts it.
 	bool defer_scanner_start_for_test = false;
 
-	/// The options a real run uses, read from the Config. Only prescan_compute_builds comes from
-	/// it, from --prescan-compute-builds, and every other field keeps its default, so the prescan
+	/// The options a real run uses, read from the Config. Only prescan_compute_builds and
+	/// prescan_graphics_libraries come from it, from --prescan-compute-builds and
+	/// --prescan-graphics-libraries, and every other field keeps its default, so the prescan
 	/// runs with the helper process and the backing reader. With the option off it equals a
 	/// default-made value. The Config must be initialized.
 	[[nodiscard]] static GuestGpuOptions FromConfig();

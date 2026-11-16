@@ -3078,6 +3078,31 @@ void CheckPrescanFlagOption() {
   std::printf("[host]    %-32s ok\n", name);
 }
 
+// --prescan-graphics-libraries reaches the getter and the options a real run's GPU is made with, apart
+// from --prescan-compute-builds. The baseline is a Config with neither, where both read off. Loading
+// each option alone tells the two apart, so a getter or a FromConfig line that reads the compute field,
+// or never reads the graphics one, fails. The Config is put back afterwards.
+void CheckPrescanGraphicsFlagOption() {
+  constexpr const char *name = "PrescanGraphicsFlagOption";
+  Config::Load({.printf_direction = Config::LogDirection::Silent});
+  const bool off = Config::PrescanGraphicsLibrariesEnabled();
+  const auto off_options = GuestGpuOptions::FromConfig();
+  Config::Load({.prescan_compute_builds = true, .printf_direction = Config::LogDirection::Silent});
+  const bool compute_only = Config::PrescanGraphicsLibrariesEnabled();
+  const auto compute_options = GuestGpuOptions::FromConfig();
+  Config::Load({.prescan_graphics_libraries = true, .printf_direction = Config::LogDirection::Silent});
+  const bool graphics_only = Config::PrescanGraphicsLibrariesEnabled();
+  const auto graphics_options = GuestGpuOptions::FromConfig();
+  Config::Load({.printf_direction = Config::LogDirection::Silent});
+  Require(name, "option", !off && !compute_only && graphics_only,
+          "the getter did not follow --prescan-graphics-libraries alone");
+  Require(name, "options",
+          !off_options.prescan_graphics_libraries && !compute_options.prescan_graphics_libraries &&
+              graphics_options.prescan_graphics_libraries && !graphics_options.prescan_compute_builds,
+          "FromConfig did not take the graphics option from its own field");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 struct BdaMapping {
   uint64_t guest_base = 0;
   u32 backing_offset = 0;
@@ -68624,6 +68649,133 @@ void CheckPrescanFlagOffBuildsNothing(VulkanHarness &vulkan) {
   std::printf("[gpu]     %-32s ok\n", name);
 }
 
+// The scanner walks graphics state on queue 0 only, the queue that draws.
+constexpr u32 PRESCAN_GPU_GRAPHICS_QUEUE = 0;
+// The pixel shader of CheckPrescanGraphicsFlag's draw. It is never mapped, so the graphics prescan's job
+// for it stops at the shader map and builds nothing.
+constexpr uint64_t PRESCAN_GPU_PS_ADDRESS = 0x0000007100000000ull;
+// A SET_CONTEXT_REG packet's header and register offset.
+constexpr u32 PRESCAN_GPU_SET_CONTEXT_HEADER_DWORDS = 2;
+// KILL_ENABLE lets the pixel stage run with no colour target, and one interpolator reads the perspective
+// centre, as GraphicsScanTests' PixelSetup writes them, so the walk offers the draw.
+constexpr u32 PRESCAN_GPU_PS_KILL = 1u << Pm4::DB_SHADER_CONTROL_KILL_ENABLE_SHIFT;
+constexpr u32 PRESCAN_GPU_PERSP_CENTER = 0x2u;
+constexpr u32 PRESCAN_GPU_ONE_INTERPOLATOR = 1;
+constexpr u32 PRESCAN_GPU_DRAW_DWORDS = 3;
+constexpr u32 PRESCAN_GPU_DRAW_VERTICES = 3;
+
+// Appends a SET_CONTEXT_REG packet that writes consecutive registers from `reg`.
+void AppendPrescanGpuSetContext(std::vector<u32> &list, u32 reg, std::initializer_list<u32> values) {
+  const auto dwords = PRESCAN_GPU_SET_CONTEXT_HEADER_DWORDS + static_cast<u32>(values.size());
+  list.insert(list.end(), {KYTY_PM4(dwords, Pm4::IT_SET_CONTEXT_REG, Pm4::R_ZERO), reg});
+  list.insert(list.end(), values);
+}
+
+// A graphics list that makes the unmapped pixel shader current and draws once with it.
+std::vector<u32> PrescanGpuDrawList() {
+  std::vector<u32> list;
+  AppendScanKeySetSh(list, Pm4::SPI_SHADER_PGM_LO_PS,
+                     {static_cast<u32>(PRESCAN_GPU_PS_ADDRESS >> SCAN_KEY_ADDRESS_LOW_SHIFT),
+                      static_cast<u32>(PRESCAN_GPU_PS_ADDRESS >> SCAN_KEY_ADDRESS_HIGH_SHIFT)});
+  AppendPrescanGpuSetContext(list, Pm4::DB_SHADER_CONTROL, {PRESCAN_GPU_PS_KILL});
+  AppendPrescanGpuSetContext(list, Pm4::SPI_PS_INPUT_ENA, {PRESCAN_GPU_PERSP_CENTER, PRESCAN_GPU_PERSP_CENTER});
+  AppendPrescanGpuSetContext(list, Pm4::SPI_PS_IN_CONTROL, {PRESCAN_GPU_ONE_INTERPOLATOR});
+  list.insert(list.end(), {KYTY_PM4(PRESCAN_GPU_DRAW_DWORDS, Pm4::IT_DRAW_INDEX_AUTO, Pm4::R_ZERO),
+                           PRESCAN_GPU_DRAW_VERTICES, 0u});
+  return list;
+}
+
+// One arm of CheckPrescanGraphicsFlag, a GPU made with the two prescan options and the first-run report
+// on. The draw list is pushed straight into the scanner, so the GPU thread never runs a draw of an
+// unmapped shader, and the scanner has finished with the job once it counts it.
+void CheckPrescanGraphicsFlagArm(VulkanHarness &vulkan, const char *name, bool compute, bool graphics) {
+  using Common::FirstRunReport::GraphicsPrescanPart;
+  auto &report = Common::FirstRunReport::Global();
+  report.Reset();
+  Common::FirstRunReport::Configure(true, false);
+  RenderContext context(vulkan.RuntimeContext(), std::filesystem::path{});
+  auto options = PrescanGpuOptions(compute);
+  options.prescan_graphics_libraries = graphics;
+  InitializePrescanGpu(context, options);
+  auto &cache = context.GetPipelineCache();
+  auto &gpu = context.GetGpu();
+  auto *scanner = GuestGpuTestAccess::Scanner(gpu);
+  const std::string arm = std::string(compute ? "compute" : "no compute") + (graphics ? " + graphics" : "");
+  if (!compute) {
+    Require(name, "the flag alone attaches nothing",
+            scanner == nullptr && !GuestGpuTestAccess::PrescanEnabledHere(gpu) &&
+                cache.GraphicsPrescanSightings() == nullptr &&
+                !report.HoldsGraphicsPrescanSource(GraphicsPrescanPart::Scanner) &&
+                !report.HoldsGraphicsPrescanSource(GraphicsPrescanPart::Cache),
+            arm + ": the graphics flag without the compute prescan started a scanner or the graphics prescan");
+    context.ShutdownGpu();
+    Common::FirstRunReport::Configure(false, false);
+    return;
+  }
+  Require(name, "a scanner is attached", scanner != nullptr, arm + ": the GPU attached no scanner");
+  Require(name, "graphics follows the flag",
+          scanner->HasGraphics() == graphics &&
+              report.HoldsGraphicsPrescanSource(GraphicsPrescanPart::Scanner) == graphics &&
+              report.HoldsGraphicsPrescanSource(GraphicsPrescanPart::Cache) == graphics,
+          arm + ": the scanner's graphics walk or its report sources did not follow the flag");
+  const auto list = PrescanGpuDrawList();
+  auto prepared = scanner->PrepareCommands(PRESCAN_GPU_GRAPHICS_QUEUE, list);
+  (void)scanner->Push(std::move(prepared.job), prepared.copy_us);
+  Require(name, "the list is walked", WaitForPrescan([scanner] { return scanner->Stats().jobs == 1; }),
+          arm + ": the scanner did not walk the pushed list");
+  Require(name, "the draw reaches the cache", cache.GraphicsPrescanDrawsOffered() == (graphics ? 1u : 0u),
+          arm + ": the walked draw did not reach the pipeline cache's graphics prescan once, or reached it "
+                "without the flag");
+  if (graphics) {
+    const auto sighting = cache.GraphicsPrescanSightings()->Find(SightingStage::Pixel, PRESCAN_GPU_PS_ADDRESS);
+    Require(name, "the walk notes its sighting",
+            sighting && (sighting->scan_verdicts & ScanVerdictBit(ScanVerdict::Recorded)) != 0,
+            arm + ": the scanner's walk did not note the draw in the cache's sightings");
+  }
+  gpu.Shutdown();
+  Require(name, "shutdown hands over the scanner part",
+          !report.HoldsGraphicsPrescanSource(GraphicsPrescanPart::Scanner),
+          arm + ": after Shutdown the report still held the scanner's graphics source");
+  context.ShutdownGpu();
+  Common::FirstRunReport::Configure(false, false);
+}
+
+// --prescan-graphics-libraries rides on the compute prescan's scanner. With both on, the GPU attaches
+// the graphics walk, a walked draw reaches the cache's sink once, the walk notes its sighting in the
+// cache's table, and the scanner's graphics figures are registered and handed over at Shutdown. The
+// baseline is compute alone, the same pushed list with the scanner but no graphics walk, which offers
+// no draw and registers no graphics part, so nothing but the flag attaches the walk. The flag alone
+// makes no scanner and starts no graphics prescan. The mutations are to drop the AttachGraphics block,
+// pass an empty sink, drop SetSightings, drop either graphics report registration, and attach the walk
+// regardless of the flag.
+void CheckPrescanGraphicsFlag(VulkanHarness &vulkan) {
+  constexpr const char *name = "PrescanGraphicsFlag";
+  CheckPrescanGraphicsFlagArm(vulkan, name, true, true);
+  CheckPrescanGraphicsFlagArm(vulkan, name, true, false);
+  CheckPrescanGraphicsFlagArm(vulkan, name, false, true);
+  Common::FirstRunReport::Global().Reset();
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
+// The GPU thread marks itself as the GPU thread, which the waited-prebuild boost reads when it waits on
+// a prebuild. The role is per thread and starts as None, so the baseline is the test thread, which
+// reads None, and a mark that leaked to every thread would fail there. The mutation is to drop
+// SetThreadRole from ThreadRun.
+void CheckGpuThreadRole(VulkanHarness &vulkan) {
+  constexpr const char *name = "GpuThreadRole";
+  using Common::GpuStall::ThreadRole;
+  RenderContext context(vulkan.RuntimeContext(), std::filesystem::path{});
+  context.InitializeGpu(nullptr, GuestGpuOptions{});
+  ThreadRole on_gpu = ThreadRole::None;
+  context.GetGpu().SendCommandSync([&on_gpu] { on_gpu = Common::GpuStall::CurrentThreadRole(); });
+  context.ShutdownGpu();
+  Require(name, "the GPU thread is marked", on_gpu == ThreadRole::Gpu,
+          "the GPU thread did not read the GPU thread's role");
+  Require(name, "other threads are not", Common::GpuStall::CurrentThreadRole() == ThreadRole::None,
+          "the test thread read a role it never set");
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
 // Without a shader store the preparer's sink passes no record bytes, so the GPU thread never frees them
 // at adoption. The sink is taken from the preparer's settings and called by hand, and the module it
 // posts waits in the intake, since nothing drains it. No bytes also pass if nothing was posted, so one
@@ -68769,6 +68921,8 @@ void CheckPrescanGuestGpu(VulkanHarness &vulkan) {
   CheckPrescanShutdownOrder(vulkan);
   CheckPrescanSingleProducer(vulkan);
   CheckPrescanFlagOffBuildsNothing(vulkan);
+  CheckPrescanGraphicsFlag(vulkan);
+  CheckGpuThreadRole(vulkan);
   CheckDispatchDepthSeen(vulkan);
   const auto store = PrescanStorePath("gpu_record");
   {
@@ -77180,6 +77334,7 @@ int main(int argc, char **argv) {
   CheckSpirvProfileElideExecSelectsBytes();
   CheckSpirvProfileElideExecSelectsOption();
   CheckPrescanFlagOption();
+  CheckPrescanGraphicsFlagOption();
   if (argc == 2 && std::strcmp(argv[1], "--elide-exec-selects-only") == 0) {
     VulkanHarness vulkan;
     for (const auto &test : ExecDiffCases()) RunCase(&vulkan, test);

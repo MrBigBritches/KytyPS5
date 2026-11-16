@@ -1081,6 +1081,8 @@ if(BUILD_TESTING)
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --scan-differential)
 	add_test(NAME emulator_prescan_compute_builds_cli
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --prescan-compute-builds)
+	add_test(NAME emulator_prescan_graphics_libraries_cli
+	         COMMAND $<TARGET_FILE:kyty_emulator> --help --prescan-graphics-libraries)
 	add_test(NAME emulator_audio_compile_hold_cli
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --audio-compile-hold)
 	add_test(NAME emulator_first_run_report_cli

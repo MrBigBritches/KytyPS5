@@ -77,6 +77,21 @@ $ArmTable["gen-prescan"] = @{
     Ready = $true
 }
 
+# The gen-prescan arm with pixel shaders and their fragment libraries built ahead from the scanner
+# (the experimental graphics prescan), so it differs from gen-prescan in one flag only.
+$ArmTable["gen-prescan-gpl"] = @{
+    Flags = @($ArmTable["gen-prescan"].Flags + @("--prescan-graphics-libraries"))
+    Ready = $true
+}
+
+# The gen-prescan-gpl arm where a draw the skip rules allow is skipped instead of deferred, so it
+# differs from gen-prescan-gpl in one flag only. The flag implies async pipelines, which the gen arms
+# leave off, so a comparison with gen-prescan-gpl measures both together.
+$ArmTable["gen-prescan-gpl-skip"] = @{
+    Flags = @($ArmTable["gen-prescan-gpl"].Flags + @("--async-pipelines-prefer-skip"))
+    Ready = $true
+}
+
 # "all" turns on every strategy, so it is Ready only once every strategy arm is, and its flags are
 # theirs together. The depth-only arm is left out, because it is the default skip rule with a
 # stricter gate. Both flags can be on at once, and then depth-only wins, so "all" would measure the

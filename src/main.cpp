@@ -82,6 +82,9 @@ static void PrintUsage() {
 	         "                                       it and build the compute shaders it is about\n"
 	         "                                       to run in a helper process (experimental).\n"
 	         "                                       Results persist only with --shader-cache.\n");
+	::printf("  --prescan-graphics-libraries         Also work out each submitted draw's pixel shader\n"
+	         "                                       and build its fragment library ahead. Needs\n"
+	         "                                       --prescan-compute-builds (experimental).\n");
 	::printf("  --tessellation                      Draw tessellation patches; skipped by default.\n");
 	::printf("  --occlusion-queries                  Count occlusion query samples on the GPU.\n");
 	::printf("  --audio-compile-hold                 Pause game audio while a long pipeline compile\n"
@@ -294,6 +297,7 @@ static constexpr Flag FLAGS[] = {
     {"--structured-jump-tables", &ConfigOptions::structured_jump_tables},
     {"--scan-differential", &ConfigOptions::scan_differential},
     {"--prescan-compute-builds", &ConfigOptions::prescan_compute_builds},
+    {"--prescan-graphics-libraries", &ConfigOptions::prescan_graphics_libraries},
     {"--tessellation", &ConfigOptions::tessellation_enabled},
     {"--occlusion-queries", &ConfigOptions::occlusion_queries_enabled},
     {"--audio-compile-hold", &ConfigOptions::audio_compile_hold_enabled},

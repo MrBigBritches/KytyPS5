@@ -93,6 +93,9 @@ struct ConfigOptions {
 	// shaders it is about to run in a helper process. Results persist only with
 	// shader_cache_enabled.
 	bool                   prescan_compute_builds      = false;
+	// Opts in to working out each submitted draw's pixel shader on the prescan's scanner and
+	// building its fragment library ahead (experimental). Needs prescan_compute_builds.
+	bool                   prescan_graphics_libraries  = false;
 	LogDirection           shader_log_direction        = LogDirection::Silent;
 	std::filesystem::path  shader_log_folder           = "_Shaders";
 	bool                   command_buffer_dump_enabled = false;
@@ -236,6 +239,9 @@ bool StructuredJumpTablesEnabled();
 bool ScanDifferentialEnabled();
 // True when the compute shaders of each submitted command list should be built ahead in a helper.
 bool PrescanComputeBuildsEnabled();
+/// True when --prescan-graphics-libraries asks the prescan to build pixel shaders and their fragment
+/// libraries ahead (experimental). It does nothing without --prescan-compute-builds.
+bool PrescanGraphicsLibrariesEnabled();
 
 LogDirection          GetPrintfDirection();
 std::filesystem::path GetPrintfOutputFile();

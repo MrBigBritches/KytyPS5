@@ -10,6 +10,7 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
+#include "graphics/guest_gpu/command_processor/graphicsScanShadow.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/command_processor/prescanScanner.h"
 #include "graphics/guest_gpu/command_processor/scanDifferential.h"
@@ -58,7 +59,8 @@ bool ReadBackingForPrescan(uint64_t address, void* destination, uint64_t bytes) 
 // Defined here and not in the options header, so that header stays free of the Config.
 GuestGpuOptions GuestGpuOptions::FromConfig() {
 	GuestGpuOptions options;
-	options.prescan_compute_builds = Config::PrescanComputeBuildsEnabled();
+	options.prescan_compute_builds     = Config::PrescanComputeBuildsEnabled();
+	options.prescan_graphics_libraries = Config::PrescanGraphicsLibrariesEnabled();
 	return options;
 }
 
@@ -89,6 +91,11 @@ GuestGpu::GuestGpu(RenderContext& renderer, const GuestGpuOptions& options): m_r
 		Common::FirstRunReport::Global().SetPrescanScanSource(
 		    [this] { return PrescanReportOf(m_prescan_scanner->Stats()); });
 	}
+	if (m_prescan_scanner != nullptr && m_prescan_scanner->HasGraphics()) {
+		Common::FirstRunReport::Global().SetGraphicsPrescanSource(
+		    Common::FirstRunReport::GraphicsPrescanPart::Scanner,
+		    [this] { return PrescanGraphicsScanReportOf(m_prescan_scanner->Stats()); });
+	}
 }
 
 GuestGpu::~GuestGpu() {
@@ -100,6 +107,11 @@ GuestGpu::~GuestGpu() {
 // one, so in both cases no scanner is attached and the run goes on without the prescan.
 void GuestGpu::StartPrescan(const GuestGpuOptions& options) {
 	if (!options.prescan_compute_builds) {
+		// Said once per GPU, which a run makes once, so the user knows the flag had no effect.
+		if (options.prescan_graphics_libraries) {
+			Log::WriteToConsoleAndLog(
+			    "Prescan: --prescan-graphics-libraries does nothing without --prescan-compute-builds\n");
+		}
 		return;
 	}
 	auto& cache = m_renderer.GetPipelineCache();
@@ -120,6 +132,14 @@ void GuestGpu::StartPrescan(const GuestGpuOptions& options) {
 	m_prescan_scanner = std::make_unique<PrescanScanner>(
 	    *inbox, options.prescan_reader ? options.prescan_reader : ScanMemoryReader(ReadBackingForPrescan),
 	    options.prescan_lag_bound);
+	if (options.prescan_graphics_libraries) {
+		auto sink   = cache.GraphicsPrescanSink();
+		auto shadow = std::make_unique<GraphicsScanShadow>();
+		// Null unless the first-run report is on, so without it the walk notes no sightings.
+		shadow->SetSightings(cache.GraphicsPrescanSightings());
+		m_prescan_scanner->AttachGraphics(std::move(shadow), std::move(sink));
+		Log::WriteToConsoleAndLog("Prescan: the scanner also walks graphics state (experimental)\n");
+	}
 	m_prescan_enabled_here = true;
 	if (!options.defer_scanner_start_for_test) {
 		m_prescan_scanner->Start();
@@ -157,6 +177,11 @@ void GuestGpu::Shutdown() {
 	// The scanner and the GPU thread are joined, so these figures are the whole run's.
 	if (m_prescan_scanner != nullptr) {
 		Common::FirstRunReport::Global().SetPrescanScanFinal(PrescanReportOf(m_prescan_scanner->Stats()));
+	}
+	if (m_prescan_scanner != nullptr && m_prescan_scanner->HasGraphics()) {
+		Common::FirstRunReport::Global().SetGraphicsPrescanFinal(
+		    Common::FirstRunReport::GraphicsPrescanPart::Scanner,
+		    PrescanGraphicsScanReportOf(m_prescan_scanner->Stats()));
 	}
 	m_shutdown_complete = true;
 }

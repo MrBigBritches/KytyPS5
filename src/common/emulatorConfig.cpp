@@ -37,6 +37,9 @@ void Load(const ConfigOptions& cfg) {
 	Common::DebugCounters::SetEnabled(cfg.perf_overlay_enabled);
 	// Pushed here rather than read by the audio code, so audio tests need no config.
 	Common::GpuStall::Configure(cfg.audio_compile_hold_enabled);
+	// The graphics prescan needs the compute prescan, and its adaptive cap is the only reader of the
+	// audio low-water signal, so without both the audio submit path signals nothing.
+	Common::GpuStall::SetAudioLowWaterHookEnabled(cfg.prescan_compute_builds && cfg.prescan_graphics_libraries);
 	Common::FirstRunReport::Configure(cfg.first_run_report_enabled, cfg.cold_pipelines_enabled);
 }
 
@@ -203,6 +206,10 @@ bool ScanDifferentialEnabled() {
 
 bool PrescanComputeBuildsEnabled() {
 	return g_config->prescan_compute_builds;
+}
+
+bool PrescanGraphicsLibrariesEnabled() {
+	return g_config->prescan_graphics_libraries;
 }
 
 LogDirection GetPrintfDirection() {

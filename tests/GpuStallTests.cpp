@@ -1,4 +1,5 @@
 #include "common/debugCounters.h"
+#include "common/emulatorConfig.h"
 #include "common/firstRunReport.h"
 #include "common/gpuStall.h"
 
@@ -654,6 +655,35 @@ void TestAudioLowWaterMarkBoundary() {
   }
 }
 
+// Config::Load turns the low-water hook on only when both the compute and the graphics prescan are
+// asked for. Each case loads default options with one combination and then makes the same primed
+// call, which signals whenever the hook is on, so only both may signal. Loading the defaults again
+// turns the hook off, and Shutdown lets go of the config. Run last, since a load also sets the stall
+// hold and the counters.
+void TestConfigLoadGatesTheHook() {
+  constexpr uint32_t kPeriod = 4096;
+  struct GateCase {
+    bool compute;
+    bool graphics;
+    bool signals;
+  };
+  Config::Initialize();
+  for (const auto &[compute, graphics, signals] :
+       {GateCase{true, true, true}, GateCase{true, false, false}, GateCase{false, true, false},
+        GateCase{false, false, false}}) {
+    Config::ConfigOptions options;
+    options.prescan_compute_builds     = compute;
+    options.prescan_graphics_libraries = graphics;
+    Config::Load(options);
+    Check(Common::GpuStall::NoteAudioQueueFill(true, static_cast<int>(kPeriod), kPeriod, 4 * kPeriod) == signals,
+          "the hook was on for a prescan combination other than both");
+  }
+  Config::Load(Config::ConfigOptions {});
+  Check(!Common::GpuStall::NoteAudioQueueFill(true, static_cast<int>(kPeriod), kPeriod, 4 * kPeriod),
+        "the default options left the hook on");
+  Config::Shutdown();
+}
+
 } // namespace
 
 int main() {
@@ -683,6 +713,7 @@ int main() {
   TestThreadRoleMarks();
   TestHoldHistogramPercentiles();
   TestExactPercentiles();
+  TestConfigLoadGatesTheHook();
   std::puts("GpuStallTests: all cases passed");
   return 0;
 }
