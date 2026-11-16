@@ -1701,6 +1701,12 @@ void DbgExitHandler(const char *, int, std::string_view) { std::abort(); }
 
 void DbgExitIfHandler(const char *, const char *, int) { std::abort(); }
 
+// The IR destructors hold a pause, and nothing here holds an ExitRejectScope
+// for it to pause.
+ExitRejectPause::ExitRejectPause() noexcept {}
+
+ExitRejectPause::~ExitRejectPause() {}
+
 } // namespace Common
 
 int main() {

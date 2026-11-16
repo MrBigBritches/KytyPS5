@@ -18,6 +18,7 @@
 #include <filesystem>
 #include <fstream>
 #include <gtest/gtest.h>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -233,6 +234,130 @@ TEST(Assert, ExitRejectScopeCoversOnlyItsOwnThread) {
 		    std::_Exit(0);
 	    },
 	    testing::ExitedWithCode(FATAL_EXIT_STATUS), "");
+}
+
+// EXITs from its destructor, as the IR destructors can through RemoveUse's EXIT_IF, holding an
+// ExitRejectPause first when `paused`. The destructor may throw so a case can catch what a scope
+// turns the EXIT into, and the flag keeps the paused and unpaused cases otherwise the same.
+struct ExitsOnDestruction {
+	bool paused = false;
+	~ExitsOnDestruction() noexcept(false) {
+		std::optional<Common::ExitRejectPause> pause;
+		if (paused) {
+			pause.emplace();
+		}
+		EXIT("%d in a destructor", REJECTED_VALUE);
+	}
+};
+
+// Thrown only to unwind, so no catch for it can mistake an ExitRejected for it.
+struct Unwinding {};
+
+// True when an unpaused ExitsOnDestruction, destroyed with nothing unwinding, threw ExitRejected.
+bool DestructorExitThrows() {
+	try {
+		const ExitsOnDestruction exits;
+	} catch (const Common::ExitRejected&) {
+		return true;
+	}
+	return false;
+}
+
+// Under a scope, EXIT in a destructor run by another exception's unwinding stays fatal, where the
+// old rule threw a second exception and std::terminate ended the child with a different status.
+// The baseline is the same destructor under the same scope with nothing unwinding, which throws.
+TEST(Assert, ExitInAnUnwindingDestructorStaysFatalUnderAScope) {
+	EXPECT_EXIT(
+	    {
+		    const Common::ExitRejectScope scope;
+		    std::_Exit(DestructorExitThrows() ? 0 : 1);
+	    },
+	    testing::ExitedWithCode(0), "");
+	EXPECT_EXIT(
+	    {
+		    const Common::ExitRejectScope scope;
+		    try {
+			    const ExitsOnDestruction exits;
+			    throw Unwinding {};
+		    } catch (const Unwinding&) {
+		    }
+		    std::_Exit(0);
+	    },
+	    testing::ExitedWithCode(FATAL_EXIT_STATUS), "");
+}
+
+// Enters its own scope while it is destroyed and notes whether EXIT under that scope threw.
+struct ScopesOnDestruction {
+	bool* threw = nullptr;
+	~ScopesOnDestruction() {
+		const Common::ExitRejectScope scope;
+		*threw = RaiseExit().rejected.file != nullptr;
+	}
+};
+
+// A scope entered inside a destructor that another exception's unwinding runs still turns EXIT
+// into a throw, which the destructor catches itself. A scope that compared against no exceptions
+// in flight, rather than the count it began with, makes that EXIT fatal. Once it ends, the outer
+// scope's own count is back, so EXIT with nothing unwinding throws again, where a count left at
+// the inner scope's value makes that EXIT fatal.
+TEST(Assert, AScopeEnteredWhileUnwindingStillThrows) {
+	EXPECT_EXIT(
+	    {
+		    const Common::ExitRejectScope outer;
+		    bool                          threw = false;
+		    try {
+			    const ScopesOnDestruction scopes {&threw};
+			    throw Unwinding {};
+		    } catch (const Unwinding&) {
+		    }
+		    std::_Exit(threw && RaiseExit().rejected.file != nullptr ? 0 : 1);
+	    },
+	    testing::ExitedWithCode(0), "");
+}
+
+// Under a scope, a destructor holding an ExitRejectPause gives EXIT's own fatal status. A pause that
+// left the scope in force makes the EXIT throw out of the destructor instead, which the death test
+// reports as a throw rather than that status. The baseline is the same destructor and scope without
+// the pause, which throws.
+TEST(Assert, ExitRejectPauseKeepsADestructorExitFatal) {
+	EXPECT_EXIT(
+	    {
+		    const Common::ExitRejectScope scope;
+		    std::_Exit(DestructorExitThrows() ? 0 : 1);
+	    },
+	    testing::ExitedWithCode(0), "");
+	EXPECT_EXIT(
+	    {
+		    const Common::ExitRejectScope scope;
+		    {
+			    const ExitsOnDestruction exits {.paused = true};
+		    }
+		    std::_Exit(0);
+	    },
+	    testing::ExitedWithCode(FATAL_EXIT_STATUS), "");
+}
+
+// A pause gives back every scope that was in force once it ends. EXIT throws straight after the
+// pause, with both scopes held, and again once the inner scope has closed. A pause that leaves the
+// depth at 0 makes the first EXIT fatal, and one that gives back a single scope makes the second
+// EXIT fatal. The second check alone misses the first case, because closing the inner scope from a
+// depth of 0 wraps the counter round to a value that is not 0. The baseline is ExitRejectScopesNest,
+// the same scopes without the pause.
+TEST(Assert, ExitRejectPauseGivesBackEveryScope) {
+	EXPECT_EXIT(
+	    {
+		    const Common::ExitRejectScope outer;
+		    bool                          threw_after_pause = false;
+		    {
+			    const Common::ExitRejectScope inner;
+			    {
+				    const Common::ExitRejectPause pause;
+			    }
+			    threw_after_pause = RaiseExit().rejected.file != nullptr;
+		    }
+		    std::_Exit(threw_after_pause && RaiseExit().rejected.file != nullptr ? 0 : 1);
+	    },
+	    testing::ExitedWithCode(0), "");
 }
 
 TEST(File, MissingFileStaysInvalidAndCreatedFileRoundTrips) {

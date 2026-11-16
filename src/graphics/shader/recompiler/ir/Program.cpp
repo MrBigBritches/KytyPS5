@@ -104,7 +104,10 @@ bool EquivalentValue(const ResourcePlan& program, Value left, Value right,
 ResourcePlan::ResourcePlan() = default;
 ResourcePlan::ResourcePlan(ResourcePlan&&) noexcept = default;
 
+// Detaches the plan's own instructions from the values they use before they are freed.
 ResourcePlan::~ResourcePlan() {
+	// Unlinking can EXIT, which must stay fatal here rather than throw out of a destructor.
+	const Common::ExitRejectPause fatal_exits;
 	for (auto& inst: value_storage) {
 		inst.Invalidate();
 	}

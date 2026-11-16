@@ -26,12 +26,35 @@ struct ExitRejected {
 /// compilation, whose inputs come from guest memory read ahead of the draw, so a check that fails
 /// there drops one job instead of the run. It must never be held where a throw cannot unwind, such as
 /// through generated code or a noexcept frame. Scopes nest.
+///
+/// An EXIT reached while an exception thrown inside the innermost scope is unwinding stays fatal,
+/// because a destructor run by that unwinding cannot throw again without ending the process through
+/// std::terminate. A scope entered inside such a destructor covers that destructor as usual.
+/// Destructors that can EXIT hold an ExitRejectPause, so an EXIT in them is the same clean fatal exit
+/// with or without a scope.
 class ExitRejectScope {
 public:
 	ExitRejectScope() noexcept;
 	~ExitRejectScope();
 	ExitRejectScope(const ExitRejectScope&)            = delete;
 	ExitRejectScope& operator=(const ExitRejectScope&) = delete;
+
+private:
+	int m_outer_uncaught = 0; ///< The enclosing scope's exception count, put back when this one ends.
+};
+
+/// Leaves EXIT fatal on this thread while it lives, even under an ExitRejectScope, and puts the
+/// scopes back when it ends (experimental). Destructors that can EXIT hold one, since a throw out of
+/// them would reach a noexcept frame and end the process through std::terminate instead of EXIT.
+class ExitRejectPause {
+public:
+	ExitRejectPause() noexcept;
+	~ExitRejectPause();
+	ExitRejectPause(const ExitRejectPause&)            = delete;
+	ExitRejectPause& operator=(const ExitRejectPause&) = delete;
+
+private:
+	uint32_t m_paused_depth = 0; ///< How many scopes were in force when the pause began.
 };
 
 } // namespace Common

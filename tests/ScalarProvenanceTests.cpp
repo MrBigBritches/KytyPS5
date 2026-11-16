@@ -931,6 +931,12 @@ void DbgExitHandler(const char *, int, std::string_view text) {
   throw std::runtime_error(std::string(text));
 }
 
+// The IR destructors hold a pause, and nothing here holds an ExitRejectScope
+// for it to pause.
+ExitRejectPause::ExitRejectPause() noexcept {}
+
+ExitRejectPause::~ExitRejectPause() {}
+
 } // namespace Common
 
 int main() {

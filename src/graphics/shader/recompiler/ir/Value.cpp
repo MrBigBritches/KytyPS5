@@ -114,7 +114,10 @@ Inst::Inst(ValueOpcode value_opcode, uint64_t value_flags)
 	}
 }
 
+// Removes this instruction from the use lists of the instructions it still takes as arguments.
 Inst::~Inst() {
+	// RemoveUse can EXIT, which must stay fatal here rather than throw out of a destructor.
+	const Common::ExitRejectPause fatal_exits;
 	ClearArgs();
 }
 

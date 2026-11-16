@@ -9098,6 +9098,12 @@ void DbgNotImplementedHandler(const char *expression, const char *file,
                            expression + " at " + file + ':' +
                            std::to_string(line));
 }
+
+// The IR destructors hold a pause, and nothing here holds an ExitRejectScope
+// for it to pause.
+ExitRejectPause::ExitRejectPause() noexcept {}
+
+ExitRejectPause::~ExitRejectPause() {}
 } // namespace Common
 
 // Keep this focused standalone target self-contained by amalgamating its small

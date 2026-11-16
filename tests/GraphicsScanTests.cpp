@@ -2,6 +2,7 @@
 // and the GPU thread's pixel input code, which is why it links the whole emulator. Each check that
 // proves a behaviour compares against a baseline stream that differs only in that behaviour.
 #include "common/assert.h"
+#include "common/childProcess.h"
 #include "common/emulatorConfig.h"
 #include "common/gpuStall.h"
 #include "graphics/guest_gpu/command_processor/graphicsScanShadow.h"
@@ -541,9 +542,20 @@ void TestRejectTallyKeepsLines() {
 	CHECK(sites.size() == 2 && sites[1].where == "Second.cpp:20" && sites[1].count == 1 && sites[1].text == "second");
 }
 
-// The death test. A scope that has ended leaves EXIT as it was, so the reserved select translated
-// outside any scope ends the process with EXIT's code. Its ctest is marked WILL_FAIL. A throw that
-// escapes, or a translation that returns, ends with 0 instead, which that ctest reports as a failure.
+// The argument that makes this binary run the death test's child instead of the tests.
+constexpr const char* EXIT_OUTSIDE_SCOPE_FLAG = "--exit-outside-scope";
+// How long the child gets to translate one shader and exit, far more than it needs.
+constexpr auto EXIT_OUTSIDE_SCOPE_LIMIT = std::chrono::seconds(30);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+constexpr int FATAL_EXIT_CODE = 321;
+#else
+// POSIX keeps the low 8 bits of the exit status.
+constexpr int FATAL_EXIT_CODE = 321 & 0xff;
+#endif
+
+// The child half of the death test, run with EXIT_OUTSIDE_SCOPE_FLAG. A scope that has ended leaves
+// EXIT as it was, so the reserved select translated outside any scope ends the process with EXIT's
+// code. A throw that is caught, or a translation that returns, ends with 0 instead.
 int ExitOutsideScope() {
 	{ const Common::ExitRejectScope ended; }
 	auto                  reserved = RawFetchMemory(SELECT_RESERVED);
@@ -557,6 +569,25 @@ int ExitOutsideScope() {
 	}
 	std::puts("EXIT did not happen");
 	return 0;
+}
+
+// The death test. This binary runs itself as the child above and requires EXIT's own code, so a
+// child that returns 0, or ends some other way such as std::terminate or a crash, fails it. A child
+// still running at the limit fails it too and is killed when `child` goes away.
+void TestExitOutsideScopeIsFatal() {
+	Common::ChildProcess           child;
+	const std::vector<std::string> arguments {EXIT_OUTSIDE_SCOPE_FLAG};
+	CHECK(child.Start(Common::ExecutablePath(), arguments));
+	const std::optional<int> code = child.Wait(EXIT_OUTSIDE_SCOPE_LIMIT);
+	if (code != FATAL_EXIT_CODE) {
+		// Says how the child ended, which the CHECK line alone does not.
+		if (code) {
+			std::fprintf(stderr, "the %s child returned %d\n", EXIT_OUTSIDE_SCOPE_FLAG, *code);
+		} else {
+			std::fprintf(stderr, "the %s child timed out\n", EXIT_OUTSIDE_SCOPE_FLAG);
+		}
+	}
+	CHECK(code == FATAL_EXIT_CODE);
 }
 
 // The most of three jobs on three workers that ran at once, each through a GraphicsJobSlot when
@@ -1433,7 +1464,7 @@ void TestPackedUnormIsNotOffered() {
 int main(int argc, char** argv) {
 	// The vertex table code reads the Config, which the emulator always has and this test makes.
 	Config::Initialize();
-	if (argc == 2 && std::strcmp(argv[1], "--exit-outside-scope") == 0) {
+	if (argc == 2 && std::strcmp(argv[1], EXIT_OUTSIDE_SCOPE_FLAG) == 0) {
 		return ExitOutsideScope();
 	}
 	TestVertexFormatGuard();
@@ -1451,6 +1482,7 @@ int main(int argc, char** argv) {
 		std::puts("GraphicsScanTests guards passed");
 		return 0;
 	}
+	TestExitOutsideScopeIsFatal();
 	TestInterpolatorWriteReachesDraw();
 	TestDrawNeedsProgramWriteSinceDoubt();
 	TestPopWithoutPushDoesNotExit();

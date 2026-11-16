@@ -5,7 +5,10 @@
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
+// Detaches every instruction from the values it uses before the instructions are freed.
 Block::~Block() {
+	// Unlinking can EXIT, which must stay fatal here rather than throw out of a destructor.
+	const Common::ExitRejectPause fatal_exits;
 	// Instructions own reverse-use links. Unlink every argument while all definitions are still
 	// alive, then let the list destroy the detached instructions.
 	for (auto& inst: instructions) {
