@@ -445,6 +445,10 @@ struct AudioUnderruns {
 	/// activity is never excused as the generator's. Saturates at the uint16 range, and is parallel
 	/// to at_ns.
 	std::vector<uint16_t> prescan_running;
+	/// How much graphics prescan work (experimental) was in progress at each underrun, its pixel shader
+	/// translations and fragment library prebuilds. It is kept apart from prescan_running, which is
+	/// the compute prescan's. Saturates at 255, and is parallel to at_ns.
+	std::vector<uint16_t> prescan_graphics_running;
 };
 
 /// What the report says about the machine and the emulator's own process. A figure the system did
@@ -1459,6 +1463,7 @@ private:
 	std::array<std::atomic<uint16_t>, AUDIO_UNDERRUN_CAPACITY> m_underrun_warm_back {};
 	std::array<std::atomic<uint8_t>, AUDIO_UNDERRUN_CAPACITY>  m_underrun_child_alive {};
 	std::array<std::atomic<uint16_t>, AUDIO_UNDERRUN_CAPACITY> m_underrun_prescan_running {};
+	std::array<std::atomic<uint8_t>, AUDIO_UNDERRUN_CAPACITY>  m_underrun_prescan_graphics_running {};
 	std::atomic<size_t>                                        m_underrun_next {0};
 	std::atomic<uint64_t>                                      m_underrun_overflow {0};
 };

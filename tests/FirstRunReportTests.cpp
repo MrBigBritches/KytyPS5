@@ -2191,6 +2191,36 @@ void TestUnderrunsCarryThePrescanTag() {
         "Reset left an old pre-scan tag in a reused slot");
 }
 
+// The graphics prescan's running jobs are taken at each underrun, apart from the compute tag. The
+// first underrun has one graphics job and no compute work, the second compute work and no graphics
+// job, and the third 300 graphics jobs, more than the byte the tag is kept in. A tag never stored,
+// copied from the compute tag, or not saturated at 255 differs from {1, 0, 255}.
+void TestUnderrunsCarryTheGraphicsRunningTag() {
+  constexpr size_t kManyJobs = 300;
+  using Common::FirstRunReport::PrescanGraphicsRunningScope;
+  Report report;
+  Common::FirstRunReport::Configure(true, false);
+  {
+    const PrescanGraphicsRunningScope job;
+    report.AddAudioUnderrun();
+  }
+  Common::FirstRunReport::SetPrescanRunningForTest(2);
+  report.AddAudioUnderrun();
+  Common::FirstRunReport::SetPrescanRunningForTest(0);
+  {
+    const auto jobs = std::make_unique<std::array<PrescanGraphicsRunningScope, kManyJobs>>();
+    report.AddAudioUnderrun();
+  }
+  Common::FirstRunReport::Configure(false, false);
+  const auto taken = report.AudioUnderrunsSoFar();
+  Check(taken.prescan_graphics_running == std::vector<uint16_t> {1, 0, 255} &&
+            taken.prescan_running == std::vector<uint16_t> {0, 2, 0},
+        "the graphics running tag was not taken at each underrun apart from the compute tag");
+  const auto json = nlohmann::json::parse(report.ToJson({}, 0, 1.0, 0.0, {}))["audio_underruns"];
+  Check(json["prescan_graphics_running"] == nlohmann::json::array({1, 0, 255}),
+        "the graphics running tag is not in the file");
+}
+
 // With a source, the writer asks it each time. A final figure replaces it at once and the source is
 // never called again, so the owner may destroy what the source reads. The baseline is the same
 // report before the final figure.
@@ -3152,6 +3182,7 @@ int main() {
   TestAudioUnderrunLanesFlagAndOverflow();
   TestHeldByCauseInJson();
   TestUnderrunsCarryThePrescanTag();
+  TestUnderrunsCarryTheGraphicsRunningTag();
   TestGenerationSourceThenFinal();
   TestGenerationWriterNeverTouchesADestroyedSource();
   TestGenerationFinalWaitsForAWriterInTheSource();

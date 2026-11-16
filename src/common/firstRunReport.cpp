@@ -331,6 +331,11 @@ void Report::AddAudioUnderrun() noexcept {
 	m_underrun_child_alive[slot].store(GeneratorChildAlive() ? 1 : 0, std::memory_order_relaxed);
 	m_underrun_prescan_running[slot].store(
 	    static_cast<uint16_t>(std::min(PrescanRunning(), count_limit)), std::memory_order_relaxed);
+	// The graphics prescan's counts are a few workers and a boost cap of two, so a byte holds them, and
+	// keeping these arrays small keeps a Report small enough for tests that put several on the stack.
+	constexpr uint32_t byte_limit = std::numeric_limits<uint8_t>::max();
+	m_underrun_prescan_graphics_running[slot].store(
+	    static_cast<uint8_t>(std::min(PrescanGraphicsRunning(), byte_limit)), std::memory_order_relaxed);
 	m_underrun_ns[slot].store(NowNs(), std::memory_order_release);
 }
 
@@ -351,6 +356,8 @@ AudioUnderruns Report::AudioUnderrunsSoFar() const {
 			    m_underrun_child_alive[slot].load(std::memory_order_relaxed));
 			result.prescan_running.push_back(
 			    m_underrun_prescan_running[slot].load(std::memory_order_relaxed));
+			result.prescan_graphics_running.push_back(
+			    m_underrun_prescan_graphics_running[slot].load(std::memory_order_relaxed));
 		}
 	}
 	return result;
@@ -764,6 +771,7 @@ void Report::Reset() {
 		m_underrun_warm_back[slot].store(0, std::memory_order_relaxed);
 		m_underrun_child_alive[slot].store(0, std::memory_order_relaxed);
 		m_underrun_prescan_running[slot].store(0, std::memory_order_relaxed);
+		m_underrun_prescan_graphics_running[slot].store(0, std::memory_order_relaxed);
 	}
 	m_underrun_next.store(0, std::memory_order_relaxed);
 	m_underrun_overflow.store(0, std::memory_order_relaxed);
@@ -1835,7 +1843,8 @@ nlohmann::json AudioUnderrunsToJson(const AudioUnderruns& underruns, int64_t epo
 	        {"warm_front", underruns.warm_front},
 	        {"warm_back", underruns.warm_back},
 	        {"child_alive", underruns.child_alive},
-	        {"prescan_running", underruns.prescan_running}};
+	        {"prescan_running", underruns.prescan_running},
+	        {"prescan_graphics_running", underruns.prescan_graphics_running}};
 }
 
 // The audio held time by cause. Each cause is written, even at 0, so a gate can read every one

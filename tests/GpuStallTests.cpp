@@ -1,4 +1,5 @@
 #include "common/debugCounters.h"
+#include "common/firstRunReport.h"
 #include "common/gpuStall.h"
 
 #include <algorithm>
@@ -413,6 +414,102 @@ void TestAudioLowWaterSignals() {
   Check(signal >= before && signal <= after, "a low-water signal did not move the throttle time to now");
 }
 
+// An underrun counts toward UnderrunsAfterLowWater only when a low-water signal came before it on its
+// port. The baseline is the same call for an underrun with no signal before it, which leaves the count
+// alone, so a count that ignores the flag fails the first check and one that never counts the second.
+void TestUnderrunsAfterLowWater() {
+  const auto before = Common::GpuStall::UnderrunsAfterLowWater();
+  Common::GpuStall::NoteUnderrun(false);
+  Check(Common::GpuStall::UnderrunsAfterLowWater() == before, "an underrun with no low-water signal was counted");
+  Common::GpuStall::NoteUnderrun(true);
+  Check(Common::GpuStall::UnderrunsAfterLowWater() == before + 1, "an underrun after a low-water signal was not counted");
+}
+
+// The hook starts off, so a run that never turns it on keeps the audio submit as it was. Run first,
+// before any case sets the gate. The baseline is the same call with the gate turned on, which signals,
+// so a hook that starts on fails the first check and the call is shown able to signal.
+void TestAudioLowWaterHookStartsOff() {
+  constexpr uint32_t kPeriod = 4096;
+  const bool off_at_start = !Common::GpuStall::NoteAudioQueueFill(true, static_cast<int>(kPeriod), kPeriod, 4 * kPeriod);
+  Common::GpuStall::SetAudioLowWaterHookEnabled(true);
+  const bool signals_on = Common::GpuStall::NoteAudioQueueFill(true, static_cast<int>(kPeriod), kPeriod, 4 * kPeriod);
+  Common::GpuStall::SetAudioLowWaterHookEnabled(false);
+  Check(off_at_start, "the audio low-water hook was on before anything turned it on");
+  Check(signals_on, "the same call did not signal with the hook turned on");
+}
+
+// With the gate on, a fill under the mark signals only from a primed queue and not on the first submit
+// after a hold, which drained the queue on purpose. Every call passes the same fill of one period
+// against a floor of four. A waiter thread is held once and then makes the resumed call, and the same
+// thread makes the baseline call after a second wait that did not hold, so the calls differ only in
+// whether the queue is primed or the thread is resuming. A negative fill, SDL's error value, is passed
+// from a primed queue on the test thread, which is not resuming, so it differs from the baseline only
+// in the fill. A hook that drops any of the three tests fails.
+void TestAudioLowWaterConditions() {
+  constexpr uint32_t kPeriod   = 4096;
+  constexpr uint32_t kFloor    = 4 * kPeriod;
+  constexpr int      kQueued   = static_cast<int>(kPeriod);
+  constexpr int      kSdlError = -1;
+  Common::GpuStall::SetAudioLowWaterHookEnabled(true);
+  const bool unprimed   = Common::GpuStall::NoteAudioQueueFill(false, kQueued, kPeriod, kFloor);
+  const bool error_fill = Common::GpuStall::NoteAudioQueueFill(true, kSdlError, kPeriod, kFloor);
+  Common::GpuStall::Configure(true, milliseconds(0));
+  auto scope = std::make_unique<Common::GpuStall::Scope>(kAnyCause);
+  std::atomic<bool> resumed_call {true};
+  std::atomic<bool> baseline_call {false};
+  std::thread waiter([&] {
+    Common::GpuStall::WaitWhileStalled();
+    resumed_call = Common::GpuStall::NoteAudioQueueFill(true, kQueued, kPeriod, kFloor);
+    Common::GpuStall::WaitWhileStalled(); // The Scope has ended, so this does not wait.
+    baseline_call = Common::GpuStall::NoteAudioQueueFill(true, kQueued, kPeriod, kFloor);
+  });
+  const auto park_deadline = Clock::now() + kParkLimit;
+  while (Common::GpuStall::WaiterCount() == 0 && Clock::now() < park_deadline)
+    std::this_thread::yield();
+  const bool parked = Common::GpuStall::WaiterCount() == 1;
+  scope.reset();
+  waiter.join();
+  Common::GpuStall::Configure(false);
+  Common::GpuStall::SetAudioLowWaterHookEnabled(false);
+  Check(parked, "the waiter did not hold");
+  Check(baseline_call, "a primed fill under the mark did not signal on a thread that was not resuming");
+  Check(!unprimed, "a queue that was not primed signalled");
+  Check(!error_fill, "an SDL error fill signalled");
+  Check(!resumed_call, "the first submit after a hold signalled");
+}
+
+// Runs one hold with `jobs` graphics prescan jobs counted when it begins. The jobs end while the
+// waiter is still parked, so the count at the hold's end is always 0.
+void RunHoldBegunWithGraphicsJobs(size_t jobs) {
+  std::vector<std::unique_ptr<Common::FirstRunReport::PrescanGraphicsRunningScope>> running;
+  for (size_t job = 0; job < jobs; ++job)
+    running.push_back(std::make_unique<Common::FirstRunReport::PrescanGraphicsRunningScope>());
+  Common::GpuStall::Configure(true, milliseconds(0));
+  auto scope = std::make_unique<Common::GpuStall::Scope>(kAnyCause);
+  auto waiters = StartParkedWaiters(1);
+  running.clear();
+  scope.reset();
+  for (auto &waiter : waiters) waiter.join();
+  Common::GpuStall::Configure(false);
+}
+
+// A stored hold carries the graphics prescan jobs running when it began, saturated at a byte. The
+// first hold begins with 300 jobs and the second with none, the baseline, and both sets of jobs are
+// gone by the hold's end. A count never stored, read at the hold's end, not read back, or not
+// saturated differs from {255, 0}.
+void TestHoldRecordsGraphicsRunning() {
+  constexpr size_t kManyJobs = 300;
+  Common::FirstRunReport::Configure(true, false);
+  RunHoldBegunWithGraphicsJobs(kManyJobs);
+  RunHoldBegunWithGraphicsJobs(0);
+  Common::FirstRunReport::Configure(false, false);
+  const auto records = Common::GpuStall::HoldRecords();
+  Check(records.size() >= 2, "the two holds were not stored");
+  Check(records[records.size() - 2].prescan_graphics_running == 255 &&
+            records[records.size() - 1].prescan_graphics_running == 0,
+        "a stored hold did not carry the graphics prescan jobs running when it began");
+}
+
 // The exact percentiles are nearest rank over the sorted holds. Ten holds of 10 to 100 ms give p50 of
 // 50 and p95 of 100, where a rank that rounds down gives 90 for p95. Nineteen holds of 300 ms and one
 // of 600 ms give an exact p95 of 300, which the buckets, with a bound of 500, could not show.
@@ -456,10 +553,69 @@ void TestHoldHistogramPercentiles() {
   Check(slow.PercentileMs(0.5) == 40000.0, "a hold in the last bucket did not report its own length");
 }
 
+// The audio low-water hook signals the throttle only with its gate on. Both runs pass the same primed
+// fill of one period against a floor of four periods, which is under the two-period mark, from a
+// thread that is not resuming from a hold, so they differ only in the gate. A hook that ignored the
+// gate would signal in the first run, and one that never signals fails the second. The signal count
+// and the throttle time are read around each call, and the gate is left off. The throttle time must
+// move forward across the gate-on call, after a short sleep, so an earlier signal such as a hold
+// start cannot stand in for it.
+void TestAudioLowWaterHookGate() {
+  constexpr uint32_t kPeriod = 4096;
+  constexpr uint32_t kFloor  = 4 * kPeriod;
+  constexpr int      kQueued = static_cast<int>(kPeriod);
+  Check(!Common::GpuStall::ResumedFromHold(), "the test thread is resuming from a hold, which skips the hook");
+
+  Common::GpuStall::SetAudioLowWaterHookEnabled(false);
+  const auto count_off  = Common::GpuStall::AudioLowWaterCount();
+  const auto signal_off = Common::GpuStall::LastThrottleSignalNs();
+  Check(!Common::GpuStall::NoteAudioQueueFill(true, kQueued, kPeriod, kFloor),
+        "the hook reported a low-water signal with the gate off");
+  Check(Common::GpuStall::AudioLowWaterCount() == count_off &&
+            Common::GpuStall::LastThrottleSignalNs() == signal_off,
+        "a low-water signal was recorded with the gate off");
+
+  // The steady clock ticks far finer than this, so a signal made now is later than any before it.
+  std::this_thread::sleep_for(milliseconds(1));
+  Common::GpuStall::SetAudioLowWaterHookEnabled(true);
+  const auto count_on  = Common::GpuStall::AudioLowWaterCount();
+  const auto signal_on = Common::GpuStall::LastThrottleSignalNs();
+  const bool signalled = Common::GpuStall::NoteAudioQueueFill(true, kQueued, kPeriod, kFloor);
+  Common::GpuStall::SetAudioLowWaterHookEnabled(false);
+  Check(signalled, "the hook did not report a low-water signal with the gate on");
+  Check(Common::GpuStall::AudioLowWaterCount() == count_on + 1 &&
+            Common::GpuStall::LastThrottleSignalNs() > signal_on,
+        "the low-water signal was not recorded with the gate on");
+}
+
+// With the gate on, the mark is the smaller of two periods and the floor less half a period. A floor
+// of two periods gives a mark of 1.5 periods, and a floor of eight periods a mark of two. A fill at
+// the mark signals nothing and one byte under it signals, so a mark off by a byte either way fails,
+// and a mark of two periods for every floor fails the two-period floor, whose 1.5-period fill would
+// then signal.
+void TestAudioLowWaterMarkBoundary() {
+  constexpr uint32_t kPeriod = 4096;
+  struct MarkCase {
+    uint32_t floor;
+    uint32_t mark;
+  };
+  for (const auto &[floor, mark] : {MarkCase{2 * kPeriod, 3 * kPeriod / 2}, MarkCase{8 * kPeriod, 2 * kPeriod}}) {
+    Common::GpuStall::SetAudioLowWaterHookEnabled(true);
+    const bool at_mark    = Common::GpuStall::NoteAudioQueueFill(true, static_cast<int>(mark), kPeriod, floor);
+    const bool under_mark = Common::GpuStall::NoteAudioQueueFill(true, static_cast<int>(mark) - 1, kPeriod, floor);
+    Common::GpuStall::SetAudioLowWaterHookEnabled(false);
+    Check(!at_mark, "a fill at the low-water mark signalled");
+    Check(under_mark, "a fill one byte under the low-water mark did not signal");
+  }
+}
+
 } // namespace
 
 int main() {
+  TestAudioLowWaterHookStartsOff();
   TestTrackerNothingActive();
+  TestAudioLowWaterHookGate();
+  TestAudioLowWaterMarkBoundary();
   TestTrackerThreshold();
   TestTrackerOverlapping();
   TestTrackerBackToBack();
@@ -476,6 +632,9 @@ int main() {
   TestHeldCausesSumToTotal();
   TestHoldStartSignalsThrottle();
   TestAudioLowWaterSignals();
+  TestUnderrunsAfterLowWater();
+  TestAudioLowWaterConditions();
+  TestHoldRecordsGraphicsRunning();
   TestHoldHistogramPercentiles();
   TestExactPercentiles();
   std::puts("GpuStallTests: all cases passed");

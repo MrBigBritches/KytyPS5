@@ -2,6 +2,7 @@
 #define KYTY_COMMON_GPU_STALL_H_
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -105,6 +106,8 @@ struct HoldRecord {
 	uint64_t  held_ns = 0;
 	int64_t   end_ns  = 0;
 	HoldCause cause   = HoldCause::Other;
+	/// How many graphics prescan jobs were running when the hold began, saturated at 255.
+	uint8_t prescan_graphics_running = 0;
 };
 
 /// When the last signal to throttle background work came, on the steady clock in nanoseconds since its
@@ -117,6 +120,38 @@ struct HoldRecord {
 /// 1.5 periods on a 1024-sample port at the 40 ms target and 2 periods on 256- and 512-sample ports.
 void NoteAudioLowWater() noexcept;
 [[nodiscard]] uint64_t AudioLowWaterCount() noexcept;
+
+/// Turns the audio low-water hook on or off for the run. It is set once before audio starts, on only
+/// when the graphics prescan runs, since its adaptive cap is the only reader of the signal.
+void SetAudioLowWaterHookEnabled(bool enabled) noexcept;
+
+namespace Detail {
+/// Whether the audio low-water hook runs. Read inline by NoteAudioQueueFill, so the off path of the
+/// audio submit is one relaxed load.
+inline std::atomic<bool> g_audio_low_water_hook {false};
+
+/// The body of NoteAudioQueueFill once the hook is known to be on.
+[[nodiscard]] bool NoteAudioQueueFillOn(bool queue_primed, int queued, uint32_t period, uint32_t min_queued) noexcept;
+} // namespace Detail
+
+/// The low-water hook of a blocking guest audio submit, called with the host queue fill it read after
+/// pacing, the period and the queue floor in bytes. With the hook off it returns false after one relaxed
+/// load and calls nothing. With it on, a primed queue under the low-water mark, outside the first
+/// submit after a hold, signals NoteAudioLowWater and returns true. A negative fill, which is SDL's
+/// error value, never signals.
+[[nodiscard]] inline bool NoteAudioQueueFill(bool queue_primed, int queued, uint32_t period,
+                                             uint32_t min_queued) noexcept {
+	if (!Detail::g_audio_low_water_hook.load(std::memory_order_relaxed)) {
+		return false;
+	}
+	return Detail::NoteAudioQueueFillOn(queue_primed, queued, period, min_queued);
+}
+
+/// Counts a blocking submit's underrun that came after a low-water signal on its port since the queue
+/// last primed, when `after_low_water`. The underrunning submit's own signal is not one, so the caller
+/// reads its flag before the hook. Relaxed, for the audio submit path.
+void NoteUnderrun(bool after_low_water) noexcept;
+[[nodiscard]] uint64_t UnderrunsAfterLowWater() noexcept;
 
 /// How many holds are kept one by one. Past it they are only counted in overflow, and the exact
 /// percentiles then cover the first holds only.

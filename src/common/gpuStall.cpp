@@ -1,6 +1,7 @@
 #include "common/gpuStall.h"
 
 #include "common/debugCounters.h"
+#include "common/firstRunReport.h"
 #include "common/logging/log.h"
 #include "common/threads.h"
 
@@ -9,6 +10,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <utility>
 
@@ -30,6 +32,10 @@ struct State {
 	// copied when that Scope ends, because a site may reclassify it until then. Id 0 means no hold.
 	uint64_t  hold_scope_id = 0;
 	HoldCause hold_cause    = HoldCause::Other;
+	// The graphics prescan jobs running when the current stall first held audio, saturated at a byte.
+	// Kept under the mutex with first_hold, so a hold that starts later cannot replace it before this
+	// hold is stored.
+	uint8_t hold_graphics_running = 0;
 };
 
 // Built on first use, so a Scope or audio push during static initialization finds it ready. It is
@@ -65,9 +71,12 @@ std::array<std::atomic<int64_t>, HOLD_RECORD_CAPACITY>  g_record_end_ns {};
 std::array<std::atomic<uint8_t>, HOLD_RECORD_CAPACITY>  g_record_cause {};
 std::atomic<size_t>                                     g_record_next {0};
 std::atomic<uint64_t>                                   g_record_overflow {0};
+// The graphics prescan jobs running when each stored hold began.
+std::array<std::atomic<uint8_t>, HOLD_RECORD_CAPACITY>  g_record_graphics_running {};
 // The last throttle signal on the steady clock in nanoseconds, and the audio low-water signals.
 std::atomic<int64_t>                                    g_last_throttle_signal_ns {0};
 std::atomic<uint64_t>                                   g_audio_low_water {0};
+std::atomic<uint64_t>                                   g_underruns_after_low_water {0};
 
 // Nanoseconds since the steady clock's epoch, the report's NowNs clock, for the throttle signals.
 int64_t SteadyNowNs() {
@@ -99,7 +108,7 @@ static_assert(AllCausesNamed(), "every HoldCause needs a name");
 
 // Keeps one finished hold, without allocating. The slot is reserved with one relaxed increment, and
 // a hold past the capacity only adds to the overflow count, so the index cannot wrap.
-void StoreHoldRecord(HoldCause cause, uint64_t held_ns, int64_t end_ns) {
+void StoreHoldRecord(HoldCause cause, uint64_t held_ns, int64_t end_ns, uint8_t graphics_running) {
 	if (g_record_next.load(std::memory_order_relaxed) >= HOLD_RECORD_CAPACITY) {
 		g_record_overflow.fetch_add(1, std::memory_order_relaxed);
 		return;
@@ -112,12 +121,14 @@ void StoreHoldRecord(HoldCause cause, uint64_t held_ns, int64_t end_ns) {
 	}
 	g_record_end_ns[slot].store(end_ns, std::memory_order_relaxed);
 	g_record_cause[slot].store(static_cast<uint8_t>(cause), std::memory_order_relaxed);
+	g_record_graphics_running[slot].store(graphics_running, std::memory_order_relaxed);
 	g_record_held_plus_one[slot].store(held_ns + 1, std::memory_order_release);
 }
 
 // Adds one finished hold to the cause table, the histogram and the records. The total is added by
-// the caller from the same value, so it is counted apart from the causes.
-void RecordHold(HoldCause cause, uint64_t held_ns, int64_t end_ns) {
+// the caller from the same value, so it is counted apart from the causes. `graphics_running` is the
+// count taken when the hold began.
+void RecordHold(HoldCause cause, uint64_t held_ns, int64_t end_ns, uint8_t graphics_running) {
 	const auto index = static_cast<size_t>(cause);
 	g_cause_ns[index].fetch_add(held_ns, std::memory_order_relaxed);
 	g_cause_count[index].fetch_add(1, std::memory_order_relaxed);
@@ -126,7 +137,7 @@ void RecordHold(HoldCause cause, uint64_t held_ns, int64_t end_ns) {
 	while (held_ns > seen_max &&
 	       !g_hold_max_ns.compare_exchange_weak(seen_max, held_ns, std::memory_order_relaxed)) {
 	}
-	StoreHoldRecord(cause, held_ns, end_ns);
+	StoreHoldRecord(cause, held_ns, end_ns, graphics_running);
 }
 
 // A thread that owns a Scope would wait on its own release, so it never waits.
@@ -259,6 +270,7 @@ Scope::~Scope() {
 	auto&                            state = GetState();
 	std::optional<Clock::time_point> stall_first_hold;
 	HoldCause                        stall_cause = HoldCause::Other;
+	uint8_t                          stall_graphics_running = 0;
 	{
 		LockGuard lock(state.mutex);
 		state.tracker.End(m_start, m_id);
@@ -272,6 +284,8 @@ Scope::~Scope() {
 			stall_first_hold = std::exchange(state.first_hold, std::nullopt);
 			stall_cause      = std::exchange(state.hold_cause, HoldCause::Other);
 			state.hold_scope_id = 0;
+			// Taken with first_hold under the same lock, so the record below keeps this hold's value.
+			stall_graphics_running = std::exchange(state.hold_graphics_running, uint8_t {0});
 			// The count goes up before the flag drops, and the release pairs with HoldInProgress's
 			// acquire, so a reader that sees the hold over also sees it counted. A hold can then
 			// never slip between the two reads of a worker that samples both.
@@ -290,7 +304,7 @@ Scope::~Scope() {
 		const auto end_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
 		                        Clock::now().time_since_epoch())
 		                        .count();
-		RecordHold(stall_cause, static_cast<uint64_t>(held_ns.count()), end_ns);
+		RecordHold(stall_cause, static_cast<uint64_t>(held_ns.count()), end_ns, stall_graphics_running);
 		DebugCounters::Add(DebugCounters::Counter::AudioHolds);
 		DebugCounters::Add(DebugCounters::Counter::AudioHoldNs,
 		                   static_cast<uint64_t>(held_ns.count()));
@@ -319,6 +333,11 @@ bool HoldWhileStalled() {
 				if (!state.first_hold.has_value()) {
 					state.first_hold = hold_start;
 					g_hold_in_progress.store(true, std::memory_order_relaxed);
+					// Read when the hold begins, so a long hold is tied to the graphics prescan work
+					// that was competing when audio stopped, not what ran by its end.
+					constexpr uint32_t byte_limit = std::numeric_limits<uint8_t>::max();
+					state.hold_graphics_running =
+					    static_cast<uint8_t>(std::min(FirstRunReport::PrescanGraphicsRunning(), byte_limit));
 					g_last_throttle_signal_ns.store(SteadyNowNs(), std::memory_order_relaxed);
 					// The stall is past the threshold, so the oldest Scope is the one that crossed it.
 					state.hold_scope_id = state.tracker.OldestId().value_or(0);
@@ -408,7 +427,9 @@ std::vector<HoldRecord> HoldRecords() {
 			const auto cause = g_record_cause[slot].load(std::memory_order_relaxed);
 			records.push_back({.held_ns = held_plus_one - 1,
 			                   .end_ns  = g_record_end_ns[slot].load(std::memory_order_relaxed),
-			                   .cause   = static_cast<HoldCause>(cause)});
+			                   .cause   = static_cast<HoldCause>(cause),
+			                   .prescan_graphics_running =
+			                       g_record_graphics_running[slot].load(std::memory_order_relaxed)});
 		}
 	}
 	return records;
@@ -425,6 +446,34 @@ void NoteAudioLowWater() noexcept {
 
 uint64_t AudioLowWaterCount() noexcept {
 	return g_audio_low_water.load(std::memory_order_relaxed);
+}
+
+void NoteUnderrun(bool after_low_water) noexcept {
+	if (after_low_water) {
+		g_underruns_after_low_water.fetch_add(1, std::memory_order_relaxed);
+	}
+}
+
+uint64_t UnderrunsAfterLowWater() noexcept {
+	return g_underruns_after_low_water.load(std::memory_order_relaxed);
+}
+
+void SetAudioLowWaterHookEnabled(bool enabled) noexcept {
+	Detail::g_audio_low_water_hook.store(enabled, std::memory_order_relaxed);
+}
+
+// The pacing wait leaves the queue just under its floor, which is two periods for a 1024-sample port
+// at the 40 ms target, so the mark is also half a period under the floor. That is 1.5 periods there,
+// about 10 ms late, which the 1 ms poll never leaves, and 2 periods on 256- and 512-sample ports.
+bool Detail::NoteAudioQueueFillOn(bool queue_primed, int queued, uint32_t period, uint32_t min_queued) noexcept {
+	constexpr uint32_t low_water_periods = 2;
+	const uint32_t     low_water         = std::min(period * low_water_periods, min_queued - period / 2);
+	// A negative fill is SDL's error value, not an empty queue, so it never signals.
+	if (queued < 0 || !queue_primed || ResumedFromHold() || queued >= static_cast<int>(low_water)) {
+		return false;
+	}
+	NoteAudioLowWater();
+	return true;
 }
 
 // Acquire pairs with the release in the Scope's constructor, so a Scope seen counted here is also

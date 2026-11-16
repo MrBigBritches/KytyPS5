@@ -127,6 +127,9 @@ private:
 		Format      format      = Format::Unknown;
 		OutputClock clock;
 		bool        queue_primed = false;
+		// A low-water signal fired on this port since the queue last primed. The submitting thread's
+		// own.
+		bool        low_water_since_primed = false;
 		int         channels_num = 0;
 		int         volume[12]   = {};
 
@@ -405,6 +408,16 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking, float 
 			Common::Thread::SleepMicro(1000);
 			queued = SDL_GetAudioStreamQueued(port->stream);
 		}
+		// Read before the hook, because an underrunning submit finds its queue under the mark too and
+		// would otherwise count as its own warning.
+		const bool warned_before = port->low_water_since_primed;
+		// A primed queue under its low-water mark is close to an underrun, so the graphics prescan's
+		// adaptive cap is told to back off. The fill was read above anyway. The hook does nothing unless
+		// the graphics prescan runs.
+		if (Common::GpuStall::NoteAudioQueueFill(port->queue_primed, queued, static_cast<uint32_t>(prepared_size),
+		                                         min_queued_size)) {
+			port->low_water_since_primed = true;
+		}
 		if (queued < static_cast<int>(prepared_size)) {
 			// A hold for a long pipeline compile drains the host queue on purpose, so the first
 			// submit after it re-primes without counting an underrun.
@@ -414,6 +427,7 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking, float 
 				// this guest thread, so it takes no lock and logs nothing. It misses the underruns
 				// of Audio3d and of non-blocking submits, which do not reach this branch.
 				Common::FirstRunReport::AddAudioUnderrun();
+				Common::GpuStall::NoteUnderrun(warned_before);
 			}
 			port->queue_primed = false;
 		}
@@ -430,7 +444,9 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking, float 
 	}
 	if (blocking && !port->queue_primed &&
 	    SDL_GetAudioStreamQueued(port->stream) >= static_cast<int>(min_queued_size)) {
-		port->queue_primed = true;
+		// Priming is the only reset of the warning, since a queue can only underrun once primed.
+		port->queue_primed           = true;
+		port->low_water_since_primed = false;
 	}
 
 	return true;
@@ -472,7 +488,9 @@ Audio::Id Audio::AudioOutOpen(int type, uint32_t samples_num, uint32_t freq, For
 
 			// Pad speaker ports keep the main output too; it plays them whenever no DualSense does.
 			if (type != AUDIO_OUT_PORT_TYPE_VIBRATION) {
-				OpenSdlDevice(&port);
+				if (OpenSdlDevice(&port)) {
+					LOGF("AudioOut: port period %u samples at %u Hz\n", port.samples_num, port.freq);
+				}
 			}
 			if (type == AUDIO_OUT_PORT_TYPE_VIBRATION || type == AUDIO_OUT_PORT_TYPE_PADSPK) {
 				port.haptics =

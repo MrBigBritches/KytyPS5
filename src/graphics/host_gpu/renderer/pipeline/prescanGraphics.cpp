@@ -617,6 +617,24 @@ VertexGroups(const GraphicsVertexCounters& counts, const PrebuiltLibraryCounts& 
 	return {std::move(modules), std::move(misses), std::move(skipped), std::move(libraries)};
 }
 
+// The graphics prescan jobs running when each audio hold of 500 ms or more began, in hold order, as
+// hold_<n>_running, after their count.
+Common::FirstRunReport::PrescanGraphicsReport::Group LongHoldsGroup() {
+	constexpr uint64_t long_hold_ns = 500'000'000;
+	Common::FirstRunReport::PrescanGraphicsReport::Group group {"holds_500ms", {}};
+	size_t index = 0;
+	for (const auto& hold: Common::GpuStall::HoldRecords()) {
+		if (hold.held_ns < long_hold_ns) {
+			continue;
+		}
+		group.figures.emplace_back(fmt::format("hold_{}_running", index),
+		                           static_cast<double>(hold.prescan_graphics_running));
+		index++;
+	}
+	group.figures.insert(group.figures.begin(), {"count", static_cast<double>(index)});
+	return group;
+}
+
 // The recompiler EXITs the workers caught, one figure per source line named <file>_<line> by the
 // file's base name, the first few lines only, after the count of distinct lines.
 Common::FirstRunReport::PrescanGraphicsReport::Group RejectedGroup(const GraphicsRejectTally& tally) {
@@ -1533,6 +1551,8 @@ Common::FirstRunReport::PrescanGraphicsReport PipelineCache::BuildGraphicsPresca
 	               {"paused_starts", Count(counters.paused_starts)},
 	               {"reduced_cap_ms", counters.cap_governor.ReducedMs(Common::FirstRunReport::NowNs())},
 	               {"reduced_cap_triggers", static_cast<double>(counters.cap_governor.Triggers())},
+	               {"audio_low_water_signals", static_cast<double>(Common::GpuStall::AudioLowWaterCount())},
+	               {"underruns_after_low_water", static_cast<double>(Common::GpuStall::UnderrunsAfterLowWater())},
 	               {"graphics_busy_fraction", GraphicsBusyFraction(counters)},
 	               {"posted", Count(counters.posted)},
 	               {"heap_image", Count(counters.heap_image)},
@@ -1581,6 +1601,7 @@ Common::FirstRunReport::PrescanGraphicsReport PipelineCache::BuildGraphicsPresca
 	for (auto& group: VertexGroups(counters.vertex, pre_raster)) {
 		report.groups.push_back(std::move(group));
 	}
+	report.groups.push_back(LongHoldsGroup());
 	report.groups.push_back(RejectedGroup(m_graphics_prescan->rejects));
 	report.groups.push_back(
 	    GraphicsBusyTimeline(counters, Common::FirstRunReport::Global().EpochNs(), Common::FirstRunReport::NowNs()));

@@ -1273,6 +1273,9 @@ struct PipelineCacheTestAccess {
   // Counts a module whose plan could not be decoded, as the generator's thread does. A test uses it
   // to change a figure after the stop and see whether the report still follows the cache.
   static void NoteBadPlan(PipelineCache &cache) { cache.m_generation->bad_plans++; }
+  // The lock a graphics prescan worker posts its module under. A test that takes it keeps the worker
+  // inside its job until the test lets go.
+  static std::mutex &GenerationMutex(PipelineCache &cache) { return cache.m_generation->mutex; }
   // One figure of the cache's part of the prescan_graphics block, or -1 when there is none.
   static double GraphicsPrescanFigure(const PipelineCache &cache, std::string_view group,
                                       std::string_view name) {
@@ -22811,6 +22814,9 @@ public:
     CheckGraphicsPrescanDedupe(fixture, sink, base, offered, rsrc2);
     CheckGraphicsPrescanVertexJob(fixture, sink, base, rsrc2);
     CheckGraphicsPrescanLateDuplicate(fixture, sink, base, rsrc2);
+    CheckGraphicsPrescanRunningTag(fixture, sink, base, rsrc2);
+    CheckGraphicsPrescanAudioRows(fixture);
+    CheckGraphicsPrescanLongHolds(fixture);
     fixture.scheduler.Finish();
     UnmapCadenceMemory(fixture.context, memory);
     SelectCadenceShader(fixture.processor, fixture.empty_shader, 0);
@@ -23141,6 +23147,133 @@ public:
     Require(GraphicsPrescanTestName, "late duplicate",
             figure("modules", "adopted") == adopted + 1 && figure("modules", "late_duplicates") == late_duplicates + 1,
             "a module the GPU thread compiled first was adopted, or not counted as a late duplicate");
+  }
+
+  // Waits until PrescanGraphicsRunning reads `jobs`, for at most `limit`.
+  static bool WaitForGraphicsRunning(uint32_t jobs, std::chrono::milliseconds limit) {
+    const auto deadline = std::chrono::steady_clock::now() + limit;
+    while (Common::FirstRunReport::PrescanGraphicsRunning() != jobs) {
+      if (std::chrono::steady_clock::now() >= deadline) {
+        return false;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return true;
+  }
+
+  // A graphics prescan job counts toward the prescan_graphics_running underrun tag while it runs. The
+  // worker is kept inside its job by holding the generation lock it posts its module under, so an
+  // underrun taken then must carry that one job. The baseline is an underrun on the same report taken
+  // just before, with no job running, which carries 0. A job that never holds its running scope, or a
+  // tag that never reads the count, fails. The report is on only here, since a scope counts only then.
+  void CheckGraphicsPrescanRunningTag(CadenceFixture &fixture, const GraphicsDrawSink &sink, uintptr_t base,
+                                      const HW::PsShaderResource2 &rsrc2) {
+    constexpr uint64_t held_offset = 0xe000;
+    constexpr u32 held_green = 9;
+    constexpr std::chrono::milliseconds idle_limit{30000};
+    constexpr std::chrono::milliseconds held_limit{5000};
+    auto &cache = fixture.context.GetPipelineCache();
+    auto &shaders = fixture.processor.GetShCtx();
+    shaders.SetPsShaderResource2(rsrc2);
+    shaders.SetPsShaderBase(PlaceGuestShader(base + held_offset, UserRedPixelShader(held_green),
+                                             Prospero::ShaderBinaryType::kPs, nullptr));
+    const auto draw = ScannedDrawOf(fixture.processor, base + held_offset);
+    const double jobs = GraphicsJobsDone(cache, false) + 1;
+    // The posted module queues one fragment library job, which counts while it runs too.
+    const double library_jobs = LibraryJobsDone(cache, "libraries") + 1;
+    auto report = std::make_unique<Common::FirstRunReport::Report>();
+    Common::FirstRunReport::Configure(true, false);
+    const bool idle = WaitForGraphicsRunning(0, idle_limit);
+    report->AddAudioUnderrun();
+    bool held = false;
+    {
+      // Nothing that can fail runs under the lock, so the worker is always let go.
+      const std::scoped_lock generation(PipelineCacheTestAccess::GenerationMutex(cache));
+      sink(std::span<const ScannedDraw>(&draw, 1));
+      held = WaitForGraphicsRunning(1, held_limit);
+      report->AddAudioUnderrun();
+    }
+    const bool finished = WaitForGraphicsJobs(cache, false, jobs);
+    // Every job the case started ends before the report goes off, so none counted here is still
+    // running when a later case reads the count.
+    const bool settled = WaitForLibraryJobs(cache, "libraries", library_jobs) && WaitForGraphicsRunning(0, idle_limit);
+    Common::FirstRunReport::Configure(false, false);
+    Require(GraphicsPrescanTestName, "running tag idle", idle, "a graphics prescan job was still running before the case");
+    Require(GraphicsPrescanTestName, "running tag worker", finished, "the held worker never finished");
+    Require(GraphicsPrescanTestName, "running tag settled", settled, "the case's library job never finished");
+    Require(GraphicsPrescanTestName, "running tag",
+            held && report->AudioUnderrunsSoFar().prescan_graphics_running == std::vector<uint16_t>{0, 1},
+            "an underrun while a graphics prescan job ran did not carry it");
+  }
+
+  // The worker group carries the audio low-water signals and the underruns that came after one, each
+  // read from its own counter. Two signals and one such underrun are made first, so the two counts
+  // differ, and a row that is missing or that reads the other counter fails.
+  void CheckGraphicsPrescanAudioRows(CadenceFixture &fixture) {
+    auto &cache = fixture.context.GetPipelineCache();
+    Common::GpuStall::NoteAudioLowWater();
+    Common::GpuStall::NoteAudioLowWater();
+    Common::GpuStall::NoteUnderrun(true);
+    const auto signals = static_cast<double>(Common::GpuStall::AudioLowWaterCount());
+    const auto underruns = static_cast<double>(Common::GpuStall::UnderrunsAfterLowWater());
+    Require(GraphicsPrescanTestName, "audio rows differ", signals != underruns,
+            "the low-water signals and the underruns after one are the same count, so they cannot be told apart");
+    Require(GraphicsPrescanTestName, "audio rows",
+            PipelineCacheTestAccess::GraphicsPrescanFigure(cache, "worker", "audio_low_water_signals") == signals &&
+                PipelineCacheTestAccess::GraphicsPrescanFigure(cache, "worker", "underruns_after_low_water") ==
+                    underruns,
+            "the worker group did not carry the low-water signals and the underruns after one");
+  }
+
+  // Runs one audio hold of `length` with `jobs` graphics prescan jobs counted when it begins. The jobs
+  // end as soon as the waiter is parked, so the count at the hold's end is always 0.
+  static bool RunHoldBegunWithGraphicsJobs(size_t jobs, std::chrono::milliseconds length) {
+    constexpr std::chrono::seconds park_limit{10};
+    std::vector<std::unique_ptr<Common::FirstRunReport::PrescanGraphicsRunningScope>> running;
+    for (size_t job = 0; job < jobs; ++job) {
+      running.push_back(std::make_unique<Common::FirstRunReport::PrescanGraphicsRunningScope>());
+    }
+    Common::GpuStall::Configure(true, std::chrono::milliseconds(0));
+    auto stall = std::make_unique<Common::GpuStall::Scope>(Common::GpuStall::HoldCause::Other);
+    std::thread waiter([] { Common::GpuStall::WaitWhileStalled(); });
+    const auto deadline = std::chrono::steady_clock::now() + park_limit;
+    while (Common::GpuStall::WaiterCount() == 0 && std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::yield();
+    }
+    const bool parked = Common::GpuStall::WaiterCount() == 1;
+    running.clear();
+    std::this_thread::sleep_for(length);
+    stall.reset();
+    waiter.join();
+    Common::GpuStall::Configure(false);
+    return parked;
+  }
+
+  // The holds_500ms group lists, for each audio hold of 500 ms or more, the graphics prescan jobs
+  // running when it began. A long hold begun with one job adds a row of 1 after the rows before it,
+  // and a short hold begun with two adds nothing. A group never written, one that keeps short holds,
+  // or one that reads the count at the hold's end, which is 0, differs.
+  void CheckGraphicsPrescanLongHolds(CadenceFixture &fixture) {
+    constexpr std::chrono::milliseconds long_hold{550};
+    constexpr std::chrono::milliseconds short_hold{20};
+    constexpr std::chrono::milliseconds idle_limit{30000};
+    auto &cache = fixture.context.GetPipelineCache();
+    const auto figure = [&](const std::string &name) {
+      return PipelineCacheTestAccess::GraphicsPrescanFigure(cache, "holds_500ms", name);
+    };
+    const double count = figure("count");
+    // A background job still running would add to the count the long hold begins with.
+    Require(GraphicsPrescanTestName, "holds idle", WaitForGraphicsRunning(0, idle_limit),
+            "a graphics prescan job was still running before the long hold");
+    Common::FirstRunReport::Configure(true, false);
+    const bool long_parked = RunHoldBegunWithGraphicsJobs(1, long_hold);
+    const bool short_parked = RunHoldBegunWithGraphicsJobs(2, short_hold);
+    Common::FirstRunReport::Configure(false, false);
+    Require(GraphicsPrescanTestName, "holds parked", long_parked && short_parked, "an audio waiter never parked");
+    Require(GraphicsPrescanTestName, "long holds",
+            count >= 0 && figure("count") == count + 1 &&
+                figure(fmt::format("hold_{}_running", static_cast<size_t>(count))) == 1,
+            "the long hold was not listed with the graphics prescan job running when it began, or the short one was");
   }
 
   static constexpr const char *GraphicsPrebuildTestName = "GraphicsPrescanPrebuild";

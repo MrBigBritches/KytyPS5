@@ -759,6 +759,104 @@ void TestHoldIsNotAnUnderrunInReport() {
 	Check(after_hold == 0, "the first output after a hold reached the report as an underrun");
 	Check(after_real == 1, "a real underrun after a hold did not reach the report");
 }
+
+// Lets the fake device play the queue down to `frames` whole frames. The division rounds the time
+// down, so a fraction of a frame more may stay, which the byte count the port reads leaves out.
+void DrainTo(Stream& stream, uint64_t frames) {
+	Drain(stream);
+	const auto keep = frames * 1000000;
+	Check(stream.frames > keep, "the queue already held no more than the frames asked for");
+	now += (stream.frames - keep) / stream.spec.freq;
+	Drain(stream);
+}
+
+// A 256-frame port at 48 kHz keeps a floor of eight periods, so its low-water mark is two periods.
+constexpr uint64_t LOW_WATER_BLOCK_FRAMES = 256;
+// Under that mark and over one period, so a submit that finds it signals and does not underrun.
+constexpr uint64_t LOW_WATER_QUEUED_FRAMES = 3 * LOW_WATER_BLOCK_FRAMES / 2;
+// Over the mark, so a submit that finds it does not signal.
+constexpr uint64_t ABOVE_LOW_WATER_FRAMES = 3 * LOW_WATER_BLOCK_FRAMES;
+// A gap far longer than the queue, so the next submit underruns.
+constexpr uint32_t UNDERRUN_GAP_US = 1000000;
+
+// One run of TestLowWaterSignalThenUnderrun: the gate, the fill the first submit finds, and what is
+// expected after the first submit, after the underrun, and of underruns after a low-water signal.
+struct LowWaterCase {
+	bool     hook_on;
+	uint64_t first_fill_frames;
+	uint64_t first_signals;
+	uint64_t total_signals;
+	uint64_t underruns_after;
+};
+
+// A primed port's first submit finds a fill, and the next one underruns. The underrunning submit
+// finds its queue under the mark too, so with the hook on it signals as well, but that signal is not
+// a warning before it. So the underrun counts as after low water only when the first submit warned.
+// - In the warned run the first submit finds 1.5 periods and signals, then the underrun signals
+//   again and counts.
+// - In the not-warned run, the baseline for the warned one, the first submit finds 3 periods, so only
+//   the underrun signals, and it does not count. Only the first fill differs.
+// - With the gate off, the warned run's submits signal nothing and count nothing.
+// An underrun that counts its own signal fails the not-warned run, and a hook skipped at an underrun
+// fails both signal totals.
+void TestLowWaterSignalThenUnderrun() {
+	for (const auto& expected: {LowWaterCase {false, LOW_WATER_QUEUED_FRAMES, 0, 0, 0},
+	                            LowWaterCase {true, LOW_WATER_QUEUED_FRAMES, 1, 2, 1},
+	                            LowWaterCase {true, ABOVE_LOW_WATER_FRAMES, 0, 1, 0}}) {
+		Fixture    f;
+		const auto port = f.Open(LOW_WATER_BLOCK_FRAMES);
+		f.Prime(port);
+		Common::GpuStall::SetAudioLowWaterHookEnabled(expected.hook_on);
+		const auto signals_before   = Common::GpuStall::AudioLowWaterCount();
+		const auto underruns_before = Common::GpuStall::UnderrunsAfterLowWater();
+		DrainTo(*streams.front(), expected.first_fill_frames);
+		f.Output(port);
+		const auto first_signals = Common::GpuStall::AudioLowWaterCount() - signals_before;
+		now += UNDERRUN_GAP_US;
+		f.Output(port);
+		const auto total_signals = Common::GpuStall::AudioLowWaterCount() - signals_before;
+		const auto underruns     = Common::GpuStall::UnderrunsAfterLowWater() - underruns_before;
+		Common::GpuStall::SetAudioLowWaterHookEnabled(false);
+		Check(first_signals == expected.first_signals, "the first submit's fill did not decide whether it signalled");
+		Check(total_signals == expected.total_signals, "the underrunning submit did not signal with the hook on, or did off");
+		Check(underruns == expected.underruns_after, "an underrun was counted after low water without a warning before it, or not with one");
+	}
+}
+
+// A warning lasts until the queue primes again. Both runs signal at 1.5 periods and later underrun with
+// no new warning before it. In one the device stalls between them, so the pacing timeout clears the
+// stale queue without an underrun and the queue primes again, and that underrun does not count. The
+// baseline makes the same submits with no stall, so the port stays primed and its underrun counts.
+// Only the stall differs, so a priming that keeps the old warning fails.
+void TestLowWaterWarningEndsAtPriming() {
+	constexpr int most_outputs  = 16; // Far more than fill the queue past its floor.
+	constexpr int prime_outputs = 8;  // Enough to fill the queue to its floor again.
+	for (const bool stall: {false, true}) {
+		Fixture    f;
+		const auto port = f.Open(LOW_WATER_BLOCK_FRAMES);
+		f.Prime(port);
+		Common::GpuStall::SetAudioLowWaterHookEnabled(true);
+		const auto signals_before   = Common::GpuStall::AudioLowWaterCount();
+		const auto underruns_before = Common::GpuStall::UnderrunsAfterLowWater();
+		DrainTo(*streams.front(), LOW_WATER_QUEUED_FRAMES);
+		f.Output(port);
+		const auto signals = Common::GpuStall::AudioLowWaterCount() - signals_before;
+		stalled            = stall;
+		for (int i = 0; i < most_outputs && stall && clears == 0; i++) {
+			f.Output(port);
+		}
+		stalled = false;
+		for (int i = 0; i < prime_outputs; i++) {
+			f.Output(port);
+		}
+		now += UNDERRUN_GAP_US;
+		f.Output(port);
+		const auto underruns = Common::GpuStall::UnderrunsAfterLowWater() - underruns_before;
+		Common::GpuStall::SetAudioLowWaterHookEnabled(false);
+		Check(signals == 1 && clears == (stall ? 1 : 0), "the case did not warn once, or did not clear only when stalled");
+		Check(underruns == (stall ? 0 : 1), "a warning outlived the queue priming again, or a warning on a primed queue was lost");
+	}
+}
 } // namespace
 
 int main() {
@@ -782,6 +880,8 @@ int main() {
 	TestUnderrunCountedWithoutHold();
 	TestUnderrunReachesReport();
 	TestHoldIsNotAnUnderrunInReport();
+	TestLowWaterSignalThenUnderrun();
+	TestLowWaterWarningEndsAtPriming();
 	Check(streams.empty(), "output stream leaked");
 	std::puts("AudioOutTimingTests: all cases passed");
 }
