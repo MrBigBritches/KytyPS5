@@ -4,6 +4,7 @@
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/firstRunReport.h"
+#include "common/gpuStall.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
@@ -553,6 +554,9 @@ void GuestGpu::ThreadRun(void* data) {
 	EXIT_IF(gpu == nullptr);
 	KYTY_PROFILER_THREAD("Thread_Gpu");
 	g_gpu_state = gpu;
+	// A prebuild this thread waits on holds up a draw, so the waited-prebuild boost may raise it past
+	// its cap.
+	Common::GpuStall::SetThreadRole(Common::GpuStall::ThreadRole::Gpu);
 
 	for (;;) {
 		Submission                   submission;

@@ -510,6 +510,51 @@ void TestHoldRecordsGraphicsRunning() {
         "a stored hold did not carry the graphics prescan jobs running when it began");
 }
 
+// The role marks the waited-prebuild boost reads. An unmarked thread is the baseline. A deferred build
+// scope gives it the role only while the scope lives, so a scope that never sets the role or never
+// gives it back fails there. A thread marked as the GPU thread keeps that role inside and after the
+// same scope, as when it runs a deferred build inline, so a scope that always sets the role fails
+// there. A thread started inside the scope still reads None, so a mark shared between threads fails.
+// Both marked threads end before the next test, so the main thread stays unmarked.
+void TestThreadRoleMarks() {
+  using Common::GpuStall::CurrentThreadRole;
+  using Common::GpuStall::ThreadRole;
+  using Common::GpuStall::ThreadRoleScope;
+  ThreadRole before = ThreadRole::Gpu;
+  ThreadRole inside = ThreadRole::None;
+  ThreadRole after  = ThreadRole::Gpu;
+  std::thread unmarked([&] {
+    before = CurrentThreadRole();
+    {
+      const ThreadRoleScope role(ThreadRole::DeferredBuild);
+      inside = CurrentThreadRole();
+    }
+    after = CurrentThreadRole();
+  });
+  unmarked.join();
+  Check(before == ThreadRole::None && inside == ThreadRole::DeferredBuild && after == ThreadRole::None,
+        "a deferred build scope did not mark an unmarked thread only while it lived");
+  ThreadRole gpu_inside = ThreadRole::None;
+  ThreadRole gpu_after  = ThreadRole::None;
+  ThreadRole other      = ThreadRole::Gpu;
+  std::thread gpu([&] {
+    Common::GpuStall::SetThreadRole(ThreadRole::Gpu);
+    {
+      const ThreadRoleScope role(ThreadRole::DeferredBuild);
+      gpu_inside = CurrentThreadRole();
+      std::thread([&] { other = CurrentThreadRole(); }).join();
+    }
+    gpu_after = CurrentThreadRole();
+  });
+  gpu.join();
+  Check(gpu_inside == ThreadRole::Gpu && gpu_after == ThreadRole::Gpu,
+        "a deferred build scope replaced or cleared the GPU thread's role");
+  Check(other == ThreadRole::None, "another thread read the GPU thread's role");
+  Check(!Common::GpuStall::BlocksDraws(ThreadRole::None) && Common::GpuStall::BlocksDraws(ThreadRole::Gpu) &&
+            Common::GpuStall::BlocksDraws(ThreadRole::DeferredBuild),
+        "only the GPU thread and a deferred build worker should block draws");
+}
+
 // The exact percentiles are nearest rank over the sorted holds. Ten holds of 10 to 100 ms give p50 of
 // 50 and p95 of 100, where a rank that rounds down gives 90 for p95. Nineteen holds of 300 ms and one
 // of 600 ms give an exact p95 of 300, which the buckets, with a bound of 500, could not show.
@@ -635,6 +680,7 @@ int main() {
   TestUnderrunsAfterLowWater();
   TestAudioLowWaterConditions();
   TestHoldRecordsGraphicsRunning();
+  TestThreadRoleMarks();
   TestHoldHistogramPercentiles();
   TestExactPercentiles();
   std::puts("GpuStallTests: all cases passed");

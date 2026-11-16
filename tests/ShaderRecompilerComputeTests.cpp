@@ -23383,10 +23383,27 @@ public:
     shaders.SetPsUserSgpr(0, half_bits);
     CheckFragmentPrebuild(fixture, sink, base, rsrc2);
     CheckPreRasterPrebuild(fixture, sink, base, rsrc2);
+    RequireBoostRowsAtZero(cache);
     CheckPreRasterDedupe(fixture, sink, base);
     CheckPreRasterEligibility(fixture, sink, base, rsrc2);
     fixture.scheduler.Finish();
     UnmapCadenceMemory(fixture.context, memory);
+  }
+
+  // After the fragment and pre-rasterization cases every draw found its prebuild finished, so nothing
+  // waited on a prebuild or boosted one. Each boost row is there at 0, where a missing row reads -1. A
+  // row that read another field still at 0 would pass too, so this only proves the rows are written.
+  static void RequireBoostRowsAtZero(const PipelineCache &cache) {
+    for (const char *row : {"boosts", "boosts_refused_cap", "boosts_blocking", "boosts_peak"}) {
+      Require(GraphicsPrebuildTestName, "fragment boost rows",
+              PipelineCacheTestAccess::GraphicsPrescanFigure(cache, "libraries", row) == 0.0,
+              "a fragment library boost row is missing or counted a boost");
+    }
+    for (const char *row : {"boosts", "boosts_refused_cap", "boosts_blocking"}) {
+      Require(GraphicsPrebuildTestName, "pre-raster boost rows",
+              PipelineCacheTestAccess::GraphicsPrescanFigure(cache, "pre_raster", row) == 0.0,
+              "a pre-rasterization library boost row is missing or counted a boost");
+    }
   }
 
   // An offered pixel shader has its fragment library built on a library worker, and its draw's pipeline

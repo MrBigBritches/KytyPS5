@@ -73,6 +73,7 @@ std::atomic<size_t>                                     g_record_next {0};
 std::atomic<uint64_t>                                   g_record_overflow {0};
 // The graphics prescan jobs running when each stored hold began.
 std::array<std::atomic<uint8_t>, HOLD_RECORD_CAPACITY>  g_record_graphics_running {};
+thread_local ThreadRole                                 t_thread_role = ThreadRole::None;
 // The last throttle signal on the steady clock in nanoseconds, and the audio low-water signals.
 std::atomic<int64_t>                                    g_last_throttle_signal_ns {0};
 std::atomic<uint64_t>                                   g_audio_low_water {0};
@@ -433,6 +434,26 @@ std::vector<HoldRecord> HoldRecords() {
 		}
 	}
 	return records;
+}
+
+void SetThreadRole(ThreadRole role) noexcept {
+	t_thread_role = role;
+}
+
+ThreadRole CurrentThreadRole() noexcept {
+	return t_thread_role;
+}
+
+ThreadRoleScope::ThreadRoleScope(ThreadRole role) noexcept: m_set(t_thread_role == ThreadRole::None) {
+	if (m_set) {
+		t_thread_role = role;
+	}
+}
+
+ThreadRoleScope::~ThreadRoleScope() {
+	if (m_set) {
+		t_thread_role = ThreadRole::None;
+	}
 }
 
 int64_t LastThrottleSignalNs() noexcept {

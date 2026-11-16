@@ -336,6 +336,8 @@ void Report::AddAudioUnderrun() noexcept {
 	constexpr uint32_t byte_limit = std::numeric_limits<uint8_t>::max();
 	m_underrun_prescan_graphics_running[slot].store(
 	    static_cast<uint8_t>(std::min(PrescanGraphicsRunning(), byte_limit)), std::memory_order_relaxed);
+	m_underrun_prescan_graphics_boosted[slot].store(
+	    static_cast<uint8_t>(std::min(PrescanGraphicsBoosted(), byte_limit)), std::memory_order_relaxed);
 	m_underrun_ns[slot].store(NowNs(), std::memory_order_release);
 }
 
@@ -358,6 +360,8 @@ AudioUnderruns Report::AudioUnderrunsSoFar() const {
 			    m_underrun_prescan_running[slot].load(std::memory_order_relaxed));
 			result.prescan_graphics_running.push_back(
 			    m_underrun_prescan_graphics_running[slot].load(std::memory_order_relaxed));
+			result.prescan_graphics_boosted.push_back(
+			    m_underrun_prescan_graphics_boosted[slot].load(std::memory_order_relaxed));
 		}
 	}
 	return result;
@@ -772,6 +776,7 @@ void Report::Reset() {
 		m_underrun_child_alive[slot].store(0, std::memory_order_relaxed);
 		m_underrun_prescan_running[slot].store(0, std::memory_order_relaxed);
 		m_underrun_prescan_graphics_running[slot].store(0, std::memory_order_relaxed);
+		m_underrun_prescan_graphics_boosted[slot].store(0, std::memory_order_relaxed);
 	}
 	m_underrun_next.store(0, std::memory_order_relaxed);
 	m_underrun_overflow.store(0, std::memory_order_relaxed);
@@ -1844,7 +1849,8 @@ nlohmann::json AudioUnderrunsToJson(const AudioUnderruns& underruns, int64_t epo
 	        {"warm_back", underruns.warm_back},
 	        {"child_alive", underruns.child_alive},
 	        {"prescan_running", underruns.prescan_running},
-	        {"prescan_graphics_running", underruns.prescan_graphics_running}};
+	        {"prescan_graphics_running", underruns.prescan_graphics_running},
+	        {"prescan_graphics_boosted", underruns.prescan_graphics_boosted}};
 }
 
 // The audio held time by cause. Each cause is written, even at 0, so a gate can read every one

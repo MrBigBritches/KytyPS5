@@ -1,5 +1,9 @@
 #include "graphics/host_gpu/renderer/pipeline/graphicsLibraryCache.h"
 
+#include "common/threadPriority.h"
+
+#include <thread>
+
 namespace Libs::Graphics {
 
 namespace {
@@ -14,7 +18,77 @@ Common::FirstRunReport::LibraryKind ReportKind(LibraryPart part) {
 
 } // namespace
 
-GraphicsLibraryCache::GraphicsLibraryCache(DestroyFunction destroy) : m_destroy(std::move(destroy)) {}
+GraphicsLibraryCache::GraphicsLibraryCache(DestroyFunction destroy)
+    : m_destroy(std::move(destroy)),
+      m_priority {.current_thread   = &Common::CurrentThreadSystemId,
+                  .boost            = &Common::BoostThreadToNormal,
+                  .lower            = [] { (void)Common::LowerCurrentThreadPriorityToLowest(); },
+                  .current_priority = &Common::CurrentThreadSystemPriority,
+                  .boost_to         = &Common::BoostThreadToPriority} {}
+
+// Only the request that moves the prebuild from Running to Boosting asks the system, so a prebuild is
+// boosted at most once however many requests wait on it. A refused boost goes back to Running, and the
+// next waiting request may try again.
+// At most MAX_CONCURRENT_BOOSTS prebuilds run boosted at once, so boosts cannot crowd out the game's
+// own threads. A slot is reserved before the system is asked and given back if it refuses. A waiter
+// that finds every slot taken waits unboosted, and its entry goes back to Running for a later waiter.
+// A blocking waiter is not held to the cap, since the draw it holds up waits on this one prebuild,
+// but it raises the prebuild only to its own priority, so it never puts the prebuild above itself.
+// It still takes a slot, so the boosts it makes keep other waiters within the cap.
+void GraphicsLibraryCache::TryBoostPrebuild(Entry& entry, LibraryPart part, bool blocking) {
+	uint8_t expected = BOOST_RUNNING;
+	if (!entry.boost_state.compare_exchange_strong(expected, BOOST_BOOSTING, std::memory_order_acq_rel)) {
+		return;
+	}
+	const uint64_t active = m_active_boosts.fetch_add(1, std::memory_order_acq_rel) + 1;
+	if (!blocking && active > MAX_CONCURRENT_BOOSTS) {
+		m_active_boosts.fetch_sub(1, std::memory_order_acq_rel);
+		Prebuilt(part).boosts_refused_cap.fetch_add(1, std::memory_order_relaxed);
+		entry.boost_state.store(BOOST_RUNNING, std::memory_order_release);
+		return;
+	}
+	const uint64_t builder = entry.builder_thread.load(std::memory_order_relaxed);
+	const bool     to_own  = blocking && m_priority.boost_to && m_priority.current_priority;
+	const bool     raised  = to_own ? m_priority.boost_to(builder, m_priority.current_priority()) : m_priority.boost(builder);
+	if (raised) {
+		Prebuilt(part).boosts.fetch_add(1, std::memory_order_relaxed);
+		Prebuilt(part).boosts_blocking.fetch_add(blocking ? 1 : 0, std::memory_order_relaxed);
+		RaiseMaxCount(Prebuilt(part).boosts_peak, active);
+		Common::FirstRunReport::NotePrescanGraphicsBoosted(true);
+	} else {
+		m_active_boosts.fetch_sub(1, std::memory_order_acq_rel);
+	}
+	entry.boost_state.store(raised ? BOOST_BOOSTED : BOOST_RUNNING, std::memory_order_release);
+}
+
+// Raises an atomic maximum. Any thread may race on it, and a lost race retries.
+void GraphicsLibraryCache::RaiseMaxCount(std::atomic<uint64_t>& maximum, uint64_t value) {
+	uint64_t seen = maximum.load(std::memory_order_relaxed);
+	while (seen < value && !maximum.compare_exchange_weak(seen, value, std::memory_order_relaxed)) {
+	}
+}
+
+// Runs on the prebuild's thread after its build. A boost still being asked for is waited out, which
+// is one system call, so the thread never finishes between a request's check and its boost and then
+// keeps normal priority for the rest of its jobs.
+void GraphicsLibraryCache::FinishPrebuildBoost(Entry& entry) {
+	uint8_t state = entry.boost_state.load(std::memory_order_acquire);
+	while (true) {
+		if (state == BOOST_BOOSTING) {
+			std::this_thread::yield();
+			state = entry.boost_state.load(std::memory_order_acquire);
+			continue;
+		}
+		if (entry.boost_state.compare_exchange_weak(state, BOOST_FINISHED, std::memory_order_acq_rel)) {
+			break;
+		}
+	}
+	if (state == BOOST_BOOSTED) {
+		m_priority.lower();
+		m_active_boosts.fetch_sub(1, std::memory_order_acq_rel);
+		Common::FirstRunReport::NotePrescanGraphicsBoosted(false);
+	}
+}
 
 GraphicsLibraryCache::~GraphicsLibraryCache() {
 	// A linked pipeline is in use as long as its libraries are, so every one must be destroyed first.
@@ -152,7 +226,11 @@ PrebuiltLibraryCounts GraphicsLibraryCache::PrebuiltCounts(LibraryPart part) con
 	        .waits         = Prebuilt(part).waits.load(std::memory_order_relaxed),
 	        .wait_ms       = static_cast<double>(Prebuilt(part).wait_us.load(std::memory_order_relaxed)) * MS_PER_US,
 	        .wait_max_ms = static_cast<double>(Prebuilt(part).wait_max_us.load(std::memory_order_relaxed)) * MS_PER_US,
-	        .key_differs = Prebuilt(part).key_differs.load(std::memory_order_relaxed)};
+	        .key_differs = Prebuilt(part).key_differs.load(std::memory_order_relaxed),
+	        .boosts      = Prebuilt(part).boosts.load(std::memory_order_relaxed),
+	        .boosts_refused_cap = Prebuilt(part).boosts_refused_cap.load(std::memory_order_relaxed),
+	        .boosts_peak        = Prebuilt(part).boosts_peak.load(std::memory_order_relaxed),
+	        .boosts_blocking    = Prebuilt(part).boosts_blocking.load(std::memory_order_relaxed)};
 }
 
 uint64_t TotalLinkedPipelines() {

@@ -609,6 +609,9 @@ VertexGroups(const GraphicsVertexCounters& counts, const PrebuiltLibraryCounts& 
 	                  {"waits", static_cast<double>(pre_raster.waits)},
 	                  {"wait_ms", pre_raster.wait_ms},
 	                  {"wait_max_ms", pre_raster.wait_max_ms},
+	                  {"boosts", static_cast<double>(pre_raster.boosts)},
+	                  {"boosts_refused_cap", static_cast<double>(pre_raster.boosts_refused_cap)},
+	                  {"boosts_blocking", static_cast<double>(pre_raster.boosts_blocking)},
 	                  {"key_differs", static_cast<double>(pre_raster.key_differs)}}};
 	for (size_t reason = 0; reason < counts.prebuild_skipped.size(); ++reason) {
 		libraries.figures.emplace_back(std::string("skipped_") + PrebuildSkipName(static_cast<GraphicsPrebuildSkip>(reason)),
@@ -1589,6 +1592,10 @@ Common::FirstRunReport::PrescanGraphicsReport PipelineCache::BuildGraphicsPresca
 	                       {"waits", static_cast<double>(prebuilt.waits)},
 	                       {"wait_ms", prebuilt.wait_ms},
 	                       {"wait_max_ms", prebuilt.wait_max_ms},
+	                       {"boosts", static_cast<double>(prebuilt.boosts)},
+	                       {"boosts_refused_cap", static_cast<double>(prebuilt.boosts_refused_cap)},
+	                       {"boosts_blocking", static_cast<double>(prebuilt.boosts_blocking)},
+	                       {"boosts_peak", static_cast<double>(prebuilt.boosts_peak)},
 	                       {"key_differs", static_cast<double>(prebuilt.key_differs)}}};
 	for (size_t reason = 0; reason < counters.prebuild_skipped.size(); ++reason) {
 		libraries.figures.emplace_back(std::string("skipped_") + PrebuildSkipName(static_cast<GraphicsPrebuildSkip>(reason)),

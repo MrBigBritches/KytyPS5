@@ -1527,7 +1527,12 @@ void PipelineCache::AcquireTimedDeferredPipeline(const GraphicsPipelineKey& key,
 
 void PipelineCache::RequestBuild(const GraphicsPipelineKey& key, const Stages& stages) {
 	auto build = std::make_shared<GraphicsBuild>(key, stages);
-	auto job   = m_build_queue->Post([this, build] { RunBuild(build); });
+	// A draw waits on the build, so the worker that runs it counts as blocking draws for the
+	// waited-prebuild boost. A GPU thread that runs it inline is marked already and stays itself.
+	auto job = m_build_queue->Post([this, build] {
+		const Common::GpuStall::ThreadRoleScope role(Common::GpuStall::ThreadRole::DeferredBuild);
+		RunBuild(build);
+	});
 	EXIT_IF(job == nullptr);
 	m_pending_graphics.emplace(key, PendingBuild {std::move(build), std::move(job)});
 	// Stored when asked for, so a pipeline still pending at exit is rebuilt by the next run.

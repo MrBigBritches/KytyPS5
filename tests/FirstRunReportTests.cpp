@@ -2221,6 +2221,25 @@ void TestUnderrunsCarryTheGraphicsRunningTag() {
         "the graphics running tag is not in the file");
 }
 
+// The boosted count of the graphics prescan is taken at each underrun. The first underrun has none
+// boosted and the second one, and the compute tag stays 0 in both, so a boosted count copied from
+// another tag or never stored differs.
+void TestUnderrunsCarryTheBoostedCount() {
+  Report report;
+  Common::FirstRunReport::Configure(true, false);
+  report.AddAudioUnderrun();
+  Common::FirstRunReport::NotePrescanGraphicsBoosted(true);
+  report.AddAudioUnderrun();
+  Common::FirstRunReport::NotePrescanGraphicsBoosted(false);
+  Common::FirstRunReport::Configure(false, false);
+  const auto taken = report.AudioUnderrunsSoFar();
+  Check(taken.prescan_graphics_boosted == std::vector<uint16_t> {0, 1} &&
+            taken.prescan_running == std::vector<uint16_t> {0, 0},
+        "the boosted count was not taken at each underrun");
+  const auto json = nlohmann::json::parse(report.ToJson({}, 0, 1.0, 0.0, {}))["audio_underruns"];
+  Check(json["prescan_graphics_boosted"] == nlohmann::json::array({0, 1}), "the boosted count is not in the file");
+}
+
 // With a source, the writer asks it each time. A final figure replaces it at once and the source is
 // never called again, so the owner may destroy what the source reads. The baseline is the same
 // report before the final figure.
@@ -3198,6 +3217,7 @@ int main() {
   TestPrescanCacheFinalReplacesSource();
   TestPrescanCacheWriterNeverTouchesADestroyedSource();
   TestPrescanCacheFinalWaitsForAWriterInTheSource();
+  TestUnderrunsCarryTheBoostedCount();
   std::puts("FirstRunReportTests: all cases passed");
   return 0;
 }

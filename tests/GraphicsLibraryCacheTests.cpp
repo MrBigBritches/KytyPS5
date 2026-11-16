@@ -2,6 +2,8 @@
 // made by functions the tests give it, which count what they make and hand out fake handles.
 
 #include "PipelinePartsFixtures.h"
+#include "common/gpuStall.h"
+#include "common/threadPriority.h"
 #include "graphics/host_gpu/renderer/pipeline/graphicsLibraryCache.h"
 
 #include <atomic>
@@ -480,6 +482,215 @@ void TestPrebuiltWaitIsCounted() {
 	std::printf("GraphicsLibraryCacheTests: prebuilt wait ok\n");
 }
 
+// What the priority hooks of the boost tests saw.
+struct BoostLog {
+	std::atomic<uint64_t> next_thread {100};
+	std::atomic<uint64_t> builder {0};
+	std::atomic<uint64_t> boosted_thread {0};
+	std::atomic<uint32_t> boosts {0};
+	std::atomic<uint32_t> lowers {0};
+};
+
+// Hooks that give each thread that asks a made-up id and record boosts and drops, so no thread's
+// real priority changes.
+GraphicsLibraryCache::PriorityHooks LoggingHooks(BoostLog& log) {
+	return {.current_thread = [&log] { return log.next_thread++; },
+	        .boost          = [&log](uint64_t thread) {
+		        log.boosted_thread = thread;
+		        log.boosts++;
+		        return true;
+	        },
+	        .lower = [&log] { log.lowers++; }};
+}
+
+// Runs a prebuild held on a promise and an ordinary request of the same key, and releases the prebuild
+// once the request has had time to reach the once flag. With `request_first` false the prebuild is
+// released and joined before the request, so the request meets a finished entry.
+void RunPrebuildAndRequest(GraphicsLibraryCache& cache, FakeDriver& driver, BoostLog& log, bool request_first) {
+	std::promise<void> release;
+	auto               released = release.get_future().share();
+	std::atomic<bool>  started {false};
+	std::thread prebuild([&] {
+		(void)cache.GetOrBuildPrebuilt(PrebuiltKey(11), [&] {
+			log.builder = log.next_thread.load() - 1;
+			started     = true;
+			released.wait();
+			return driver.Build(LibraryPart::Fragment);
+		});
+	});
+	const auto deadline = std::chrono::steady_clock::now() + kStuck;
+	while (!started && std::chrono::steady_clock::now() < deadline) {
+		std::this_thread::yield();
+	}
+	Check(started, "the prebuild never started");
+	const auto request_once = [&] { (void)cache.GetOrBuild(PrebuiltKey(11), [&] { return driver.Build(LibraryPart::Fragment); }); };
+	if (!request_first) {
+		release.set_value();
+		prebuild.join();
+		request_once();
+		return;
+	}
+	std::thread request(request_once);
+	constexpr std::chrono::milliseconds kRequestArrival(100);
+	std::this_thread::sleep_for(kRequestArrival);
+	release.set_value();
+	prebuild.join();
+	request.join();
+}
+
+// An ordinary request that meets a prebuild still running raises the prebuild's thread before it
+// waits, once, and the prebuild drops back when its build is over. The baseline request comes after
+// the prebuild finished and boosts nothing, so only waiting on a running prebuild makes the boost.
+void TestWaitingRequestBoostsPrebuild() {
+	FakeDriver driver;
+	auto       cache = MakeCache(driver);
+	BoostLog   log;
+	cache.SetPriorityHooksForTest(LoggingHooks(log));
+	RunPrebuildAndRequest(cache, driver, log, true);
+	Check(log.boosts == 1 && log.boosted_thread == log.builder && log.lowers == 1,
+	      "a request waiting on a running prebuild did not boost its thread once, or it never dropped back");
+	Check(cache.PrebuiltCounts().boosts == 1 && cache.PrebuiltCounts().waits == 1,
+	      "the boost or the wait was not counted");
+	Check(driver.Builds(LibraryPart::Fragment) == 1, "the waiting request built its own copy");
+
+	FakeDriver after_driver;
+	auto       after = MakeCache(after_driver);
+	BoostLog   after_log;
+	after.SetPriorityHooksForTest(LoggingHooks(after_log));
+	RunPrebuildAndRequest(after, after_driver, after_log, false);
+	Check(after_log.boosts == 0 && after_log.lowers == 0 && after.PrebuiltCounts().boosts == 0,
+	      "a request after the prebuild finished boosted it");
+	std::printf("GraphicsLibraryCacheTests: prebuilt boost ok\n");
+}
+
+// With three prebuilds held and a request waiting on each, only MAX_CONCURRENT_BOOSTS of them are
+// boosted, the third waiter is refused and waits unboosted, and the peak is the cap. The single-wait
+// test above is the baseline, where the one waiter is boosted, so the refusal comes from the cap.
+void TestBoostsAreCapped() {
+	constexpr uint32_t kPrebuilds = 3;
+	FakeDriver         driver;
+	auto               cache = MakeCache(driver);
+	BoostLog           log;
+	cache.SetPriorityHooksForTest(LoggingHooks(log));
+	std::promise<void>       release;
+	auto                     released = release.get_future().share();
+	std::atomic<uint32_t>    started {0};
+	std::vector<std::thread> threads;
+	for (uint32_t index = 0; index < kPrebuilds; ++index) {
+		threads.emplace_back([&, index] {
+			(void)cache.GetOrBuildPrebuilt(PrebuiltKey(30 + index), [&] {
+				started++;
+				released.wait();
+				return driver.Build(LibraryPart::Fragment);
+			});
+		});
+	}
+	const auto deadline = std::chrono::steady_clock::now() + kStuck;
+	while (started < kPrebuilds && std::chrono::steady_clock::now() < deadline) {
+		std::this_thread::yield();
+	}
+	Check(started == kPrebuilds, "the prebuilds never started");
+	for (uint32_t index = 0; index < kPrebuilds; ++index) {
+		threads.emplace_back([&, index] {
+			(void)cache.GetOrBuild(PrebuiltKey(30 + index), [&] { return driver.Build(LibraryPart::Fragment); });
+		});
+	}
+	constexpr std::chrono::milliseconds kRequestArrival(100);
+	std::this_thread::sleep_for(kRequestArrival);
+	release.set_value();
+	for (auto& thread: threads) {
+		thread.join();
+	}
+	const auto counts = cache.PrebuiltCounts();
+	Check(counts.boosts == MAX_CONCURRENT_BOOSTS && counts.boosts_refused_cap == 1 &&
+	          counts.boosts_peak == MAX_CONCURRENT_BOOSTS && log.lowers == MAX_CONCURRENT_BOOSTS,
+	      "more prebuilds were boosted at once than the cap allows");
+	Check(driver.Builds(LibraryPart::Fragment) == kPrebuilds, "a waiter built its own copy");
+	std::printf("GraphicsLibraryCacheTests: boost cap ok\n");
+}
+
+// What a cache with every boost slot taken by two ordinary waiters did for a third waiter, which is a
+// deferred build worker when `blocking`, and how many boosts went to the waiter's own priority.
+struct CapFullOutcome {
+	PrebuiltLibraryCounts counts;
+	uint32_t              boost_tos = 0;
+	uint32_t              lowers    = 0;
+};
+
+CapFullOutcome RunThirdWaiterWithCapFull(bool blocking) {
+	constexpr uint32_t kPrebuilds  = 3;
+	constexpr uint32_t kFirstKey   = 40;
+	FakeDriver         driver;
+	auto               cache = MakeCache(driver);
+	BoostLog           log;
+	std::atomic<uint32_t> boost_tos {0};
+	auto                  hooks = LoggingHooks(log);
+	hooks.current_priority      = [] { return 0; };
+	hooks.boost_to              = [&](uint64_t thread, int) {
+		log.boosted_thread = thread;
+		log.boosts++;
+		boost_tos++;
+		return true;
+	};
+	cache.SetPriorityHooksForTest(hooks);
+	std::promise<void>       release;
+	auto                     released = release.get_future().share();
+	std::atomic<uint32_t>    started {0};
+	std::vector<std::thread> threads;
+	for (uint32_t index = 0; index < kPrebuilds; ++index) {
+		threads.emplace_back([&, index] {
+			(void)cache.GetOrBuildPrebuilt(PrebuiltKey(kFirstKey + index), [&] {
+				started++;
+				released.wait();
+				return driver.Build(LibraryPart::Fragment);
+			});
+		});
+	}
+	const auto wait_for = [](const auto& done) {
+		const auto deadline = std::chrono::steady_clock::now() + kStuck;
+		while (!done() && std::chrono::steady_clock::now() < deadline) {
+			std::this_thread::yield();
+		}
+		return done();
+	};
+	Check(wait_for([&] { return started == kPrebuilds; }), "the prebuilds never started");
+	const auto request = [&](uint32_t index, bool as_deferred) {
+		return std::thread([&, index, as_deferred] {
+			if (as_deferred) {
+				Common::GpuStall::SetThreadRole(Common::GpuStall::ThreadRole::DeferredBuild);
+			}
+			(void)cache.GetOrBuild(PrebuiltKey(kFirstKey + index), [&] { return driver.Build(LibraryPart::Fragment); });
+		});
+	};
+	threads.push_back(request(0, false));
+	threads.push_back(request(1, false));
+	Check(wait_for([&] { return log.boosts == MAX_CONCURRENT_BOOSTS; }), "the ordinary waiters did not fill the cap");
+	threads.push_back(request(2, blocking));
+	constexpr std::chrono::milliseconds kRequestArrival(100);
+	std::this_thread::sleep_for(kRequestArrival);
+	release.set_value();
+	for (auto& thread: threads) {
+		thread.join();
+	}
+	return {cache.PrebuiltCounts(), boost_tos.load(), log.lowers.load()};
+}
+
+// A deferred build worker that waits on a running prebuild while every boost slot is taken still
+// boosts it, to its own priority, and it drops back at its end. The baseline's third waiter is an
+// ordinary one, which the cap refuses, so the boost past the cap comes from the waiter blocking a draw.
+void TestBlockingWaiterBoostsPastCap() {
+	const auto blocking = RunThirdWaiterWithCapFull(true);
+	Check(blocking.counts.boosts == MAX_CONCURRENT_BOOSTS + 1 && blocking.counts.boosts_blocking == 1 &&
+	          blocking.boost_tos == 1 && blocking.counts.boosts_refused_cap == 0 &&
+	          blocking.counts.boosts_peak == MAX_CONCURRENT_BOOSTS + 1 && blocking.lowers == MAX_CONCURRENT_BOOSTS + 1,
+	      "a deferred build worker waiting with the cap full did not boost the prebuild to its own priority");
+	const auto ordinary = RunThirdWaiterWithCapFull(false);
+	Check(ordinary.counts.boosts == MAX_CONCURRENT_BOOSTS && ordinary.counts.boosts_refused_cap == 1 &&
+	          ordinary.boost_tos == 0 && ordinary.counts.boosts_blocking == 0,
+	      "an ordinary waiter with the cap full was not refused");
+	std::printf("GraphicsLibraryCacheTests: blocking boost ok\n");
+}
+
 // A prebuilt pre-rasterization library answers the first ordinary request for its key, counted once
 // as a first hit of that part and not of the fragment part, and is not built again. The baseline is an
 // ordinary build of another vertex shader's key, which counts no first hit.
@@ -609,6 +820,130 @@ void TestPrebuildCountsAsBuilt() {
 	std::printf("GraphicsLibraryCacheTests: prebuild counts as built ok\n");
 }
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+// The priorities RunRealBoost read, the prebuild thread's after it lowered itself, while its build ran
+// boosted and once the prebuild returned, and the waiter's own.
+struct DropBackLevels {
+	int lowered = 0;
+	int during  = 0;
+	int after   = 0;
+	int waiter  = 0;
+};
+
+// Runs one prebuild with the cache's own priority hooks, on a thread that first lowers itself as the
+// graphics prescan's library workers do, and one request that waits on it. The waiter blocks draws
+// when `blocking` and lowers itself one ordinary step first when `waiter_lowered`. The build is held
+// until the boost is counted, so `during` is read while the thread runs boosted.
+DropBackLevels RunRealBoost(bool blocking, bool waiter_lowered) {
+	constexpr uint64_t kKey = 50;
+	FakeDriver         driver;
+	auto               cache = MakeCache(driver);
+	DropBackLevels     levels;
+	std::promise<void> release;
+	auto               released = release.get_future().share();
+	std::atomic<bool>  started {false};
+	std::thread        prebuild([&] {
+		(void)Common::LowerCurrentThreadPriorityToLowest();
+		levels.lowered = Common::CurrentThreadSystemPriority();
+		(void)cache.GetOrBuildPrebuilt(PrebuiltKey(kKey), [&] {
+			started = true;
+			released.wait();
+			levels.during = Common::CurrentThreadSystemPriority();
+			return driver.Build(LibraryPart::Fragment);
+		});
+		levels.after = Common::CurrentThreadSystemPriority();
+	});
+	Check(WaitFor(started), "the prebuild never started");
+	std::thread request([&] {
+		if (waiter_lowered) {
+			(void)Common::LowerCurrentThreadPriority();
+		}
+		if (blocking) {
+			Common::GpuStall::SetThreadRole(Common::GpuStall::ThreadRole::DeferredBuild);
+		}
+		levels.waiter = Common::CurrentThreadSystemPriority();
+		(void)cache.GetOrBuild(PrebuiltKey(kKey), [&] { return driver.Build(LibraryPart::Fragment); });
+	});
+	const auto deadline = std::chrono::steady_clock::now() + kStuck;
+	while (cache.PrebuiltCounts().boosts == 0 && std::chrono::steady_clock::now() < deadline) {
+		std::this_thread::yield();
+	}
+	release.set_value();
+	prebuild.join();
+	request.join();
+	Check(cache.PrebuiltCounts().boosts == 1, "the waiting request never boosted the prebuild");
+	return levels;
+}
+
+// A boosted prebuild drops back to exactly the level its thread was lowered to, whatever level the
+// boost raised it to. An ordinary waiter raises it to normal priority, and a blocking waiter that runs
+// one step lowered raises it only to that step, so the two runs boost to different levels. Each run
+// also checks that the boost reached the waiter's level, so a thread that never moved cannot pass as
+// one that dropped back. Windows only, where the levels are absolute and the boost is accepted. Linux
+// works the drop out from the boosted nice value and usually refuses an unprivileged raise, and macOS
+// has no boost.
+void TestBoostDropsBackToTheLoweredLevel() {
+	for (const bool blocking: {false, true}) {
+		const auto levels = RunRealBoost(blocking, blocking);
+		Check(levels.during == levels.waiter && levels.during != levels.lowered,
+		      "the boost did not raise the prebuild to the waiter's level");
+		Check(levels.after == levels.lowered, "a boosted prebuild did not drop back to the level it was lowered to");
+	}
+	std::printf("GraphicsLibraryCacheTests: boost drop-back ok\n");
+}
+#endif
+
+// A boost gives back its slot and its underrun tag when the prebuild drops back. One more prebuild than
+// MAX_CONCURRENT_BOOSTS is held and waited on in turn, each over before the next starts, so only one
+// runs boosted at a time and each should be boosted. A slot kept after the drop refuses the last one.
+// The first round reads the tag while its prebuild runs boosted, one above the count before, so a tag
+// never noted stays level. After the last round the count is back where it began, so a tag never given
+// back, or a drop that takes nothing away, leaves it raised.
+void TestBoostGivesBackItsSlotAndTag() {
+	constexpr uint64_t kFirstKey = 60;
+	FakeDriver         driver;
+	auto               cache = MakeCache(driver);
+	BoostLog           log;
+	cache.SetPriorityHooksForTest(LoggingHooks(log));
+	const uint32_t before     = Common::FirstRunReport::PrescanGraphicsBoosted();
+	bool           tag_raised = false;
+	for (uint64_t index = 0; index <= MAX_CONCURRENT_BOOSTS; ++index) {
+		const auto         key = PrebuiltKey(kFirstKey + index);
+		std::promise<void> release;
+		auto               released = release.get_future().share();
+		std::atomic<bool>  started {false};
+		std::thread        prebuild([&] {
+			(void)cache.GetOrBuildPrebuilt(key, [&] {
+				started = true;
+				released.wait();
+				return driver.Build(LibraryPart::Fragment);
+			});
+		});
+		Check(WaitFor(started), "the prebuild never started");
+		std::thread request([&] { (void)cache.GetOrBuild(key, [&] { return driver.Build(LibraryPart::Fragment); }); });
+		// The tag is noted just after the boost is counted, so the first round waits for both.
+		const auto boosted = [&] {
+			return cache.PrebuiltCounts().boosts == index + 1 &&
+			       (index != 0 || Common::FirstRunReport::PrescanGraphicsBoosted() == before + 1);
+		};
+		const auto deadline = std::chrono::steady_clock::now() + kStuck;
+		while (!boosted() && std::chrono::steady_clock::now() < deadline) {
+			std::this_thread::yield();
+		}
+		tag_raised = tag_raised || (index == 0 && boosted());
+		release.set_value();
+		prebuild.join();
+		request.join();
+	}
+	const auto counts = cache.PrebuiltCounts();
+	Check(counts.boosts == MAX_CONCURRENT_BOOSTS + 1 && counts.boosts_refused_cap == 0 && counts.boosts_peak == 1 &&
+	          log.lowers == MAX_CONCURRENT_BOOSTS + 1,
+	      "a boost kept its slot after its prebuild dropped back");
+	Check(tag_raised && Common::FirstRunReport::PrescanGraphicsBoosted() == before,
+	      "the boosted tag did not count a running boost or did not give it back at the drop");
+	std::printf("GraphicsLibraryCacheTests: boost gives back its slot and tag ok\n");
+}
+
 } // namespace
 
 int main() {
@@ -622,10 +957,17 @@ int main() {
 	TestPrebuiltFirstHit();
 	TestPrebuiltWaitIsCounted();
 	TestPrebuiltKeyDiffers();
+	TestWaitingRequestBoostsPrebuild();
+	TestBoostsAreCapped();
+	TestBlockingWaiterBoostsPastCap();
 	TestPreRasterPrebuiltFirstHit();
 	TestWaitClaimsThePrebuilt();
 	TestPreRasterKeyDiffers();
 	TestPrebuildCountsAsBuilt();
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	TestBoostDropsBackToTheLoweredLevel();
+#endif
+	TestBoostGivesBackItsSlotAndTag();
 	std::printf("GraphicsLibraryCacheTests: ok\n");
 	return 0;
 }

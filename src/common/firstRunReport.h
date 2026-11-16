@@ -449,6 +449,9 @@ struct AudioUnderruns {
 	/// translations and fragment library prebuilds. It is kept apart from prescan_running, which is
 	/// the compute prescan's. Saturates at 255, and is parallel to at_ns.
 	std::vector<uint16_t> prescan_graphics_running;
+	/// How many graphics prescan library prebuilds were boosted to normal priority at each underrun.
+	/// Parallel to at_ns.
+	std::vector<uint16_t> prescan_graphics_boosted;
 };
 
 /// What the report says about the machine and the emulator's own process. A figure the system did
@@ -1464,6 +1467,7 @@ private:
 	std::array<std::atomic<uint8_t>, AUDIO_UNDERRUN_CAPACITY>  m_underrun_child_alive {};
 	std::array<std::atomic<uint16_t>, AUDIO_UNDERRUN_CAPACITY> m_underrun_prescan_running {};
 	std::array<std::atomic<uint8_t>, AUDIO_UNDERRUN_CAPACITY>  m_underrun_prescan_graphics_running {};
+	std::array<std::atomic<uint8_t>, AUDIO_UNDERRUN_CAPACITY>  m_underrun_prescan_graphics_boosted {};
 	std::atomic<size_t>                                        m_underrun_next {0};
 	std::atomic<uint64_t>                                      m_underrun_overflow {0};
 };
@@ -1523,6 +1527,7 @@ inline std::atomic<int32_t>  g_warm_back_running {0};
 inline std::atomic<bool>     g_child_alive {false};
 inline std::atomic<int32_t>  g_prescan_running {0};
 inline std::atomic<int32_t>  g_prescan_graphics_running {0};
+inline std::atomic<int32_t>  g_prescan_graphics_boosted {0};
 inline std::atomic<uint32_t> g_warm_workers {0};
 
 /// A counter never reads below zero. Scopes only add and then take back what they added, so a
@@ -1665,6 +1670,18 @@ private:
 /// to have met the graphics prescan's work rather than the compute prescan's.
 [[nodiscard]] inline uint32_t PrescanGraphicsRunning() noexcept {
 	return Detail::ReadCount(Detail::g_prescan_graphics_running);
+}
+
+/// The figure behind the prescan_graphics_boosted underrun tag, the graphics prescan's library
+/// prebuilds running at normal priority now because a request waits on them.
+[[nodiscard]] inline uint32_t PrescanGraphicsBoosted() noexcept {
+	return Detail::ReadCount(Detail::g_prescan_graphics_boosted);
+}
+
+/// Adds one boosted prebuild, or takes one away when `boosted` is false. The library cache calls it
+/// when a boost is accepted and when the boosted prebuild drops back, so the two always balance.
+inline void NotePrescanGraphicsBoosted(bool boosted) noexcept {
+	Detail::g_prescan_graphics_boosted.fetch_add(boosted ? 1 : -1, std::memory_order_relaxed);
 }
 
 /// Counts one graphics prescan job toward PrescanGraphicsRunning while it lives, when the report is

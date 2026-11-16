@@ -101,6 +101,16 @@ struct HoldHistogram {
 	[[nodiscard]] double MaxMs() const;
 };
 
+/// Which kind of thread the calling thread is, for the waited-prebuild boost. A thread is None until it
+/// says otherwise.
+enum class ThreadRole : uint8_t { None, Gpu, DeferredBuild };
+
+/// Whether a thread of this role blocks a draw while it waits, which is true of the GPU thread and of
+/// a deferred build worker.
+[[nodiscard]] constexpr bool BlocksDraws(ThreadRole role) {
+	return role == ThreadRole::Gpu || role == ThreadRole::DeferredBuild;
+}
+
 /// One finished hold of guest audio. end_ns is on the steady clock.
 struct HoldRecord {
 	uint64_t  held_ns = 0;
@@ -152,6 +162,23 @@ inline std::atomic<bool> g_audio_low_water_hook {false};
 /// reads its flag before the hook. Relaxed, for the audio submit path.
 void NoteUnderrun(bool after_low_water) noexcept;
 [[nodiscard]] uint64_t UnderrunsAfterLowWater() noexcept;
+
+/// Says which kind of thread the calling thread is, for the waited-prebuild boost.
+void SetThreadRole(ThreadRole role) noexcept;
+[[nodiscard]] ThreadRole CurrentThreadRole() noexcept;
+
+/// Gives the calling thread `role` while it lives, unless it has one already, so a deferred build the
+/// GPU thread runs inline still counts as the GPU thread's.
+class ThreadRoleScope {
+public:
+	explicit ThreadRoleScope(ThreadRole role) noexcept;
+	~ThreadRoleScope();
+	ThreadRoleScope(const ThreadRoleScope&)            = delete;
+	ThreadRoleScope& operator=(const ThreadRoleScope&) = delete;
+
+private:
+	bool m_set = false;
+};
 
 /// How many holds are kept one by one. Past it they are only counted in overflow, and the exact
 /// percentiles then cover the first holds only.
