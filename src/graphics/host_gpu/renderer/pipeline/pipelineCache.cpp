@@ -17,6 +17,7 @@
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
 #include "graphics/host_gpu/renderer/pipeline/generationState.h"
+#include "graphics/host_gpu/renderer/pipeline/graphicsCompileOptions.h"
 #include "graphics/host_gpu/renderer/pipeline/graphicsLibraryCache.h"
 #include "graphics/host_gpu/renderer/pipeline/pixelInputs.h"
 #include "graphics/host_gpu/renderer/pipeline/prescanGraphics.h"
@@ -474,6 +475,9 @@ ShaderModule& PipelineCache::CompileModule(Program& program, const ProgramKey& k
 	return module;
 }
 
+// Finds or compiles the module of one stage for the draw or dispatch, binds it to the input info and
+// advances the push data cursor past it. Returns null for a compute dispatch that must be skipped.
+// Graphics stages take their compile options from GraphicsStageCompileOptions, as the prescan does.
 template <typename InputInfo>
 const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputInfo& input_info,
                                               uint32_t& push_data_cursor) {
@@ -496,23 +500,17 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	    .read_specialization_memory = ReadShaderGuestMemory,
 	    .image_heap                 = m_image_heap,
 	};
-	ShaderRecompiler::CompileOptions options {.wave_size = input_info.wave_size};
-	if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
-		options.stage            = input_info.logical_stage;
-		options.input_info.vertex = &input_info;
-		options.user_data_base   = 8;
-		if (options.stage == ShaderType::Mesh ||
-		    options.stage == ShaderType::TessellationControl) {
-			options.user_data_base = 0;
-			options.wave_size =
-			    options.stage == ShaderType::Mesh ? input_info.mesh.wave_size : 64u;
-		}
-	} else if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) {
-		options.stage            = ShaderType::Pixel;
-		options.input_info.pixel = &input_info;
+	// The profile stays at the default here, since CompileModule puts the device's own in.
+	const GraphicsCompileHost host {.structured_jump_tables = Config::StructuredJumpTablesEnabled(),
+	                                .emit_debug_info        = Config::GraphicsDebugDumpEnabled()};
+	ShaderRecompiler::CompileOptions options;
+	if constexpr (!std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+		options = GraphicsStageCompileOptions(input_info, host);
 	} else {
-		static_assert(std::is_same_v<InputInfo, ShaderComputeInputInfo>);
-		options.stage              = ShaderType::Compute;
+		options = {.stage                  = ShaderType::Compute,
+		           .wave_size              = input_info.wave_size,
+		           .emit_debug_info        = host.emit_debug_info,
+		           .structured_jump_tables = host.structured_jump_tables};
 		options.input_info.compute = &input_info;
 		runtime.workgroup_counts   = input_info.workgroup_counts;
 		runtime.indirect_args_address = input_info.indirect_args_address;
@@ -560,8 +558,6 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	options.user_data       = user_data;
 	options.back_code       = params.back_code;
 	options.dump_ir         = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
-	options.emit_debug_info = Config::GraphicsDebugDumpEnabled();
-	options.structured_jump_tables = Config::StructuredJumpTablesEnabled();
 	ShaderRecompiler::ShaderSource source;
 	if (entry == m_program_cache.end()) {
 		DumpShader(params.code, fmt::format("original/{}_{:016x}.bin",

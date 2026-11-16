@@ -9,6 +9,7 @@
 #include "graphics/guest_gpu/command_processor/graphicsScanShadow.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/pipeline/generationState.h"
+#include "graphics/host_gpu/renderer/pipeline/graphicsCompileOptions.h"
 #include "graphics/host_gpu/renderer/pipeline/graphicsLibraryCache.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineParts.h"
 #include "graphics/host_gpu/renderer/pipeline/prescanHeapProbe.h"
@@ -165,18 +166,21 @@ struct PixelPrescanBuild {
 	uint64_t                           id = 0;
 };
 
+// The host fields of a prescan compile, from the values cached when the sink was made. The profile
+// is the device's own, which GetProgram's compile puts in too.
+GraphicsCompileHost PrescanCompileHost(const StoreGen::HostValues& host, bool emit_debug_info) {
+	return {.structured_jump_tables = host.structured_jump_tables,
+	        .profile                = &host.profile,
+	        .emit_debug_info        = emit_debug_info};
+}
+
 // The options GetProgram translates a pixel shader with, from the cached host values.
 ShaderRecompiler::CompileOptions PixelOptions(GraphicsUnit& unit, std::span<const uint32_t> user_data,
                                               const StoreGen::HostValues& host, bool emit_debug_info) {
-	ShaderRecompiler::CompileOptions options {.wave_size = unit.info.wave_size};
-	options.stage                  = ShaderType::Pixel;
-	options.input_info.pixel       = &unit.info;
-	options.shader_hash            = unit.code_hash;
-	options.user_data              = user_data;
-	options.dump_ir                = false;
-	options.emit_debug_info        = emit_debug_info;
-	options.structured_jump_tables = host.structured_jump_tables;
-	options.profile                = &host.profile;
+	auto options        = GraphicsStageCompileOptions(unit.info, PrescanCompileHost(host, emit_debug_info));
+	options.shader_hash = unit.code_hash;
+	options.user_data   = user_data;
+	options.dump_ir     = false;
 	return options;
 }
 
@@ -1386,16 +1390,10 @@ void PipelineCache::PostVertexBuild(const ScannedDraw& draw, const GraphicsStage
 	auto&      state       = *m_graphics_prescan;
 	auto&      counts      = state.counters.vertex;
 	const auto program_key = source.program_key;
-	ShaderRecompiler::CompileOptions options {.wave_size = info.wave_size};
-	options.stage                  = info.logical_stage;
-	options.input_info.vertex      = &info;
-	options.user_data_base         = 8;
-	options.shader_hash            = source.code_hash;
-	options.user_data              = source.user_data;
-	options.dump_ir                = false;
-	options.emit_debug_info        = state.emit_debug_info;
-	options.structured_jump_tables = state.host.structured_jump_tables;
-	options.profile                = &state.host.profile;
+	auto options        = GraphicsStageCompileOptions(info, PrescanCompileHost(state.host, state.emit_debug_info));
+	options.shader_hash = source.code_hash;
+	options.user_data   = source.user_data;
+	options.dump_ir     = false;
 	state.program_keys.Publish(program_key, PrescanFeedback::Answer::Busy);
 	auto build = CompileStage(source, options, state.rejects, state.dedupe);
 	if (build.skip) {

@@ -39,6 +39,7 @@
 #include "graphics/host_gpu/renderer/image/tiler.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/generationState.h"
+#include "graphics/host_gpu/renderer/pipeline/graphicsCompileOptions.h"
 #include "graphics/shader/recompiler/ir/Serialize.h"
 #include "graphics/shader/shaderStoreRecord.h"
 #include "graphics/guest_gpu/command_processor/prescanDispatchInputs.h"
@@ -2812,6 +2813,59 @@ void CheckModuleIdGolden() {
   std::printf("[host]    %-32s ok\n", name);
 }
 
+// The options GraphicsStageCompileOptions gives each stage. The baseline is the vertex row against the
+// mesh row, made from the same input info, so they differ only in the stage, the base and the wave
+// size. A base or wave size the helper never set would read the same in both. The control row's mesh
+// wave size equals its draw wave size, so only the fixed control wave size passes. Each host field is
+// non-default, so one the helper left out reads the default and fails. The default host must keep the
+// default profile, which GetProgram relies on, since CompileModule puts the device's profile in later.
+void CheckGraphicsStageCompileOptions() {
+  constexpr const char *name = "GraphicsStageCompileOptions";
+  constexpr u32 draw_wave = 32;
+  constexpr u32 mesh_wave = 64;
+  constexpr u32 reserved_base = 0;
+  const ShaderRecompiler::Spirv::Profile profile{};
+  const GraphicsCompileHost host{.structured_jump_tables = true, .profile = &profile, .emit_debug_info = true};
+  const auto host_fields = [&](const ShaderRecompiler::CompileOptions &options) {
+    return options.structured_jump_tables && options.emit_debug_info && options.profile == &profile;
+  };
+  struct Row {
+    ShaderType stage;
+    u32 mesh_wave;
+    u32 base;
+    u32 wave;
+    const char *label;
+  };
+  const Row rows[] = {
+      {ShaderType::Vertex, mesh_wave, VERTEX_USER_DATA_BASE, draw_wave, "vertex"},
+      {ShaderType::Mesh, mesh_wave, reserved_base, mesh_wave, "mesh"},
+      {ShaderType::TessellationEvaluation, mesh_wave, VERTEX_USER_DATA_BASE, draw_wave, "evaluation"},
+      {ShaderType::TessellationControl, draw_wave, reserved_base, TESS_CONTROL_WAVE_SIZE, "control"},
+  };
+  ShaderVertexInputInfo vertex_info;
+  vertex_info.wave_size = draw_wave;
+  for (const auto &row : rows) {
+    vertex_info.logical_stage = row.stage;
+    vertex_info.mesh.wave_size = row.mesh_wave;
+    const auto options = GraphicsStageCompileOptions(vertex_info, host);
+    Require(name, row.label,
+            options.stage == row.stage && options.input_info.vertex == &vertex_info && host_fields(options),
+            "the stage, the input info or a host field was not the one given");
+    Require(name, row.label, options.user_data_base == row.base && options.wave_size == row.wave,
+            "the user data base or the wave size broke the stage's rule");
+  }
+  ShaderPixelInputInfo pixel_info;
+  pixel_info.wave_size = draw_wave;
+  const auto pixel = GraphicsStageCompileOptions(pixel_info, host);
+  Require(name, "pixel",
+          pixel.stage == ShaderType::Pixel && pixel.input_info.pixel == &pixel_info && host_fields(pixel) &&
+              pixel.user_data_base == reserved_base && pixel.wave_size == draw_wave,
+          "the pixel options were not the draw's wave size with user data at 0 and the host fields");
+  Require(name, "default profile", GraphicsCompileHost{}.profile == &ShaderRecompiler::Spirv::DefaultProfile,
+          "the default host does not keep the default profile");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 // The flag must be off by default and on when only its field is set.
 void CheckNativeFloatMinMaxConfig() {
   constexpr const char *name = "NativeFloatMinMaxConfig";
@@ -3957,6 +4011,14 @@ struct GateFrame {
   uint32_t depth_draws = MIN_DRAWS_FOR_SKIP;
 };
 using GateScript = std::vector<std::optional<GateFrame>>;
+
+// Defined further down, with the compute jump-table case and the store checks. The graphics
+// jump-table check builds its shader and reads its store with them.
+std::vector<u32> MakeJumpTableShader(u32 selector_sgpr, u32 marker_vgpr,
+                                     const std::function<void(std::vector<u32> *)> &tail);
+std::filesystem::path PrescanStorePath(const char *tag);
+std::vector<DecodedModuleRecord> ReadStoredModuleRecords(const std::filesystem::path &path,
+                                                         bool skip_other_records = false);
 
 class VulkanHarness {
 public:
@@ -23615,6 +23677,130 @@ public:
     std::printf("[gpu]     %-32s ok\n", GraphicsPrebuildTestName);
   }
 
+  static constexpr const char *JumpTablePathsTestName = "GraphicsJumpTablePaths";
+
+  // The jump-table shader as a pixel shader. Its selector is user register s0, and each body moves its
+  // marker into red, which nothing reads, since only the SPIR-V is checked. The markers keep the bodies
+  // apart. The tail exports the colour. `green` is an inline constant, so two shaders that differ only
+  // in it have different code and so different hashes.
+  static std::vector<u32> JumpTablePixelShader(u32 green) {
+    constexpr u32 selector_sgpr = 0;
+    constexpr u32 red_vgpr = 0;
+    return MakeJumpTableShader(selector_sgpr, red_vgpr, [green](std::vector<u32> *code) {
+      constexpr u32 one_bits = 0x3f800000u;
+      AppendVMovU32(code, 1, green);
+      AppendVMovU32(code, 2, 0);
+      AppendVMovLiteral(code, 3, one_bits);
+      code->push_back(EncodeExp0(0, 0xf));
+      code->push_back(EncodeExp1(0, 1, 2, 3));
+      AppendEnd(code);
+    });
+  }
+
+  // A jump-table pixel shader built with structured jump tables on has no OpSwitch on either path,
+  // the prescan's worker and the GPU thread's own compile, which both take the flag from
+  // GraphicsStageCompileOptions. The baseline is the same run with the flag off, where both builds
+  // keep the dispatcher's OpSwitch. Only the flag differs, so a missing switch is the structured
+  // lowering's doing, and a path that dropped the flag keeps its switch. A selector folded to a
+  // constant could also remove the switch, which the baseline rules out.
+  void CheckGraphicsJumpTablePaths() {
+    constexpr const char *name = JumpTablePathsTestName;
+    constexpr uintptr_t structured_base = 0x0000000207800000ull;
+    constexpr uintptr_t baseline_base = 0x0000000207900000ull;
+    const auto structured = JumpTablePixelSpirv(true, structured_base);
+    const auto baseline = JumpTablePixelSpirv(false, baseline_base);
+    constexpr std::array<const char *, 2> paths{"prescan", "GPU thread"};
+    for (size_t path = 0; path < paths.size(); path++) {
+      Require(name, paths[path], !structured[path].empty() && !baseline[path].empty(),
+              "a pixel module's record is missing from the store");
+      Require(name, paths[path], SpirvOpcodeCount(baseline[path], spv::OpSwitch) > 0,
+              "the flag-off baseline has no OpSwitch, so its absence below would prove nothing");
+      Require(name, paths[path], SpirvOpcodeCount(structured[path], spv::OpSwitch) == 0,
+              "a build with structured jump tables on kept the dispatcher's OpSwitch");
+    }
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // One run of CheckGraphicsJumpTablePaths in a fresh context, since the prescan reads the flag once
+  // when its sink is made. The store keeps each pixel module's SPIR-V. Returns the SPIR-V of the
+  // shader offered to the prescan, then of the one the GPU thread compiled, empty where none was stored.
+  std::array<std::vector<u32>, 2> JumpTablePixelSpirv(bool structured, uintptr_t base) {
+    Config::ConfigOptions options;
+    options.printf_direction = Config::LogDirection::Silent;
+    options.structured_jump_tables = structured;
+    Config::Load(options);
+    const auto store = PrescanStorePath(structured ? "jump_table_on" : "jump_table_off");
+    const std::array codes{JumpTablePixelShader(0), JumpTablePixelShader(1)};
+    {
+      // The context opens the store before the sink is made, or the prescan would keep no records.
+      RenderContext context(RuntimeContext(), store);
+      context.InitializeGpu(nullptr);
+      LibKernel::Memory::InstallGpuResources(&context);
+      context.GetGpu().SendCommandSync([&] {
+        CommandProcessor processor(context, 0);
+        processor.BufferInit();
+        CadenceFixture fixture{context, context.GetCommandScheduler(), processor};
+        DrawJumpTablePixelShaders(fixture, base, codes);
+      });
+      LibKernel::Memory::InstallGpuResources(nullptr);
+      context.ShutdownGpu();
+    }
+    Config::Load({.printf_direction = Config::LogDirection::Silent});
+    std::array<std::vector<u32>, 2> spirv;
+    for (auto &record : ReadStoredModuleRecords(store, true)) {
+      for (size_t index = 0; index < codes.size(); index++) {
+        const auto hash = XXH3_64bits(codes[index].data(), codes[index].size() * sizeof(u32));
+        if (record.stage == ShaderType::Pixel && record.hash == hash) spirv[index] = record.spirv;
+      }
+    }
+    std::filesystem::remove_all(store.parent_path());
+    return spirv;
+  }
+
+  // Offers the first shader to the prescan and draws it, so the GPU thread binds the prescan's module
+  // and stores its record at that first use. Then draws the second without an offer, so the GPU thread
+  // compiles it and stores its own record.
+  void DrawJumpTablePixelShaders(CadenceFixture &fixture, uintptr_t base, const std::array<std::vector<u32>, 2> &codes) {
+    constexpr const char *name = JumpTablePathsTestName;
+    constexpr u32 extent = 16;
+    constexpr uint64_t vertex_offset = 0x1000;
+    constexpr std::array<uint64_t, 2> pixel_offsets{0x2000, 0x3000};
+    constexpr u32 selector = 2;
+    static ShaderUserData vertex_user_data{};
+    CadenceMemory memory{base, CadenceMemorySize};
+    MapCadenceMemory(fixture.context, memory);
+    auto &cache = fixture.context.GetPipelineCache();
+    PipelineCacheTestAccess::EnableGeneration(cache);
+    const auto sink = cache.GraphicsPrescanSink();
+    const auto figure = [&](const char *group, const char *row) {
+      return PipelineCacheTestAccess::GraphicsPrescanFigure(cache, group, row);
+    };
+    SetupCadenceColorTarget(fixture.processor.GetCtx(), base + CadenceSecondRegion, extent);
+    fixture.processor.GetUcfg().SetPrimitiveType(Prospero::PrimitiveType::kTriList);
+    auto &shaders = fixture.processor.GetShCtx();
+    shaders.SetEsShaderBase(PlaceGuestShader(base + vertex_offset, CadenceTriangleVertexShader(),
+                                             Prospero::ShaderBinaryType::kGs, &vertex_user_data));
+    HW::PsShaderResource2 rsrc2{};
+    rsrc2.user_sgpr = 1;
+    shaders.SetPsShaderResource2(rsrc2);
+    shaders.SetPsUserSgpr(0, selector);
+    shaders.SetPsShaderBase(
+        PlaceGuestShader(base + pixel_offsets[0], codes[0], Prospero::ShaderBinaryType::kPs, nullptr));
+    const auto draw = ScannedDrawOf(fixture.processor, base + pixel_offsets[0]);
+    sink(std::span<const ScannedDraw>(&draw, 1));
+    Require(name, "prescan posted", WaitForGraphicsWorker(cache, 1) && figure("worker", "posted") == 1,
+            "the prescan did not post the offered jump-table shader");
+    (void)DrawAndReadTarget(fixture);
+    Require(name, "prescan module used", figure("modules", "used") == 1 && figure("misses", "unpredicted") == 0,
+            "the draw did not bind the prescan's module");
+    shaders.SetPsShaderBase(
+        PlaceGuestShader(base + pixel_offsets[1], codes[1], Prospero::ShaderBinaryType::kPs, nullptr));
+    (void)DrawAndReadTarget(fixture);
+    Require(name, "GPU thread compiled", figure("misses", "unpredicted") == 1,
+            "the GPU thread did not compile the shader that was never offered");
+    UnmapCadenceMemory(fixture.context, memory);
+  }
+
   // Sets up the target, the plain triangle vertex shader and one pixel user register at a half, then
   // runs each prebuild case in guest memory of its own.
   void CheckGraphicsPrebuildCases(CadenceFixture &fixture) {
@@ -39430,15 +39616,17 @@ TestCase ScalarConditionalMoveB64() {
 constexpr u32 JumpTableMarkerBase = 0x100u;
 constexpr std::array<u32, 5> JumpTableEntryBodies = {0u, 1u, 2u, 1u, 3u};
 
-// Builds a shader that clamps the selector in s4 with s_min_u32, like real titles do, and
-// jumps through an S_SETPC_B64 table to a body that moves its marker into v1. The last
-// body falls through to the store of v1 at each lane's dword.
-std::vector<u32> MakeJumpTableMarkerShader() {
+// Builds a shader that clamps the selector in `selector_sgpr` into s0 with s_min_u32, like real
+// titles do, and jumps through an S_SETPC_B64 table to a body that moves its marker into
+// `marker_vgpr`. The last body falls through to `tail`, which must end the program, and the table
+// of JumpTableEntryBodies follows it.
+std::vector<u32> MakeJumpTableShader(u32 selector_sgpr, u32 marker_vgpr,
+                                     const std::function<void(std::vector<u32> *)> &tail) {
   constexpr u32 literal = 255u;
   constexpr u32 bodies = 4u;
   constexpr auto entries = static_cast<u32>(JumpTableEntryBodies.size());
   std::vector<u32> code;
-  code.push_back(EncodeSop2(0x07, 0, 4, InlineU32(entries - 1u))); // s_min_u32 s0, s4, 4
+  code.push_back(EncodeSop2(0x07, 0, selector_sgpr, InlineU32(entries - 1u))); // s_min_u32 s0, sN, 4
   code.push_back(EncodeSop2(0x1e, 0, 0, InlineU32(3)));            // s_lshl_b32 s0, s0, 3
   code.push_back(EncodeSop1(0x1f, 8, 0));                          // s_getpc_b64 s[8:9]
   const auto table_base = static_cast<u32>(code.size()) * 4u;
@@ -39458,21 +39646,31 @@ std::vector<u32> MakeJumpTableMarkerShader() {
   std::vector<size_t> exits;
   for (u32 body = 0; body < bodies; ++body) {
     body_pcs.push_back(static_cast<u32>(code.size()) * 4u);
-    AppendVMovLiteral(&code, 1, JumpTableMarkerBase + body);
-    if (body + 1u == bodies) continue; // falls through to the store
+    AppendVMovLiteral(&code, marker_vgpr, JumpTableMarkerBase + body);
+    if (body + 1u == bodies) continue; // falls through to the tail
     exits.push_back(code.size());
     code.push_back(0u);
   }
   for (const auto exit : exits)
     code[exit] = EncodeSopp(0x02, static_cast<u32>(code.size() - exit - 1u)); // s_branch
-  AppendStoreVgprAtLaneDwordOffset(&code, 1, 0, 0);
-  AppendEnd(&code);
+  tail(&code);
   code[table_literal] = static_cast<u32>(code.size()) * 4u - table_base;
   for (const auto body : JumpTableEntryBodies) {
     code.push_back(body_pcs[body] - target_base);
     code.push_back(0u);
   }
   return code;
+}
+
+// The compute jump-table shader. Its selector is in s4 and each body's marker goes to v1, which the
+// tail stores at each lane's dword.
+std::vector<u32> MakeJumpTableMarkerShader() {
+  constexpr u32 selector_sgpr = 4;
+  constexpr u32 marker_vgpr = 1;
+  return MakeJumpTableShader(selector_sgpr, marker_vgpr, [](std::vector<u32> *code) {
+    AppendStoreVgprAtLaneDwordOffset(code, marker_vgpr, 0, 0);
+    AppendEnd(code);
+  });
 }
 
 // Builds the wave64 jump-table marker test for one selector in one control-flow mode. Every lane
@@ -64756,8 +64954,11 @@ void CheckBackgroundWarmUp(VulkanHarness &vulkan) {
 
 // Reads the module records of a shader store file. The header is not read: the records start at the
 // first offset from which every frame to the end of the file unframes, which the checksums make
-// certain.
-std::vector<DecodedModuleRecord> ReadStoredModuleRecords(const std::filesystem::path &path) {
+// certain. A record of another type rejects the start offset it was reached from, so the read finds
+// no records unless `skip_other_records`, which a store of draws needs, since it holds pipeline
+// records too.
+std::vector<DecodedModuleRecord> ReadStoredModuleRecords(const std::filesystem::path &path,
+                                                         bool skip_other_records) {
   std::vector<uint8_t> bytes;
   if (Common::File file; Common::File::IsFileExisting(path) && file.Open(path, Common::File::Mode::Read)) {
     bytes.resize(file.Size());
@@ -64779,6 +64980,10 @@ std::vector<DecodedModuleRecord> ReadStoredModuleRecords(const std::filesystem::
       ShaderRecompiler::IR::Reader reader{frame->raw};
       auto type = StoreRecord::Module;
       ShaderRecompiler::IR::IoAll(reader, type);
+      if (type != StoreRecord::Module && skip_other_records && reader.ok) {
+        at += frame->frame_bytes;
+        continue;
+      }
       DecodedModuleRecord record;
       if (type == StoreRecord::Module) DecodeModuleRecord(reader, record);
       if (type != StoreRecord::Module || !reader.ok || !reader.bytes.empty()) {
@@ -77321,6 +77526,7 @@ int main(int argc, char **argv) {
   CheckSubmitCadenceConfig();
   CheckSubmitCadenceLogic();
   CheckWarmTakeCause();
+  CheckGraphicsStageCompileOptions();
   if (argc == 2 && std::strcmp(argv[1], "--submit-cadence-only") == 0) {
     return 0;
   }
@@ -78916,6 +79122,7 @@ int main(int argc, char **argv) {
   CheckFirstRunWiring(vulkan);
   vulkan.CheckOrderedDispatch();
   vulkan.CheckGpuSubmitCadence();
+  vulkan.CheckGraphicsJumpTablePaths();
   vulkan.CheckCadenceTextureAge();
   vulkan.CheckZeroStrideBufferBinding();
   vulkan.CheckNullStorageBufferDescriptor();
