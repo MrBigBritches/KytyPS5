@@ -279,9 +279,11 @@ void PipelineCache::AdoptGenerated(GeneratedModule&& item) {
 	// A prescan module builds on the prescan's own set, which the pause for draws never holds, so
 	// the intake is stopped for it when that set is.
 	const auto* warm_set = item.order.prescan ? m_prescan_compute.get() : m_warm_compute.get();
+	// A graphics prescan module builds nothing on a warm set, so only the intake's stop refuses it.
+	const bool           graphics = item.order.prescan && item.key.stage != ShaderType::Compute;
 	StoreGen::DrainFacts facts;
-	facts.stopped =
-	    state.stopped.load(std::memory_order_relaxed) || warm_set == nullptr || warm_set->Stopping();
+	facts.stopped = state.stopped.load(std::memory_order_relaxed) ||
+	                (!graphics && (warm_set == nullptr || warm_set->Stopping()));
 	facts.plan_hash  = item.plan_hash;
 	Program* program = nullptr;
 	ProgramIterator entry;
@@ -316,6 +318,12 @@ void PipelineCache::TakeGeneratedIn(GeneratedModule&& item, Program& program) {
 	program.modules.push_back(std::move(item.module));
 	if (prescan) {
 		RetainPrescanRecord(program.modules.back());
+		// A graphics prescan module has no pipeline of its own to build. Its draw's pipeline is built
+		// when the draw comes, and the module is only counted until a lookup binds it.
+		if (item.key.stage != ShaderType::Compute) {
+			NoteGraphicsPrescanAdopted(program.modules.back().id, item.key.stage);
+			return;
+		}
 		StartPrescanCompute(program.modules.back());
 		return;
 	}
@@ -381,6 +389,11 @@ void PipelineCache::NoteRefused(const GeneratedModule& item, StoreGen::DrainVerd
 	// as a duplicate, which tells the preparer the guess was right, so it does not count towards the
 	// back-off. A plan mismatch or a stop leaves the module unused.
 	if (item.order.prescan) {
+		// The graphics prescan has no variant tracker to tell, so its late duplicates are counted here.
+		if (item.key.stage != ShaderType::Compute) {
+			NoteGraphicsPrescanRefused(verdict == DrainVerdict::DropDuplicate, item.key.stage);
+			return;
+		}
 		if (verdict == DrainVerdict::DropDuplicate && m_prescan != nullptr) {
 			m_prescan->NoteDuplicate(item.module.id);
 		}
@@ -462,6 +475,7 @@ void PipelineCache::StopStoreGeneration() {
 	// and freed now, which also leaves the list empty before the program cache is destroyed.
 	state.retained_records.Release();
 	FinishPrescanReport();
+	FinishGraphicsPrescanReport();
 	// The final figures are taken now that nothing posts and nothing drains, and handed to the
 	// report in one step that also takes the source away. The writer may be calling the source at
 	// this moment, which is safe since the state still exists. After this it never calls it again,

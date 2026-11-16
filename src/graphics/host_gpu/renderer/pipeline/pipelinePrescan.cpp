@@ -168,7 +168,11 @@ void PipelineCache::EnablePrescan(StoreGen::PrescanTransportFactory make_transpo
 	    [this] { return BuildPrescanReport(false); });
 }
 
+// The graphics prescan's workers post into the same intake and build into the library cache, so they
+// are joined first, which StopStoreGeneration's call and the destructor's both get before the intake
+// or the library cache goes.
 void PipelineCache::StopPrescan() {
+	StopGraphicsPrescan();
 	if (m_prescan != nullptr) {
 		m_prescan->Stop();
 	}

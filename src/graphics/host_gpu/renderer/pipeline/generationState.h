@@ -73,6 +73,8 @@ struct PipelineCache::GenerationState {
 	// second.
 	GeneratedIntake generator;
 	GeneratedIntake prescan {.always_plan = true};
+	// The graphics prescan's translate worker's own (experimental), so it never shares the preparer's.
+	GeneratedIntake prescan_graphics {.always_plan = true};
 	// The GPU thread's own part. A drain moves the inbox into the backlogs and takes a few at a
 	// time. Prescan modules have their own backlog, which is taken first, since the scan found them
 	// about to run and a burst of generator modules must not hold them back.

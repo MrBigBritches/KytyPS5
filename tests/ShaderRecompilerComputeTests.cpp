@@ -46,6 +46,8 @@
 #include "graphics/guest_gpu/command_processor/submitScan.h"
 #include "graphics/guest_gpu/guestGpuOptions.h"
 #include "graphics/host_gpu/renderer/pipeline/prescanHandoff.h"
+#include "graphics/host_gpu/renderer/pipeline/pixelInputs.h"
+#include "graphics/host_gpu/renderer/pipeline/prescanGraphics.h"
 #include "graphics/shader/storegen/computeCompile.h"
 #include "graphics/shader/storegen/computeTranslation.h"
 #include "graphics/shader/storegen/ebootShaderScan.h"
@@ -1271,6 +1273,35 @@ struct PipelineCacheTestAccess {
   // Counts a module whose plan could not be decoded, as the generator's thread does. A test uses it
   // to change a figure after the stop and see whether the report still follows the cache.
   static void NoteBadPlan(PipelineCache &cache) { cache.m_generation->bad_plans++; }
+  // One figure of the cache's part of the prescan_graphics block, or -1 when there is none.
+  static double GraphicsPrescanFigure(const PipelineCache &cache, std::string_view group,
+                                      std::string_view name) {
+    if (cache.m_graphics_prescan == nullptr) {
+      return -1.0;
+    }
+    for (const auto &each : cache.BuildGraphicsPrescanReport().groups) {
+      for (const auto &[figure, value] : each.figures) {
+        if (each.name == group && figure == name) {
+          return value;
+        }
+      }
+    }
+    return -1.0;
+  }
+  // The sum of every figure of one group of the cache's part of the prescan_graphics block, or -1 when
+  // there is none, so a wait can count every skip class without naming each.
+  static double GraphicsPrescanGroupSum(const PipelineCache &cache, std::string_view group) {
+    if (cache.m_graphics_prescan == nullptr) {
+      return -1.0;
+    }
+    double sum = 0.0;
+    for (const auto &each : cache.BuildGraphicsPrescanReport().groups) {
+      for (const auto &[figure, value] : each.figures) {
+        sum += each.name == group ? value : 0.0;
+      }
+    }
+    return sum;
+  }
 
   // The generation block the report would write now, which holds the rows of the cache.
   static Common::FirstRunReport::ShaderStoreGenerationReport GenerationBlock(const PipelineCache &cache) {
@@ -22655,6 +22686,463 @@ public:
     SelectCadenceShader(fixture.processor, fixture.empty_shader, 0);
   }
 
+  static constexpr const char *GraphicsPrescanTestName = "GraphicsPrescanAdoption";
+
+  // Copies a program into the mapped guest memory and maps it as a shader there, so the graphics
+  // prescan's worker, which reads only through the backing alias, can read it too.
+  static uint64_t PlaceGuestShader(uint64_t address, const std::vector<u32> &code,
+                                   Prospero::ShaderBinaryType type, ShaderUserData *user_data) {
+    const auto bytes = static_cast<u32>(code.size() * sizeof(u32));
+    Require(GraphicsPrescanTestName, "shader copy",
+            LibKernel::Memory::TryWriteBacking(address, code.data(), bytes), "the shader could not be copied");
+    ShaderMapUserData(address, {.type = type, .user_data = user_data, .code_size_bytes = bytes});
+    return address;
+  }
+
+  // The draw the scanner would offer for the registers as they stand, made with the same helpers its
+  // shadow uses.
+  static ScannedDraw ScannedDrawOf(CommandProcessor &processor, uint64_t key_hash) {
+    const auto &ctx = processor.GetCtx();
+    const auto &sh = ctx.GetShaderRegisters();
+    ScannedDraw draw;
+    PixelTargetExportMapping mapping{};
+    (void)TryPixelTargetExportMapping(ctx, PixelColorOutputMask(ctx), mapping);
+    ShaderGetStaticInputInfoPS(processor.GetShCtx().GetPs(), sh, mapping, ShaderMappedData{}, draw.ps_info);
+    (void)FinishPixelInputInfo(ctx, {.primitive_type = processor.GetUcfg().GetPrimType()}, draw.ps_info);
+    draw.ps_regs = processor.GetShCtx().GetPs();
+    draw.ps_program_address = draw.ps_regs.ps_regs.data_addr;
+    draw.vs_program_address = processor.GetShCtx().GetVs().es_regs.data_addr;
+    draw.shader_stages = ctx.GetShaderStages();
+    draw.gs_lds_size = processor.GetShCtx().GetVs().gs_regs.rsrc2.lds_size;
+    draw.key_hash = key_hash;
+    return draw;
+  }
+
+  // A pixel shader whose red comes from user register s0, so it has push data and its module's push
+  // start depends on where the draw's push data ends, which a constant colour shader never shows.
+  // `green` is an inline constant, so two shaders that differ only in it have different code.
+  static std::vector<u32> UserRedPixelShader(u32 green = 0) {
+    constexpr u32 v_mov_b32 = 0x01;
+    constexpr u32 one_bits = 0x3f800000u;
+    std::vector<u32> code;
+    code.push_back(EncodeVop1(v_mov_b32, 0, 0));
+    AppendVMovU32(&code, 1, green);
+    AppendVMovU32(&code, 2, 0);
+    AppendVMovLiteral(&code, 3, one_bits);
+    code.push_back(EncodeExp0(0, 0xf));
+    code.push_back(EncodeExp1(0, 1, 2, 3));
+    AppendEnd(&code);
+    return code;
+  }
+
+  // Waits for the worker to post or skip everything it was given.
+  static bool WaitForGraphicsWorker(const PipelineCache &cache, double jobs) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    while (std::chrono::steady_clock::now() < deadline) {
+      double done = PipelineCacheTestAccess::GraphicsPrescanFigure(cache, "worker", "posted");
+      for (const char *reason : {"code_unmapped", "code_unreadable", "code_changed", "vertex_unmapped",
+                                 "has_calls", "materialize_faulted", "materialize_failed",
+                                 "invalid_descriptor", "exceeds_specialization"}) {
+        done += PipelineCacheTestAccess::GraphicsPrescanFigure(cache, "skipped", reason);
+      }
+      if (done >= jobs) {
+        return true;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    return false;
+  }
+
+  // Steps 6 and 8 end to end. A draw offered to the graphics prescan has its pixel shader translated
+  // on the worker and posted, the GPU thread takes the module in at the draw's lookup and binds it
+  // instead of compiling, which counts it used with no miss. The baseline is a second pixel shader
+  // drawn the same way but never offered, whose lookup compiles on the GPU thread and is counted as
+  // unpredicted. Only whether the draw was offered differs, so the use comes from the prescan.
+  void CheckGraphicsPrescanAdoption(CadenceFixture &fixture) {
+    constexpr u32 extent = 16;
+    constexpr uintptr_t base = 0x0000000207000000ull;
+    constexpr uint64_t vertex_offset = 0x1000;
+    constexpr uint64_t offered_offset = 0x2000;
+    constexpr uint64_t plain_offset = 0x3000;
+    CadenceMemory memory{base, CadenceMemorySize};
+    MapCadenceMemory(fixture.context, memory);
+    auto &cache = fixture.context.GetPipelineCache();
+    PipelineCacheTestAccess::EnableGeneration(cache);
+    const auto sink = cache.GraphicsPrescanSink();
+    static ShaderUserData vertex_user_data{};
+    const auto vertex = PlaceGuestShader(base + vertex_offset, CadenceTriangleVertexShader(),
+                                         Prospero::ShaderBinaryType::kGs, &vertex_user_data);
+    const auto offered = PlaceGuestShader(base + offered_offset, UserRedPixelShader(),
+                                          Prospero::ShaderBinaryType::kPs, nullptr);
+    const auto plain = PlaceGuestShader(base + plain_offset,
+                                        CadenceColorPixelShader({0.75f, 0.5f, 0.25f, 1.0f}),
+                                        Prospero::ShaderBinaryType::kPs, nullptr);
+    auto &registers = fixture.processor.GetCtx();
+    SetupCadenceColorTarget(registers, base + CadenceSecondRegion, extent);
+    fixture.processor.GetUcfg().SetPrimitiveType(Prospero::PrimitiveType::kTriList);
+    fixture.processor.GetShCtx().SetEsShaderBase(vertex);
+    fixture.processor.GetShCtx().SetPsShaderBase(offered);
+    // One user register, red at a half.
+    constexpr u32 half_bits = 0x3f000000u;
+    HW::PsShaderResource2 rsrc2{};
+    rsrc2.user_sgpr = 1;
+    fixture.processor.GetShCtx().SetPsShaderResource2(rsrc2);
+    fixture.processor.GetShCtx().SetPsUserSgpr(0, half_bits);
+    const auto draw = ScannedDrawOf(fixture.processor, 0x5151u);
+    sink(std::span<const ScannedDraw>(&draw, 1));
+    Require(GraphicsPrescanTestName, "worker", WaitForGraphicsWorker(cache, 1), "the worker never finished");
+    const auto figure = [&](const char *group, const char *name) {
+      return PipelineCacheTestAccess::GraphicsPrescanFigure(cache, group, name);
+    };
+    Require(GraphicsPrescanTestName, "posted", figure("worker", "posted") == 1, "the offered draw was not posted");
+    (void)RunCadenceStream(fixture.processor, CadenceDrawStream());
+    Require(GraphicsPrescanTestName, "used",
+            figure("modules", "adopted") == 1 && figure("modules", "used") == 1 &&
+                figure("misses", "late") == 0 && figure("misses", "id_differs") == 0 &&
+                figure("misses", "unpredicted") == 0,
+            "the offered draw's lookup did not bind the prescan module");
+    fixture.processor.GetShCtx().SetPsShaderBase(plain);
+    fixture.processor.GetShCtx().SetPsShaderResource2({});
+    (void)RunCadenceStream(fixture.processor, CadenceDrawStream());
+    Require(GraphicsPrescanTestName, "baseline",
+            figure("modules", "used") == 1 && figure("misses", "unpredicted") == 1,
+            "a draw never offered was not counted as unpredicted");
+    CheckGraphicsPrescanPushStartDiffers(fixture, sink, base, rsrc2);
+    CheckGraphicsPrescanDedupe(fixture, sink, base, offered, rsrc2);
+    CheckGraphicsPrescanVertexJob(fixture, sink, base, rsrc2);
+    CheckGraphicsPrescanLateDuplicate(fixture, sink, base, rsrc2);
+    fixture.scheduler.Finish();
+    UnmapCadenceMemory(fixture.context, memory);
+    SelectCadenceShader(fixture.processor, fixture.empty_shader, 0);
+    std::printf("[gpu]     %-32s ok\n", GraphicsPrescanTestName);
+  }
+
+  // An id_differs miss is put down to the push start when the prescan's module has the GPU's
+  // specialization but another push start. The offered draw says its vertex stage is merged, so the
+  // worker starts the push data where a mesh draw would, while the GPU draws it as a plain vertex
+  // shader. The first case, which agreed on the vertex stage, had no id_differs miss at all.
+  void CheckGraphicsPrescanPushStartDiffers(CadenceFixture &fixture, const GraphicsDrawSink &sink,
+                                            uintptr_t base, const HW::PsShaderResource2 &rsrc2) {
+    constexpr uint64_t mismatched_offset = 0x6000;
+    constexpr u32 merged_stages = 0x20u;
+    constexpr u32 distinct_green = 1;
+    auto &cache = fixture.context.GetPipelineCache();
+    const auto figure = [&](const char *group, const char *name) {
+      return PipelineCacheTestAccess::GraphicsPrescanFigure(cache, group, name);
+    };
+    const auto mismatched = PlaceGuestShader(base + mismatched_offset, UserRedPixelShader(distinct_green),
+                                             Prospero::ShaderBinaryType::kPs, nullptr);
+    fixture.processor.GetShCtx().SetPsShaderBase(mismatched);
+    fixture.processor.GetShCtx().SetPsShaderResource2(rsrc2);
+    auto draw = ScannedDrawOf(fixture.processor, 0x6262u);
+    draw.shader_stages = merged_stages;
+    sink(std::span<const ScannedDraw>(&draw, 1));
+    Require(GraphicsPrescanTestName, "mismatched worker", WaitForGraphicsWorker(cache, 2),
+            "the worker never finished the mismatched draw");
+    (void)RunCadenceStream(fixture.processor, CadenceDrawStream());
+    Require(GraphicsPrescanTestName, "push start differs",
+            figure("misses", "id_differs") == 1 && figure("misses", "id_differs_push_start") == 1 &&
+                figure("misses", "id_differs_specialization") == 0 && figure("misses", "id_differs_other") == 0,
+            "a module that differed only in its push start was not put down to the push start");
+  }
+
+  // The jobs of one stage the worker finished so far, posted or skipped for any reason.
+  static double GraphicsJobsDone(const PipelineCache &cache, bool vertex) {
+    return PipelineCacheTestAccess::GraphicsPrescanFigure(cache, vertex ? "vs_modules" : "worker", "posted") +
+           PipelineCacheTestAccess::GraphicsPrescanGroupSum(cache, vertex ? "vs_skipped" : "skipped");
+  }
+
+  // Waits until the worker has finished `jobs` jobs of the stage in all.
+  static bool WaitForGraphicsJobs(const PipelineCache &cache, bool vertex, double jobs) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    while (std::chrono::steady_clock::now() < deadline) {
+      if (GraphicsJobsDone(cache, vertex) >= jobs) {
+        return true;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    return false;
+  }
+
+  // Waits until one figure reaches `target`. A worker may bump a counter after the work it counts is
+  // already published and taken further, so a check of such a counter waits instead of reading once.
+  static bool WaitForGraphicsFigure(const PipelineCache &cache, const char *group, const char *name,
+                                    double target) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    while (std::chrono::steady_clock::now() < deadline) {
+      if (PipelineCacheTestAccess::GraphicsPrescanFigure(cache, group, name) >= target) {
+        return true;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    return false;
+  }
+
+  // Clears the colour target of the adoption case, draws the current shaders' triangle over all of it
+  // and reads it back, four words per pixel.
+  std::vector<u32> DrawAndReadTarget(CadenceFixture &fixture) {
+    constexpr u32 extent = 16;
+    auto &registers = fixture.processor.GetCtx();
+    fixture.scheduler.Finish();
+    RenderColorInfo color{};
+    RenderExecutorTestAccess::ResolveRenderColorTarget(fixture.context.GetRenderExecutor(),
+                                                       fixture.scheduler.Current(), color, 0);
+    TextureCacheTestAccess::ClearImage(fixture.context.GetTextureCache(), fixture.scheduler.Current(),
+                                       color.image_id, {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, {});
+    SetCadenceDrawColumns(registers, 0, extent, extent);
+    (void)RunCadenceStream(fixture.processor, CadenceDrawStream());
+    fixture.scheduler.Finish();
+    return ReadCachedTexel(GraphicsPrescanTestName, fixture.context, color.image_id, {}, {extent, extent, 1});
+  }
+
+  // Whether a render of UserRedPixelShader(`marker`) matches a GPU-compiled baseline render of
+  // UserRedPixelShader(`baseline_marker`). The baseline must cover every pixel with red 0.5 from s0 and
+  // alpha 1, so two empty renders never match. Every pixel must then agree in red, blue and alpha, and
+  // green must be the render's own marker wherever the baseline kept its marker, or 0 where the
+  // baseline's was flushed, since the markers are tiny denormal bit patterns.
+  static bool SameRedRender(const std::vector<u32> &render, u32 marker, const std::vector<u32> &baseline,
+                            u32 baseline_marker) {
+    constexpr u32 half_bits = 0x3f000000u;
+    constexpr u32 one_bits = 0x3f800000u;
+    constexpr size_t channels = 4;
+    if (baseline.empty() || render.size() != baseline.size()) {
+      return false;
+    }
+    for (size_t pixel = 0; pixel < baseline.size(); pixel += channels) {
+      const u32 green = baseline[pixel + 1] == baseline_marker ? marker : 0u;
+      if (baseline[pixel] != half_bits || baseline[pixel + 3] != one_bits || render[pixel] != baseline[pixel] ||
+          render[pixel + 1] != green || render[pixel + 2] != baseline[pixel + 2] ||
+          render[pixel + 3] != baseline[pixel + 3]) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  // The worker's second dedupe. The offered shader of CheckGraphicsPrescanAdoption is offered again
+  // under another scanner key, so the sink queues it, and the worker finds its module claimed and stops
+  // as deduped_late without posting. The baseline is a shader never offered, queued the same way, which
+  // posts with no deduped_late. Only whether the module was built before differs.
+  void CheckGraphicsPrescanDedupe(CadenceFixture &fixture, const GraphicsDrawSink &sink, uintptr_t base,
+                                  uint64_t offered, const HW::PsShaderResource2 &rsrc2) {
+    constexpr uint64_t fresh_offset = 0x9000;
+    constexpr u32 fresh_green = 4;
+    auto &cache = fixture.context.GetPipelineCache();
+    const auto figure = [&](const char *group, const char *name) {
+      return PipelineCacheTestAccess::GraphicsPrescanFigure(cache, group, name);
+    };
+    const auto offer = [&](uint64_t address, uint64_t key_hash) {
+      fixture.processor.GetShCtx().SetPsShaderBase(address);
+      fixture.processor.GetShCtx().SetPsShaderResource2(rsrc2);
+      const auto draw = ScannedDrawOf(fixture.processor, key_hash);
+      const double jobs = GraphicsJobsDone(cache, false) + 1;
+      sink(std::span<const ScannedDraw>(&draw, 1));
+      return WaitForGraphicsJobs(cache, false, jobs);
+    };
+    const double posted = figure("worker", "posted");
+    const double deduped = figure("skipped", "deduped_late");
+    Require(GraphicsPrescanTestName, "repeat worker", offer(offered, 0xb1b1u),
+            "the worker never finished the repeated shader");
+    Require(GraphicsPrescanTestName, "deduped late",
+            figure("skipped", "deduped_late") == deduped + 1 && figure("worker", "posted") == posted,
+            "a module the worker built before was built and posted again");
+    const auto fresh = PlaceGuestShader(base + fresh_offset, UserRedPixelShader(fresh_green),
+                                        Prospero::ShaderBinaryType::kPs, nullptr);
+    Require(GraphicsPrescanTestName, "fresh worker", offer(fresh, 0xb2b2u),
+            "the worker never finished the fresh shader");
+    Require(GraphicsPrescanTestName, "fresh baseline",
+            figure("skipped", "deduped_late") == deduped + 1 && figure("worker", "posted") == posted + 1,
+            "a shader the worker never built was deduped or not posted");
+    // The repeat must leave the program key settled. Drawn with one user clip plane, the shader's push
+    // data starts later, so the GPU thread compiles a module the worker never built, which is id_differs
+    // only while the key still reads as built. A repeat that cleared it would make this unpredicted.
+    const double id_differs = figure("misses", "id_differs");
+    const double unpredicted = figure("misses", "unpredicted");
+    fixture.processor.GetShCtx().SetPsShaderBase(offered);
+    const auto clip = fixture.processor.GetCtx().GetClipControl();
+    auto one_plane = clip;
+    one_plane.user_clip_planes = 1;
+    fixture.processor.GetCtx().SetClipControl(one_plane);
+    (void)RunCadenceStream(fixture.processor, CadenceDrawStream());
+    fixture.processor.GetCtx().SetClipControl(clip);
+    Require(GraphicsPrescanTestName, "repeat keeps the key",
+            figure("misses", "id_differs") == id_differs + 1 && figure("misses", "unpredicted") == unpredicted,
+            "the repeated job cleared its program key, so a module it did not build read as unpredicted");
+  }
+
+  // The cadence triangle vertex shader behind a dead move of `marker`, so its code, and with it its
+  // module, is new to the cache. Its x is also scaled by user register 0, which a vertex shader finds in
+  // s8 after the merged-stage prefix. With that register at 1.0 it draws the same triangle, and a module
+  // compiled as if user data started elsewhere scales x by another register and draws something else.
+  static std::vector<u32> MarkedTriangleVertexShader(u32 marker) {
+    constexpr u32 unused_vgpr = 7;
+    constexpr u32 v_mul_f32 = 0x08;
+    constexpr u32 x_vgpr = 3;
+    constexpr u32 first_user_sgpr = 8;
+    constexpr u32 position_target = 0x0c;
+    constexpr u32 all_components = 0xf;
+    std::vector<u32> code;
+    AppendVMovU32(&code, unused_vgpr, marker);
+    auto triangle = CadenceTriangleVertexShader();
+    const auto position_export = std::ranges::find(triangle, EncodeExp0(position_target, all_components));
+    triangle.insert(position_export, EncodeVop2(v_mul_f32, x_vgpr, first_user_sgpr, x_vgpr));
+    code.insert(code.end(), triangle.begin(), triangle.end());
+    return code;
+  }
+
+  // The draw with its vertex half too, filled as the scanner's AppendDraw fills it.
+  static ScannedDraw ScannedVertexDrawOf(CommandProcessor &processor, uint64_t key_hash, uint64_t vs_key_hash,
+                                         bool offer_vs) {
+    const auto &ctx = processor.GetCtx();
+    auto draw = ScannedDrawOf(processor, key_hash);
+    draw.vs_regs = processor.GetShCtx().GetVs();
+    draw.pa_cl_vs_out_cntl = ctx.GetShaderRegisters().m_paClVsOutCntl;
+    draw.clip_control = ctx.GetClipControl();
+    draw.mode_control = ctx.GetModeControl();
+    const auto &viewport = ctx.GetScreenViewport().viewports[0];
+    draw.viewport_scale = {viewport.xscale, viewport.yscale};
+    draw.viewport_offset = {viewport.xoffset, viewport.yoffset};
+    draw.vs_key_hash = vs_key_hash;
+    draw.offer_vs = offer_vs;
+    return draw;
+  }
+
+  // Places a fresh pixel and vertex shader pair at `address`, offers its draw with or without the vertex
+  // half, waits for the worker's pixel job and, when offered, its vertex job and its queued count, then
+  // draws it on the GPU thread and returns the target's pixels.
+  std::vector<u32> OfferAndDrawVertexPair(CadenceFixture &fixture, const GraphicsDrawSink &sink, uint64_t address,
+                                          u32 marker, bool offer_vs, const HW::PsShaderResource2 &rsrc2) {
+    constexpr uint64_t vertex_offset = 0x800;
+    static ShaderUserData vertex_user_data{};
+    auto &cache = fixture.context.GetPipelineCache();
+    auto &shaders = fixture.processor.GetShCtx();
+    shaders.SetPsShaderBase(PlaceGuestShader(address, UserRedPixelShader(marker), Prospero::ShaderBinaryType::kPs,
+                                             nullptr));
+    shaders.SetEsShaderBase(PlaceGuestShader(address + vertex_offset, MarkedTriangleVertexShader(marker),
+                                             Prospero::ShaderBinaryType::kGs, &vertex_user_data));
+    shaders.SetPsShaderResource2(rsrc2);
+    const auto draw = ScannedVertexDrawOf(fixture.processor, address, address + vertex_offset, offer_vs);
+    const double pixel_jobs = GraphicsJobsDone(cache, false) + 1;
+    const double vertex_jobs = GraphicsJobsDone(cache, true) + 1;
+    // vs_queued goes up only after the post returns, which a second worker can beat to the vertex post.
+    const double queued = PipelineCacheTestAccess::GraphicsPrescanFigure(cache, "worker", "vs_queued") + 1;
+    sink(std::span<const ScannedDraw>(&draw, 1));
+    Require(GraphicsPrescanTestName, "vertex pair worker",
+            WaitForGraphicsJobs(cache, false, pixel_jobs) &&
+                (!offer_vs || (WaitForGraphicsJobs(cache, true, vertex_jobs) &&
+                               WaitForGraphicsFigure(cache, "worker", "vs_queued", queued))),
+            "the worker never finished the vertex pair's jobs");
+    return DrawAndReadTarget(fixture);
+  }
+
+  // The vertex job end to end. A draw offered with its vertex half has its pixel job queue a vertex job,
+  // which translates the vertex shader and posts it, and the GPU thread binds that module at the draw
+  // instead of compiling, so it counts used with no vertex miss. The baseline goes first, a fresh pair
+  // offered without its vertex half, which queues no vertex job and whose vertex shader the GPU thread
+  // compiles itself as unpredicted. Only offer_vs differs between the two, so the adopted vertex module
+  // must also draw the baseline's pixels.
+  void CheckGraphicsPrescanVertexJob(CadenceFixture &fixture, const GraphicsDrawSink &sink, uintptr_t base,
+                                     const HW::PsShaderResource2 &rsrc2) {
+    constexpr uint64_t baseline_offset = 0xa000;
+    constexpr uint64_t offered_offset = 0xb000;
+    constexpr u32 baseline_marker = 5;
+    constexpr u32 offered_marker = 6;
+    auto &cache = fixture.context.GetPipelineCache();
+    const auto figure = [&](const char *group, const char *name) {
+      return PipelineCacheTestAccess::GraphicsPrescanFigure(cache, group, name);
+    };
+    auto &shaders = fixture.processor.GetShCtx();
+    const auto vertex_regs = shaders.GetVs();
+    // One user register at 1.0 for the marked vertex shaders' x scale.
+    constexpr u32 one_bits = 0x3f800000u;
+    auto one_user_sgpr = vertex_regs.gs_regs.rsrc2;
+    one_user_sgpr.user_sgpr = 1;
+    shaders.SetGsShaderResource2(one_user_sgpr);
+    shaders.SetGsUserSgpr(0, one_bits);
+    const double queued = figure("worker", "vs_queued");
+    const double posted = figure("vs_modules", "posted");
+    const double adopted = figure("vs_modules", "adopted");
+    const double used = figure("vs_modules", "used");
+    const double unpredicted = figure("vs_misses", "unpredicted");
+    const double late = figure("vs_misses", "late");
+    const double id_differs = figure("vs_misses", "id_differs");
+    const auto baseline = OfferAndDrawVertexPair(fixture, sink, base + baseline_offset, baseline_marker, false, rsrc2);
+    Require(GraphicsPrescanTestName, "vertex baseline",
+            figure("worker", "vs_queued") == queued && figure("vs_modules", "posted") == posted &&
+                figure("vs_modules", "adopted") == adopted && figure("vs_modules", "used") == used &&
+                figure("vs_misses", "unpredicted") == unpredicted + 1,
+            "a vertex half never offered was built, or its shader was not compiled as unpredicted");
+    const auto render = OfferAndDrawVertexPair(fixture, sink, base + offered_offset, offered_marker, true, rsrc2);
+    Require(GraphicsPrescanTestName, "vertex posted",
+            figure("worker", "vs_queued") == queued + 1 && figure("vs_modules", "posted") == posted + 1,
+            "the offered vertex half was not queued once and posted");
+    Require(GraphicsPrescanTestName, "vertex used",
+            figure("vs_modules", "adopted") == adopted + 1 && figure("vs_modules", "used") == used + 1 &&
+                figure("vs_misses", "unpredicted") == unpredicted + 1 &&
+                figure("vs_misses", "late") == late && figure("vs_misses", "id_differs") == id_differs,
+            "the offered draw's vertex lookup did not bind the prescan module");
+    // The adopted vertex module must draw what the GPU thread's own compile of the baseline drew.
+    Require(GraphicsPrescanTestName, "vertex renders",
+            SameRedRender(render, offered_marker, baseline, baseline_marker),
+            "the adopted vertex module drew other pixels than the GPU thread's own compile");
+    shaders.SetGsShaderResource2(vertex_regs.gs_regs.rsrc2);
+    shaders.SetGsUserSgpr(0, vertex_regs.gs_user_sgpr.value[0]);
+    shaders.SetEsShaderBase(vertex_regs.es_regs.data_addr);
+  }
+
+  // Offers one draw of the pixel shader at `address` and waits until the worker posted or skipped it.
+  static bool OfferAndWaitForPixelJob(CadenceFixture &fixture, const GraphicsDrawSink &sink, uint64_t address) {
+    auto &cache = fixture.context.GetPipelineCache();
+    const auto draw = ScannedDrawOf(fixture.processor, address);
+    const double jobs = GraphicsJobsDone(cache, false) + 1;
+    sink(std::span<const ScannedDraw>(&draw, 1));
+    return WaitForGraphicsJobs(cache, false, jobs);
+  }
+
+  // A module the worker posts after the GPU thread compiled the same one is refused at the next drain
+  // and counted as a late duplicate, not adopted. The baseline goes first, a fresh shader offered and
+  // posted before its first draw, which is adopted with no late duplicate. Only whether the GPU thread
+  // compiled the shader before the post differs. The adopted shader's pixels are also compared with
+  // the late shader's first draw, which the GPU thread compiled itself.
+  void CheckGraphicsPrescanLateDuplicate(CadenceFixture &fixture, const GraphicsDrawSink &sink, uintptr_t base,
+                                         const HW::PsShaderResource2 &rsrc2) {
+    constexpr uint64_t early_offset = 0xc000;
+    constexpr uint64_t late_offset = 0xd000;
+    constexpr u32 early_green = 7;
+    constexpr u32 late_green = 8;
+    auto &cache = fixture.context.GetPipelineCache();
+    auto &shaders = fixture.processor.GetShCtx();
+    const auto figure = [&](const char *group, const char *name) {
+      return PipelineCacheTestAccess::GraphicsPrescanFigure(cache, group, name);
+    };
+    const double adopted = figure("modules", "adopted");
+    const double late_duplicates = figure("modules", "late_duplicates");
+    const double used = figure("modules", "used");
+    shaders.SetPsShaderResource2(rsrc2);
+    shaders.SetPsShaderBase(PlaceGuestShader(base + early_offset, UserRedPixelShader(early_green),
+                                             Prospero::ShaderBinaryType::kPs, nullptr));
+    Require(GraphicsPrescanTestName, "early worker", OfferAndWaitForPixelJob(fixture, sink, base + early_offset),
+            "the worker never finished the shader offered before its draw");
+    const auto adopted_render = DrawAndReadTarget(fixture);
+    Require(GraphicsPrescanTestName, "early adopted",
+            figure("modules", "adopted") == adopted + 1 && figure("modules", "late_duplicates") == late_duplicates &&
+                figure("modules", "used") == used + 1,
+            "a module posted before its first draw was not adopted and used, or counted as a late duplicate");
+    shaders.SetPsShaderBase(PlaceGuestShader(base + late_offset, UserRedPixelShader(late_green),
+                                             Prospero::ShaderBinaryType::kPs, nullptr));
+    const auto compiled_render = DrawAndReadTarget(fixture);
+    // The adopted module must render what the GPU thread's own compile of the same shader shape does.
+    Require(GraphicsPrescanTestName, "adopted renders",
+            SameRedRender(adopted_render, early_green, compiled_render, late_green),
+            "the adopted pixel module drew other pixels than the GPU thread's own compile");
+    Require(GraphicsPrescanTestName, "late worker", OfferAndWaitForPixelJob(fixture, sink, base + late_offset),
+            "the worker never finished the shader offered after its draw");
+    (void)RunCadenceStream(fixture.processor, CadenceDrawStream());
+    Require(GraphicsPrescanTestName, "late duplicate",
+            figure("modules", "adopted") == adopted + 1 && figure("modules", "late_duplicates") == late_duplicates + 1,
+            "a module the GPU thread compiled first was adopted, or not counted as a late duplicate");
+  }
+
   // The checks of T5, separate to keep each function short.
   void CheckCadenceRenderPassResults(const CadenceDraws &unsplit, const CadenceDraws &split,
                                      const std::array<float, 4> &first_color,
@@ -22887,6 +23375,7 @@ public:
       fixture.empty_shader = reinterpret_cast<uint64_t>(code.data());
       CheckCadenceBuffers(fixture);
       CheckCadenceRenderPass(fixture);
+      CheckGraphicsPrescanAdoption(fixture);
       CheckCadenceDispatches(fixture);
       CheckCadenceIdle(fixture);
       CheckCadenceIndirect(fixture);
@@ -64569,10 +65058,34 @@ void CheckWarmUpStaysFront(VulkanHarness &vulkan, GuestGpu &gpu,
   std::printf("[gpu]     %-32s ok\n", name);
 }
 
+// The cache hands the report its final graphics prescan figures when store generation stops, so the
+// report never calls back into a cache that is gone. The report is reset first, so the baseline, the
+// source it holds once the prescan started, can only be this cache's. A cache is made on the main
+// thread only, which is why this runs here and not with the cadence cases.
+void CheckGraphicsPrescanFinalReport(VulkanHarness &vulkan) {
+  constexpr const char *name = "GraphicsPrescanFinalReport";
+  using Common::FirstRunReport::GraphicsPrescanPart;
+  auto &report = Common::FirstRunReport::Global();
+  report.Reset();
+  PipelineCache cache(vulkan.RuntimeContext(), nullptr);
+  PipelineCacheTestAccess::EnableGeneration(cache);
+  Require(name, "no source yet", !report.HoldsGraphicsPrescanSource(GraphicsPrescanPart::Cache),
+          "the reset report held a graphics prescan source");
+  (void)cache.GraphicsPrescanSink();
+  Require(name, "source held", report.HoldsGraphicsPrescanSource(GraphicsPrescanPart::Cache),
+          "the started graphics prescan registered no report source");
+  cache.StopStoreGeneration();
+  Require(name, "final figures", !report.HoldsGraphicsPrescanSource(GraphicsPrescanPart::Cache),
+          "the stop left the report holding a source that reads the cache");
+  report.Reset();
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
 // Captures two module records of one program by compiling it with two strides into a store, and runs
 // the checks of the generated modules over them.
 void CheckGeneratedModules(VulkanHarness &vulkan) {
   Config::Load({.printf_direction = Config::LogDirection::Silent});
+  CheckGraphicsPrescanFinalReport(vulkan);
   const auto dir = std::filesystem::temp_directory_path() /
                    fmt::format("kyty_generated_modules_{}",
                                std::chrono::steady_clock::now().time_since_epoch().count());

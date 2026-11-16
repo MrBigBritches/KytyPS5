@@ -526,6 +526,9 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		// A prescan module's record goes to the store at its first use, so a guess the game never
 		// runs leaves nothing in the store.
 		StoreOnFirstUse(entry->second, module);
+		if constexpr (!std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+			NoteGraphicsPrescanBind(module.id, entry->first.stage);
+		}
 		input_info.stage = {.module = &module, .resources = &entry->second.resources};
 		module.info.bindings.AdvancePushData(push_data_cursor);
 		return &module;
@@ -615,6 +618,8 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 		NoteGeneratedMiss(params.hash, compiled.id, entry->second.call_source != nullptr, false);
 		NoteInlineComputeModule(compiled.id);
+	} else {
+		NoteGraphicsPrescanMiss(entry->first, compiled, params.Base());
 	}
 	return bind(compiled);
 }

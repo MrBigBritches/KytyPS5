@@ -72,6 +72,7 @@ class CommandBuffer;
 class GraphicsLibraryCache;
 struct FragmentKey;
 struct PreRasterKey;
+struct GraphicsStageSource;
 class PrescanPreparer;
 struct PrescanPreparerConfig;
 
@@ -505,6 +506,14 @@ public:
 	// Stops the preparer and its transport and joins it, so nothing posts into the intake after.
 	// The preparer stays, so its counters can still be read. Calling it again does nothing.
 	void StopPrescan();
+	/// Starts the graphics prescan (experimental) and returns the sink its scanner hands each walk's
+	/// draws to. The sink runs on the scanner thread, and queues each new draw's pixel shader for a
+	/// low priority worker to translate and post into the generated intake. Call it on the main thread
+	/// after EnablePrescan, before the scanner starts. Without the prescan's intake it returns an empty
+	/// sink. The sink refers to this cache, which must outlive the scanner.
+	[[nodiscard]] GraphicsDrawSink GraphicsPrescanSink();
+	/// How many draws the graphics prescan's sink was given. Any thread.
+	[[nodiscard]] uint64_t GraphicsPrescanDrawsOffered() const noexcept;
 	// What the prescan's pipeline builds did so far. Any thread.
 	[[nodiscard]] PrescanBuildStats PrescanBuilds() const;
 	// How many of the GPU thread's own compute compiles were charged to PrescanInFlight only because
@@ -671,6 +680,45 @@ private:
 	// figures, or null. The preparer owns it, so it lives as long as m_prescan. The factory sets it
 	// while EnablePrescan makes the preparer, and nothing changes it once that succeeded.
 	StoreGen::SupervisorPrescanTransport* m_prescan_supervisor = nullptr;
+	// The graphics prescan (experimental), null unless GraphicsPrescanSink started it. Defined in
+	// prescanGraphics.h.
+	struct GraphicsPrescanState;
+	std::unique_ptr<GraphicsPrescanState> m_graphics_prescan;
+	// Queues the new draws of one walk for translation. Scanner thread.
+	void OfferGraphicsDraws(std::span<const ScannedDraw> draws);
+	// Translates one draw's pixel shader, posts its module and queues its fragment library, then queues
+	// the draw's vertex job when `chain_vertex`. Worker.
+	void RunGraphicsPrescanJob(const ScannedDraw& draw, std::chrono::steady_clock::time_point offered, bool chain_vertex);
+	// Queues a draw's vertex job in the translate queue's back lane, with the pixel shader's bindings
+	// when the caller has them. Scanner thread or worker.
+	void PostVertexJob(const ScannedDraw& draw, std::optional<ShaderRecompiler::IR::Bindings> ps_bindings);
+	// A vertex job: finds the pixel shader's bindings if it was not given them and runs RunVertexPrescan.
+	void RunVertexJob(const ScannedDraw& draw, const std::optional<ShaderRecompiler::IR::Bindings>& ps_bindings);
+	// The vertex shader's compile and post, and its pre-rasterization library prebuild. Workers.
+	void RunVertexPrescan(const ScannedDraw& draw, const ShaderRecompiler::IR::Bindings& ps_bindings, uint32_t ps_cursor);
+	void PostVertexBuild(const ScannedDraw& draw, const GraphicsStageSource& source, const ShaderVertexInputInfo& info,
+	                     std::chrono::steady_clock::time_point start);
+	// Makes the module of a graphics prescan record and hands it to the GPU thread, as
+	// PostPrescanModule does with the graphics intake. Worker.
+	void PostGraphicsPrescanModule(DecodedModuleRecord&& record, std::vector<uint8_t>&& record_bytes);
+	// Counts the first bind of an adopted graphics prescan module. GPU thread.
+	void NoteGraphicsPrescanBind(uint64_t id, ShaderType stage);
+	// Counts an adopted graphics prescan module, and one the drain refused. GPU thread.
+	void NoteGraphicsPrescanAdopted(uint64_t id, ShaderType stage);
+	void NoteGraphicsPrescanRefused(bool duplicate, ShaderType stage);
+	// Classifies a pixel or vertex shader the GPU thread compiled itself, and with the first-run report
+	// on adds a miss row with what the sightings say of `code_address`, the program's guest address.
+	// GPU thread.
+	void NoteGraphicsPrescanMiss(const ProgramKey& key, const ShaderModule& module, uint64_t code_address);
+	// Logs an id_differs miss against the modules the prescan built for its program key, and counts
+	// which field set it apart. GPU thread.
+	void NoteGraphicsPrescanIdDiffers(uint64_t program_key, const ShaderModule& module);
+	// Stops both graphics prescan queues, which joins their workers. Calling it again does nothing.
+	void StopGraphicsPrescan();
+	// The cache's part of the prescan_graphics report block, and its hand-over at the stop.
+	[[nodiscard]] Common::FirstRunReport::PrescanGraphicsReport BuildGraphicsPrescanReport() const;
+	void FinishGraphicsPrescanReport();
+	bool m_graphics_prescan_report_registered = false;
 	// Written by the prescan's build workers, read by anyone.
 	struct PrescanBuildCounters {
 		std::atomic<uint64_t> builds {0};

@@ -4,14 +4,19 @@
 #include "common/firstRunReport.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineBuildQueue.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/pipeline/prescanHandoff.h"
+#include "graphics/shader/storegen/computeTranslation.h"
 
 #include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 // The pipeline cache's side of the graphics prescan (experimental). The scanner offers the draws it
@@ -47,6 +52,27 @@ enum class GraphicsPrescanSkip : uint8_t {
 	Count,
 };
 
+/// Why a fragment library was not built ahead.
+enum class GraphicsPrebuildSkip : uint8_t {
+	LibrariesOff,   ///< The device does not build pipelines from libraries.
+	NoHeapLayout,   ///< No image heap layout, which every library layout names.
+	NoSplitModule,  ///< The split PS module could not be made.
+	LayoutLimits,   ///< The PS bindings alone are past the device limits.
+	AlreadyThere,  ///< The library was in the cache already.
+	Count,
+};
+
+/// What the GPU thread's own pixel shader compile says about the prescan.
+enum class GraphicsPrescanMiss : uint8_t {
+	Late,        ///< The prescan built or was building this program, and its module came too late.
+	IdDiffers,   ///< The prescan built this program's key under another module id.
+	Unpredicted, ///< The prescan never built this program's key.
+	Count,
+};
+
+/// How many buckets the posted-after-offer histogram has. Bucket n counts values below 2^n ms and
+/// at least half that, bucket 0 counts zero, and the last takes all larger ones.
+inline constexpr size_t GRAPHICS_PRESCAN_HISTOGRAM_BUCKETS = 20;
 /// How many whole seconds of the run the busy timeline covers, 15 minutes.
 inline constexpr size_t GRAPHICS_PRESCAN_TIMELINE_SECONDS = 900;
 
@@ -77,6 +103,11 @@ using GraphicsPrescanReader = bool (*)(void* userdata, uint64_t address, std::sp
 ScannedVertexInputInfo(const ScannedDraw& draw, const ShaderMapSnapshot& vertex, std::array<uint32_t, 2> max_viewport,
                        GraphicsPrescanReader read, void* userdata, ShaderVertexInputInfo& info);
 
+/// A hash of a pixel shader's program key, its code hash, user data count and static key words. The
+/// worker publishes it and the GPU thread computes it again at a miss, so both must use this.
+[[nodiscard]] uint64_t GraphicsProgramKeyHash(uint64_t code_hash, uint32_t user_data_count,
+                                              std::span<const uint32_t> static_state);
+
 /// The recompiler EXITs the worker's ExitRejectScope caught, by source line, for the report (experimental).
 /// Each distinct line is logged once, the first time it is caught.
 class GraphicsRejectTally {
@@ -101,6 +132,35 @@ private:
 /// @return false where it threw, after noting the EXIT in `tally`. Only translation and compilation may
 ///         run here. MaterializeResources must not, since its generated walker code cannot unwind.
 [[nodiscard]] bool RunRejectable(GraphicsRejectTally& tally, const std::function<void()>& step);
+
+/// One module the worker built, kept for diagnosing an id_differs miss.
+struct GraphicsPrescanVariant {
+	uint64_t                                     id         = 0;
+	uint32_t                                     push_start = 0;
+	ShaderRecompiler::IR::ResourceSpecialization specialization;
+};
+
+/// The vertex stage's own counts, beside the pixel stage's in GraphicsPrescanCounters.
+struct GraphicsVertexCounters {
+	std::atomic<uint64_t> posted {0};
+	std::array<std::atomic<uint64_t>, static_cast<size_t>(GraphicsPrescanSkip::Count)> skipped {};
+	std::atomic<uint64_t> translate_us {0};
+	std::atomic<uint64_t> adopted {0};
+	std::atomic<uint64_t> used {0};
+	std::atomic<uint64_t> late_duplicates {0};
+	std::array<std::atomic<uint64_t>, static_cast<size_t>(GraphicsPrescanMiss::Count)> misses {};
+	std::atomic<uint64_t> id_differs_push_start {0};
+	std::atomic<uint64_t> id_differs_specialization {0};
+	std::atomic<uint64_t> id_differs_other {0};
+	std::atomic<uint64_t> prebuilt {0};
+	std::atomic<uint64_t> prebuild_us {0};
+	std::atomic<uint64_t> prebuild_in_scope {0};
+	std::atomic<uint64_t> prebuild_in_hold {0};
+	std::array<std::atomic<uint64_t>, static_cast<size_t>(GraphicsPrebuildSkip::Count)> prebuild_skipped {};
+	std::atomic<uint64_t> prebuild_provoking_unsupported {0};
+	/// Pre-rasterization prebuilds not queued, since one of the same key was built or queued already.
+	std::atomic<uint64_t> prebuild_deduped_late {0};
+};
 
 /// How long a throttle signal holds the graphics prescan at GRAPHICS_PRESCAN_REDUCED_RUNNING_JOBS, and
 /// that cap. Each further signal re-arms the whole window. Jobs already running finish.
@@ -136,6 +196,7 @@ private:
 struct GraphicsPrescanCounters {
 	/// The adaptive cap the running slots are taken under.
 	GraphicsCapGovernor cap_governor;
+	GraphicsVertexCounters vertex;
 	/// Graphics jobs that waited for a running slot under GRAPHICS_PRESCAN_MAX_RUNNING_JOBS, and of
 	/// those the ones that waited while a reduced window lowered the cap.
 	std::atomic<uint64_t> capped_waits {0};
@@ -152,8 +213,43 @@ struct GraphicsPrescanCounters {
 	std::array<uint32_t, GRAPHICS_PRESCAN_TIMELINE_SECONDS> timeline_busy_us {};
 	std::array<uint8_t, GRAPHICS_PRESCAN_TIMELINE_SECONDS>  timeline_peak {};
 	int64_t                                                 busy_since_ns = 0;
+	std::atomic<uint64_t> offered {0};
+	std::atomic<uint64_t> deduped {0};
+	std::atomic<uint64_t> not_queued {0};
+	std::atomic<uint64_t> queued {0};
+	/// The vertex halves the scanner offered, those already queued once, and those queued now.
+	std::atomic<uint64_t> vs_offered {0};
+	std::atomic<uint64_t> vs_deduped {0};
+	std::atomic<uint64_t> vs_queued {0};
+	std::atomic<uint64_t> posted {0};
+	std::atomic<uint64_t> heap_image {0};
+	std::array<std::atomic<uint64_t>, static_cast<size_t>(GraphicsPrescanSkip::Count)> skipped {};
+	std::atomic<uint64_t> translate_us {0};
+	std::atomic<uint64_t> translate_max_us {0};
+	std::array<std::atomic<uint64_t>, GRAPHICS_PRESCAN_HISTOGRAM_BUCKETS> posted_after_offer_ms {};
+	std::atomic<uint64_t> posted_after_offer_max_us {0};
+	std::atomic<uint64_t> adopted {0};
+	std::atomic<uint64_t> used {0};
+	std::atomic<uint64_t> late_duplicates {0};
+	std::array<std::atomic<uint64_t>, static_cast<size_t>(GraphicsPrescanMiss::Count)> misses {};
+	// What set an id_differs miss apart from the modules the prescan built for the program key: only
+	// the push start, only the specialization, or neither alone.
+	std::atomic<uint64_t> id_differs_push_start {0};
+	std::atomic<uint64_t> id_differs_specialization {0};
+	std::atomic<uint64_t> id_differs_other {0};
+	std::atomic<uint64_t> prebuilt {0};
+	std::atomic<uint64_t> prebuild_us {0};
+	std::atomic<uint64_t> prebuild_in_scope {0};
+	std::atomic<uint64_t> prebuild_in_hold {0};
+	std::array<std::atomic<uint64_t>, static_cast<size_t>(GraphicsPrebuildSkip::Count)> prebuild_skipped {};
 };
 
+/// How many workers translate pixel and vertex shaders, and how many build their fragment and
+/// pre-rasterization libraries, both below normal priority. One translate worker fell behind the
+/// scanner by about half a second at p90. Four library workers pushed the compute prescan's in-flight
+/// hold past the audio limit in a measured title, and two kept it under.
+inline constexpr uint32_t GRAPHICS_PRESCAN_TRANSLATE_WORKERS = 3;
+inline constexpr uint32_t GRAPHICS_PRESCAN_LIBRARY_WORKERS   = 2;
 /// The most graphics jobs running at once across both queues, translate and library, so the graphics
 /// prescan never takes more than two cores from the game however many workers wait.
 inline constexpr uint32_t GRAPHICS_PRESCAN_MAX_RUNNING_JOBS = 2;
@@ -177,6 +273,30 @@ struct GraphicsQueueBound {
 /// @return whether the job was queued. False also after the queue stopped, which drops nothing.
 [[nodiscard]] bool PostBounded(PipelineBuildQueue& queue, GraphicsQueueBound& bound, PipelineBuildQueue::Lane lane,
                                Common::UniqueFunction<void> work);
+
+/// The worker's second dedupe, by what decides a module, before the costly steps (experimental). The first
+/// job of a program key keeps its resource plan, so a later job of the same key can work out its
+/// specialization without translating, and every job claims its (program key, push start,
+/// specialization) once.
+class GraphicsBuildDedupe {
+public:
+	/// A kept plan. Its walk writes scratch inside the plan, so one walk at a time, under the mutex.
+	struct KeptPlan {
+		std::mutex                         mutex;
+		ShaderRecompiler::IR::ResourcePlan plan;
+	};
+	/// The plan kept for `plan_key`, or null. A kept plan lives as long as this.
+	[[nodiscard]] KeptPlan* FindPlan(uint64_t plan_key);
+	/// Keeps a plan for `plan_key` unless one is kept already.
+	void KeepPlan(uint64_t plan_key, ShaderRecompiler::IR::ResourcePlan&& plan);
+	/// Claims a key. True the first time, and false once it was claimed.
+	[[nodiscard]] bool Claim(uint64_t key);
+
+private:
+	std::mutex                                             m_mutex;
+	std::unordered_map<uint64_t, std::unique_ptr<KeptPlan>> m_plans;
+	std::unordered_set<uint64_t>                           m_claimed;
+};
 
 /// Holds one of the GRAPHICS_PRESCAN_MAX_RUNNING_JOBS running slots for a graphics job while it lives.
 /// The compute prescan goes first by priority instead of a wait, since the graphics workers run a step
@@ -207,6 +327,53 @@ void AddBusyToTimeline(GraphicsPrescanCounters& counters, int64_t epoch_ns, int6
 /// the second now, at most GRAPHICS_PRESCAN_TIMELINE_SECONDS. The interval still open counts up to now.
 [[nodiscard]] Common::FirstRunReport::PrescanGraphicsReport::Group
 GraphicsBusyTimeline(const GraphicsPrescanCounters& counters, int64_t epoch_ns, int64_t now_ns);
+
+struct PipelineCache::GraphicsPrescanState {
+	/// Starts both queues with the given worker counts.
+	GraphicsPrescanState(uint32_t translate_workers, uint32_t library_workers)
+	    : translate(translate_workers, PipelineBuildQueueOptions {.low_priority = true, .lowest_priority = true}),
+	      libraries(library_workers, PipelineBuildQueueOptions {.low_priority = true, .lowest_priority = true}) {}
+
+	/// The host values every translation uses, taken once so no worker asks the device.
+	StoreGen::HostValues host;
+	/// What GetProgram reads from the Config, read once here.
+	bool emit_debug_info = false;
+	/// Whether module records are kept, which is only with a shader store.
+	bool keep_records = false;
+	/// Graphics jobs running now across both queues, which GRAPHICS_PRESCAN_MAX_RUNNING_JOBS caps.
+	std::atomic<uint32_t> running_jobs {0};
+	/// The pixel and vertex half keys already offered. The scanner thread's own, since only the sink
+	/// touches them.
+	std::unordered_set<uint64_t> offered_keys;
+	std::unordered_set<uint64_t> offered_vs_keys;
+	/// The bindings of each pixel half built, by its scanner key, for a vertex job whose pixel half was
+	/// built by an earlier job, since the vertex shader's push data starts after the pixel shader's.
+	std::mutex                                                        ps_bindings_mutex;
+	std::unordered_map<uint64_t, ShaderRecompiler::IR::Bindings>      ps_bindings;
+	/// The second dedupe, and each queue's bounds.
+	GraphicsBuildDedupe dedupe;
+	GraphicsQueueBound  translate_bound;
+	GraphicsQueueBound  libraries_bound;
+	/// The ids of adopted prescan modules no lookup has bound yet, pixel and vertex. The GPU thread's own.
+	std::unordered_set<uint64_t> adopted;
+	std::unordered_set<uint64_t> adopted_vertex;
+	/// The ids the workers built and the program keys they started on (Busy) or built (Settled), for
+	/// the GPU thread to read without a lock when it compiles a pixel shader itself. The table was made
+	/// for one writer. With several, each store is still one atomic word, and the only loss is a clear
+	/// racing another worker's store into the same slot, which costs one miss its class.
+	PrescanFeedback built_ids;
+	PrescanFeedback program_keys;
+	GraphicsPrescanCounters counters;
+	/// The recompiler EXITs caught on the workers, counted as recompiler_rejected skips too.
+	GraphicsRejectTally rejects;
+	/// The modules built per program key hash. The worker adds under the lock and only an id_differs
+	/// miss reads, which is rare, so the lock never holds up a lookup that hits.
+	std::mutex                                                          variants_mutex;
+	std::unordered_map<uint64_t, std::vector<GraphicsPrescanVariant>> variants;
+	/// Declared last, so their workers are joined before anything they use is destroyed.
+	PipelineBuildQueue translate;
+	PipelineBuildQueue libraries;
+};
 
 } // namespace Libs::Graphics
 

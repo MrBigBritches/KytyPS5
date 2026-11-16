@@ -1517,6 +1517,7 @@ inline std::atomic<int32_t>  g_warm_front_running {0};
 inline std::atomic<int32_t>  g_warm_back_running {0};
 inline std::atomic<bool>     g_child_alive {false};
 inline std::atomic<int32_t>  g_prescan_running {0};
+inline std::atomic<int32_t>  g_prescan_graphics_running {0};
 inline std::atomic<uint32_t> g_warm_workers {0};
 
 /// A counter never reads below zero. Scopes only add and then take back what they added, so a
@@ -1651,6 +1652,35 @@ private:
 		}
 	}
 
+	bool m_active;
+};
+
+/// The figure behind the prescan_graphics_running underrun tag (experimental), which is the graphics
+/// prescan's worker jobs in progress now. It is apart from PrescanRunning, so an underrun can be told
+/// to have met the graphics prescan's work rather than the compute prescan's.
+[[nodiscard]] inline uint32_t PrescanGraphicsRunning() noexcept {
+	return Detail::ReadCount(Detail::g_prescan_graphics_running);
+}
+
+/// Counts one graphics prescan job toward PrescanGraphicsRunning while it lives, when the report is
+/// on. Whether it counts is fixed when it is made, so it gives back exactly what it took.
+class PrescanGraphicsRunningScope {
+public:
+	PrescanGraphicsRunningScope() noexcept
+	    : m_active(Enabled()) {
+		if (m_active) {
+			Detail::g_prescan_graphics_running.fetch_add(1, std::memory_order_relaxed);
+		}
+	}
+	~PrescanGraphicsRunningScope() {
+		if (m_active) {
+			Detail::g_prescan_graphics_running.fetch_sub(1, std::memory_order_relaxed);
+		}
+	}
+	PrescanGraphicsRunningScope(const PrescanGraphicsRunningScope&)            = delete;
+	PrescanGraphicsRunningScope& operator=(const PrescanGraphicsRunningScope&) = delete;
+
+private:
 	bool m_active;
 };
 

@@ -3068,11 +3068,37 @@ void TestPrescanMissRowFollowsTheFlag() {
         "a miss row was kept while the report was off, or lost while it was on");
 }
 
+// A graphics prescan job's scope counts toward PrescanGraphicsRunning while it lives, with the report
+// on, and gives the count back when it ends, even after the report went off meanwhile. The baseline is
+// a scope made with the report off, which counts nothing, so a scope that adds nothing fails the first
+// check and one that ignores the report fails the last.
+void TestPrescanGraphicsRunningScope() {
+  using Common::FirstRunReport::PrescanGraphicsRunning;
+  using Common::FirstRunReport::PrescanGraphicsRunningScope;
+  Common::FirstRunReport::Configure(true, false);
+  {
+    const PrescanGraphicsRunningScope first;
+    const PrescanGraphicsRunningScope second;
+    Check(PrescanGraphicsRunning() == 2, "two graphics prescan jobs were not both counted");
+  }
+  Check(PrescanGraphicsRunning() == 0, "a finished graphics prescan job is still counted");
+  {
+    const PrescanGraphicsRunningScope made_on;
+    Common::FirstRunReport::Configure(false, false);
+  }
+  Check(PrescanGraphicsRunning() == 0, "a scope made with the report on kept its count after the report went off");
+  {
+    const PrescanGraphicsRunningScope made_off;
+    Check(PrescanGraphicsRunning() == 0, "a graphics prescan job was counted while the report was off");
+  }
+}
+
 int main() {
   TestGraphicsPrescanBlock();
   TestGraphicsPrescanSeries();
   TestEpochNsGivesBackTheEpoch();
   TestPrescanMissRowFollowsTheFlag();
+  TestPrescanGraphicsRunningScope();
   TestPausesMergeByFlip();
   TestPendingPauseCounts();
   TestOnlyGpuThreadBlocks();
