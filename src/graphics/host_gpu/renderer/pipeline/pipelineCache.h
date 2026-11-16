@@ -70,6 +70,7 @@ struct GraphicContext;
 struct ShaderParams;
 class CommandBuffer;
 class GraphicsLibraryCache;
+class GraphicsShaderSightings;
 struct FragmentKey;
 struct PreRasterKey;
 struct GraphicsStageSource;
@@ -514,6 +515,10 @@ public:
 	[[nodiscard]] GraphicsDrawSink GraphicsPrescanSink();
 	/// How many draws the graphics prescan's sink was given. Any thread.
 	[[nodiscard]] uint64_t GraphicsPrescanDrawsOffered() const noexcept;
+	/// The graphics prescan's sightings of shader addresses, for the scanner's walk to note its
+	/// verdicts in. Null unless GraphicsPrescanSink started the prescan with the first-run report on,
+	/// so a run without the report notes nothing. Lives as long as this cache.
+	[[nodiscard]] GraphicsShaderSightings* GraphicsPrescanSightings() noexcept;
 	// What the prescan's pipeline builds did so far. Any thread.
 	[[nodiscard]] PrescanBuildStats PrescanBuilds() const;
 	// How many of the GPU thread's own compute compiles were charged to PrescanInFlight only because

@@ -470,6 +470,73 @@ const char* MissName(GraphicsPrescanMiss miss) {
 	return "unknown";
 }
 
+// Notes what the sink or a worker did with a draw's shader address, when sightings are kept.
+void NoteJobSighting(GraphicsShaderSightings* sightings, SightingStage stage, uint64_t address, const char* outcome,
+                     SightingKind kind = SightingKind::Verdict) {
+	if (sightings != nullptr) {
+		sightings->NoteJob(stage, address, outcome, kind, Common::FirstRunReport::NowNs());
+	}
+}
+
+// Notes what the sink did with a draw's shader address. `noted` holds the keys the sink has noted,
+// the scanner thread's own. A deduped draw only repeats an earlier note of its key's address, which a
+// repeat never replaces, so it takes the lock and the clock only for an address the sink has not
+// noted yet. Past the cap the set stops growing and repeats are left out.
+void NoteSinkSighting(GraphicsShaderSightings* sightings, std::unordered_set<uint64_t>& noted, SightingStage stage,
+                      uint64_t address, const char* outcome, SightingKind kind) {
+	if (sightings == nullptr) {
+		return;
+	}
+	const auto key = SightingKey(stage, address);
+	if (kind == SightingKind::Repeat && (noted.contains(key) || noted.size() >= GRAPHICS_SIGHTING_CAP)) {
+		return;
+	}
+	if (noted.size() < GRAPHICS_SIGHTING_CAP) {
+		noted.insert(key);
+	}
+	NoteJobSighting(sightings, stage, address, outcome, kind);
+}
+
+// Milliseconds from `then_ns` to `now_ns`, or -1 when `then_ns` did not happen. A worker can note a
+// time just after a row read `now_ns`, as a Late miss's post does, so a time after it reads as 0 and
+// never as the -1 of a time that did not happen.
+double SightingAgoMs(int64_t now_ns, int64_t then_ns) {
+	if (then_ns == SIGHTING_NO_TIME) {
+		return -1.0;
+	}
+	return std::max(0.0, static_cast<double>(now_ns - then_ns) / (NS_PER_US * US_PER_MS));
+}
+
+// The miss row of one shader the GPU thread compiled itself, of any kind, with what the sightings
+// remember of its program's address. Without sightings both outcomes are unknown. With them, an
+// address never noted has an unknown scan, since the walk may never have reached its draws, and no job
+// unless some address was turned away past the cap, which makes the job unknown too. A sighted address
+// lists every verdict the walk gave its draws, none when only the pipeline cache noted it.
+Common::FirstRunReport::PrescanMissRow PrescanMissRowOf(ShaderType stage, const ShaderModule& module, uint64_t code_hash,
+                                                        GraphicsPrescanMiss miss, const GraphicsShaderSightings* sightings,
+                                                        uint64_t address) {
+	using Common::FirstRunReport::PRESCAN_OUTCOME_NONE;
+	using Common::FirstRunReport::PRESCAN_OUTCOME_UNKNOWN;
+	const bool vertex = stage == ShaderType::Vertex;
+	Common::FirstRunReport::PrescanMissRow row {.stage = vertex ? "vs" : "ps", .id = module.id, .hash = code_hash,
+	                                            .kind = MissName(miss), .at_ns = Common::FirstRunReport::NowNs()};
+	if (sightings == nullptr) {
+		return row;
+	}
+	const auto sighting = sightings->Find(vertex ? SightingStage::Vertex : SightingStage::Pixel, address);
+	if (!sighting) {
+		row.job = std::string(sightings->Dropped() == 0 ? PRESCAN_OUTCOME_NONE : PRESCAN_OUTCOME_UNKNOWN);
+		return row;
+	}
+	row.seen              = true;
+	row.scan              = ScanVerdictNames(sighting->scan_verdicts);
+	row.job               = sighting->job != nullptr ? sighting->job : std::string(PRESCAN_OUTCOME_NONE);
+	row.first_seen_ago_ms = SightingAgoMs(row.at_ns, sighting->first_seen_ns);
+	row.offered_ago_ms    = SightingAgoMs(row.at_ns, sighting->offered_ns);
+	row.posted_ago_ms     = SightingAgoMs(row.at_ns, sighting->posted_ns);
+	return row;
+}
+
 // A short fingerprint of a specialization, the module id of an otherwise empty key, which hashes every
 // field the way the real id does.
 uint64_t SpecializationHash(const IR::ResourceSpecialization& specialization) {
@@ -1096,6 +1163,9 @@ GraphicsDrawSink PipelineCache::GraphicsPrescanSink() {
 		                              m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize};
 		state->emit_debug_info = Config::GraphicsDebugDumpEnabled();
 		state->keep_records    = static_cast<bool>(m_store);
+		if (Common::FirstRunReport::Enabled()) {
+			state->sightings = std::make_unique<GraphicsShaderSightings>();
+		}
 		m_graphics_prescan     = std::move(state);
 		m_graphics_prescan_report_registered = true;
 		Common::FirstRunReport::Global().SetGraphicsPrescanSource(
@@ -1108,6 +1178,10 @@ uint64_t PipelineCache::GraphicsPrescanDrawsOffered() const noexcept {
 	return m_graphics_prescan == nullptr ? 0 : m_graphics_prescan->counters.offered.load(std::memory_order_relaxed);
 }
 
+GraphicsShaderSightings* PipelineCache::GraphicsPrescanSightings() noexcept {
+	return m_graphics_prescan == nullptr ? nullptr : m_graphics_prescan->sightings.get();
+}
+
 // Each half's key is queued once over the run, so a draw drawn every frame costs a set lookup or two
 // after its first. A draw whose halves are both new gets one pixel job, which queues the vertex job
 // when it has the bindings the vertex shader's push start follows. A draw with only a new vertex half
@@ -1117,21 +1191,36 @@ uint64_t PipelineCache::GraphicsPrescanDrawsOffered() const noexcept {
 void PipelineCache::OfferGraphicsDraws(std::span<const ScannedDraw> draws) {
 	auto& state     = *m_graphics_prescan;
 	auto& counters  = state.counters;
+	auto* sightings = state.sightings.get();
 	for (const auto& draw: draws) {
 		counters.offered.fetch_add(1, std::memory_order_relaxed);
 		const bool new_ps = draw.offer_ps && state.offered_keys.insert(draw.key_hash).second;
 		counters.deduped.fetch_add(draw.offer_ps && !new_ps ? 1 : 0, std::memory_order_relaxed);
+		if (draw.offer_ps && !new_ps) {
+			NoteSinkSighting(sightings, state.sink_noted, SightingStage::Pixel, draw.ps_program_address, "deduped",
+			                 SightingKind::Repeat);
+		}
 		bool new_vs = false;
 		if (draw.offer_vs && draw.vs_key_hash != 0) {
 			counters.vs_offered.fetch_add(1, std::memory_order_relaxed);
 			new_vs = state.offered_vs_keys.insert(draw.vs_key_hash).second;
 			counters.vs_deduped.fetch_add(new_vs ? 0 : 1, std::memory_order_relaxed);
+			if (!new_vs) {
+				NoteSinkSighting(sightings, state.sink_noted, SightingStage::Vertex, draw.vs_program_address, "deduped",
+				                 SightingKind::Repeat);
+			}
 		}
 		if (new_ps) {
+			// Noted before the post, so a worker that starts at once cannot have its outcome replaced.
+			NoteSinkSighting(sightings, state.sink_noted, SightingStage::Pixel, draw.ps_program_address, "queued",
+			                 SightingKind::Queued);
 			const auto offered = Clock::now();
 			const bool queued  = PostBounded(state.translate, state.translate_bound, PipelineBuildQueue::Lane::Front,
 			                                 [this, draw, offered, new_vs] { RunGraphicsPrescanJob(draw, offered, new_vs); });
 			(queued ? counters.queued : counters.not_queued).fetch_add(1, std::memory_order_relaxed);
+			if (!queued) {
+				NoteJobSighting(sightings, SightingStage::Pixel, draw.ps_program_address, "not_queued");
+			}
 		} else if (new_vs) {
 			PostVertexJob(draw, std::nullopt);
 		}
@@ -1141,9 +1230,14 @@ void PipelineCache::OfferGraphicsDraws(std::span<const ScannedDraw> draws) {
 // Queues a vertex job behind every pixel job.
 void PipelineCache::PostVertexJob(const ScannedDraw& draw, std::optional<ShaderRecompiler::IR::Bindings> ps_bindings) {
 	auto& state = *m_graphics_prescan;
+	// Noted before the post, so a worker that starts at once cannot have its outcome replaced.
+	NoteJobSighting(state.sightings.get(), SightingStage::Vertex, draw.vs_program_address, "queued", SightingKind::Queued);
 	const bool queued = PostBounded(state.translate, state.translate_bound, PipelineBuildQueue::Lane::Back,
 	                                [this, draw, ps_bindings = std::move(ps_bindings)] { RunVertexJob(draw, ps_bindings); });
 	state.counters.vs_queued.fetch_add(queued ? 1 : 0, std::memory_order_relaxed);
+	if (!queued) {
+		NoteJobSighting(state.sightings.get(), SightingStage::Vertex, draw.vs_program_address, "not_queued");
+	}
 }
 
 // A vertex job given no bindings takes those its pixel half's job kept. Without them the push start
@@ -1161,6 +1255,8 @@ void PipelineCache::RunVertexJob(const ScannedDraw& draw, const std::optional<Sh
 	if (!bindings) {
 		state.counters.vertex.skipped[static_cast<size_t>(GraphicsPrescanSkip::VertexNoPixel)].fetch_add(
 		    1, std::memory_order_relaxed);
+		NoteJobSighting(state.sightings.get(), SightingStage::Vertex, draw.vs_program_address,
+		                SkipName(GraphicsPrescanSkip::VertexNoPixel));
 		return;
 	}
 	const GraphicsJobSlot slot(state.running_jobs, state.counters, state.translate);
@@ -1190,6 +1286,7 @@ void PipelineCache::RunGraphicsPrescanJob(const ScannedDraw& draw, Clock::time_p
 		state.program_keys.Publish(unit.program_key,
 		                           built_elsewhere ? PrescanFeedback::Answer::Settled : PrescanFeedback::Answer::None);
 		counters.skipped[static_cast<size_t>(*skip)].fetch_add(1, std::memory_order_relaxed);
+		NoteJobSighting(state.sightings.get(), SightingStage::Pixel, draw.ps_program_address, SkipName(*skip));
 		// The vertex half was offered with this pixel half, so it goes too, and a later vertex job finds
 		// the bindings if another job of the same module keeps them.
 		if (chain_vertex) {
@@ -1210,6 +1307,7 @@ void PipelineCache::RunGraphicsPrescanJob(const ScannedDraw& draw, Clock::time_p
 	PostGraphicsPrescanModule(MakeRecord(source, build, {}), std::move(bytes));
 	const auto posted = Clock::now();
 	counters.posted.fetch_add(1, std::memory_order_relaxed);
+	NoteJobSighting(state.sightings.get(), SightingStage::Pixel, draw.ps_program_address, "posted", SightingKind::Posted);
 	const auto after_offer_us = WholeMicros(posted - offered);
 	counters.posted_after_offer_ms[MillisecondBucket(after_offer_us)].fetch_add(1, std::memory_order_relaxed);
 	RaiseMax(counters.posted_after_offer_max_us, after_offer_us);
@@ -1241,6 +1339,7 @@ void PipelineCache::RunVertexPrescan(const ScannedDraw& draw, const ShaderRecomp
 	const auto start  = Clock::now();
 	const auto skip   = [&](GraphicsPrescanSkip reason) {
 		counts.skipped[static_cast<size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
+		NoteJobSighting(state.sightings.get(), SightingStage::Vertex, draw.vs_program_address, SkipName(reason));
 	};
 	const auto vertex = ShaderTryGetMapped(draw.vs_program_address);
 	if (draw.indirect || !vertex) {
@@ -1304,6 +1403,7 @@ void PipelineCache::PostVertexBuild(const ScannedDraw& draw, const GraphicsStage
 		state.program_keys.Publish(program_key,
 		                           built_elsewhere ? PrescanFeedback::Answer::Settled : PrescanFeedback::Answer::None);
 		counts.skipped[static_cast<size_t>(*build.skip)].fetch_add(1, std::memory_order_relaxed);
+		NoteJobSighting(state.sightings.get(), SightingStage::Vertex, draw.vs_program_address, SkipName(*build.skip));
 		return;
 	}
 	std::vector<int32_t> formats;
@@ -1319,6 +1419,7 @@ void PipelineCache::PostVertexBuild(const ScannedDraw& draw, const GraphicsStage
 	auto bytes = state.keep_records ? EncodeRecord(source, build, formats) : std::vector<uint8_t> {};
 	PostGraphicsPrescanModule(MakeRecord(source, build, formats), std::move(bytes));
 	counts.posted.fetch_add(1, std::memory_order_relaxed);
+	NoteJobSighting(state.sightings.get(), SightingStage::Vertex, draw.vs_program_address, "posted", SightingKind::Posted);
 	counts.translate_us.fetch_add(WholeMicros(Clock::now() - start), std::memory_order_relaxed);
 	// A library of the same key built or queued already is not queued again, before any module or
 	// layout is made for it.
@@ -1493,6 +1594,11 @@ void PipelineCache::NoteGraphicsPrescanMiss(const ProgramKey& key, const ShaderM
 	}
 	auto& misses = key.stage == ShaderType::Vertex ? state.counters.vertex.misses : state.counters.misses;
 	misses[static_cast<size_t>(miss)].fetch_add(1, std::memory_order_relaxed);
+	// The row is only built with the report on, after the class is decided, so it changes nothing.
+	if (Common::FirstRunReport::Enabled()) {
+		Common::FirstRunReport::AddPrescanMissRow(
+		    PrescanMissRowOf(key.stage, module, key.hash, miss, state.sightings.get(), code_address));
+	}
 }
 
 // A built module that matches the GPU's in specialization but not push start points at the push
@@ -1582,6 +1688,10 @@ Common::FirstRunReport::PrescanGraphicsReport PipelineCache::BuildGraphicsPresca
 	misses.figures.emplace_back("id_differs_push_start", Count(counters.id_differs_push_start));
 	misses.figures.emplace_back("id_differs_specialization", Count(counters.id_differs_specialization));
 	misses.figures.emplace_back("id_differs_other", Count(counters.id_differs_other));
+	if (state.sightings != nullptr) {
+		misses.figures.emplace_back("sightings_kept", static_cast<double>(state.sightings->Kept()));
+		misses.figures.emplace_back("sightings_dropped", static_cast<double>(state.sightings->Dropped()));
+	}
 	const auto prebuilt = m_libraries != nullptr ? m_libraries->PrebuiltCounts() : PrebuiltLibraryCounts {};
 	Group      libraries {"libraries",
 	                      {{"prebuilt", Count(counters.prebuilt)},

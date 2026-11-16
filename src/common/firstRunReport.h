@@ -229,8 +229,8 @@ struct DeferredResolve {
 	uint64_t    window_hold_count_change = 0;
 	double      held_ms           = 0.0;
 	double      window_held_ms    = 0.0;
-	/// The vertex and pixel stage ids of the critical key, which name the shaders a stalled resolve
-	/// waited on. Set only when has_critical says the resolve had a critical key.
+	/// The vertex and pixel stage ids of the critical key, which tie a stalled resolve to its prescan
+	/// miss rows. Set only when has_critical says the resolve had a critical key.
 	bool        has_critical      = false;
 	uint64_t    critical_vs       = 0;
 	uint64_t    critical_ps       = 0;

@@ -22771,7 +22771,13 @@ public:
     MapCadenceMemory(fixture.context, memory);
     auto &cache = fixture.context.GetPipelineCache();
     PipelineCacheTestAccess::EnableGeneration(cache);
+    // The report is on while the prescan starts, so it keeps sightings for CheckGraphicsPrescanMissRows.
+    // Sightings only record, so the checks before that one see what they saw without them.
+    Common::FirstRunReport::Configure(true, false);
     const auto sink = cache.GraphicsPrescanSink();
+    Common::FirstRunReport::Configure(false, false);
+    Require(GraphicsPrescanTestName, "sightings", cache.GraphicsPrescanSightings() != nullptr,
+            "the prescan started with the report on kept no sightings");
     static ShaderUserData vertex_user_data{};
     const auto vertex = PlaceGuestShader(base + vertex_offset, CadenceTriangleVertexShader(),
                                          Prospero::ShaderBinaryType::kGs, &vertex_user_data);
@@ -22811,12 +22817,15 @@ public:
             figure("modules", "used") == 1 && figure("misses", "unpredicted") == 1,
             "a draw never offered was not counted as unpredicted");
     CheckGraphicsPrescanPushStartDiffers(fixture, sink, base, rsrc2);
+    CheckGraphicsPrescanMissRows(fixture, sink, base, rsrc2);
     CheckGraphicsPrescanDedupe(fixture, sink, base, offered, rsrc2);
     CheckGraphicsPrescanVertexJob(fixture, sink, base, rsrc2);
     CheckGraphicsPrescanLateDuplicate(fixture, sink, base, rsrc2);
     CheckGraphicsPrescanRunningTag(fixture, sink, base, rsrc2);
     CheckGraphicsPrescanAudioRows(fixture);
     CheckGraphicsPrescanLongHolds(fixture);
+    CheckGraphicsPrescanSightingNotes(fixture, sink, base, rsrc2);
+    CheckGraphicsPrescanAgoClamp(fixture, base);
     fixture.scheduler.Finish();
     UnmapCadenceMemory(fixture.context, memory);
     SelectCadenceShader(fixture.processor, fixture.empty_shader, 0);
@@ -22850,6 +22859,82 @@ public:
             figure("misses", "id_differs") == 1 && figure("misses", "id_differs_push_start") == 1 &&
                 figure("misses", "id_differs_specialization") == 0 && figure("misses", "id_differs_other") == 0,
             "a module that differed only in its push start was not put down to the push start");
+  }
+
+  // Waits until the sightings remember `outcome` as the address's last job, for at most 30 seconds, and
+  // returns what they remember then. A worker notes its outcome just after it counts it, so a wait on
+  // the report's counts alone can read the sighting too early.
+  static std::optional<ShaderSighting> WaitForSightingJob(const GraphicsShaderSightings &sightings,
+                                                          SightingStage stage, uint64_t address,
+                                                          std::string_view outcome) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    while (std::chrono::steady_clock::now() < deadline) {
+      const auto sighting = sightings.Find(stage, address);
+      if (sighting && sighting->job != nullptr && outcome == sighting->job) {
+        return sighting;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    return std::nullopt;
+  }
+
+  // Each pixel shader the GPU thread compiles itself gets a miss row with what the prescan did with its
+  // address. One shader is offered with more user registers than GetShaderParams takes, so the worker
+  // skips it as too_many_user_data, and the GPU thread, whose registers are fine, compiles it as
+  // unpredicted. Its row says the address was seen and names that skip, which only the worker's note
+  // can have put there. The baseline is another shader drawn the same way but never offered, whose row
+  // says it was never seen, with an unknown scan and no job, so a row that always said seen fails. No
+  // shadow walked either draw, so the offered one has no scan verdict.
+  void CheckGraphicsPrescanMissRows(CadenceFixture &fixture, const GraphicsDrawSink &sink, uintptr_t base,
+                                    const HW::PsShaderResource2 &rsrc2) {
+    constexpr uint64_t refused_offset = 0x7000;
+    constexpr uint64_t unseen_offset = 0x8000;
+    constexpr u32 refused_green = 2;
+    constexpr u32 unseen_green = 3;
+    auto &cache = fixture.context.GetPipelineCache();
+    auto &shaders = fixture.processor.GetShCtx();
+    const auto refused = PlaceGuestShader(base + refused_offset, UserRedPixelShader(refused_green),
+                                          Prospero::ShaderBinaryType::kPs, nullptr);
+    const auto unseen = PlaceGuestShader(base + unseen_offset, UserRedPixelShader(unseen_green),
+                                         Prospero::ShaderBinaryType::kPs, nullptr);
+    shaders.SetPsShaderBase(refused);
+    shaders.SetPsShaderResource2(rsrc2);
+    auto draw = ScannedDrawOf(fixture.processor, 0x7373u);
+    draw.ps_regs.ps_regs.rsrc2.user_sgpr = HW::UserSgprInfo::SGPRS_MAX + 1;
+    sink(std::span<const ScannedDraw>(&draw, 1));
+    Require(GraphicsPrescanTestName, "refused worker",
+            WaitForSightingJob(*cache.GraphicsPrescanSightings(), SightingStage::Pixel, refused, "too_many_user_data")
+                .has_value(),
+            "the worker never noted its skip of the draw with too many user registers");
+    const auto before = Common::FirstRunReport::Global().PrescanMissRows().size();
+    Common::FirstRunReport::Configure(true, false);
+    (void)RunCadenceStream(fixture.processor, CadenceDrawStream());
+    shaders.SetPsShaderBase(unseen);
+    (void)RunCadenceStream(fixture.processor, CadenceDrawStream());
+    Common::FirstRunReport::Configure(false, false);
+    CheckGraphicsPrescanMissRowFields(Common::FirstRunReport::Global().PrescanMissRows(), before);
+  }
+
+  // The fields CheckGraphicsPrescanMissRows asks of its two rows, the offered shader's first.
+  static void CheckGraphicsPrescanMissRowFields(const std::vector<Common::FirstRunReport::PrescanMissRow> &all,
+                                                size_t before) {
+    std::vector<Common::FirstRunReport::PrescanMissRow> rows;
+    for (size_t index = before; index < all.size(); index++) {
+      if (all[index].stage == "ps") rows.push_back(all[index]);
+    }
+    Require(GraphicsPrescanTestName, "miss rows", rows.size() == 2, "the two compiles did not add two pixel miss rows");
+    const auto &offered = rows[0];
+    const auto &plain = rows[1];
+    Require(GraphicsPrescanTestName, "offered row",
+            offered.kind == "unpredicted" && offered.seen && offered.job == "too_many_user_data" &&
+                offered.scan.empty() && offered.offered_ago_ms >= 0.0 && offered.first_seen_ago_ms >= 0.0 &&
+                offered.posted_ago_ms < 0.0 && offered.id != 0 && offered.hash != 0,
+            "the offered shader's row did not name the worker's skip");
+    Require(GraphicsPrescanTestName, "unseen row",
+            plain.kind == "unpredicted" && !plain.seen && plain.scan == std::vector<std::string>{"unknown"} &&
+                plain.job == "none" &&
+                plain.offered_ago_ms < 0.0 && plain.hash != offered.hash && plain.id != offered.id,
+            "the never offered shader's row did not say it was never seen");
   }
 
   // The jobs of one stage the worker finished so far, posted or skipped for any reason.
@@ -23274,6 +23359,151 @@ public:
             count >= 0 && figure("count") == count + 1 &&
                 figure(fmt::format("hold_{}_running", static_cast<size_t>(count))) == 1,
             "the long hold was not listed with the graphics prescan job running when it began, or the short one was");
+  }
+
+  // Places a fresh pixel and vertex shader pair at `address` and returns its draw, keyed by the two
+  // addresses, with or without the vertex half. Nothing is offered or drawn.
+  static ScannedDraw PlacePairDraw(CadenceFixture &fixture, uint64_t address, u32 marker, bool offer_vs) {
+    constexpr uint64_t vertex_offset = 0x800;
+    static ShaderUserData vertex_user_data{};
+    auto &shaders = fixture.processor.GetShCtx();
+    shaders.SetPsShaderBase(PlaceGuestShader(address, UserRedPixelShader(marker), Prospero::ShaderBinaryType::kPs,
+                                             nullptr));
+    shaders.SetEsShaderBase(PlaceGuestShader(address + vertex_offset, MarkedTriangleVertexShader(marker),
+                                             Prospero::ShaderBinaryType::kGs, &vertex_user_data));
+    return ScannedVertexDrawOf(fixture.processor, address, address + vertex_offset, offer_vs);
+  }
+
+  // The sightings the sink and the workers note, with the vertex user register the marked vertex
+  // shaders read set as CheckGraphicsPrescanVertexJob sets it, and put back after.
+  void CheckGraphicsPrescanSightingNotes(CadenceFixture &fixture, const GraphicsDrawSink &sink, uintptr_t base,
+                                         const HW::PsShaderResource2 &rsrc2) {
+    constexpr u32 one_bits = 0x3f800000u;
+    auto &shaders = fixture.processor.GetShCtx();
+    const auto vertex_regs = shaders.GetVs();
+    auto one_user_sgpr = vertex_regs.gs_regs.rsrc2;
+    one_user_sgpr.user_sgpr = 1;
+    shaders.SetGsShaderResource2(one_user_sgpr);
+    shaders.SetGsUserSgpr(0, one_bits);
+    shaders.SetPsShaderResource2(rsrc2);
+    const auto posted = CheckGraphicsPrescanJobSightings(fixture, sink, base);
+    CheckGraphicsPrescanSinkSightings(fixture, sink, base, posted);
+    shaders.SetGsShaderResource2(vertex_regs.gs_regs.rsrc2);
+    shaders.SetGsUserSgpr(0, vertex_regs.gs_user_sgpr.value[0]);
+    shaders.SetEsShaderBase(vertex_regs.es_regs.data_addr);
+  }
+
+  // What the workers note of each address, over four fresh pairs. A pair offered with its vertex half
+  // ends with its vertex address posted and an offered time, which only the vertex post's queued and
+  // posted notes give. A pair offered without it ends with its pixel address posted, the pixel worker's
+  // own note, and its vertex address never noted, so a vertex note made for any draw fails. A pair with
+  // more vertex user registers than a module takes stops its vertex job as too_many_user_data, and one
+  // with too many pixel user registers leaves its vertex job no bindings, so it stops as
+  // vertex_no_pixel. The pixel half's notes are of the pixel stage, so only the vertex job's own skip
+  // notes can name either on a vertex address. Returns the posted pair's draw.
+  ScannedDraw CheckGraphicsPrescanJobSightings(CadenceFixture &fixture, const GraphicsDrawSink &sink, uintptr_t base) {
+    constexpr uint64_t posted_offset = 0x5000;
+    constexpr uint64_t vertex_refused_offset = 0x5200;
+    constexpr uint64_t pixel_refused_offset = 0x5400;
+    constexpr uint64_t pixel_only_offset = 0xf000;
+    constexpr u32 posted_marker = 10;
+    constexpr u32 pixel_only_marker = 11;
+    constexpr u32 vertex_refused_marker = 12;
+    constexpr u32 pixel_refused_marker = 13;
+    constexpr u32 too_many_user_sgprs = HW::UserSgprInfo::SGPRS_MAX + 1;
+    const auto &sightings = *fixture.context.GetPipelineCache().GraphicsPrescanSightings();
+    const auto offer = [&](const ScannedDraw &draw) { sink(std::span<const ScannedDraw>(&draw, 1)); };
+    const auto posted = PlacePairDraw(fixture, base + posted_offset, posted_marker, true);
+    offer(posted);
+    const auto pixel_only = PlacePairDraw(fixture, base + pixel_only_offset, pixel_only_marker, false);
+    offer(pixel_only);
+    auto vertex_refused = PlacePairDraw(fixture, base + vertex_refused_offset, vertex_refused_marker, true);
+    vertex_refused.vs_regs.gs_regs.rsrc2.user_sgpr = too_many_user_sgprs;
+    offer(vertex_refused);
+    auto pixel_refused = PlacePairDraw(fixture, base + pixel_refused_offset, pixel_refused_marker, true);
+    pixel_refused.ps_regs.ps_regs.rsrc2.user_sgpr = too_many_user_sgprs;
+    offer(pixel_refused);
+    const auto vertex = WaitForSightingJob(sightings, SightingStage::Vertex, posted.vs_program_address, "posted");
+    Require(GraphicsPrescanTestName, "vertex posted sighting",
+            vertex && vertex->offered_ns != SIGHTING_NO_TIME && vertex->posted_ns >= vertex->offered_ns,
+            "the offered vertex half's address was not noted queued and then posted");
+    Require(GraphicsPrescanTestName, "pixel only sighting",
+            WaitForSightingJob(sightings, SightingStage::Pixel, pixel_only.ps_program_address, "posted") &&
+                !sightings.Find(SightingStage::Vertex, pixel_only.vs_program_address),
+            "the pixel-only pair's pixel address was not noted posted, or its vertex address was noted");
+    Require(GraphicsPrescanTestName, "vertex skip sightings",
+            WaitForSightingJob(sightings, SightingStage::Vertex, vertex_refused.vs_program_address,
+                               "too_many_user_data") &&
+                WaitForSightingJob(sightings, SightingStage::Vertex, pixel_refused.vs_program_address,
+                                   "vertex_no_pixel"),
+            "a vertex job's skip was not noted on its vertex address");
+    return posted;
+  }
+
+  // The sink's notes of a deduped draw, a late vertex dedupe, and the sightings' rows in the report.
+  // The posted pair's draw is offered again under its own keys at two addresses nothing offered
+  // before, which the sink dedupes, so only its repeat notes can put the two addresses in, and neither
+  // is noted before. Offered once more under a new vertex key, its vertex job finds the module claimed,
+  // so its address turns from posted to deduped_late. The report's sightings_kept and
+  // sightings_dropped rows must then read the sightings, which keep some and drop none, so a row that
+  // read the other figure fails.
+  void CheckGraphicsPrescanSinkSightings(CadenceFixture &fixture, const GraphicsDrawSink &sink, uintptr_t base,
+                                         ScannedDraw posted) {
+    constexpr uint64_t repeat_pixel_offset = 0xfc00;
+    constexpr uint64_t repeat_vertex_offset = 0xfe00;
+    constexpr uint64_t new_vertex_key = 0x5a5a;
+    auto &cache = fixture.context.GetPipelineCache();
+    const auto &sightings = *cache.GraphicsPrescanSightings();
+    auto repeat = posted;
+    repeat.ps_program_address = base + repeat_pixel_offset;
+    repeat.vs_program_address = base + repeat_vertex_offset;
+    const bool unnoted = !sightings.Find(SightingStage::Pixel, repeat.ps_program_address) &&
+                         !sightings.Find(SightingStage::Vertex, repeat.vs_program_address);
+    sink(std::span<const ScannedDraw>(&repeat, 1));
+    const auto pixel = sightings.Find(SightingStage::Pixel, repeat.ps_program_address);
+    const auto vertex = sightings.Find(SightingStage::Vertex, repeat.vs_program_address);
+    Require(GraphicsPrescanTestName, "sink repeats",
+            unnoted && pixel && vertex && pixel->job != nullptr && std::string_view(pixel->job) == "deduped" &&
+                vertex->job != nullptr && std::string_view(vertex->job) == "deduped" &&
+                pixel->offered_ns == SIGHTING_NO_TIME && vertex->offered_ns == SIGHTING_NO_TIME,
+            "a deduped draw's new addresses were not noted as deduped, or were noted as queued");
+    posted.vs_key_hash = new_vertex_key;
+    sink(std::span<const ScannedDraw>(&posted, 1));
+    Require(GraphicsPrescanTestName, "vertex dedupe sighting",
+            WaitForSightingJob(sightings, SightingStage::Vertex, posted.vs_program_address, "deduped_late").has_value(),
+            "a vertex job whose module was claimed was not noted as deduped_late");
+    const auto figure = [&](const char *name) { return PipelineCacheTestAccess::GraphicsPrescanFigure(cache, "misses", name); };
+    Require(GraphicsPrescanTestName, "sightings rows",
+            sightings.Kept() >= 2 && sightings.Dropped() == 0 &&
+                figure("sightings_kept") == static_cast<double>(sightings.Kept()) && figure("sightings_dropped") == 0,
+            "the report's sightings rows did not read the sightings' kept and dropped counts");
+  }
+
+  // A sighting time after the miss row's own time reads as 0 ago, not as the -1 of a time that did not
+  // happen. A fresh shader never offered is noted posted an hour ahead of the clock, as a worker that
+  // posts while the GPU thread builds the row would be, and is then drawn with the report on, so its
+  // miss row finds that note. Its offered time was never noted and must still read -1, so a clamp that
+  // also swallowed the -1 fails too.
+  void CheckGraphicsPrescanAgoClamp(CadenceFixture &fixture, uintptr_t base) {
+    constexpr uint64_t ahead_offset = 0x5600;
+    constexpr u32 ahead_marker = 14;
+    constexpr int64_t hour_ns = 3'600'000'000'000;
+    auto &sightings = *fixture.context.GetPipelineCache().GraphicsPrescanSightings();
+    const auto ahead = PlaceGuestShader(base + ahead_offset, UserRedPixelShader(ahead_marker),
+                                        Prospero::ShaderBinaryType::kPs, nullptr);
+    sightings.NoteJob(SightingStage::Pixel, ahead, "posted", SightingKind::Posted,
+                      Common::FirstRunReport::NowNs() + hour_ns);
+    fixture.processor.GetShCtx().SetPsShaderBase(ahead);
+    const auto before = static_cast<std::ptrdiff_t>(Common::FirstRunReport::Global().PrescanMissRows().size());
+    Common::FirstRunReport::Configure(true, false);
+    (void)RunCadenceStream(fixture.processor, CadenceDrawStream());
+    Common::FirstRunReport::Configure(false, false);
+    const auto all = Common::FirstRunReport::Global().PrescanMissRows();
+    const auto row = std::find_if(all.begin() + before, all.end(), [](const auto &each) { return each.stage == "ps"; });
+    Require(GraphicsPrescanTestName, "ago clamp",
+            row != all.end() && row->seen && row->posted_ago_ms == 0.0 && row->first_seen_ago_ms == 0.0 &&
+                row->offered_ago_ms < 0.0,
+            "a sighting time after the miss row's own read as never happened, or a time never noted did not");
   }
 
   static constexpr const char *GraphicsPrebuildTestName = "GraphicsPrescanPrebuild";

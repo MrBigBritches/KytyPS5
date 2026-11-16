@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_PIPELINE_PRESCANGRAPHICS_H_
 
 #include "common/firstRunReport.h"
+#include "graphics/guest_gpu/command_processor/graphicsScanSightings.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineBuildQueue.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/prescanHandoff.h"
@@ -370,6 +371,12 @@ struct PipelineCache::GraphicsPrescanState {
 	/// miss reads, which is rare, so the lock never holds up a lookup that hits.
 	std::mutex                                                          variants_mutex;
 	std::unordered_map<uint64_t, std::vector<GraphicsPrescanVariant>> variants;
+	/// What the walk, the sink and the workers did with each shader address, for the first-run report's
+	/// miss rows. Made only with the report on when the prescan starts, so without it nothing is noted.
+	std::unique_ptr<GraphicsShaderSightings> sightings;
+	/// The sighting keys the sink has noted, so a deduped draw takes the sightings' lock once per
+	/// address. The scanner thread's own, like offered_keys.
+	std::unordered_set<uint64_t> sink_noted;
 	/// Declared last, so their workers are joined before anything they use is destroyed.
 	PipelineBuildQueue translate;
 	PipelineBuildQueue libraries;
