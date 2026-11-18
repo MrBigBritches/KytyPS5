@@ -108,6 +108,15 @@ struct ConfigOptions {
 	bool                   playgo_hack_enabled         = false;
 	bool                   skip_notice_screen          = false;
 	std::string            launch_activity;
+	// Draw system UI such as trophy toasts with the new system UI framework.
+	bool                   system_ui_enabled           = false;
+	// For testing, show a sample trophy toast of each grade in turn, without a game unlocking one.
+	bool                   system_ui_test_toasts       = false;
+	// Log how long each trophy toast took to draw and how much it drew, to compare the old and
+	// new toast. Each toast is logged once it leaves, so one still on screen at quit isn't.
+	bool                   system_ui_stats             = false;
+	// For a player who asks for less motion, the trophy toast fades without sliding or shining.
+	bool                   system_ui_reduced_motion    = false;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	bool red_zone_protection_enabled = false;
 #endif
@@ -189,6 +198,14 @@ bool PlayGoHackEnabled();
 bool SkipNoticeScreen();
 // Activity ID of the one-shot launchActivity game intent; empty sends none.
 const std::string& GetLaunchActivity();
+/// True when system UI is drawn with the new system UI framework.
+bool SystemUiEnabled();
+/// True when sample trophy toasts should be shown for testing.
+bool SystemUiTestToasts();
+/// True when each trophy toast's drawing statistics should be logged.
+bool SystemUiStatsEnabled();
+/// True when the new system UI should use less motion.
+bool SystemUiReducedMotion();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 bool RedZoneProtectionEnabled();
 #endif
